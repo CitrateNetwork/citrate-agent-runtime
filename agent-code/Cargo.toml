@@ -1,0 +1,17 @@
+[package]
+name = "citrate-agent-code"
+version = "0.1.0"
+edition = "2021"
+description = "Coding agent tools: file_read, file_write, file_edit, shell_exec, git_ops, search_code — OpenCode-style bridge for IDE/Studio"
+
+[dependencies]
+citrate-agent-core = { path = "../agent-core" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
