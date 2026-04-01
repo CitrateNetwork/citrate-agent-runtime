@@ -9,6 +9,13 @@ use std::time::Duration;
 
 pub struct ShellExec;
 
+/// Commands that are always denied (destructive or privilege escalation).
+const DENIED_COMMANDS: &[&str] = &[
+    "sudo", "su ", "chmod 777", "rm -rf /", "rm -rf ~",
+    "mkfs", "dd if=", ":(){ :|:& };:",
+    "curl | sh", "wget | sh", "curl | bash", "wget | bash",
+];
+
 /// Default timeout for shell commands: 30 seconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -58,6 +65,16 @@ impl AgentTool for ShellExec {
             .get("command")
             .and_then(|c| c.as_str())
             .ok_or_else(|| AgentError::InvalidParams("'command' is required".into()))?;
+
+        // Check for denied commands (destructive or privilege escalation)
+        let cmd_lower = command.to_lowercase();
+        for denied in DENIED_COMMANDS {
+            if cmd_lower.contains(denied) {
+                return Err(AgentError::ExecutionFailed(
+                    format!("command denied: contains '{}' (security policy)", denied),
+                ));
+            }
+        }
 
         let timeout_ms = params
             .get("timeout_ms")
