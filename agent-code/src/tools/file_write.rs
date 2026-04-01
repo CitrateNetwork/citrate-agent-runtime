@@ -10,9 +10,34 @@ use std::path::{Path, PathBuf};
 
 pub struct FileWrite;
 
+/// Paths that are always denied for write operations (security-sensitive).
+const DENIED_PATTERNS: &[&str] = &[
+    ".ssh", ".gnupg", ".aws", ".config/gcloud", ".kube", ".env",
+];
+
+/// File extensions that are always denied for write operations.
+const DENIED_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks"];
+
 /// Resolve a path relative to the workspace for write operations.
 /// Unlike reads, the file need not exist yet — we validate the parent directory.
+/// Also checks denied patterns and extensions per SandboxPolicy rules.
 fn resolve_write_path(workspace: &str, path: &str) -> Result<PathBuf, AgentError> {
+    // Check denied patterns
+    for pattern in DENIED_PATTERNS {
+        if path.contains(pattern) {
+            return Err(AgentError::ExecutionFailed(
+                format!("access denied: path contains '{}' (security-sensitive)", pattern),
+            ));
+        }
+    }
+    // Check denied extensions
+    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+        if DENIED_EXTENSIONS.contains(&ext) {
+            return Err(AgentError::ExecutionFailed(
+                format!("write denied: '{}' files are security-sensitive", ext),
+            ));
+        }
+    }
     let workspace = Path::new(workspace)
         .canonicalize()
         .map_err(|e| AgentError::ExecutionFailed(format!("invalid workspace dir: {e}")))?;
