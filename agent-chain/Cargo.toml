@@ -1,6 +1,6 @@
 [package]
 name = "citrate-agent-chain"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 description = "Native chain agent tools: check_balance, send_tx, deploy_contract, query_contract, list_models, run_inference, explain_tx"
 
