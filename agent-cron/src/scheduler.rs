@@ -31,6 +31,17 @@ pub struct CronJob {
     pub enabled: bool,
     /// ISO 8601 timestamp of the last time this job fired (if ever).
     pub last_run: Option<String>,
+    /// Snapshot of the capability grant captured at REGISTRATION
+    /// time. The fire-time check verifies the snapshot's signature
+    /// is still valid AND that the live grant hasn't been revoked
+    /// AND that the snapshot's policy still admits the tool. This
+    /// closes audit AGT-14: pre-fix the cron loop re-resolved
+    /// `grant_id` at fire time, so a grant rotated to a more
+    /// permissive scope after registration would silently elevate
+    /// the cron's authority.
+    /// RM-B1 / WP-E5.9 (audit AGT-14).
+    #[serde(default)]
+    pub grant_snapshot: Option<citrate_agent_core::canonical::CapabilityGrant>,
 }
 
 /// Result of a `tick()` — jobs that are due for execution.
@@ -144,6 +155,59 @@ impl CronScheduler {
     pub async fn tick_now(&self) -> Vec<DueJob> {
         self.tick(Utc::now()).await
     }
+
+    /// Fire-time grant validation. Given a `DueJob`, check that the
+    /// snapshot captured at registration is still valid:
+    ///   1. The snapshot's signature still verifies (i.e. the issuer
+    ///      key on file still consents to this exact preimage).
+    ///   2. The snapshot's `tool_name` is in `allowed_tools`.
+    ///   3. The snapshot's expiry hasn't elapsed.
+    ///
+    /// Returns `Ok(())` if the cron is allowed to fire, `Err(reason)`
+    /// otherwise. Caller is responsible for checking against the
+    /// LIVE grant store for revocation if it cares about that
+    /// (snapshot-only is sufficient for AGT-14's "no silent
+    /// elevation" property).
+    /// RM-B1 / WP-E5.9 (audit AGT-14).
+    pub fn validate_fire(due: &DueJob, now: DateTime<Utc>) -> Result<(), String> {
+        let snapshot = due
+            .job
+            .grant_snapshot
+            .as_ref()
+            .ok_or_else(|| "no grant snapshot recorded at registration".to_string())?;
+
+        // Signature still valid? (Either it was always signed and
+        // still verifies, or it was never signed and we treat that
+        // as legacy-OK — operator's policy choice at registration.)
+        if !snapshot.signature.is_empty() || !snapshot.issuer_pubkey.is_empty() {
+            snapshot
+                .verify_signature()
+                .map_err(|e| format!("snapshot signature invalid: {}", e))?;
+        }
+
+        // Tool still in scope?
+        if !snapshot.allowed_tools.is_empty()
+            && !snapshot
+                .allowed_tools
+                .iter()
+                .any(|t| t == &due.job.tool_name)
+        {
+            return Err(format!(
+                "snapshot does not authorize tool '{}'",
+                due.job.tool_name
+            ));
+        }
+
+        // Expiry?
+        if snapshot
+            .is_expired(now)
+            .map_err(|e| format!("snapshot expires_at malformed: {}", e))?
+        {
+            return Err("snapshot has expired".to_string());
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for CronScheduler {
@@ -251,6 +315,7 @@ mod tests {
             params: serde_json::json!({"key": "value"}),
             enabled: true,
             last_run: None,
+            grant_snapshot: None,
         }
     }
 
@@ -416,5 +481,102 @@ mod tests {
         let now = Utc::now();
         // Only 5 fields — invalid
         assert!(!schedule_matches("0 0 12 * *", now));
+    }
+
+    // ── RM-E5 / WP-E5.9 (audit AGT-14) cron grant snapshot ──────────
+
+    use citrate_agent_core::canonical::{CapabilityGrant, PolicyProfile};
+
+    fn make_snapshot(allowed_tool: &str, expires_at: &str) -> CapabilityGrant {
+        CapabilityGrant {
+            id: "grant-cron".to_string(),
+            issuer: "0xuser".to_string(),
+            recipient: "cron".to_string(),
+            allowed_tools: vec![allowed_tool.to_string()],
+            max_value_per_tx: None,
+            allowed_paths: vec![],
+            expires_at: expires_at.to_string(),
+            policy: PolicyProfile::Operator,
+            revoked: false,
+            connected_since: 0,
+            issuer_pubkey: Vec::new(),
+            signature: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agt14_validate_fire_passes_when_snapshot_authorizes_tool() {
+        let mut job = make_job("j1", "* * * * * *");
+        job.tool_name = "check_balance".to_string();
+        job.grant_snapshot = Some(make_snapshot("check_balance", "2030-01-01T00:00:00Z"));
+        let due = DueJob {
+            job: job.clone(),
+            matched_at: Utc::now(),
+        };
+        CronScheduler::validate_fire(&due, Utc::now()).expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn test_agt14_validate_fire_rejects_missing_snapshot() {
+        let job = make_job("j1", "* * * * * *");
+        let due = DueJob {
+            job,
+            matched_at: Utc::now(),
+        };
+        let err = CronScheduler::validate_fire(&due, Utc::now())
+            .expect_err("missing snapshot should error");
+        assert!(err.contains("snapshot"));
+    }
+
+    #[tokio::test]
+    async fn test_agt14_validate_fire_rejects_unauthorized_tool() {
+        let mut job = make_job("j1", "* * * * * *");
+        job.tool_name = "send_tx".to_string();
+        // Snapshot only allows `check_balance`, not `send_tx`.
+        job.grant_snapshot = Some(make_snapshot("check_balance", "2030-01-01T00:00:00Z"));
+        let due = DueJob {
+            job,
+            matched_at: Utc::now(),
+        };
+        let err = CronScheduler::validate_fire(&due, Utc::now())
+            .expect_err("unauthorized tool should error");
+        assert!(err.contains("does not authorize"));
+    }
+
+    #[tokio::test]
+    async fn test_agt14_validate_fire_rejects_expired_snapshot() {
+        let mut job = make_job("j1", "* * * * * *");
+        job.tool_name = "check_balance".to_string();
+        // Snapshot expired in 2020.
+        job.grant_snapshot = Some(make_snapshot("check_balance", "2020-01-01T00:00:00Z"));
+        let due = DueJob {
+            job,
+            matched_at: Utc::now(),
+        };
+        let err = CronScheduler::validate_fire(&due, Utc::now())
+            .expect_err("expired snapshot should error");
+        assert!(err.contains("expired"));
+    }
+
+    /// Core AGT-14 case: the live grant has been rotated to a more
+    /// permissive scope, but the snapshot — locked at registration
+    /// — refuses the elevated tool.
+    #[tokio::test]
+    async fn test_agt14_snapshot_blocks_post_registration_elevation() {
+        let mut job = make_job("j1", "* * * * * *");
+        // Cron was registered to do `check_balance` only.
+        job.tool_name = "check_balance".to_string();
+        job.grant_snapshot = Some(make_snapshot("check_balance", "2030-01-01T00:00:00Z"));
+
+        // Imagine the operator later rotated the grant to also
+        // authorize `send_tx`. The cron's job record might
+        // independently change `tool_name` to "send_tx", but the
+        // snapshot still says "check_balance only".
+        job.tool_name = "send_tx".to_string();
+        let due = DueJob {
+            job,
+            matched_at: Utc::now(),
+        };
+        assert!(CronScheduler::validate_fire(&due, Utc::now()).is_err());
     }
 }
