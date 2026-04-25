@@ -84,7 +84,8 @@ mod tests {
         assert_eq!(tools::FileRead.risk_level(), RiskLevel::Low);
         assert_eq!(tools::FileWrite.risk_level(), RiskLevel::Medium);
         assert_eq!(tools::FileEdit.risk_level(), RiskLevel::Medium);
-        assert_eq!(tools::ShellExec.risk_level(), RiskLevel::Medium);
+        // RM-B1 / WP-E4.5 (audit AGT-03): Critical, not Medium.
+        assert_eq!(tools::ShellExec.risk_level(), RiskLevel::Critical);
         assert_eq!(tools::GitOps.risk_level(), RiskLevel::Medium);
         assert_eq!(tools::SearchCode.risk_level(), RiskLevel::Low);
     }
@@ -328,16 +329,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_exec_failing_command() {
+        // Post RM-E4: shell builtins like `exit 42` no longer apply
+        // because we don't go through `sh -c`. Use an allowlisted
+        // binary (`cat`) on a missing file to produce a non-zero
+        // exit. This proves the failure-path plumbing still works
+        // even though shell builtins are gone.
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let ctx = test_ctx_with_dir(dir.path().to_str().expect("valid path"));
         let result = tools::ShellExec
-            .execute(serde_json::json!({ "command": "exit 42" }), &ctx)
+            .execute(
+                serde_json::json!({ "command": "cat /nonexistent-citrate-test-file" }),
+                &ctx,
+            )
             .await
             .expect("shell_exec should return result, not error");
 
         assert!(!result.success);
         let data = result.data.expect("should have data");
-        assert_eq!(data["exit_code"], 42);
+        // `cat` returns 1 on missing file across coreutils/BSD.
+        assert!(
+            data["exit_code"].as_i64().expect("exit_code int") != 0,
+            "expected non-zero exit, got {:?}",
+            data["exit_code"]
+        );
     }
 
     #[tokio::test]
@@ -349,6 +363,119 @@ mod tests {
         assert!(result.is_err());
         let err = result.expect_err("should fail without command");
         assert!(err.to_string().contains("'command' is required"));
+    }
+
+    // ── RM-E4 / WP-E4.4 bypass attempts (audit AGT-04) ──────────────
+
+    /// Helper: assert the parser rejects a command. Any rejection
+    /// reason is acceptable — the contract is "this string must
+    /// not run a process."
+    fn assert_rejected(command: &str) {
+        use crate::tools::shell_exec::parse_and_validate_command;
+        let r = parse_and_validate_command(command);
+        assert!(
+            r.is_err(),
+            "AGT-04: bypass attempt {:?} must be rejected",
+            command
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_pipe_chain() {
+        assert_rejected("ls | rm -rf /");
+        assert_rejected("cat /etc/passwd | base64");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_semicolon_chain() {
+        assert_rejected("ls; rm -rf /");
+        assert_rejected("cargo build ; sudo apt install evil");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_ampersand_background() {
+        assert_rejected("cargo build &");
+        assert_rejected("ls && rm -rf /");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_redirect() {
+        assert_rejected("echo evil > /etc/passwd");
+        assert_rejected("cat < /etc/shadow");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_command_substitution() {
+        assert_rejected("echo $(rm -rf /)");
+        assert_rejected("echo `whoami`");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_variable_expansion() {
+        assert_rejected("echo $HOME");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_non_allowlisted_binary() {
+        assert_rejected("sudo cargo build");
+        assert_rejected("dd if=/dev/zero of=/etc/passwd");
+        assert_rejected("nc -l 9000");
+        assert_rejected("/bin/su -");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_attacker_staged_absolute_path() {
+        // `cargo` IS allowlisted, but only at SAFE_PATH locations.
+        // /tmp/cargo (an attacker-staged binary) is rejected.
+        assert_rejected("/tmp/cargo build");
+        assert_rejected("/home/user/.local/bin/cargo build");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_accepts_allowlisted_binaries() {
+        use crate::tools::shell_exec::parse_and_validate_command;
+        let cases = &[
+            "cargo build --release",
+            "git status",
+            "forge test",
+            "ls -la src",
+            "rg pattern src",
+            "/usr/bin/python3 --version",
+        ];
+        for c in cases {
+            assert!(
+                parse_and_validate_command(c).is_ok(),
+                "must accept allowlisted: {}",
+                c
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_empty_command() {
+        assert_rejected("");
+        assert_rejected("   ");
+    }
+
+    #[tokio::test]
+    async fn test_agt04_rejects_newline_smuggling() {
+        // Some shell parsers treat `\n` like `;`.
+        assert_rejected("cargo build\nrm -rf /");
+        assert_rejected("ls\rrm -rf /");
+    }
+
+    /// AGT-05: invalid workspace_dir rejects.
+    #[tokio::test]
+    async fn test_agt05_invalid_workspace_dir_rejects() {
+        let mut ctx = test_ctx_with_dir("/nonexistent-citrate-cwd-test");
+        ctx.workspace_dir = "/nonexistent-citrate-cwd-test".to_string();
+        let result = tools::ShellExec
+            .execute(serde_json::json!({ "command": "echo hi" }), &ctx)
+            .await;
+        assert!(
+            result.is_err(),
+            "AGT-05: nonexistent workspace_dir must reject"
+        );
     }
 
     // ── GitOps tests ────────────────────────────────────────────────────

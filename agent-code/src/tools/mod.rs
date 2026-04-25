@@ -1,7 +1,7 @@
 mod file_read;
 mod file_write;
 mod file_edit;
-mod shell_exec;
+pub mod shell_exec;
 mod git_operations;
 mod search_code;
 
