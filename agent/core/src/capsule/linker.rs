@@ -257,8 +257,8 @@ impl LinkerBuilder {
             .map_err(|e| linker_err("citrate:chain/eth-call@0.1.0 instance", e))?;
         inst.func_wrap(
             "call",
-            |store: wasmtime::StoreContextMut<'_, HostCtx>,
-             (to, _data): (Vec<u8>, Vec<u8>)|
+            |mut store: wasmtime::StoreContextMut<'_, HostCtx>,
+             (to, data): (Vec<u8>, Vec<u8>)|
              -> wasmtime::Result<(Result<Vec<u8>, String>,)> {
                 if to.len() != 20 {
                     return Ok((Err(format!(
@@ -274,9 +274,17 @@ impl LinkerBuilder {
                         hex::encode(addr)
                     )),));
                 }
-                // CIT-AGENT-9c-host stub: deterministic empty response.
-                // The first real RPC dispatch lands in CIT-AGENT-9c-1
-                // when the first tool capsule needs live data.
+                // Record the call before consuming any test fixture
+                // so the post-call inspection (last_eth_call_*) is
+                // always populated for authorized calls.
+                // CIT-AGENT-9c-1.
+                store.data_mut().record_eth_call(addr, data.clone());
+                // If a test fixture is injected, return it; otherwise
+                // the stub from 9c-host (empty bytes). Real RPC
+                // dispatch lands in CIT-AGENT-9c-1-rpc.
+                if let Some(canned) = store.data_mut().take_eth_call_canned_response() {
+                    return Ok((Ok(canned),));
+                }
                 Ok((Ok(Vec::new()),))
             },
         )

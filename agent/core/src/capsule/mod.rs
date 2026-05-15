@@ -858,6 +858,385 @@ tier = "bundled"
         );
     }
 
+    /// CIT-AGENT-9c-1 helper: invoke `query` on the
+    /// list-compliance-posture capsule with `(framework, scope)`
+    /// strings. Returns the WIT `result<posture-row, string>` as
+    /// a Rust `Result<DecodedRow, String>`.
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedRow {
+        row_id: [u8; 32],
+        framework: [u8; 32],
+        scope: [u8; 32],
+        evidence_cid: [u8; 32],
+        attestor: [u8; 32],
+        posture: u8,
+        expired: bool,
+        attested_at_block: u64,
+        expires_at_block: u64,
+    }
+
+    #[cfg(test)]
+    fn invoke_list_compliance_query(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        framework: &str,
+        scope: &str,
+    ) -> Result<DecodedRow, String> {
+        use wasmtime::component::Val;
+        let iface_index = instance
+            .get_export(
+                &mut *store,
+                None,
+                "citrate:list-compliance-posture/query@0.1.0",
+            )
+            .expect("capsule exports `query` interface");
+        let func_index = instance
+            .get_export(&mut *store, Some(&iface_index), "query")
+            .expect("query interface exports `query` func");
+        let func = instance
+            .get_func(&mut *store, func_index)
+            .expect("query func resolves");
+        let args = vec![
+            Val::String(framework.to_string()),
+            Val::String(scope.to_string()),
+        ];
+        let mut results = [Val::Bool(false)];
+        func.call(&mut *store, &args, &mut results)
+            .expect("query call completes");
+        func.post_return(&mut *store).expect("post_return clears");
+        // Unwrap the result<posture-row, string>.
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::Record(fields) => {
+                        let lookup = |name: &str| -> Val {
+                            fields
+                                .iter()
+                                .find(|(k, _)| k == name)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_else(|| panic!("field {name} missing"))
+                        };
+                        let bytes32 = |v: Val| -> [u8; 32] {
+                            match v {
+                                Val::List(bytes) => {
+                                    let raw: Vec<u8> = bytes
+                                        .into_iter()
+                                        .map(|b| match b {
+                                            Val::U8(b) => b,
+                                            _ => panic!("non-u8 in bytes32"),
+                                        })
+                                        .collect();
+                                    assert_eq!(raw.len(), 32, "expected 32 bytes");
+                                    let mut a = [0u8; 32];
+                                    a.copy_from_slice(&raw);
+                                    a
+                                }
+                                _ => panic!("expected list<u8>"),
+                            }
+                        };
+                        let u8v = |v: Val| -> u8 {
+                            if let Val::U8(b) = v {
+                                b
+                            } else {
+                                panic!("expected u8")
+                            }
+                        };
+                        let boolv = |v: Val| -> bool {
+                            if let Val::Bool(b) = v {
+                                b
+                            } else {
+                                panic!("expected bool")
+                            }
+                        };
+                        let u64v = |v: Val| -> u64 {
+                            if let Val::U64(n) = v {
+                                n
+                            } else {
+                                panic!("expected u64")
+                            }
+                        };
+                        Ok(DecodedRow {
+                            row_id: bytes32(lookup("row-id")),
+                            framework: bytes32(lookup("framework")),
+                            scope: bytes32(lookup("scope")),
+                            evidence_cid: bytes32(lookup("evidence-cid")),
+                            attestor: bytes32(lookup("attestor")),
+                            posture: u8v(lookup("posture")),
+                            expired: boolv(lookup("expired")),
+                            attested_at_block: u64v(lookup("attested-at-block")),
+                            expires_at_block: u64v(lookup("expires-at-block")),
+                        })
+                    }
+                    other => panic!("expected Record in Ok, got {other:?}"),
+                },
+                Ok(None) => panic!("Ok(None) not expected for posture-row"),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string in Err, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Val::Result, got {other:?}"),
+        }
+    }
+
+    /// CIT-AGENT-9c-1 helper: load the list-compliance-posture capsule
+    /// from disk, build engine + linker, return store + instance.
+    #[cfg(test)]
+    fn load_list_compliance_capsule() -> (
+        wasmtime::Store<wasm::HostCtx>,
+        wasmtime::component::Instance,
+    ) {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("list-compliance-posture");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("list-compliance-posture capsule.wasm on disk");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("list-compliance-posture manifest.toml on disk");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("list-compliance-posture instantiates")
+    }
+
+    /// CIT-AGENT-9c-1 — verifies the capsule encodes the canonical
+    /// ABI calldata for `BoeingComplianceRegistry.framework(...)`.
+    /// The expected layout is:
+    ///   selector (4 bytes) || framework_hash (32 bytes) || scope (32 bytes)
+    /// where selector = keccak256("framework(bytes32,bytes32)")[0..4]
+    /// and framework_hash = keccak256(framework_slug).
+    #[test]
+    fn list_compliance_posture_capsule_encodes_correct_calldata() {
+        use sha3::{Digest, Keccak256};
+
+        let (mut store, instance) = load_list_compliance_capsule();
+        // Inject a 288-byte zero-padded response so the capsule's
+        // decoder doesn't error out before we can inspect what it
+        // sent.
+        let canned = vec![0u8; 288];
+        store.data_mut().inject_eth_call_canned_response(canned);
+
+        let framework_slug = "fedramp-moderate";
+        let scope_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let scope_arg = format!("0x{scope_hex}");
+        let _ = invoke_list_compliance_query(&mut store, instance, framework_slug, &scope_arg);
+
+        // Compute expected calldata.
+        let mut sel_hasher = Keccak256::new();
+        sel_hasher.update(b"framework(bytes32,bytes32)");
+        let sel_full = sel_hasher.finalize();
+        let mut expected = Vec::with_capacity(68);
+        expected.extend_from_slice(&sel_full[..4]);
+        let mut fw_hasher = Keccak256::new();
+        fw_hasher.update(framework_slug.as_bytes());
+        let fw_hash = fw_hasher.finalize();
+        expected.extend_from_slice(&fw_hash);
+        expected.extend_from_slice(&hex::decode(scope_hex).unwrap());
+
+        let actual = store
+            .data()
+            .last_eth_call_data()
+            .expect("host fn recorded the call")
+            .clone();
+        assert_eq!(actual.len(), 68, "calldata is 4-byte selector + 64-byte args");
+        assert_eq!(
+            actual, expected,
+            "capsule must produce canonical framework(bytes32,bytes32) calldata",
+        );
+
+        // Verify the `to` is the manifest-allow-listed address.
+        let to = store.data().last_eth_call_to().expect("to recorded").clone();
+        assert_eq!(
+            hex::encode(to),
+            "8dbbbc46d840f40205b48d76aa9fc5063b7d55d8",
+            "calldata must be routed to BoeingComplianceRegistry"
+        );
+    }
+
+    /// CIT-AGENT-9c-1 — verifies the capsule decodes a 288-byte
+    /// `Row` response into the WIT `posture-row` record correctly.
+    /// Layout per LiveComplianceBindings::decode_row:
+    ///   [0..32)    row_id
+    ///   [32..64)   framework
+    ///   [64..96)   scope
+    ///   [96..128)  evidence_cid
+    ///   [128..160) attestor
+    ///   [160..192) posture (last byte)
+    ///   [192..224) expired (last byte 0/1)
+    ///   [224..256) attested_at_block (low 8 bytes BE)
+    ///   [256..288) expires_at_block (low 8 bytes BE)
+    #[test]
+    fn list_compliance_posture_capsule_decodes_response() {
+        let (mut store, instance) = load_list_compliance_capsule();
+
+        // Hand-craft a 288-byte response with known field values.
+        let mut canned = vec![0u8; 288];
+        // row_id: 0x11..11
+        canned[0..32].fill(0x11);
+        // framework: 0x22..22
+        canned[32..64].fill(0x22);
+        // scope: 0x33..33
+        canned[64..96].fill(0x33);
+        // evidence_cid: 0x44..44
+        canned[96..128].fill(0x44);
+        // attestor: 0x55..55
+        canned[128..160].fill(0x55);
+        // posture = 2 (Attested) — last byte of chunk at 160..192
+        canned[191] = 2;
+        // expired = true — last byte of chunk at 192..224
+        canned[223] = 1;
+        // attested_at_block = 1000 (low 8 bytes BE of chunk 224..256)
+        let attested: u64 = 1000;
+        canned[248..256].copy_from_slice(&attested.to_be_bytes());
+        // expires_at_block = 12345
+        let expires: u64 = 12345;
+        canned[280..288].copy_from_slice(&expires.to_be_bytes());
+        store.data_mut().inject_eth_call_canned_response(canned);
+
+        let result = invoke_list_compliance_query(
+            &mut store,
+            instance,
+            "fedramp-moderate",
+            "0x00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
+        let row = result.expect("decode succeeds");
+        assert_eq!(row.row_id, [0x11; 32]);
+        assert_eq!(row.framework, [0x22; 32]);
+        assert_eq!(row.scope, [0x33; 32]);
+        assert_eq!(row.evidence_cid, [0x44; 32]);
+        assert_eq!(row.attestor, [0x55; 32]);
+        assert_eq!(row.posture, 2);
+        assert!(row.expired);
+        assert_eq!(row.attested_at_block, 1000);
+        assert_eq!(row.expires_at_block, 12345);
+    }
+
+    /// CIT-AGENT-9c-1 — when the capsule's manifest allow-list does
+    /// NOT include the contract address hardcoded into the capsule
+    /// source, the host fn rejects the call with
+    /// `ChainCallNotAuthorized` and the capsule re-emits the err
+    /// string through its result.
+    ///
+    /// This tests the "compiled-in contract address vs. manifest
+    /// declaration" mismatch path: a deployment-time bug where the
+    /// manifest was edited without rebuilding the capsule. The
+    /// security property is that the host fn closes the gap.
+    #[test]
+    fn list_compliance_posture_capsule_blocks_unauthorized_address() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("list-compliance-posture");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("list-compliance-posture capsule.wasm on disk");
+
+        // Use a tampered manifest where the allow-list points at a
+        // DIFFERENT address (not the one the capsule has compiled in).
+        let manifest_str = r#"
+[capsule]
+name = "list-compliance-posture-tampered"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = ["eth_call:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9c-1"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("tampered manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        let (mut store, instance) = capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("tampered capsule still instantiates");
+
+        let result = invoke_list_compliance_query(
+            &mut store,
+            instance,
+            "fedramp-moderate",
+            "0x00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
+        let err = result.expect_err("call must fail when capsule's target is not allow-listed");
+        assert!(
+            err.starts_with("ChainCallNotAuthorized:"),
+            "host fn must reject; got: {err}"
+        );
+        // The forensic info: the BoeingComplianceRegistry address
+        // (the capsule's compiled-in target) appears in the error
+        // even though the manifest allow-listed deadbeef. This is
+        // the "compiled-in vs declared mismatch" surface.
+        assert!(
+            err.contains("8dbbbc46"),
+            "error must name the capsule's actual target; got: {err}"
+        );
+    }
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects
