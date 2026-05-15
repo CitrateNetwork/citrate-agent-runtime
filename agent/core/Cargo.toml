@@ -46,3 +46,6 @@ wasmtime-wasi = "26"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
+# WAT → WASM at test time for the CIT-AGENT-3d component-instantiation
+# tests. Pinned to a version aligned with wasmtime 26.
+wat = "1.224"

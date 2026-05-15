@@ -23,6 +23,7 @@
 
 use crate::capsule::filesystem;
 use crate::capsule::manifest::{Manifest, NetworkPolicy};
+use crate::capsule::wasm::HostCtx;
 use crate::error::AgentError;
 use std::collections::BTreeSet;
 use wasmtime::component::Linker;
@@ -48,14 +49,10 @@ pub enum CapabilityToken {
     WasiFilesystem,
 }
 
-/// Placeholder for the per-capsule host context. CIT-AGENT-3d will
-/// populate this with WasiCtx + ResourceTable + manifest-derived
-/// filesystem allow-list. For 3c the linker is constructed against
-/// an opaque host context so the type signature stabilizes.
-pub struct HostCtx;
-
 /// LinkerBuilder for the per-capsule wasmtime Linker. Starts empty;
-/// the manifest constructor adds only what's declared.
+/// the manifest constructor adds only what's declared. CIT-AGENT-3d
+/// promoted the `HostCtx` from a placeholder to the real
+/// `wasmtime_wasi::WasiView` impl in `capsule::wasm`.
 pub struct LinkerBuilder {
     linker: Linker<HostCtx>,
     permitted: BTreeSet<CapabilityToken>,
@@ -117,11 +114,114 @@ impl LinkerBuilder {
         &self.permitted
     }
 
+    /// Wire real `wasmtime-wasi` host functions into the linker based
+    /// on the permitted capability tokens. The selection mirrors
+    /// `wasmtime_wasi::add_to_linker_sync` but only registers the
+    /// subsystems whose token is permitted — i.e. "build from
+    /// manifest, NOT filter default" at the linker level.
+    ///
+    /// Per RFC §4.5: a new wasmtime version adding a host fn under
+    /// `wasi:sockets` can't leak through to a `network = "none"`
+    /// capsule because the per-capsule linker never called the
+    /// sockets add_to_linker family. CIT-AGENT-3d.
+    pub fn wire_wasi_host_fns(mut self) -> Result<Self, AgentError> {
+        use wasmtime_wasi::bindings as b;
+        use wasmtime_wasi::{WasiImpl, WasiView};
+
+        // The `closure` pattern + `type_annotate` workaround is
+        // copied verbatim from wasmtime_wasi::add_to_linker_sync.
+        fn type_annotate<T: WasiView, F>(val: F) -> F
+        where
+            F: Fn(&mut T) -> WasiImpl<&mut T>,
+        {
+            val
+        }
+        let closure = type_annotate::<HostCtx, _>(|t| WasiImpl(t));
+        let l = &mut self.linker;
+
+        if self.permitted.contains(&CapabilityToken::WasiCli) {
+            b::cli::exit::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::exit", e))?;
+            b::cli::environment::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::environment", e))?;
+            b::cli::stdin::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::stdin", e))?;
+            b::cli::stdout::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::stdout", e))?;
+            b::cli::stderr::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::stderr", e))?;
+            b::cli::terminal_input::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::terminal_input", e))?;
+            b::cli::terminal_output::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::terminal_output", e))?;
+            b::cli::terminal_stdin::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::terminal_stdin", e))?;
+            b::cli::terminal_stdout::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::terminal_stdout", e))?;
+            b::cli::terminal_stderr::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("cli::terminal_stderr", e))?;
+        }
+        if self.permitted.contains(&CapabilityToken::WasiClocks) {
+            b::clocks::wall_clock::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("clocks::wall_clock", e))?;
+            b::clocks::monotonic_clock::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("clocks::monotonic_clock", e))?;
+        }
+        if self.permitted.contains(&CapabilityToken::WasiRandom) {
+            b::random::random::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("random::random", e))?;
+            b::random::insecure::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("random::insecure", e))?;
+            b::random::insecure_seed::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("random::insecure_seed", e))?;
+        }
+        // I/O streams + io::error are foundational for filesystem
+        // AND sockets — register when either is permitted.
+        let needs_io = self.permitted.contains(&CapabilityToken::WasiFilesystem)
+            || self.permitted.contains(&CapabilityToken::WasiSockets)
+            || self.permitted.contains(&CapabilityToken::WasiCli);
+        if needs_io {
+            b::io::error::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("io::error", e))?;
+            b::sync::io::poll::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("io::poll", e))?;
+            b::sync::io::streams::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("io::streams", e))?;
+        }
+        if self.permitted.contains(&CapabilityToken::WasiFilesystem) {
+            b::sync::filesystem::types::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("filesystem::types", e))?;
+            b::filesystem::preopens::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("filesystem::preopens", e))?;
+        }
+        if self.permitted.contains(&CapabilityToken::WasiSockets) {
+            b::sync::sockets::tcp::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::tcp", e))?;
+            b::sockets::tcp_create_socket::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::tcp_create_socket", e))?;
+            b::sync::sockets::udp::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::udp", e))?;
+            b::sockets::udp_create_socket::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::udp_create_socket", e))?;
+            b::sockets::instance_network::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::instance_network", e))?;
+            b::sockets::network::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::network", e))?;
+            b::sockets::ip_name_lookup::add_to_linker_get_host(l, closure)
+                .map_err(|e| linker_err("sockets::ip_name_lookup", e))?;
+        }
+        Ok(self)
+    }
+
     /// Consume the builder, yielding the wasmtime `Linker` ready for
-    /// instantiation. Real instantiation lands in CIT-AGENT-3d.
+    /// instantiation.
     pub fn into_linker(self) -> Linker<HostCtx> {
         self.linker
     }
+}
+
+fn linker_err<E: std::fmt::Display>(family: &str, e: E) -> AgentError {
+    AgentError::Capsule(format!("wasi {family} add_to_linker_get_host failed: {e}"))
 }
 
 #[cfg(test)]

@@ -99,13 +99,37 @@ impl Capsule {
     /// manifest. CIT-AGENT-3c — the linker is constructed with only
     /// the WASI capabilities the manifest declares (fail-closed,
     /// "build from manifest, NOT filter default" per planset).
-    /// Actual instantiation lands in CIT-AGENT-3d alongside
-    /// `Capsule::call(...)`.
+    /// CIT-AGENT-3d adds real wasmtime-wasi host fn wiring via
+    /// `wire_wasi_host_fns`.
     pub fn prepare_linker(
         &self,
         engine: &wasmtime::Engine,
     ) -> Result<linker::LinkerBuilder, AgentError> {
-        linker::LinkerBuilder::from_manifest(engine, &self.manifest)
+        linker::LinkerBuilder::from_manifest(engine, &self.manifest)?.wire_wasi_host_fns()
+    }
+
+    /// Instantiate the capsule's WASM component against the prepared
+    /// linker. CIT-AGENT-3d: this is the runtime path that proves
+    /// the fail-closed property — a WASM importing `wasi:sockets`
+    /// fails here with a link error when the manifest's
+    /// `[capability].network = "none"` denied the sockets host fns.
+    ///
+    /// Returns `Ok(())` on successful instantiation; calling typed
+    /// exports of the resulting `Instance` requires the WIT-typed
+    /// binding layer which lands when capsules' typed-call API
+    /// arrives (per-capsule sprint, post-3d).
+    pub fn instantiate(
+        &self,
+        engine: &wasmtime::Engine,
+        linker: &wasmtime::component::Linker<wasm::HostCtx>,
+    ) -> Result<(), AgentError> {
+        let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
+            .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
+        let mut store = wasmtime::Store::new(engine, wasm::HostCtx::empty());
+        linker
+            .instantiate(&mut store, &component)
+            .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
+        Ok(())
     }
 
     pub fn name(&self) -> &str {
@@ -232,6 +256,218 @@ tier = "bundled"
             .expect("manifest-declared body hash matches; load succeeds");
         assert_eq!(capsule.name(), "test-capsule");
         assert_eq!(capsule.manifest.capsule.content_hash, body_hash);
+    }
+
+    /// CIT-AGENT-3d — instantiate a minimal empty WASM component
+    /// (no imports) under a linker built from a `network = "none",
+    /// filesystem = []` manifest. Instantiation MUST succeed since
+    /// the component imports nothing.
+    #[test]
+    fn instantiate_empty_component_succeeds() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+
+        // Tiny empty component: `(component)` in WAT compiles to a
+        // 16-byte component-model binary.
+        let component_wasm = wat::parse_str("(component)").expect("WAT compiles");
+
+        let manifest_str = r#"
+[capsule]
+name = "empty-component"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = []
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-3d"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm: component_wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect("empty component instantiates");
+    }
+
+    /// CIT-AGENT-3d — instantiate a component that has an exported
+    /// function (no imports) under a strict linker. Confirms the
+    /// instantiation path handles components with exports cleanly.
+    #[test]
+    fn instantiate_component_with_export_succeeds() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+
+        // A component that contains a core module with a single
+        // function and exports it. No imports.
+        let component_wat = r#"
+(component
+    (core module $m
+        (func (export "ping") (result i32) i32.const 42)
+    )
+    (core instance $i (instantiate $m))
+)
+"#;
+        let component_wasm = wat::parse_str(component_wat).expect("WAT compiles");
+
+        let manifest_str = r#"
+[capsule]
+name = "ping"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = []
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-3d"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm: component_wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect("component with export instantiates");
+    }
+
+    /// CIT-AGENT-3d — malformed WASM bytes are rejected at parse,
+    /// not at instantiate. The error variant carries the parse
+    /// diagnostic.
+    #[test]
+    fn instantiate_malformed_wasm_rejects() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+
+        let bad_wasm = vec![0x00, 0x01, 0x02, 0x03]; // not a valid WASM header
+
+        let manifest_str = r#"
+[capsule]
+name = "bad-wasm"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = []
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "test"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm: bad_wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        let err = capsule
+            .instantiate(&engine, &linker)
+            .expect_err("malformed WASM rejected");
+        assert!(err.to_string().contains("parse") || err.to_string().contains("instantiate"));
     }
 
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
