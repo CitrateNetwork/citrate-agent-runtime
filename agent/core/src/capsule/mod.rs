@@ -1792,6 +1792,243 @@ tier = "bundled"
 
     // ────────────────────── (end CIT-AGENT-9c-3) ──────────────────
 
+    // ────────────────────── CIT-AGENT-9c-4 ────────────────────────
+    // verify-provenance-chain: single call, mixed (bool, bytes32[])
+    // return — exercises variable-length array decoding behind an
+    // offset.
+
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedVerifyResult {
+        ok: bool,
+        chain: Vec<[u8; 32]>,
+    }
+
+    #[cfg(test)]
+    fn invoke_verify_provenance_chain(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        part_hash: &str,
+    ) -> Result<DecodedVerifyResult, String> {
+        use wasmtime::component::Val;
+        let iface_index = instance
+            .get_export(
+                &mut *store,
+                None,
+                "citrate:verify-provenance-chain/query@0.1.0",
+            )
+            .expect("capsule exports `query` interface");
+        let func_index = instance
+            .get_export(&mut *store, Some(&iface_index), "query")
+            .expect("query interface exports `query` func");
+        let func = instance
+            .get_func(&mut *store, func_index)
+            .expect("query func resolves");
+        let args = vec![Val::String(part_hash.to_string())];
+        let mut results = [Val::Bool(false)];
+        func.call(&mut *store, &args, &mut results)
+            .expect("query call completes");
+        func.post_return(&mut *store).expect("post_return clears");
+
+        fn bytes32_from_val(v: &Val) -> [u8; 32] {
+            match v {
+                Val::List(bytes) => {
+                    let raw: Vec<u8> = bytes
+                        .iter()
+                        .map(|b| match b {
+                            Val::U8(b) => *b,
+                            _ => panic!("non-u8 in bytes32"),
+                        })
+                        .collect();
+                    assert_eq!(raw.len(), 32);
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&raw);
+                    a
+                }
+                _ => panic!("expected list<u8>"),
+            }
+        }
+
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::Record(fields) => {
+                        let f = |name: &str| -> &Val {
+                            fields
+                                .iter()
+                                .find(|(k, _)| k == name)
+                                .map(|(_, v)| v)
+                                .unwrap_or_else(|| panic!("field {name} missing"))
+                        };
+                        let ok = if let Val::Bool(b) = f("ok") {
+                            *b
+                        } else {
+                            panic!("expected bool for ok")
+                        };
+                        let chain = if let Val::List(items) = f("chain") {
+                            items.iter().map(bytes32_from_val).collect()
+                        } else {
+                            panic!("expected list for chain")
+                        };
+                        Ok(DecodedVerifyResult { ok, chain })
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                },
+                Ok(None) => panic!("Ok(None) not expected for verify-result"),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn load_verify_provenance_capsule() -> (
+        wasmtime::Store<wasm::HostCtx>,
+        wasmtime::component::Instance,
+    ) {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("verify-provenance-chain");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("verify-provenance capsule.wasm on disk");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("verify-provenance manifest.toml on disk");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("verify-provenance instantiates")
+    }
+
+    /// Build a (bool, bytes32[]) response. Layout:
+    ///   [0..32)  bool (last byte 0/1)
+    ///   [32..64) offset = 0x40 (64) pointing to the array data
+    ///   [64..96) array length
+    ///   [96..)   N × 32 bytes of entries
+    #[cfg(test)]
+    fn build_verify_response(ok: bool, chain: &[[u8; 32]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96 + chain.len() * 32);
+        let mut ok_chunk = [0u8; 32];
+        ok_chunk[31] = if ok { 1 } else { 0 };
+        out.extend_from_slice(&ok_chunk);
+        let mut off = [0u8; 32];
+        off[31] = 0x40;
+        out.extend_from_slice(&off);
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(chain.len() as u64).to_be_bytes());
+        out.extend_from_slice(&len);
+        for entry in chain {
+            out.extend_from_slice(entry);
+        }
+        out
+    }
+
+    /// CIT-AGENT-9c-4 — calldata encoding for verifyChain(bytes32).
+    #[test]
+    fn verify_provenance_chain_capsule_encodes_correct_calldata() {
+        use sha3::{Digest, Keccak256};
+
+        let (mut store, instance) = load_verify_provenance_capsule();
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_verify_response(true, &[]));
+
+        let hash_hex = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let _ = invoke_verify_provenance_chain(
+            &mut store,
+            instance,
+            &format!("0x{hash_hex}"),
+        );
+
+        let mut h = Keccak256::new();
+        h.update(b"verifyChain(bytes32)");
+        let sel = h.finalize();
+
+        let history = store.data().eth_call_history();
+        assert_eq!(history.len(), 1);
+        let call = &history[0];
+        assert_eq!(
+            hex::encode(call.0),
+            "1afe987622ab5add275d2fd21248f77f5e00667f",
+            "routed to PartProvenanceRegistry"
+        );
+        assert_eq!(call.1[..4], sel[..4]);
+        assert_eq!(&call.1[4..36], &hex::decode(hash_hex).unwrap()[..]);
+    }
+
+    /// CIT-AGENT-9c-4 — non-empty chain decode.
+    #[test]
+    fn verify_provenance_chain_capsule_decodes_mixed_return() {
+        let (mut store, instance) = load_verify_provenance_capsule();
+        let step_a = [0xa1u8; 32];
+        let step_b = [0xb2u8; 32];
+        let step_c = [0xc3u8; 32];
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_verify_response(
+                true,
+                &[step_a, step_b, step_c],
+            ));
+
+        let result = invoke_verify_provenance_chain(
+            &mut store,
+            instance,
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        );
+        let v = result.expect("decode succeeds");
+        assert!(v.ok);
+        assert_eq!(v.chain.len(), 3);
+        assert_eq!(v.chain[0], step_a);
+        assert_eq!(v.chain[1], step_b);
+        assert_eq!(v.chain[2], step_c);
+    }
+
+    /// CIT-AGENT-9c-4 — empty chain with ok=false is a valid
+    /// response (unknown part), returned as Ok, not Err.
+    #[test]
+    fn verify_provenance_chain_capsule_decodes_empty_chain() {
+        let (mut store, instance) = load_verify_provenance_capsule();
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_verify_response(false, &[]));
+
+        let result = invoke_verify_provenance_chain(
+            &mut store,
+            instance,
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        );
+        let v = result.expect(
+            "empty chain with ok=false is a valid response, not an error",
+        );
+        assert!(!v.ok);
+        assert_eq!(v.chain.len(), 0);
+    }
+
+    // ────────────────────── (end CIT-AGENT-9c-4) ──────────────────
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects

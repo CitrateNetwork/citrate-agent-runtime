@@ -1,0 +1,40 @@
+# CIT-AGENT-9c-4 — verify-provenance-chain capsule.
+# Single eth_call to PartProvenanceRegistry.verifyChain(bytes32);
+# decodes (bool, bytes32[]) tuple.
+
+[capsule]
+name = "verify-provenance-chain"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = ["eth_call:0x1afe987622ab5add275d2fd21248f77f5e00667f"]
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = ["FedRAMP-Moderate", "FedRAMP-High", "CMMC-L3", "ITAR"]
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9c-4"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
