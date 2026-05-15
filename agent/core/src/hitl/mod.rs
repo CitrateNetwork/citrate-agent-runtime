@@ -22,9 +22,14 @@
 
 pub mod quorum;
 pub mod roles;
+pub mod signing;
 
 pub use quorum::Quorum;
 pub use roles::{can_approve, is_conflict};
+pub use signing::{
+    signer_id_from_pubkey, verify_attestation, AttestedSignature, Ed25519FileSurface,
+    SigningSurface,
+};
 // Role is also re-exported here for ergonomics — same enum as
 // `capsule::manifest::Role`.
 pub use crate::capsule::manifest::Role;
@@ -114,13 +119,30 @@ pub struct Signer {
     pub role: Role,
 }
 
-/// An approval signature on an action. CIT-AGENT-4a tracks only the
-/// signer identity + role; 4b adds the hardware-attested signature
-/// payload (PIV/CAC/FIDO2/OS keychain) that proves the signer
-/// actually authorized the action.
+/// An approval signature on an action. CIT-AGENT-4b extends this
+/// with the attested-signature material: signature bytes + pubkey.
+/// `add_signature` verifies the bytes against the recorded action
+/// payload before accepting; a synthetic / spoofed signature is
+/// rejected with `SignatureError::AttestationInvalid`.
+///
+/// The `Signer.id` MUST equal the SHA-256 fingerprint of `pubkey`
+/// (per `signing::signer_id_from_pubkey`); this is enforced by
+/// `signing::verify_attestation`.
 #[derive(Debug, Clone)]
 pub struct Signature {
     pub signer: Signer,
+    pub signature_bytes: Vec<u8>,
+    pub pubkey: [u8; 32],
+}
+
+impl From<AttestedSignature> for Signature {
+    fn from(a: AttestedSignature) -> Self {
+        Self {
+            signer: a.signer,
+            signature_bytes: a.signature_bytes,
+            pubkey: a.pubkey,
+        }
+    }
 }
 
 /// Errors from the role-aware approval flow. Returned by
@@ -139,6 +161,10 @@ pub enum SignatureError {
     /// The action's pending entry was not found (already settled, or
     /// never submitted).
     UnknownCallId,
+    /// CIT-AGENT-4b — attestation material is invalid: signature does
+    /// not verify under the claimed pubkey, signer.id doesn't match
+    /// the pubkey fingerprint, or signature length is wrong.
+    AttestationInvalid(String),
 }
 
 impl std::fmt::Display for SignatureError {
@@ -159,15 +185,23 @@ impl std::fmt::Display for SignatureError {
                 "role conflict: {existing:?} already signed; cannot also accept {attempted:?}"
             ),
             SignatureError::UnknownCallId => write!(f, "no pending action with that call_id"),
+            SignatureError::AttestationInvalid(m) => {
+                write!(f, "attestation invalid: {m}")
+            }
         }
     }
 }
 
 /// State for a role-aware action awaiting quorum-based approval.
-/// CIT-AGENT-4a.
+/// CIT-AGENT-4a + 4b: includes the canonical action payload that
+/// signatures must attest to.
 struct RoleAwareEntry {
     quorum: Quorum,
     proposer: Signer,
+    /// Canonical bytes signers attest to. Verified by `add_signature`
+    /// against the supplied `Signature.signature_bytes` before
+    /// accepting. CIT-AGENT-4b.
+    payload: Vec<u8>,
     signatures: Vec<Signature>,
     resolver: oneshot::Sender<ApprovalOutcome>,
 }
@@ -296,11 +330,17 @@ impl ApprovalQueue {
     /// any signer issues a rejection, or when the per-call timeout
     /// fires.
     ///
+    /// CIT-AGENT-4b: `payload` is the canonical bytes signers must
+    /// attest to (typically a serialized form of the action's args).
+    /// `add_signature` will reject any signature that doesn't verify
+    /// against this exact byte sequence.
+    ///
     /// Tier-low actions (`Quorum::AutoApprove`) short-circuit to
     /// `AutoApproved` without entering the queue.
     pub async fn submit_for_action(
         &self,
         call: ToolCall,
+        payload: Vec<u8>,
         quorum: Quorum,
         proposer: Signer,
     ) -> ApprovalOutcomePublic {
@@ -320,6 +360,7 @@ impl ApprovalQueue {
                 RoleAwareEntry {
                     quorum,
                     proposer,
+                    payload,
                     signatures: Vec::new(),
                     resolver: tx,
                 },
@@ -363,6 +404,17 @@ impl ApprovalQueue {
         let entry = role_q
             .get_mut(call_id)
             .ok_or(SignatureError::UnknownCallId)?;
+        // CIT-AGENT-4b: verify the attestation against the recorded
+        // action payload BEFORE the other SoD checks. A spoofed
+        // signature is rejected here.
+        let attested = AttestedSignature {
+            signer: sig.signer.clone(),
+            signature_bytes: sig.signature_bytes.clone(),
+            pubkey: sig.pubkey,
+        };
+        if let Err(e) = verify_attestation(&entry.payload, &attested) {
+            return Err(SignatureError::AttestationInvalid(e.to_string()));
+        }
         // SoD: proposer cannot also approve.
         if entry.proposer.id == sig.signer.id {
             return Err(SignatureError::ProposerCannotSelfApprove);
@@ -418,6 +470,17 @@ impl ApprovalQueue {
             .ok()
             .and_then(|q| q.get(call_id).map(|e| e.signatures.clone()))
             .unwrap_or_default()
+    }
+
+    /// CIT-AGENT-4b — the canonical bytes the action's signers must
+    /// attest to. Returned to signing-surface holders so they can
+    /// produce an `AttestedSignature` over the exact payload the
+    /// queue will verify.
+    pub fn payload_for(&self, call_id: &str) -> Option<Vec<u8>> {
+        self.role_pending
+            .lock()
+            .ok()
+            .and_then(|q| q.get(call_id).map(|e| e.payload.clone()))
     }
 
     // ── BFR-INT-12b legacy helpers ─────────────────────────────────
@@ -494,17 +557,41 @@ mod tests {
         }
     }
 
-    fn mksigner(id: &str, role: Role) -> Signer {
-        Signer {
-            id: id.to_string(),
-            role,
-        }
+    /// Build a deterministic Ed25519FileSurface for tests. The seed
+    /// byte is hashed into a [u8; 32] so different "names" get
+    /// different keys (and therefore different signer.id values).
+    fn surface(name: &str, role: Role) -> signing::Ed25519FileSurface {
+        let mut seed = [0u8; 32];
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(32);
+        seed[..n].copy_from_slice(&bytes[..n]);
+        signing::Ed25519FileSurface::from_seed(seed, role)
     }
 
-    fn mksig(id: &str, role: Role) -> Signature {
-        Signature {
-            signer: mksigner(id, role),
-        }
+    /// Sign a payload using a per-name surface, returning the
+    /// queue-shaped `Signature` ready for `add_signature`.
+    fn sign_with(name: &str, role: Role, payload: &[u8]) -> Signature {
+        let s = surface(name, role);
+        s.sign(payload).expect("sign").into()
+    }
+
+    /// Build the Signer for a per-name surface (proposer id +
+    /// quorum-set membership). 4b binds id = pubkey fingerprint.
+    fn signer_for(name: &str, role: Role) -> Signer {
+        surface(name, role).signer()
+    }
+
+    /// Convenience: sign the queue's currently-recorded payload for
+    /// an action. Looks up `payload_for(call_id)`, signs it under
+    /// the named surface, and returns the `Signature`.
+    fn sign_queued(
+        q: &ApprovalQueue,
+        call_id: &str,
+        name: &str,
+        role: Role,
+    ) -> Signature {
+        let payload = q.payload_for(call_id).expect("call_id is queued");
+        sign_with(name, role, &payload)
     }
 
     // ── CIT-AGENT-4a tests ────────────────────────────────────────
@@ -515,8 +602,9 @@ mod tests {
         let outcome = q
             .submit_for_action(
                 mkcall("read_public"),
+                b"any payload".to_vec(),
                 Quorum::for_tier(crate::capsule::manifest::RiskTier::Low, &[]),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await;
         assert_eq!(outcome, ApprovalOutcomePublic::AutoApproved);
@@ -529,16 +617,18 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("medium_action"),
+                b"medium action payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::Medium,
                     &[Role::Reviewer],
                 ),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
-        q.add_signature("call_medium_action", mksig("bob", Role::Reviewer))
+        let sig = sign_queued(&q, "call_medium_action", "bob", Role::Reviewer);
+        q.add_signature("call_medium_action", sig)
             .expect("bob signs as reviewer");
         let outcome = handle.await.expect("task");
         assert_eq!(outcome, ApprovalOutcomePublic::Approved);
@@ -551,22 +641,23 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("high_action"),
+                b"high action payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::High,
                     &[Role::Reviewer, Role::ComplianceOfficer, Role::SecurityOfficer],
                 ),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
         // First signature — not enough; still pending.
-        q.add_signature("call_high_action", mksig("bob", Role::Reviewer))
-            .expect("first sig");
+        let s1 = sign_queued(&q, "call_high_action", "bob", Role::Reviewer);
+        q.add_signature("call_high_action", s1).expect("first sig");
         assert_eq!(q.signatures_on("call_high_action").len(), 1);
         // Second signature — quorum met.
-        q.add_signature("call_high_action", mksig("carol", Role::ComplianceOfficer))
-            .expect("second sig");
+        let s2 = sign_queued(&q, "call_high_action", "carol", Role::ComplianceOfficer);
+        q.add_signature("call_high_action", s2).expect("second sig");
         let outcome = handle.await.expect("task");
         assert_eq!(outcome, ApprovalOutcomePublic::Approved);
     }
@@ -578,33 +669,25 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("critical_action"),
+                b"critical action payload".to_vec(),
                 Quorum::for_tier(crate::capsule::manifest::RiskTier::Critical, &[]),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
-        // Two of the three required — pending.
-        q.add_signature("call_critical_action", mksig("bob", Role::Reviewer))
-            .expect("first");
-        // SecurityOfficer + ComplianceOfficer is a SoD conflict —
-        // we have to assign them to DIFFERENT people, AND the role-
-        // pair check blocks them from being in the same action.
-        // For critical we need Reviewer + ComplianceOfficer +
-        // SecurityOfficer all in the SAME action, but the
-        // is_conflict check on ComplianceOfficer+SecurityOfficer
-        // BLOCKS this. This is a planset tension to flag.
-        //
-        // Per planset §"Role-conflict enforcement", the conflict
-        // applies when the SAME PERSON holds both roles — not when
-        // distinct people each hold one. Our is_conflict checks the
-        // role pair without person identity. For the test we
-        // demonstrate the critical-quorum path WITHOUT the
-        // role-pair conflict by skipping the third signer (i.e.,
-        // confirming the quorum stays pending).
-        let _ = q.add_signature("call_critical_action", mksig("carol", Role::ComplianceOfficer));
-        // Don't drive completion; just confirm two of three settled
-        // without resolving.
+        // Reviewer + ComplianceOfficer accepted; SecurityOfficer
+        // blocked by the role-pair SoD check (planset tension
+        // flagged in CIT-AGENT-4a REPORT).
+        let s1 = sign_queued(&q, "call_critical_action", "bob", Role::Reviewer);
+        q.add_signature("call_critical_action", s1).expect("first");
+        let s2 = sign_queued(
+            &q,
+            "call_critical_action",
+            "carol",
+            Role::ComplianceOfficer,
+        );
+        let _ = q.add_signature("call_critical_action", s2);
         assert_eq!(q.signatures_on("call_critical_action").len(), 2);
         // Drop the handle by rejecting so the test cleans up.
         q.reject_action("call_critical_action").expect("reject cleanup");
@@ -619,17 +702,19 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("audit_query"),
+                b"audit query payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::Medium,
                     &[Role::Auditor, Role::Reviewer],
                 ),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
+        let bad = sign_queued(&q, "call_audit_query", "dave", Role::Auditor);
         let err = q
-            .add_signature("call_audit_query", mksig("dave", Role::Auditor))
+            .add_signature("call_audit_query", bad)
             .expect_err("auditor cannot approve");
         assert_eq!(err, SignatureError::AuditorCannotApprove);
         // The action stays pending; reject to clean up.
@@ -644,17 +729,23 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("self_action"),
+                b"self action payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::Medium,
                     &[Role::Reviewer],
                 ),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
+        // "alice" surface with role=Reviewer has the SAME pubkey
+        // (and therefore same signer.id) as the proposer surface.
+        // The queue dedupes by pubkey-fingerprint, so this is the
+        // structural "same person, two roles" reject.
+        let self_sig = sign_queued(&q, "call_self_action", "alice", Role::Reviewer);
         let err = q
-            .add_signature("call_self_action", mksig("alice", Role::Reviewer))
+            .add_signature("call_self_action", self_sig)
             .expect_err("proposer cannot self-approve");
         assert_eq!(err, SignatureError::ProposerCannotSelfApprove);
         q.reject_action("call_self_action").expect("cleanup");
@@ -668,19 +759,21 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("dup_action"),
+                b"dup action payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::High,
                     &[Role::Reviewer, Role::ComplianceOfficer],
                 ),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
-        q.add_signature("call_dup_action", mksig("bob", Role::Reviewer))
-            .expect("first");
+        let first = sign_queued(&q, "call_dup_action", "bob", Role::Reviewer);
+        q.add_signature("call_dup_action", first).expect("first");
+        let dup = sign_queued(&q, "call_dup_action", "bob", Role::ComplianceOfficer);
         let err = q
-            .add_signature("call_dup_action", mksig("bob", Role::ComplianceOfficer))
+            .add_signature("call_dup_action", dup)
             .expect_err("same person twice");
         assert_eq!(err, SignatureError::DuplicateSigner);
         q.reject_action("call_dup_action").expect("cleanup");
@@ -694,28 +787,92 @@ mod tests {
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
                 mkcall("role_conflict_action"),
+                b"role conflict payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::High,
                     &[Role::ComplianceOfficer, Role::SecurityOfficer],
                 ),
-                mksigner("alice", Role::Operator),
+                signer_for("alice", Role::Operator),
             )
             .await
         });
         tokio::task::yield_now().await;
-        q.add_signature(
+        let first = sign_queued(
+            &q,
             "call_role_conflict_action",
-            mksig("carol", Role::ComplianceOfficer),
-        )
-        .expect("first");
+            "carol",
+            Role::ComplianceOfficer,
+        );
+        q.add_signature("call_role_conflict_action", first)
+            .expect("first");
+        let conflicting = sign_queued(
+            &q,
+            "call_role_conflict_action",
+            "diana",
+            Role::SecurityOfficer,
+        );
         let err = q
-            .add_signature(
-                "call_role_conflict_action",
-                mksig("diana", Role::SecurityOfficer),
-            )
+            .add_signature("call_role_conflict_action", conflicting)
             .expect_err("CO + SO conflict");
         assert!(matches!(err, SignatureError::RoleConflict { .. }));
         q.reject_action("call_role_conflict_action").expect("cleanup");
+        let _ = handle.await;
+    }
+
+    // ── CIT-AGENT-4b: attested-signature tests ────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn tampered_signature_bytes_rejected() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let handle = tokio::spawn(async move {
+            qa.submit_for_action(
+                mkcall("tamper"),
+                b"tamper payload".to_vec(),
+                Quorum::for_tier(
+                    crate::capsule::manifest::RiskTier::Medium,
+                    &[Role::Reviewer],
+                ),
+                signer_for("alice", Role::Operator),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let mut bad = sign_queued(&q, "call_tamper", "bob", Role::Reviewer);
+        // Flip a bit in the signature.
+        bad.signature_bytes[0] ^= 0x40;
+        let err = q
+            .add_signature("call_tamper", bad)
+            .expect_err("tampered sig rejects");
+        assert!(matches!(err, SignatureError::AttestationInvalid(_)));
+        q.reject_action("call_tamper").expect("cleanup");
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wrong_payload_signature_rejected() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let handle = tokio::spawn(async move {
+            qa.submit_for_action(
+                mkcall("payload_check"),
+                b"action A".to_vec(),
+                Quorum::for_tier(
+                    crate::capsule::manifest::RiskTier::Medium,
+                    &[Role::Reviewer],
+                ),
+                signer_for("alice", Role::Operator),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        // Attacker signs a DIFFERENT payload, claims it's for this action.
+        let bad = sign_with("bob", Role::Reviewer, b"action B");
+        let err = q
+            .add_signature("call_payload_check", bad)
+            .expect_err("wrong payload rejects");
+        assert!(matches!(err, SignatureError::AttestationInvalid(_)));
+        q.reject_action("call_payload_check").expect("cleanup");
         let _ = handle.await;
     }
 
