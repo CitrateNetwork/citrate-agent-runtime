@@ -47,6 +47,13 @@ pub enum CapabilityToken {
     /// `wasi:filesystem` (FS open/read/write). Permitted only when
     /// `[capability].filesystem` is non-empty.
     WasiFilesystem,
+    /// `citrate:chain/eth-call@0.1.0` (read-only chain calls).
+    /// Permitted only when `[capability].chain_calls` contains at
+    /// least one `eth_call:<address>` entry. The host fn enforces
+    /// the per-address allow-list at call time — the token here
+    /// just gates whether the host fn is registered at all.
+    /// CIT-AGENT-9c-host.
+    CitrateChainEthCall,
 }
 
 /// LinkerBuilder for the per-capsule wasmtime Linker. Starts empty;
@@ -104,6 +111,17 @@ impl LinkerBuilder {
             // manifest rather than later at first filesystem call.
             filesystem::parse_all(&manifest.capability.filesystem)?;
             b.permitted.insert(CapabilityToken::WasiFilesystem);
+        }
+        // Citrate chain eth-call — token gates whether the host fn
+        // gets registered at all; the host fn itself enforces the
+        // per-address allow-list at call time. CIT-AGENT-9c-host.
+        if manifest
+            .capability
+            .chain_calls
+            .iter()
+            .any(|s| s.starts_with("eth_call:"))
+        {
+            b.permitted.insert(CapabilityToken::CitrateChainEthCall);
         }
         Ok(b)
     }
@@ -210,7 +228,60 @@ impl LinkerBuilder {
             b::sockets::ip_name_lookup::add_to_linker_get_host(l, closure)
                 .map_err(|e| linker_err("sockets::ip_name_lookup", e))?;
         }
+        // CIT-AGENT-9c-host: citrate:chain/eth-call. Two-layer
+        // enforcement: the token in `permitted` means the host fn
+        // is registered at all; the host fn closure consults the
+        // per-call `to` address against the per-capsule allow-list
+        // held by `HostCtx::eth_call_allow_list`. The allow-list
+        // arrives via `Capsule::instantiate` populating the store
+        // data — the linker itself doesn't see the addresses.
+        if self.permitted.contains(&CapabilityToken::CitrateChainEthCall) {
+            self.wire_citrate_chain_eth_call()?;
+        }
         Ok(self)
+    }
+
+    /// Wire `citrate:chain/eth-call@0.1.0` into the linker. The host
+    /// fn signature mirrors:
+    /// ```wit
+    /// interface eth-call {
+    ///     call: func(to: list<u8>, data: list<u8>)
+    ///         -> result<list<u8>, string>;
+    /// }
+    /// ```
+    /// CIT-AGENT-9c-host.
+    fn wire_citrate_chain_eth_call(&mut self) -> Result<(), AgentError> {
+        let mut inst = self
+            .linker
+            .instance("citrate:chain/eth-call@0.1.0")
+            .map_err(|e| linker_err("citrate:chain/eth-call@0.1.0 instance", e))?;
+        inst.func_wrap(
+            "call",
+            |store: wasmtime::StoreContextMut<'_, HostCtx>,
+             (to, _data): (Vec<u8>, Vec<u8>)|
+             -> wasmtime::Result<(Result<Vec<u8>, String>,)> {
+                if to.len() != 20 {
+                    return Ok((Err(format!(
+                        "ChainCallNotAuthorized: `to` must be 20 bytes, got {}",
+                        to.len()
+                    )),));
+                }
+                let mut addr: [u8; 20] = [0; 20];
+                addr.copy_from_slice(&to);
+                if !store.data().is_eth_call_authorized(&addr) {
+                    return Ok((Err(format!(
+                        "ChainCallNotAuthorized: 0x{}",
+                        hex::encode(addr)
+                    )),));
+                }
+                // CIT-AGENT-9c-host stub: deterministic empty response.
+                // The first real RPC dispatch lands in CIT-AGENT-9c-1
+                // when the first tool capsule needs live data.
+                Ok((Ok(Vec::new()),))
+            },
+        )
+        .map_err(|e| linker_err("citrate:chain/eth-call call func_wrap", e))?;
+        Ok(())
     }
 
     /// Consume the builder, yielding the wasmtime `Linker` ready for

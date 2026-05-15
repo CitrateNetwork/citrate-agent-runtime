@@ -11,15 +11,23 @@ use wasmtime::component::ResourceTable;
 use wasmtime::{Config, Engine};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
+/// A 20-byte EVM address.
+pub type Address = [u8; 20];
+
 /// Per-capsule host context — RFC-CIT-AGENT-0001 §4.5 invariant 3
 /// runtime side. Holds the `WasiCtx` (the WASI capability + state
-/// container) and the `ResourceTable` (the Component Model resource
-/// pool). CIT-AGENT-3d lands the minimal implementation; future
-/// sprints extend `HostCtx` with per-capsule resource handles (chain
-/// client, audit sink, etc.) as the call path needs them.
+/// container), the `ResourceTable` (the Component Model resource
+/// pool), and the per-capsule chain-call allow-list (CIT-AGENT-9c-host).
+/// Future sprints extend `HostCtx` with chain-client + audit-sink
+/// handles as the call path needs them.
 pub struct HostCtx {
     ctx: WasiCtx,
     table: ResourceTable,
+    /// Manifest-parsed allow-list for `citrate:chain/eth-call`. The
+    /// host fn at call time consults this list; a `to` arg outside
+    /// the list returns `Err("ChainCallNotAuthorized: ...")` without
+    /// dispatching the RPC. CIT-AGENT-9c-host.
+    eth_call_allow_list: Vec<Address>,
 }
 
 impl HostCtx {
@@ -32,7 +40,29 @@ impl HostCtx {
         Self {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
+            eth_call_allow_list: Vec::new(),
         }
+    }
+
+    /// Build a host context with a chain-call allow-list. Called by
+    /// `Capsule::instantiate` when the manifest declares any
+    /// `eth_call:<address>` entries.
+    pub fn with_eth_call_allow_list(allow_list: Vec<Address>) -> Self {
+        Self {
+            ctx: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            eth_call_allow_list: allow_list,
+        }
+    }
+
+    /// Whether `to` is in the manifest-declared eth-call allow-list.
+    pub fn is_eth_call_authorized(&self, to: &Address) -> bool {
+        self.eth_call_allow_list.iter().any(|a| a == to)
+    }
+
+    /// Inspection accessor for the allow-list (audit + tests).
+    pub fn eth_call_allow_list(&self) -> &[Address] {
+        &self.eth_call_allow_list
     }
 }
 

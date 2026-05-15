@@ -1,0 +1,46 @@
+# CIT-AGENT-9c-host — echo-chain capsule. Demonstrates the
+# citrate:chain/eth-call host fn end-to-end: a capsule that
+# declares a chain_calls allow-list, imports the WIT interface,
+# and is rejected at call time when it asks for an address
+# outside the allow-list.
+
+[capsule]
+name = "echo-chain"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+# Single address allowed: the Boeing AgentDecisionRegistryV2
+# contract used in BFR-INT-12b. The host fn enforces this list
+# at call time; unauthorized addresses produce
+# `Err("ChainCallNotAuthorized: 0x...")`.
+chain_calls = ["eth_call:0x4a86659BDab24dc444C72fbbaD4cd83491820E40"]
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9c-host"
+tla_spec = ""
+
+[signing]
+tier = "bundled"

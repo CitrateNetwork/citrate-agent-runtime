@@ -123,13 +123,64 @@ impl Capsule {
         engine: &wasmtime::Engine,
         linker: &wasmtime::component::Linker<wasm::HostCtx>,
     ) -> Result<(), AgentError> {
+        let (_store, _instance) = self.instantiate_with_store(engine, linker)?;
+        Ok(())
+    }
+
+    /// Instantiate and return the `Store` + `Instance` so callers
+    /// can invoke typed exports on the instance. Threads the
+    /// manifest-declared `chain_calls` allow-list into the `HostCtx`
+    /// the store carries, so `citrate:chain/eth-call` host fns can
+    /// consult it at call time. CIT-AGENT-9c-host.
+    pub fn instantiate_with_store(
+        &self,
+        engine: &wasmtime::Engine,
+        linker: &wasmtime::component::Linker<wasm::HostCtx>,
+    ) -> Result<
+        (
+            wasmtime::Store<wasm::HostCtx>,
+            wasmtime::component::Instance,
+        ),
+        AgentError,
+    > {
         let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
             .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
-        let mut store = wasmtime::Store::new(engine, wasm::HostCtx::empty());
-        linker
+        let allow_list = self.parse_eth_call_allow_list()?;
+        let mut store = wasmtime::Store::new(
+            engine,
+            wasm::HostCtx::with_eth_call_allow_list(allow_list),
+        );
+        let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
-        Ok(())
+        Ok((store, instance))
+    }
+
+    /// Parse the manifest's `chain_calls` entries of shape
+    /// `eth_call:0x<40-hex>` into 20-byte `Address`es. Entries with
+    /// the wrong prefix are silently skipped (they belong to other
+    /// chain-call families that this sprint hasn't wired yet, e.g.
+    /// `model_inference:0x...`). CIT-AGENT-9c-host.
+    fn parse_eth_call_allow_list(&self) -> Result<Vec<wasm::Address>, AgentError> {
+        let mut out = Vec::new();
+        for entry in &self.manifest.capability.chain_calls {
+            let Some(rest) = entry.strip_prefix("eth_call:") else {
+                continue;
+            };
+            let hex_part = rest.strip_prefix("0x").unwrap_or(rest);
+            if hex_part.len() != 40 {
+                return Err(AgentError::Capsule(format!(
+                    "chain_calls entry {entry:?} expected eth_call:0x<40 hex>, got {hex_part:?}"
+                )));
+            }
+            let bytes = hex::decode(hex_part).map_err(|e| {
+                AgentError::Capsule(format!("chain_calls entry {entry:?} hex decode: {e}"))
+            })?;
+            let mut addr: wasm::Address = [0; 20];
+            addr.copy_from_slice(&bytes);
+            out.push(addr);
+        }
+        Ok(out)
     }
 
     pub fn name(&self) -> &str {
@@ -646,6 +697,165 @@ tier = "bundled"
         capsule
             .instantiate(&engine, &linker)
             .expect("hello capsule instantiates under manifest-built linker");
+    }
+
+    /// CIT-AGENT-9c-host helper: invoke `query` on the echo-chain
+    /// capsule with the given `to` + `data` bytes. Returns the WIT
+    /// `result<list<u8>, string>` as a Rust `Result<Vec<u8>, String>`.
+    /// Used by both the authorized + unauthorized integration tests.
+    #[cfg(test)]
+    fn invoke_echo_chain_query(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        to: Vec<u8>,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        use wasmtime::component::Val;
+        // wasmtime 26 component-model dynamic-export lookup. The
+        // `query` interface is exported under
+        // `citrate:echo-chain-capsule/query@0.1.0`; the `query`
+        // function lives inside that exported instance.
+        let iface_index = instance
+            .get_export(&mut *store, None, "citrate:echo-chain-capsule/query@0.1.0")
+            .expect("capsule exports `query` interface");
+        let func_index = instance
+            .get_export(&mut *store, Some(&iface_index), "query")
+            .expect("query interface exports `query` func");
+        let func = instance
+            .get_func(&mut *store, func_index)
+            .expect("query func resolves");
+        let to_val = Val::List(to.into_iter().map(Val::U8).collect());
+        let data_val = Val::List(data.into_iter().map(Val::U8).collect());
+        let mut results = [Val::Bool(false)]; // placeholder; replaced by call
+        func.call(&mut *store, &[to_val, data_val], &mut results)
+            .expect("query call completes");
+        func.post_return(&mut *store)
+            .expect("post_return clears the call");
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::List(bytes) => Ok(bytes
+                        .iter()
+                        .map(|v| match v {
+                            Val::U8(b) => *b,
+                            _ => panic!("expected u8 in list"),
+                        })
+                        .collect()),
+                    other => panic!("expected list<u8> in Ok, got {other:?}"),
+                },
+                Ok(None) => Ok(Vec::new()),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string in Err, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Val::Result, got {other:?}"),
+        }
+    }
+
+    /// CIT-AGENT-9c-host — happy-path. The echo-chain capsule
+    /// declares allow-list `["eth_call:0x4a86...20E40"]` in its
+    /// manifest. Calling `query` with that exact address returns
+    /// `Ok(vec![])` (the host fn's stub success response).
+    #[test]
+    fn echo_chain_capsule_with_authorized_address_succeeds() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("echo-chain");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("echo-chain capsule.wasm exists");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("echo-chain manifest.toml exists");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        let (mut store, instance) = capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("echo-chain instantiates with chain-call host fn");
+
+        // The manifest-authorized address — matches what was parsed
+        // out of `chain_calls = ["eth_call:0x4a86659B..."]`.
+        let authorized = hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_echo_chain_query(&mut store, instance, authorized, vec![]);
+        assert_eq!(
+            result,
+            Ok(Vec::new()),
+            "authorized eth_call returns Ok(empty) stub response"
+        );
+    }
+
+    /// CIT-AGENT-9c-host — empirical proof that the per-address
+    /// allow-list rejects an unauthorized `to`. The host fn returns
+    /// `Err("ChainCallNotAuthorized: 0x...")` through the WIT
+    /// result type; the capsule sees the err and re-emits it.
+    #[test]
+    fn echo_chain_capsule_blocks_unauthorized_address() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("echo-chain");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("echo-chain capsule.wasm exists");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("echo-chain manifest.toml exists");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        let (mut store, instance) = capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("echo-chain instantiates");
+
+        // Address NOT in the manifest allow-list.
+        let unauthorized = vec![1u8; 20];
+        let result = invoke_echo_chain_query(&mut store, instance, unauthorized, vec![]);
+        let err = result.expect_err("unauthorized address must be rejected");
+        assert!(
+            err.starts_with("ChainCallNotAuthorized:"),
+            "rejection must name the cause; got: {err}"
+        );
+        // The rejection must include the address that was blocked
+        // (forensic value: an operator reading the audit log can
+        // see what was attempted, not just that something failed).
+        assert!(
+            err.contains("0x0101"),
+            "rejection message must include attempted address; got: {err}"
+        );
     }
 
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
