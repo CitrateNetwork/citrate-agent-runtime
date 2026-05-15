@@ -5,7 +5,9 @@
 //! (the always-required default). NFS/S3 + WORM + chain-anchor come
 //! in 5b/c.
 
+mod chain;
 mod fs;
+pub use chain::{AnchorStrategy, ChainAnchorSink};
 pub use fs::FilesystemSink;
 
 use crate::audit::record::AuditRecord;

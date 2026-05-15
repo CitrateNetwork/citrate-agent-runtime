@@ -1,19 +1,18 @@
-//! Chain client — RFC-CIT-AGENT-0001 §3.1 "Chain Client".
+//! Chain client — RFC-CIT-AGENT-0001 §3.1 "Chain Client" + planset
+//! `06_ON_CHAIN_SURFACE.md`.
 //!
-//! Lands in CIT-AGENT-6 per planset
-//! [`.agentile/planset/2026-05-14-citrate-agent/08_SPRINT_SEQUENCE.md`]
-//! when the on-chain contract surface ships (5 contracts:
-//! OrganizationSBT, AgentSBT, CapsuleRegistry, AnchorRegistry,
-//! BenchmarkRegistry).
+//! CIT-AGENT-6d lands the first Rust adapter: `AnchorRegistryClient`
+//! talks to the AnchorRegistry contract deployed by
+//! `script/DeployCitAgent.s.sol`. The other 4 contract adapters
+//! (OrganizationSBT, AgentSBT, CapsuleRegistry, BenchmarkRegistry)
+//! land in per-contract slices.
 //!
-//! Will contain: `pub trait ChainClient`, ethers-rs adapter for
-//! chain 40204, AnchorRegistry write API (3 strategies — per-capsule,
-//! per-approval, nightly Merkle root), OrganizationSBT + AgentSBT
-//! read + watch.
-//!
-//! NOTE: BFR-INT-12b's `RecorderClient` lives in `audit/` today and
-//! writes to the Boeing-specific `AgentDecisionRegistryV2`. When the
-//! cit-agent contracts deploy (CIT-AGENT-6), the canonical write path
-//! moves to `AnchorRegistry` and `RecorderClient` becomes a
-//! Boeing-overlay adapter — see planset
-//! `06_ON_CHAIN_SURFACE.md` row 21.
+//! Architecture: each Rust adapter mirrors the BFR-INT-12b
+//! `audit::recorder::RecorderClient` shape — `citrate-wallet-core`
+//! provides the RPC client + transaction builder; the adapter
+//! supplies the ABI encoding + the eth_call + send-tx ergonomics for
+//! one contract.
+
+pub mod anchor;
+
+pub use anchor::{encode_anchor, encode_is_anchored, AnchorRegistryClient};

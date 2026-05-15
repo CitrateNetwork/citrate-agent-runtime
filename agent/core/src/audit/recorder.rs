@@ -379,7 +379,9 @@ fn push_bytes_dynamic(out: &mut Vec<u8>, data: &[u8]) {
 
 /// Derive the 20-byte EVM address from a secp256k1 signing key:
 /// `keccak256(uncompressed_pubkey_64_bytes)[12..32]`.
-fn derive_address(signing_key: &SigningKey) -> String {
+/// `pub(crate)` so CIT-AGENT-6d's `chain::anchor::AnchorRegistryClient`
+/// can reuse it without duplicating the recipe.
+pub(crate) fn derive_address(signing_key: &SigningKey) -> String {
     let verifying = signing_key.verifying_key();
     let encoded = verifying.to_encoded_point(false);
     // Strip the 0x04 prefix → 64 bytes (32 X || 32 Y).
