@@ -2650,6 +2650,300 @@ tier = "bundled"
 
     // ────────────────────── (end CIT-AGENT-9c-write-host) ─────────
 
+    // ────────────────── CIT-AGENT-9c-write-tools (5+6+7) ──────────
+    // Three production write capsules: provision-user, revoke-role,
+    // anchor-session. Each test verifies the capsule's ABI encoding
+    // matches the canonical encoder in `audit::recorder` bit-for-bit
+    // — the encoders there were BFR-INT-12b tested against live
+    // contracts, so matching them is sufficient proof of correctness.
+
+    /// Shared helper: load a write-tool capsule from disk with the
+    /// gate-allow + recording mock dispatcher, return store +
+    /// instance + dispatcher handle for post-call inspection.
+    #[cfg(test)]
+    fn load_write_capsule(
+        capsule_name: &str,
+    ) -> (
+        wasmtime::Store<wasm::HostCtx>,
+        wasmtime::component::Instance,
+        std::sync::Arc<MockSendDispatcher>,
+    ) {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join(capsule_name);
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm")).unwrap();
+        let manifest_str =
+            std::fs::read_to_string(capsule_dir.join("manifest.toml")).unwrap();
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let gate = Arc::new(MockGate {
+            decisions: std::sync::Mutex::new(Vec::new()),
+            allow: true,
+            reason: String::new(),
+        });
+        let dispatcher_impl = Arc::new(MockSendDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tx_hash: [0xa1u8; 32],
+        });
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule.prepare_linker(&engine).unwrap().into_linker();
+        let (store, instance) = capsule
+            .instantiate_with_write_path(
+                &engine,
+                &linker,
+                None,
+                Some(dispatcher_impl.clone()),
+                Some(gate),
+            )
+            .unwrap();
+        (store, instance, dispatcher_impl)
+    }
+
+    /// Generic invocation: calls the named export with the given
+    /// `Val` args and returns the WIT `result<list<u8>, string>`
+    /// unwrapped to `Result<Vec<u8>, String>`.
+    #[cfg(test)]
+    fn invoke_write_capsule(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        iface_name: &str,
+        func_name: &str,
+        args: Vec<wasmtime::component::Val>,
+    ) -> Result<Vec<u8>, String> {
+        use wasmtime::component::Val;
+        let iface = instance
+            .get_export(&mut *store, None, iface_name)
+            .expect("interface export");
+        let func_idx = instance
+            .get_export(&mut *store, Some(&iface), func_name)
+            .expect("func export");
+        let func = instance.get_func(&mut *store, func_idx).unwrap();
+        let mut results = [Val::Bool(false)];
+        func.call(&mut *store, &args, &mut results)
+            .expect("call completes");
+        func.post_return(&mut *store).expect("post_return clears");
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::List(bytes) => Ok(bytes
+                        .iter()
+                        .map(|b| match b {
+                            Val::U8(b) => *b,
+                            _ => panic!("non-u8"),
+                        })
+                        .collect()),
+                    other => panic!("expected list<u8>, got {other:?}"),
+                },
+                Ok(None) => Ok(Vec::new()),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// CIT-AGENT-9c-6 — revoke-role calldata matches the canonical
+    /// `audit::recorder::encode_revoke` byte-for-byte.
+    #[test]
+    fn revoke_role_capsule_calldata_matches_canonical_encoder() {
+        use crate::audit::recorder;
+        use sha3::{Digest, Keccak256};
+        use wasmtime::component::Val;
+
+        let (mut store, instance, dispatcher_impl) = load_write_capsule("revoke-role");
+
+        let user_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+        let tenant_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+        let reason_str = "policy-violation";
+
+        let result = invoke_write_capsule(
+            &mut store,
+            instance,
+            "citrate:revoke-role/action@0.1.0",
+            "revoke",
+            vec![
+                Val::String(format!("0x{user_hex}")),
+                Val::String(format!("0x{tenant_hex}")),
+                Val::String(reason_str.to_string()),
+            ],
+        );
+        assert_eq!(result, Ok(vec![0xa1u8; 32]), "tx hash flows back");
+
+        // Compute expected calldata via the canonical encoder.
+        let user_b: [u8; 32] = hex::decode(user_hex).unwrap().try_into().unwrap();
+        let tenant_b: [u8; 32] = hex::decode(tenant_hex).unwrap().try_into().unwrap();
+        let mut h = Keccak256::new();
+        h.update(reason_str.as_bytes());
+        let reason_b: [u8; 32] = h.finalize().into();
+        let mut h = Keccak256::new();
+        h.update(
+            format!(
+                "revoke_role|0x{}|0x{}|{}",
+                hex::encode(user_b),
+                hex::encode(tenant_b),
+                reason_str
+            )
+            .as_bytes(),
+        );
+        let corr_b: [u8; 32] = h.finalize().into();
+        let expected = recorder::encode_revoke(user_b, tenant_b, reason_b, corr_b);
+
+        let calls = dispatcher_impl.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1, expected,
+            "capsule calldata MUST match canonical encoder byte-for-byte"
+        );
+        // Also: routed to RoleEscalation, not somewhere else.
+        assert_eq!(
+            hex::encode(calls[0].0),
+            "a6a4122126a75611ea06241e404327addfe8eb5e"
+        );
+    }
+
+    /// CIT-AGENT-9c-7 — anchor-session calldata matches canonical.
+    #[test]
+    fn anchor_session_capsule_calldata_matches_canonical_encoder() {
+        use crate::audit::recorder;
+        use sha3::{Digest, Keccak256};
+        use wasmtime::component::Val;
+
+        let (mut store, instance, dispatcher_impl) = load_write_capsule("anchor-session");
+
+        let session_hex = "3333333333333333333333333333333333333333333333333333333333333333";
+        let scope_hex = "4444444444444444444444444444444444444444444444444444444444444444";
+        let merkle_hex = "5555555555555555555555555555555555555555555555555555555555555555";
+        let result = invoke_write_capsule(
+            &mut store,
+            instance,
+            "citrate:anchor-session/action@0.1.0",
+            "anchor",
+            vec![
+                Val::U8(1),
+                Val::String(format!("0x{session_hex}")),
+                Val::String(format!("0x{scope_hex}")),
+                Val::String(format!("0x{merkle_hex}")),
+                Val::String("0x".to_string()), // empty ipfs_cid
+                Val::U64(42),
+            ],
+        );
+        assert_eq!(result, Ok(vec![0xa1u8; 32]));
+
+        let session_b: [u8; 32] =
+            hex::decode(session_hex).unwrap().try_into().unwrap();
+        let scope_b: [u8; 32] = hex::decode(scope_hex).unwrap().try_into().unwrap();
+        let merkle_b: [u8; 32] = hex::decode(merkle_hex).unwrap().try_into().unwrap();
+        let ipfs_b = [0u8; 32];
+        let mut seed = Vec::with_capacity(64);
+        seed.extend_from_slice(&session_b);
+        seed.extend_from_slice(&merkle_b);
+        let mut h = Keccak256::new();
+        h.update(&seed);
+        let bundle_id: [u8; 32] = h.finalize().into();
+        let expected = recorder::encode_anchor_bundle(
+            1, bundle_id, session_b, scope_b, merkle_b, ipfs_b, 42,
+        );
+
+        let calls = dispatcher_impl.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1, expected,
+            "capsule calldata MUST match canonical encoder byte-for-byte"
+        );
+        assert_eq!(
+            hex::encode(calls[0].0),
+            "9a58e44f8dd6fd6a75637a32e6e51c16440996f8"
+        );
+    }
+
+    /// CIT-AGENT-9c-5 — provision-user calldata matches canonical.
+    /// Dynamic-tail encoder — the hardest of the three.
+    #[test]
+    fn provision_user_capsule_calldata_matches_canonical_encoder() {
+        use crate::audit::recorder;
+        use sha3::{Digest, Keccak256};
+        use wasmtime::component::Val;
+
+        let (mut store, instance, dispatcher_impl) = load_write_capsule("provision-user");
+
+        let user_hex = "6666666666666666666666666666666666666666666666666666666666666666";
+        let tenant_hex = "7777777777777777777777777777777777777777777777777777777777777777";
+        let role_hex = "8888888888888888888888888888888888888888888888888888888888888888";
+        let duration_sec: u32 = 3600;
+        let reauth_kind = "kba";
+
+        let result = invoke_write_capsule(
+            &mut store,
+            instance,
+            "citrate:provision-user/action@0.1.0",
+            "provision",
+            vec![
+                Val::String(format!("0x{user_hex}")),
+                Val::String(format!("0x{tenant_hex}")),
+                Val::String(format!("0x{role_hex}")),
+                Val::U32(duration_sec),
+                Val::String(reauth_kind.to_string()),
+            ],
+        );
+        assert_eq!(result, Ok(vec![0xa1u8; 32]));
+
+        let user_b: [u8; 32] = hex::decode(user_hex).unwrap().try_into().unwrap();
+        let tenant_b: [u8; 32] =
+            hex::decode(tenant_hex).unwrap().try_into().unwrap();
+        let role_b: [u8; 32] = hex::decode(role_hex).unwrap().try_into().unwrap();
+        let mut h = Keccak256::new();
+        h.update(
+            format!(
+                "provision_user|0x{}|0x{}",
+                hex::encode(user_b),
+                hex::encode(tenant_b)
+            )
+            .as_bytes(),
+        );
+        let corr_b: [u8; 32] = h.finalize().into();
+        let reauth_proof = vec![0x01u8];
+        let expected = recorder::encode_request_elevation(
+            user_b,
+            tenant_b,
+            role_b,
+            duration_sec,
+            corr_b,
+            &reauth_proof,
+            reauth_kind,
+        );
+
+        let calls = dispatcher_impl.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1, expected,
+            "provision-user calldata (dynamic tails) MUST match canonical"
+        );
+        assert_eq!(
+            hex::encode(calls[0].0),
+            "a6a4122126a75611ea06241e404327addfe8eb5e"
+        );
+    }
+
+    // ────────────────── (end CIT-AGENT-9c-write-tools) ────────────
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects
