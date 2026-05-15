@@ -1571,6 +1571,227 @@ tier = "bundled"
 
     // ────────────────────── (end CIT-AGENT-9c-2) ──────────────────
 
+    // ────────────────────── CIT-AGENT-9c-3 ────────────────────────
+    // query-supplier-status: single-call capsule, static-struct decode.
+
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedSupplier {
+        supplier_id: [u8; 32],
+        scope: [u8; 32],
+        state: u8,
+        registered_at: u64,
+        qualification_period_days: u64,
+    }
+
+    #[cfg(test)]
+    fn invoke_query_supplier(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        supplier_id: &str,
+    ) -> Result<DecodedSupplier, String> {
+        use wasmtime::component::Val;
+        let iface_index = instance
+            .get_export(
+                &mut *store,
+                None,
+                "citrate:query-supplier-status/query@0.1.0",
+            )
+            .expect("capsule exports `query` interface");
+        let func_index = instance
+            .get_export(&mut *store, Some(&iface_index), "query")
+            .expect("query interface exports `query` func");
+        let func = instance
+            .get_func(&mut *store, func_index)
+            .expect("query func resolves");
+        let args = vec![Val::String(supplier_id.to_string())];
+        let mut results = [Val::Bool(false)];
+        func.call(&mut *store, &args, &mut results)
+            .expect("query call completes");
+        func.post_return(&mut *store).expect("post_return clears");
+
+        fn bytes32_from_val(v: &Val) -> [u8; 32] {
+            match v {
+                Val::List(bytes) => {
+                    let raw: Vec<u8> = bytes
+                        .iter()
+                        .map(|b| match b {
+                            Val::U8(b) => *b,
+                            _ => panic!("non-u8 in bytes32"),
+                        })
+                        .collect();
+                    assert_eq!(raw.len(), 32);
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&raw);
+                    a
+                }
+                _ => panic!("expected list<u8>"),
+            }
+        }
+
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::Record(fields) => {
+                        let f = |name: &str| -> &Val {
+                            fields
+                                .iter()
+                                .find(|(k, _)| k == name)
+                                .map(|(_, v)| v)
+                                .unwrap_or_else(|| panic!("field {name} missing"))
+                        };
+                        Ok(DecodedSupplier {
+                            supplier_id: bytes32_from_val(f("supplier-id")),
+                            scope: bytes32_from_val(f("scope")),
+                            state: if let Val::U8(b) = f("state") { *b } else { panic!() },
+                            registered_at: if let Val::U64(n) = f("registered-at") {
+                                *n
+                            } else {
+                                panic!()
+                            },
+                            qualification_period_days: if let Val::U64(n) =
+                                f("qualification-period-days")
+                            {
+                                *n
+                            } else {
+                                panic!()
+                            },
+                        })
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                },
+                Ok(None) => panic!("Ok(None) not expected for supplier-view"),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn load_query_supplier_capsule() -> (
+        wasmtime::Store<wasm::HostCtx>,
+        wasmtime::component::Instance,
+    ) {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("query-supplier-status");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("query-supplier capsule.wasm on disk");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("query-supplier manifest.toml on disk");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("query-supplier instantiates")
+    }
+
+    /// CIT-AGENT-9c-3 — calldata encoding.
+    #[test]
+    fn query_supplier_status_capsule_encodes_correct_calldata() {
+        use sha3::{Digest, Keccak256};
+
+        let (mut store, instance) = load_query_supplier_capsule();
+        // Inject a 192-byte zero-padded response.
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(vec![0u8; 192]);
+
+        let id_hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let id_arg = format!("0x{id_hex}");
+        let _ = invoke_query_supplier(&mut store, instance, &id_arg);
+
+        let mut h = Keccak256::new();
+        h.update(b"get(bytes32)");
+        let sel = h.finalize();
+
+        let history = store.data().eth_call_history();
+        assert_eq!(history.len(), 1);
+        let call = &history[0];
+        assert_eq!(
+            hex::encode(call.0),
+            "425064443c3c3392c47dcbe10d455831545efd9b",
+            "calldata routed to SupplierRegistry"
+        );
+        assert_eq!(call.1.len(), 36, "selector(4) + bytes32(32) = 36 bytes");
+        assert_eq!(call.1[..4], sel[..4]);
+        assert_eq!(&call.1[4..36], &hex::decode(id_hex).unwrap()[..]);
+    }
+
+    /// CIT-AGENT-9c-3 — static-struct decoder.
+    #[test]
+    fn query_supplier_status_capsule_decodes_response() {
+        let (mut store, instance) = load_query_supplier_capsule();
+
+        // 192 bytes for the 6-chunk static struct (we read 5).
+        let mut canned = vec![0u8; 192];
+        canned[0..32].fill(0xa1); // supplier_id
+        canned[32..64].fill(0xb2); // scope
+        canned[95] = 3; // state (last byte of chunk at 64..96)
+        let reg: u64 = 9999;
+        canned[120..128].copy_from_slice(&reg.to_be_bytes());
+        let period: u64 = 365;
+        canned[152..160].copy_from_slice(&period.to_be_bytes());
+        store.data_mut().enqueue_eth_call_canned_response(canned);
+
+        let result = invoke_query_supplier(
+            &mut store,
+            instance,
+            "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        let row = result.expect("decode succeeds");
+        assert_eq!(row.supplier_id, [0xa1; 32]);
+        assert_eq!(row.scope, [0xb2; 32]);
+        assert_eq!(row.state, 3);
+        assert_eq!(row.registered_at, 9999);
+        assert_eq!(row.qualification_period_days, 365);
+    }
+
+    /// CIT-AGENT-9c-3 — bad input hex is rejected by the capsule's
+    /// parser before any host fn call is made.
+    #[test]
+    fn query_supplier_status_capsule_rejects_malformed_id() {
+        let (mut store, instance) = load_query_supplier_capsule();
+        let result = invoke_query_supplier(&mut store, instance, "not-a-hex-string");
+        let err = result.expect_err("malformed hex must be rejected");
+        assert!(
+            err.starts_with("expected 32-byte hex"),
+            "error names the input contract; got: {err}"
+        );
+        // No host fn call should have been made — the parse failure
+        // is pre-call.
+        assert_eq!(
+            store.data().eth_call_history().len(),
+            0,
+            "parse failure must short-circuit before eth_call"
+        );
+    }
+
+    // ────────────────────── (end CIT-AGENT-9c-3) ──────────────────
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects
