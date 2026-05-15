@@ -31,11 +31,18 @@ sha2 = "0.10"
 
 # CIT-AGENT-3b — signature chain + WIT/WASM cross-check.
 # ed25519 matches the native scheme used by citrate-wallet (workspace
-# already pins 2.1). CIT-AGENT-3c will add wit-parser + wasmparser when
-# the per-capsule linker work begins; 3b's invariant-2 check is a
-# pure-string scan of WIT imports (the linker's job is to enforce
-# the static analysis at instantiation time).
+# already pins 2.1). 3b's invariant-2 check is a pure-string scan of
+# WIT imports (the linker's job is to enforce the static analysis at
+# instantiation time).
 ed25519-dalek = { version = "2.1", features = ["std"] }
+
+# CIT-AGENT-3c — wasmtime engine + per-capsule linker.
+# Pinned to wasmtime 26.x (current 2026 stable). The component-model
+# feature is required for the WASM Component Model that capsules use.
+# wasmtime-wasi provides the standard WASI host implementations we'll
+# wire selectively per manifest in CIT-AGENT-3d.
+wasmtime = { version = "26", features = ["component-model"] }
+wasmtime-wasi = "26"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

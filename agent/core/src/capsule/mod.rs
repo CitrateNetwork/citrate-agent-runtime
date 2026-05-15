@@ -14,9 +14,12 @@
 //! 2,600 distinct states PASS).
 
 pub mod archive;
+pub mod filesystem;
+pub mod linker;
 pub mod manifest;
 pub mod tiers;
 pub mod verify;
+pub mod wasm;
 
 use crate::error::AgentError;
 use std::io::Read;
@@ -90,6 +93,19 @@ impl Capsule {
         })?;
         verify::verify_capability_against_wit(&capsule.manifest, wit_str)?;
         Ok(capsule)
+    }
+
+    /// Build the per-capsule wasmtime linker from this capsule's
+    /// manifest. CIT-AGENT-3c — the linker is constructed with only
+    /// the WASI capabilities the manifest declares (fail-closed,
+    /// "build from manifest, NOT filter default" per planset).
+    /// Actual instantiation lands in CIT-AGENT-3d alongside
+    /// `Capsule::call(...)`.
+    pub fn prepare_linker(
+        &self,
+        engine: &wasmtime::Engine,
+    ) -> Result<linker::LinkerBuilder, AgentError> {
+        linker::LinkerBuilder::from_manifest(engine, &self.manifest)
     }
 
     pub fn name(&self) -> &str {
@@ -216,6 +232,69 @@ tier = "bundled"
             .expect("manifest-declared body hash matches; load succeeds");
         assert_eq!(capsule.name(), "test-capsule");
         assert_eq!(capsule.manifest.capsule.content_hash, body_hash);
+    }
+
+    /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
+    /// `from_archive`: a loaded capsule + an engine yields a
+    /// constructed per-capsule linker whose permitted set reflects
+    /// the manifest exactly.
+    #[test]
+    fn prepare_linker_reflects_manifest_capabilities() {
+        use crate::capsule::linker::CapabilityToken;
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+
+        let manifest_str = r#"
+[capsule]
+name = "linker-roundtrip"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "broker-only"
+filesystem = ["read:/data"]
+chain_calls = []
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "test"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        // Wrap in a fake Capsule (no archive) to exercise prepare_linker
+        // independently of from_archive.
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents::default(),
+        };
+        let engine = EngineFactory::build().unwrap();
+        let builder = capsule.prepare_linker(&engine).expect("linker builds");
+        let permitted = builder.permitted();
+        assert!(permitted.contains(&CapabilityToken::WasiSockets));
+        assert!(permitted.contains(&CapabilityToken::WasiFilesystem));
+        assert!(permitted.contains(&CapabilityToken::WasiCli));
     }
 
     /// CIT-AGENT-3b — round-trip `from_archive_verified` with a real
