@@ -20,10 +20,14 @@
 //! superseded by a manifest-driven lookup (`Capsule::metadata` -> {risk,
 //! description}). Until then they stay here as the agreed defaults.
 
+pub mod break_glass;
 pub mod quorum;
 pub mod roles;
 pub mod signing;
 
+pub use break_glass::{
+    BreakGlassEntry, BreakGlassError, BreakGlassPhase, BreakGlassRegistry, AFFIRMATION_WINDOW,
+};
 pub use quorum::Quorum;
 pub use roles::{can_approve, is_conflict};
 pub use signing::{
