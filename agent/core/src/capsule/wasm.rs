@@ -28,20 +28,17 @@ pub struct HostCtx {
     /// the list returns `Err("ChainCallNotAuthorized: ...")` without
     /// dispatching the RPC. CIT-AGENT-9c-host.
     eth_call_allow_list: Vec<Address>,
-    /// Pre-canned eth_call response — test-only fixture. When `Some`,
-    /// the host fn returns these bytes on authorized calls instead
-    /// of dispatching the (future) real RPC. Production code paths
-    /// MUST NOT set this; the value is only ever populated by the
-    /// `inject_eth_call_canned_response` method, which is gated on
-    /// the calling crate exposing test fixtures. CIT-AGENT-9c-1.
-    eth_call_canned_response: Option<Vec<u8>>,
-    /// Forensic record of the most recent eth_call (to, data). Tests
-    /// inspect this to verify the calldata produced by the capsule
-    /// matches the expected ABI encoding. Production audit log uses
-    /// the AuditChain instead; this field is internal to the
-    /// linker/test boundary. CIT-AGENT-9c-1.
-    last_eth_call_to: Option<Address>,
-    last_eth_call_data: Option<Vec<u8>>,
+    /// Queue of pre-canned eth_call responses — test-only fixture.
+    /// When non-empty, the host fn pops the front entry on each
+    /// authorized call. When empty, falls back to the stub
+    /// `Ok(Vec::new())`. CIT-AGENT-9c-2 (extended from 9c-1's
+    /// single-response shape to support multi-call capsules).
+    eth_call_canned_queue: std::collections::VecDeque<Vec<u8>>,
+    /// Per-call forensic record of every eth_call (to, data). Tests
+    /// inspect this to verify the capsule produced the expected
+    /// ABI encoding for each call in a multi-call sequence.
+    /// CIT-AGENT-9c-2 (extended from 9c-1's "last only" shape).
+    eth_call_history: Vec<(Address, Vec<u8>)>,
 }
 
 impl HostCtx {
@@ -55,9 +52,8 @@ impl HostCtx {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             eth_call_allow_list: Vec::new(),
-            eth_call_canned_response: None,
-            last_eth_call_to: None,
-            last_eth_call_data: None,
+            eth_call_canned_queue: std::collections::VecDeque::new(),
+            eth_call_history: Vec::new(),
         }
     }
 
@@ -69,9 +65,8 @@ impl HostCtx {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             eth_call_allow_list: allow_list,
-            eth_call_canned_response: None,
-            last_eth_call_to: None,
-            last_eth_call_data: None,
+            eth_call_canned_queue: std::collections::VecDeque::new(),
+            eth_call_history: Vec::new(),
         }
     }
 
@@ -85,35 +80,50 @@ impl HostCtx {
         &self.eth_call_allow_list
     }
 
-    /// Inject a canned response for the eth_call host fn. **Test
-    /// fixture only.** Production code paths leave this as `None`,
-    /// and the host fn returns `Ok(Vec::new())` as a stub until the
-    /// real RPC dispatch lands in CIT-AGENT-9c-1-rpc.
+    /// Single-response convenience for tests that only expect one
+    /// host fn invocation. Clears any queued responses + enqueues
+    /// one entry. Preserves the CIT-AGENT-9c-1 API shape.
     pub fn inject_eth_call_canned_response(&mut self, bytes: Vec<u8>) {
-        self.eth_call_canned_response = Some(bytes);
+        self.eth_call_canned_queue.clear();
+        self.eth_call_canned_queue.push_back(bytes);
     }
 
-    /// Take the canned response (consumes the fixture so the next
-    /// call would fall back to the default stub). Used by the host
-    /// fn.
+    /// Enqueue a canned response for the next eth_call. Multi-call
+    /// capsules push one per expected call; the host fn pops in
+    /// order. CIT-AGENT-9c-2.
+    pub fn enqueue_eth_call_canned_response(&mut self, bytes: Vec<u8>) {
+        self.eth_call_canned_queue.push_back(bytes);
+    }
+
+    /// Pop the next canned response from the front of the queue.
+    /// Returns `None` if the queue is empty (host fn falls back to
+    /// the stub).
     pub fn take_eth_call_canned_response(&mut self) -> Option<Vec<u8>> {
-        self.eth_call_canned_response.take()
+        self.eth_call_canned_queue.pop_front()
     }
 
-    /// Record the last (to, data) pair the host fn was invoked with.
-    /// Used by integration tests to verify the calldata the capsule
-    /// produced matches the expected ABI encoding.
+    /// Append a (to, data) record to the host fn's per-call history.
+    /// Tests inspect this to verify calldata for each call in a
+    /// multi-call sequence.
     pub fn record_eth_call(&mut self, to: Address, data: Vec<u8>) {
-        self.last_eth_call_to = Some(to);
-        self.last_eth_call_data = Some(data);
+        self.eth_call_history.push((to, data));
     }
 
+    /// Full call history (audit + tests).
+    pub fn eth_call_history(&self) -> &[(Address, Vec<u8>)] {
+        &self.eth_call_history
+    }
+
+    /// Last call's `to`, if any. Convenience accessor that
+    /// preserves the CIT-AGENT-9c-1 test API.
     pub fn last_eth_call_to(&self) -> Option<&Address> {
-        self.last_eth_call_to.as_ref()
+        self.eth_call_history.last().map(|(to, _)| to)
     }
 
+    /// Last call's `data`, if any. Convenience accessor that
+    /// preserves the CIT-AGENT-9c-1 test API.
     pub fn last_eth_call_data(&self) -> Option<&Vec<u8>> {
-        self.last_eth_call_data.as_ref()
+        self.eth_call_history.last().map(|(_, d)| d)
     }
 }
 

@@ -1237,6 +1237,340 @@ tier = "bundled"
         );
     }
 
+    // ────────────────────── CIT-AGENT-9c-2 ────────────────────────
+    // Multi-call capsule: query-decisions-by-tenant. Tests verify
+    // both calldata invocations + the N-cap policy.
+
+    #[cfg(test)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedDecision {
+        decision_id: [u8; 32],
+        user: [u8; 32],
+        tenant: [u8; 32],
+        corr_id: [u8; 32],
+        class: u8,
+        recorded_at_block: u64,
+    }
+
+    #[cfg(test)]
+    fn invoke_query_decisions(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        tenant: &str,
+        n: u32,
+    ) -> Result<Vec<DecodedDecision>, String> {
+        use wasmtime::component::Val;
+        let iface_index = instance
+            .get_export(
+                &mut *store,
+                None,
+                "citrate:query-decisions-by-tenant/query@0.1.0",
+            )
+            .expect("capsule exports `query` interface");
+        let func_index = instance
+            .get_export(&mut *store, Some(&iface_index), "query")
+            .expect("query interface exports `query` func");
+        let func = instance
+            .get_func(&mut *store, func_index)
+            .expect("query func resolves");
+        let args = vec![Val::String(tenant.to_string()), Val::U32(n)];
+        let mut results = [Val::Bool(false)];
+        func.call(&mut *store, &args, &mut results)
+            .expect("query call completes");
+        func.post_return(&mut *store).expect("post_return clears");
+
+        fn bytes32_from_val(v: &Val) -> [u8; 32] {
+            match v {
+                Val::List(bytes) => {
+                    let raw: Vec<u8> = bytes
+                        .iter()
+                        .map(|b| match b {
+                            Val::U8(b) => *b,
+                            _ => panic!("non-u8 in bytes32"),
+                        })
+                        .collect();
+                    assert_eq!(raw.len(), 32);
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&raw);
+                    a
+                }
+                _ => panic!("expected list<u8>"),
+            }
+        }
+
+        fn decode_decision_record(boxed: &wasmtime::component::Val) -> DecodedDecision {
+            match boxed {
+                Val::Record(fields) => {
+                    let f = |name: &str| -> &Val {
+                        fields
+                            .iter()
+                            .find(|(k, _)| k == name)
+                            .map(|(_, v)| v)
+                            .unwrap_or_else(|| panic!("field {name} missing"))
+                    };
+                    DecodedDecision {
+                        decision_id: bytes32_from_val(f("decision-id")),
+                        user: bytes32_from_val(f("user")),
+                        tenant: bytes32_from_val(f("tenant")),
+                        corr_id: bytes32_from_val(f("corr-id")),
+                        class: if let Val::U8(b) = f("class") { *b } else { panic!() },
+                        recorded_at_block: if let Val::U64(n) = f("recorded-at-block") {
+                            *n
+                        } else {
+                            panic!()
+                        },
+                    }
+                }
+                _ => panic!("expected Record, got {boxed:?}"),
+            }
+        }
+
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::List(items) => Ok(items.iter().map(decode_decision_record).collect()),
+                    other => panic!("expected list, got {other:?}"),
+                },
+                Ok(None) => Ok(Vec::new()),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn load_query_decisions_capsule() -> (
+        wasmtime::Store<wasm::HostCtx>,
+        wasmtime::component::Instance,
+    ) {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("query-decisions-by-tenant");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("query-decisions capsule.wasm on disk");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("query-decisions manifest.toml on disk");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("query-decisions instantiates")
+    }
+
+    /// Build a 64-byte bytes32[] return with one ID (the
+    /// minimum valid response: outer offset 32 + length 1 +
+    /// one 32-byte entry).
+    #[cfg(test)]
+    fn build_bytes32_array_response(ids: &[[u8; 32]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + ids.len() * 32);
+        // Outer offset = 0x20
+        let mut off = [0u8; 32];
+        off[31] = 0x20;
+        out.extend_from_slice(&off);
+        // Length
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(ids.len() as u64).to_be_bytes());
+        out.extend_from_slice(&len);
+        // Entries
+        for id in ids {
+            out.extend_from_slice(id);
+        }
+        out
+    }
+
+    /// Build a getDecision dynamic-struct response. The outer
+    /// offset points at byte 32 (immediately after itself); the
+    /// struct body is 11 chunks (354 bytes; but our decoder only
+    /// reads 10 chunks ending at s+288..s+320). Pads to 352 bytes
+    /// total to satisfy the bound check.
+    #[cfg(test)]
+    fn build_decision_response(
+        decision_id: [u8; 32],
+        user: [u8; 32],
+        tenant: [u8; 32],
+        corr_id: [u8; 32],
+        class: u8,
+        recorded_at_block: u64,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 320);
+        // Outer offset = 0x20
+        let mut off = [0u8; 32];
+        off[31] = 0x20;
+        out.extend_from_slice(&off);
+        // s = 32. Chunks at s+0..32, s+32..64, ..., s+288..320.
+        out.extend_from_slice(&decision_id);
+        out.extend_from_slice(&user);
+        out.extend_from_slice(&tenant);
+        out.extend_from_slice(&corr_id);
+        // class at s+128..s+160 (last byte)
+        let mut class_chunk = [0u8; 32];
+        class_chunk[31] = class;
+        out.extend_from_slice(&class_chunk);
+        // skipped chunks at s+160..s+288 (4 chunks = 128 bytes)
+        out.extend_from_slice(&[0u8; 128]);
+        // ts at s+288..s+320 (low 8 bytes BE)
+        let mut ts_chunk = [0u8; 32];
+        ts_chunk[24..32].copy_from_slice(&recorded_at_block.to_be_bytes());
+        out.extend_from_slice(&ts_chunk);
+        out
+    }
+
+    /// CIT-AGENT-9c-2 — verifies the capsule produces canonical
+    /// latestByTenant calldata followed by per-ID getDecision
+    /// calldata. Two host fn calls expected (one ID returned).
+    #[test]
+    fn query_decisions_by_tenant_capsule_encodes_correct_calldata() {
+        use sha3::{Digest, Keccak256};
+
+        let (mut store, instance) = load_query_decisions_capsule();
+        // 1st response: array with one ID (= 0x77..77).
+        let id_a = [0x77u8; 32];
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_bytes32_array_response(&[id_a]));
+        // 2nd response: a valid getDecision for id_a.
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_decision_response(
+                id_a,
+                [0xaau8; 32],
+                [0xbbu8; 32],
+                [0xccu8; 32],
+                3,
+                42,
+            ));
+
+        let tenant_hex = "0011223344556677889900aabbccddee0011223344556677889900aabbccddee";
+        let tenant_arg = format!("0x{tenant_hex}");
+        let _ = invoke_query_decisions(&mut store, instance, &tenant_arg, 3);
+
+        // Expected selectors
+        let mut h = Keccak256::new();
+        h.update(b"latestByTenant(bytes32,uint256)");
+        let sel_latest = h.finalize();
+        let mut h = Keccak256::new();
+        h.update(b"getDecision(bytes32)");
+        let sel_get = h.finalize();
+
+        let history = store.data().eth_call_history();
+        assert_eq!(history.len(), 2, "expected 1 + 1 calls (1 latest + 1 get)");
+
+        // Call 1: latestByTenant(tenant, 3)
+        let call1 = &history[0];
+        assert_eq!(
+            hex::encode(call1.0),
+            "4a86659bdab24dc444c72fbbad4cd83491820e40",
+            "call 1 routed to AgentDecisionRegistryV2"
+        );
+        assert_eq!(call1.1[..4], sel_latest[..4]);
+        let tenant_bytes = hex::decode(tenant_hex).unwrap();
+        assert_eq!(&call1.1[4..36], &tenant_bytes[..]);
+        // N param: last byte should be 3 (under the cap)
+        assert_eq!(call1.1[67], 3, "n encoded as 3");
+
+        // Call 2: getDecision(id_a)
+        let call2 = &history[1];
+        assert_eq!(call2.1[..4], sel_get[..4]);
+        assert_eq!(&call2.1[4..36], &id_a[..]);
+    }
+
+    /// CIT-AGENT-9c-2 — verifies the capsule decodes 2 getDecision
+    /// responses into structured DecisionSummary records.
+    #[test]
+    fn query_decisions_by_tenant_capsule_decodes_multi_response() {
+        let (mut store, instance) = load_query_decisions_capsule();
+        let id_a = [0x11u8; 32];
+        let id_b = [0x22u8; 32];
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_bytes32_array_response(&[id_a, id_b]));
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_decision_response(
+                id_a,
+                [0xa1u8; 32],
+                [0xb1u8; 32],
+                [0xc1u8; 32],
+                1,
+                100,
+            ));
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_decision_response(
+                id_b,
+                [0xa2u8; 32],
+                [0xb2u8; 32],
+                [0xc2u8; 32],
+                2,
+                200,
+            ));
+
+        let result = invoke_query_decisions(
+            &mut store,
+            instance,
+            "0x0011223344556677889900aabbccddee0011223344556677889900aabbccddee",
+            10,
+        );
+        let list = result.expect("multi-call decode succeeds");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].decision_id, id_a);
+        assert_eq!(list[0].class, 1);
+        assert_eq!(list[0].recorded_at_block, 100);
+        assert_eq!(list[1].decision_id, id_b);
+        assert_eq!(list[1].class, 2);
+        assert_eq!(list[1].recorded_at_block, 200);
+    }
+
+    /// CIT-AGENT-9c-2 — n is silently clamped to 50. Calling with
+    /// n=100 must encode 50 in the latestByTenant calldata.
+    #[test]
+    fn query_decisions_by_tenant_capsule_caps_n_at_50() {
+        let (mut store, instance) = load_query_decisions_capsule();
+        // First call: empty array (no follow-ups needed).
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(build_bytes32_array_response(&[]));
+
+        let _ = invoke_query_decisions(
+            &mut store,
+            instance,
+            "0x0011223344556677889900aabbccddee0011223344556677889900aabbccddee",
+            100,
+        );
+
+        let history = store.data().eth_call_history();
+        assert_eq!(history.len(), 1, "empty ID array → no getDecision calls");
+        let n_byte = history[0].1[67]; // last byte of the second uint256 arg
+        assert_eq!(n_byte, 50, "n=100 was clamped to MAX_N=50");
+        // High bytes should be zero (no encoding overflow).
+        assert_eq!(&history[0].1[36..67], &[0u8; 31][..]);
+    }
+
+    // ────────────────────── (end CIT-AGENT-9c-2) ──────────────────
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects

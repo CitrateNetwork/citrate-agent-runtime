@@ -1,0 +1,42 @@
+# CIT-AGENT-9c-2 — query-decisions-by-tenant capsule.
+#
+# Reads AgentDecisionRegistryV2 on chain 40204. Two-call shape:
+# latestByTenant returns IDs, then getDecision per ID. Both go
+# through the same eth-call host fn against the same address.
+
+[capsule]
+name = "query-decisions-by-tenant"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = ["eth_call:0x4a86659BDab24dc444C72fbbaD4cd83491820E40"]
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = ["FedRAMP-Moderate", "FedRAMP-High", "CMMC-L3", "ITAR"]
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9c-2"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
