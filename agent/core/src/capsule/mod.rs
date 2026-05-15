@@ -588,6 +588,66 @@ tier = "bundled"
         );
     }
 
+    /// CIT-AGENT-9b — first end-to-end compiled-capsule test.
+    /// Reads the `capsules/hello/capsule.wasm` artifact built by
+    /// `tools/cps-build/hello-capsule/` (cargo-component →
+    /// wasm32-unknown-unknown), constructs the cit-agent Capsule
+    /// + manifest matching the on-disk manifest.toml shape, builds
+    /// the manifest-driven linker, and instantiates the component.
+    ///
+    /// This is the converse of CIT-AGENT-9a's fail-closed test:
+    /// 9a proved an undeclared-import component is rejected; 9b
+    /// proves a no-import, manifest-compliant component is
+    /// accepted. Together they bracket the load gate.
+    ///
+    /// The on-disk WASM is committed to the repo (under
+    /// `citrate_v0.01.1/capsules/hello/`); the source crate is
+    /// also committed (under `tools/cps-build/hello-capsule/`)
+    /// so anyone can reproduce the build. If the build product
+    /// drifts from the source, this test fails because the on-
+    /// disk capsule.wasm and the manifest declared content_hash
+    /// will diverge.
+    #[test]
+    fn hello_capsule_loads_and_instantiates() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        // CARGO_MANIFEST_DIR is .../citrate_v0.01.1/agent/core/;
+        // the capsules live one level up at .../capsules/hello/.
+        let manifest_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("hello");
+        let wasm_path = capsule_dir.join("capsule.wasm");
+        let manifest_path = capsule_dir.join("manifest.toml");
+        let wasm =
+            std::fs::read(&wasm_path).expect("hello capsule.wasm exists on disk");
+        let manifest_str = std::fs::read_to_string(&manifest_path)
+            .expect("hello manifest.toml exists on disk");
+        let manifest = Manifest::parse(&manifest_str).expect("hello manifest parses");
+
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs from hello manifest")
+            .into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect("hello capsule instantiates under manifest-built linker");
+    }
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects
