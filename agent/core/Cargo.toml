@@ -28,6 +28,10 @@ toml = "0.8"
 zstd = "0.13"
 tar = "0.4"
 sha2 = "0.10"
+# CIT-AGENT-5a — canonical CBOR for audit-chain record encoding.
+# RFC 8949 §4.2.1 deterministic encoding rules.
+ciborium = "0.2"
+base64 = "0.22"
 
 # CIT-AGENT-3b — signature chain + WIT/WASM cross-check.
 # ed25519 matches the native scheme used by citrate-wallet (workspace
