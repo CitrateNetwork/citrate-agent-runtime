@@ -470,6 +470,124 @@ tier = "bundled"
         assert!(err.to_string().contains("parse") || err.to_string().contains("instantiate"));
     }
 
+    /// CIT-AGENT-9a — empirical fail-closed proof for the
+    /// "build from manifest, NOT filter default" linker invariant.
+    ///
+    /// CIT-AGENT-3c proved the linker's *permitted set* excludes
+    /// undeclared capabilities. CIT-AGENT-9a closes the empirical
+    /// gap: a component whose WASM declares an import that the
+    /// manifest-built linker did NOT register MUST be rejected
+    /// before any host call can occur. Without this, the security
+    /// claim ("undeclared caps cannot be reached") rests on
+    /// inference from the permitted-set check rather than direct
+    /// observation of wasmtime rejecting the load.
+    ///
+    /// Concretely: build a WAT component declaring a custom host
+    /// import in the `citrate:` namespace; build a manifest with
+    /// `network = "none"`, `filesystem = []`; construct the linker;
+    /// attempt to load the component. Wasmtime rejects the load
+    /// before any host call is reached. The exact failure layer
+    /// (parse vs. instantiate) is a wasmtime implementation
+    /// detail and may shift between versions — the security
+    /// invariant is "load fails", not "load fails at one specific
+    /// layer". The test allows either layer; if both stop
+    /// rejecting, this test fires and the security claim must be
+    /// re-examined immediately.
+    #[test]
+    fn instantiate_rejects_undeclared_host_import() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+
+        // A component that imports an interface the linker won't
+        // register. The interface name is intentionally NOT one of
+        // the WASI families the `from_manifest` linker knows about,
+        // so even a fully-permissive manifest could not coincidentally
+        // satisfy this import. (We want to exercise "fail-closed on
+        // undeclared", not "fail-closed on misdeclared".)
+        // Component with a single function import. The interface
+        // name uses the `citrate:` namespace so it cannot collide
+        // with any WASI family the manifest-built linker registers.
+        let component_wat = r#"
+(component
+    (import "citrate:capsule-9a/forbidden" (func (param "x" u32) (result u32)))
+)
+"#;
+        let component_wasm =
+            wat::parse_str(component_wat).expect("WAT compiles to a component");
+
+        let manifest_str = r#"
+[capsule]
+name = "fail-closed-witness"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = []
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9a"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm: component_wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs (no caps to add)")
+            .into_linker();
+        let err = capsule
+            .instantiate(&engine, &linker)
+            .expect_err("component with undeclared host import must fail to load");
+        // The security invariant: the load FAILED. Either layer
+        // (parse or instantiate / link) is acceptable evidence —
+        // the capsule never reaches a state where its (undeclared)
+        // import could be called. We assert on a broad set of
+        // wasmtime failure substrings so a future wasmtime upgrade
+        // that changes the error wording does not silently weaken
+        // the security claim — at least one of these substrings
+        // MUST be present in any honest failure.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parse")
+                || msg.contains("import")
+                || msg.contains("instantiate")
+                || msg.contains("forbidden")
+                || msg.contains("citrate:capsule-9a"),
+            "load-fail error must indicate parse/import/instantiate failure; got: {msg}",
+        );
+    }
+
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
     /// constructed per-capsule linker whose permitted set reflects
