@@ -6,7 +6,9 @@
 //! disabled — fuel + epoch interruption land in CIT-AGENT-3d when
 //! `Capsule::call(...)` becomes real).
 
+use crate::capsule::dispatcher::EthCallDispatcher;
 use crate::error::AgentError;
+use std::sync::Arc;
 use wasmtime::component::ResourceTable;
 use wasmtime::{Config, Engine};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
@@ -39,6 +41,13 @@ pub struct HostCtx {
     /// ABI encoding for each call in a multi-call sequence.
     /// CIT-AGENT-9c-2 (extended from 9c-1's "last only" shape).
     eth_call_history: Vec<(Address, Vec<u8>)>,
+    /// Optional production dispatcher for `citrate:chain/eth-call`.
+    /// When set AND the canned-queue is empty, the host fn calls
+    /// the dispatcher's `eth_call` to obtain the real chain
+    /// response. When `None`, the host fn falls back to
+    /// `Ok(Vec::new())` (the 9c-host legacy stub).
+    /// CIT-AGENT-9c-1-rpc.
+    eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
 }
 
 impl HostCtx {
@@ -54,6 +63,7 @@ impl HostCtx {
             eth_call_allow_list: Vec::new(),
             eth_call_canned_queue: std::collections::VecDeque::new(),
             eth_call_history: Vec::new(),
+            eth_call_dispatcher: None,
         }
     }
 
@@ -67,7 +77,32 @@ impl HostCtx {
             eth_call_allow_list: allow_list,
             eth_call_canned_queue: std::collections::VecDeque::new(),
             eth_call_history: Vec::new(),
+            eth_call_dispatcher: None,
         }
+    }
+
+    /// Build a host context with an allow-list AND a production
+    /// dispatcher. Used by `Capsule::instantiate_with_store_and_dispatcher`
+    /// for the live chain-dispatch path. CIT-AGENT-9c-1-rpc.
+    pub fn with_dispatcher(
+        allow_list: Vec<Address>,
+        dispatcher: Arc<dyn EthCallDispatcher>,
+    ) -> Self {
+        Self {
+            ctx: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            eth_call_allow_list: allow_list,
+            eth_call_canned_queue: std::collections::VecDeque::new(),
+            eth_call_history: Vec::new(),
+            eth_call_dispatcher: Some(dispatcher),
+        }
+    }
+
+    /// Get a clone of the dispatcher, if any. Host fn uses this to
+    /// route real eth_call invocations when the canned-queue is
+    /// empty.
+    pub fn eth_call_dispatcher(&self) -> Option<Arc<dyn EthCallDispatcher>> {
+        self.eth_call_dispatcher.clone()
     }
 
     /// Whether `to` is in the manifest-declared eth-call allow-list.

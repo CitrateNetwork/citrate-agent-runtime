@@ -14,6 +14,7 @@
 //! 2,600 distinct states PASS).
 
 pub mod archive;
+pub mod dispatcher;
 pub mod filesystem;
 pub mod linker;
 pub mod manifest;
@@ -132,6 +133,11 @@ impl Capsule {
     /// manifest-declared `chain_calls` allow-list into the `HostCtx`
     /// the store carries, so `citrate:chain/eth-call` host fns can
     /// consult it at call time. CIT-AGENT-9c-host.
+    ///
+    /// No dispatcher is attached — the host fn falls back to its
+    /// legacy `Ok(empty)` stub when the canned-queue is empty. For
+    /// production end-to-end dispatch, use
+    /// `instantiate_with_store_and_dispatcher`. CIT-AGENT-9c-1-rpc.
     pub fn instantiate_with_store(
         &self,
         engine: &wasmtime::Engine,
@@ -149,6 +155,35 @@ impl Capsule {
         let mut store = wasmtime::Store::new(
             engine,
             wasm::HostCtx::with_eth_call_allow_list(allow_list),
+        );
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
+        Ok((store, instance))
+    }
+
+    /// Instantiate with a production `EthCallDispatcher` attached
+    /// to the HostCtx. When the capsule calls `citrate:chain/eth-call`
+    /// AND no canned-queue fixture is present, the host fn routes
+    /// the call through `dispatcher.eth_call(...)`. CIT-AGENT-9c-1-rpc.
+    pub fn instantiate_with_store_and_dispatcher(
+        &self,
+        engine: &wasmtime::Engine,
+        linker: &wasmtime::component::Linker<wasm::HostCtx>,
+        dispatcher: std::sync::Arc<dyn dispatcher::EthCallDispatcher>,
+    ) -> Result<
+        (
+            wasmtime::Store<wasm::HostCtx>,
+            wasmtime::component::Instance,
+        ),
+        AgentError,
+    > {
+        let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
+            .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
+        let allow_list = self.parse_eth_call_allow_list()?;
+        let mut store = wasmtime::Store::new(
+            engine,
+            wasm::HostCtx::with_dispatcher(allow_list, dispatcher),
         );
         let instance = linker
             .instantiate(&mut store, &component)
@@ -2028,6 +2063,177 @@ tier = "bundled"
     }
 
     // ────────────────────── (end CIT-AGENT-9c-4) ──────────────────
+
+    // ────────────────────── CIT-AGENT-9c-1-rpc ────────────────────
+    // Trait-based dispatcher path: capsule calls eth-call, host fn
+    // routes to a pluggable `EthCallDispatcher`. Tests use a
+    // recording mock to verify the call reaches the dispatcher and
+    // its response flows back to the capsule.
+
+    /// Mock dispatcher used in this module's integration test.
+    #[cfg(test)]
+    struct LocalMockDispatcher {
+        calls: std::sync::Mutex<Vec<([u8; 20], Vec<u8>)>>,
+        response: Vec<u8>,
+    }
+
+    #[cfg(test)]
+    impl dispatcher::EthCallDispatcher for LocalMockDispatcher {
+        fn eth_call(
+            &self,
+            to: &wasm::Address,
+            data: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            self.calls.lock().unwrap().push((*to, data.to_vec()));
+            Ok(self.response.clone())
+        }
+    }
+
+    /// CIT-AGENT-9c-1-rpc — end-to-end test of the production
+    /// dispatch path. Instantiate echo-chain with a mock dispatcher
+    /// (NO canned-queue fixture), call `query`, and verify:
+    ///   1. The dispatcher received the (to, data) pair.
+    ///   2. The dispatcher's response bytes flow back to the
+    ///      capsule through the WIT `result<list<u8>, string>` type.
+    ///   3. The host fn's record_eth_call still ran (audit trail
+    ///      preserved across the dispatcher path).
+    #[test]
+    fn echo_chain_capsule_dispatches_via_real_dispatcher() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("echo-chain");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+            .expect("echo-chain capsule.wasm on disk");
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+            .expect("echo-chain manifest.toml on disk");
+        let manifest = Manifest::parse(&manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+
+        let dispatcher_response = vec![0xfeu8, 0xed, 0xbe, 0xef];
+        let mock = Arc::new(LocalMockDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            response: dispatcher_response.clone(),
+        });
+
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        let (mut store, instance) = capsule
+            .instantiate_with_store_and_dispatcher(&engine, &linker, mock.clone())
+            .expect("instantiates with dispatcher");
+
+        // NOTE: deliberately no canned-queue entry. The host fn
+        // must hit the dispatcher path.
+        let authorized = hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_echo_chain_query(
+            &mut store,
+            instance,
+            authorized.clone(),
+            vec![0x12, 0x34],
+        );
+        assert_eq!(
+            result,
+            Ok(dispatcher_response.clone()),
+            "dispatcher response flows back to the capsule"
+        );
+
+        // The mock saw the call.
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "dispatcher invoked exactly once");
+        let mut addr_arr = [0u8; 20];
+        addr_arr.copy_from_slice(&authorized);
+        assert_eq!(calls[0].0, addr_arr, "dispatcher receives the to bytes");
+        assert_eq!(
+            calls[0].1,
+            vec![0x12, 0x34],
+            "dispatcher receives the data bytes"
+        );
+
+        // The host fn's record_eth_call ran — audit trail
+        // preserved across the dispatcher path, not just the
+        // test-fixture path.
+        let history = store.data().eth_call_history();
+        assert_eq!(
+            history.len(),
+            1,
+            "host fn still records via dispatcher path"
+        );
+        assert_eq!(history[0].0, addr_arr);
+    }
+
+    /// CIT-AGENT-9c-1-rpc — dispatch precedence. When BOTH a canned
+    /// queue entry AND a dispatcher are present, the canned queue
+    /// wins. This preserves the 12 read-tool tests' behavior under
+    /// the new dispatch order.
+    #[test]
+    fn canned_queue_takes_precedence_over_dispatcher() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("echo-chain");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm")).unwrap();
+        let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml")).unwrap();
+        let manifest = Manifest::parse(&manifest_str).unwrap();
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+
+        let mock = Arc::new(LocalMockDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            response: vec![0xffu8; 8],
+        });
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule.prepare_linker(&engine).unwrap().into_linker();
+        let (mut store, instance) = capsule
+            .instantiate_with_store_and_dispatcher(&engine, &linker, mock.clone())
+            .unwrap();
+
+        // Pre-queue a canned response — should be returned ahead of
+        // the dispatcher's response.
+        store
+            .data_mut()
+            .enqueue_eth_call_canned_response(vec![0x42; 4]);
+
+        let authorized = hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_echo_chain_query(&mut store, instance, authorized, vec![]);
+        assert_eq!(result, Ok(vec![0x42; 4]), "canned queue wins over dispatcher");
+        assert_eq!(
+            mock.calls.lock().unwrap().len(),
+            0,
+            "dispatcher MUST NOT have been called"
+        );
+    }
+
+    // ────────────────────── (end CIT-AGENT-9c-1-rpc) ──────────────
 
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a

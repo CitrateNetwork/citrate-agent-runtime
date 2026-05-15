@@ -279,11 +279,16 @@ impl LinkerBuilder {
                 // always populated for authorized calls.
                 // CIT-AGENT-9c-1.
                 store.data_mut().record_eth_call(addr, data.clone());
-                // If a test fixture is injected, return it; otherwise
-                // the stub from 9c-host (empty bytes). Real RPC
-                // dispatch lands in CIT-AGENT-9c-1-rpc.
+                // Resolution order (CIT-AGENT-9c-1-rpc):
+                //   1. Test fixture (canned-queue front).
+                //   2. Production dispatcher (real RPC).
+                //   3. Legacy stub (Ok(empty)) — preserved for
+                //      capsules instantiated without a dispatcher.
                 if let Some(canned) = store.data_mut().take_eth_call_canned_response() {
                     return Ok((Ok(canned),));
+                }
+                if let Some(dispatcher) = store.data().eth_call_dispatcher() {
+                    return Ok((dispatcher.eth_call(&addr, &data),));
                 }
                 Ok((Ok(Vec::new()),))
             },
