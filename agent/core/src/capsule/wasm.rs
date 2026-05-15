@@ -6,7 +6,7 @@
 //! disabled — fuel + epoch interruption land in CIT-AGENT-3d when
 //! `Capsule::call(...)` becomes real).
 
-use crate::capsule::dispatcher::EthCallDispatcher;
+use crate::capsule::dispatcher::{ApprovalGate, EthCallDispatcher, EthSendDispatcher};
 use crate::error::AgentError;
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
@@ -48,6 +48,33 @@ pub struct HostCtx {
     /// `Ok(Vec::new())` (the 9c-host legacy stub).
     /// CIT-AGENT-9c-1-rpc.
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
+    /// Manifest-parsed allow-list for `citrate:chain/eth-send`.
+    /// The send host fn rejects `to` addresses outside this list.
+    /// CIT-AGENT-9c-write-host.
+    eth_send_allow_list: Vec<Address>,
+    /// Per-call forensic record of every eth_send (to, data).
+    /// Parallel to `eth_call_history`; tests + audit consumers
+    /// inspect both.
+    eth_send_history: Vec<(Address, Vec<u8>)>,
+    /// Test fixture for eth_send responses (tx hash). Same shape
+    /// as `eth_call_canned_queue`.
+    eth_send_canned_queue: std::collections::VecDeque<[u8; 32]>,
+    /// Optional production dispatcher for `citrate:chain/eth-send`.
+    /// When set AND the canned-queue is empty, the host fn calls
+    /// the dispatcher's `eth_send` AFTER the approval gate clears.
+    eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
+    /// Optional HITL approval gate. Every eth_send call traverses
+    /// this gate BEFORE the dispatcher is invoked. When `None`,
+    /// the host fn rejects all eth_send calls with
+    /// `Err("ChainSendApprovalRejected: no approval gate configured")`
+    /// — defense-in-depth: writes without a gate are write-disabled.
+    /// CIT-AGENT-9c-write-host.
+    approval_gate: Option<Arc<dyn ApprovalGate>>,
+    /// Self-identifier passed to the approval gate in
+    /// `ApprovalRequest.capsule_name`. Set by the instantiate path
+    /// from the manifest's `[capsule].name`. Empty when not yet
+    /// instantiated.
+    capsule_name: String,
 }
 
 impl HostCtx {
@@ -64,38 +91,56 @@ impl HostCtx {
             eth_call_canned_queue: std::collections::VecDeque::new(),
             eth_call_history: Vec::new(),
             eth_call_dispatcher: None,
+            eth_send_allow_list: Vec::new(),
+            eth_send_history: Vec::new(),
+            eth_send_canned_queue: std::collections::VecDeque::new(),
+            eth_send_dispatcher: None,
+            approval_gate: None,
+            capsule_name: String::new(),
         }
     }
 
-    /// Build a host context with a chain-call allow-list. Called by
-    /// `Capsule::instantiate` when the manifest declares any
-    /// `eth_call:<address>` entries.
+    /// Build a host context with a read allow-list (eth-call only).
+    /// Write path stays unconfigured — no eth_send calls will
+    /// succeed because `approval_gate = None` rejects them all.
     pub fn with_eth_call_allow_list(allow_list: Vec<Address>) -> Self {
-        Self {
-            ctx: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
-            eth_call_allow_list: allow_list,
-            eth_call_canned_queue: std::collections::VecDeque::new(),
-            eth_call_history: Vec::new(),
-            eth_call_dispatcher: None,
-        }
+        let mut s = Self::empty();
+        s.eth_call_allow_list = allow_list;
+        s
     }
 
-    /// Build a host context with an allow-list AND a production
-    /// dispatcher. Used by `Capsule::instantiate_with_store_and_dispatcher`
-    /// for the live chain-dispatch path. CIT-AGENT-9c-1-rpc.
+    /// Build a host context with a read allow-list AND a read
+    /// dispatcher. CIT-AGENT-9c-1-rpc. Write path still
+    /// unconfigured.
     pub fn with_dispatcher(
         allow_list: Vec<Address>,
         dispatcher: Arc<dyn EthCallDispatcher>,
     ) -> Self {
-        Self {
-            ctx: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
-            eth_call_allow_list: allow_list,
-            eth_call_canned_queue: std::collections::VecDeque::new(),
-            eth_call_history: Vec::new(),
-            eth_call_dispatcher: Some(dispatcher),
-        }
+        let mut s = Self::empty();
+        s.eth_call_allow_list = allow_list;
+        s.eth_call_dispatcher = Some(dispatcher);
+        s
+    }
+
+    /// Build a host context with the full write-path wiring: read +
+    /// write allow-lists, both dispatchers (any can be None), and
+    /// the approval gate. CIT-AGENT-9c-write-host.
+    pub fn with_write_path(
+        eth_call_allow_list: Vec<Address>,
+        eth_send_allow_list: Vec<Address>,
+        eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
+        eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
+        approval_gate: Option<Arc<dyn ApprovalGate>>,
+        capsule_name: String,
+    ) -> Self {
+        let mut s = Self::empty();
+        s.eth_call_allow_list = eth_call_allow_list;
+        s.eth_send_allow_list = eth_send_allow_list;
+        s.eth_call_dispatcher = eth_call_dispatcher;
+        s.eth_send_dispatcher = eth_send_dispatcher;
+        s.approval_gate = approval_gate;
+        s.capsule_name = capsule_name;
+        s
     }
 
     /// Get a clone of the dispatcher, if any. Host fn uses this to
@@ -103,6 +148,45 @@ impl HostCtx {
     /// empty.
     pub fn eth_call_dispatcher(&self) -> Option<Arc<dyn EthCallDispatcher>> {
         self.eth_call_dispatcher.clone()
+    }
+
+    // ────────────────── eth_send accessors (9c-write-host) ──────
+
+    pub fn is_eth_send_authorized(&self, to: &Address) -> bool {
+        self.eth_send_allow_list.iter().any(|a| a == to)
+    }
+
+    pub fn eth_send_allow_list(&self) -> &[Address] {
+        &self.eth_send_allow_list
+    }
+
+    pub fn record_eth_send(&mut self, to: Address, data: Vec<u8>) {
+        self.eth_send_history.push((to, data));
+    }
+
+    pub fn eth_send_history(&self) -> &[(Address, Vec<u8>)] {
+        &self.eth_send_history
+    }
+
+    /// Pop the next canned tx hash response (test fixture).
+    pub fn take_eth_send_canned_response(&mut self) -> Option<[u8; 32]> {
+        self.eth_send_canned_queue.pop_front()
+    }
+
+    pub fn enqueue_eth_send_canned_response(&mut self, tx_hash: [u8; 32]) {
+        self.eth_send_canned_queue.push_back(tx_hash);
+    }
+
+    pub fn eth_send_dispatcher(&self) -> Option<Arc<dyn EthSendDispatcher>> {
+        self.eth_send_dispatcher.clone()
+    }
+
+    pub fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>> {
+        self.approval_gate.clone()
+    }
+
+    pub fn capsule_name(&self) -> &str {
+        &self.capsule_name
     }
 
     /// Whether `to` is in the manifest-declared eth-call allow-list.

@@ -80,6 +80,43 @@ impl EthCallDispatcher for RpcEthCallDispatcher {
     }
 }
 
+/// Approval-gate request payload. The host fn populates this on
+/// every write call before consulting the `ApprovalGate`. Implementations
+/// surface the fields to the operator (capsule name + target
+/// address + calldata bytes) so the approval decision is informed.
+///
+/// CIT-AGENT-9c-write-host.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub capsule_name: String,
+    pub method: String,
+    pub to: Address,
+    pub data: Vec<u8>,
+}
+
+/// Synchronous facade over the asynchronous `ApprovalQueue` (RFC
+/// §5). Every eth_send invocation traverses this gate before the
+/// dispatcher is consulted. Production impls bridge to the async
+/// queue via `tokio::task::block_in_place` + `Handle::block_on`;
+/// test impls do allow/deny synchronously. CIT-AGENT-9c-write-host.
+pub trait ApprovalGate: Send + Sync {
+    /// Returns `Ok(())` when the operator approves, `Err(reason)`
+    /// when rejected. Blocks the calling thread until the decision
+    /// is made (or a timeout fires, surfaced as `Err`).
+    fn request(&self, req: ApprovalRequest) -> Result<(), String>;
+}
+
+/// Pluggable dispatcher for the `citrate:chain/eth-send` host
+/// function. Production impls sign + submit the calldata via
+/// `citrate-wallet-core::RpcClient::send_raw_transaction` and
+/// return the tx hash. Test impls return canned hashes.
+/// CIT-AGENT-9c-write-host.
+pub trait EthSendDispatcher: Send + Sync {
+    /// Send a signed transaction to `to` with `data`. Returns the
+    /// 32-byte transaction hash on success.
+    fn eth_send(&self, to: &Address, data: &[u8]) -> Result<[u8; 32], String>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

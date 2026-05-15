@@ -162,6 +162,45 @@ impl Capsule {
         Ok((store, instance))
     }
 
+    /// Instantiate with the full write-path wiring: read + write
+    /// allow-lists (parsed from the manifest), both dispatchers,
+    /// and the HITL approval gate. Any of the optional arcs may be
+    /// `None` — the host fn rejects accordingly (no gate ⇒ all
+    /// eth_send calls fail closed). CIT-AGENT-9c-write-host.
+    pub fn instantiate_with_write_path(
+        &self,
+        engine: &wasmtime::Engine,
+        linker: &wasmtime::component::Linker<wasm::HostCtx>,
+        eth_call_dispatcher: Option<std::sync::Arc<dyn dispatcher::EthCallDispatcher>>,
+        eth_send_dispatcher: Option<std::sync::Arc<dyn dispatcher::EthSendDispatcher>>,
+        approval_gate: Option<std::sync::Arc<dyn dispatcher::ApprovalGate>>,
+    ) -> Result<
+        (
+            wasmtime::Store<wasm::HostCtx>,
+            wasmtime::component::Instance,
+        ),
+        AgentError,
+    > {
+        let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
+            .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
+        let (read_allow, write_allow) = self.parse_chain_call_allow_lists()?;
+        let mut store = wasmtime::Store::new(
+            engine,
+            wasm::HostCtx::with_write_path(
+                read_allow,
+                write_allow,
+                eth_call_dispatcher,
+                eth_send_dispatcher,
+                approval_gate,
+                self.manifest.capsule.name.clone(),
+            ),
+        );
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
+        Ok((store, instance))
+    }
+
     /// Instantiate with a production `EthCallDispatcher` attached
     /// to the HostCtx. When the capsule calls `citrate:chain/eth-call`
     /// AND no canned-queue fixture is present, the host fn routes
@@ -191,21 +230,29 @@ impl Capsule {
         Ok((store, instance))
     }
 
-    /// Parse the manifest's `chain_calls` entries of shape
-    /// `eth_call:0x<40-hex>` into 20-byte `Address`es. Entries with
-    /// the wrong prefix are silently skipped (they belong to other
-    /// chain-call families that this sprint hasn't wired yet, e.g.
-    /// `model_inference:0x...`). CIT-AGENT-9c-host.
-    fn parse_eth_call_allow_list(&self) -> Result<Vec<wasm::Address>, AgentError> {
-        let mut out = Vec::new();
+    /// Parse the manifest's `chain_calls` entries into per-prefix
+    /// allow-lists. Recognized prefixes:
+    ///   `eth_call:0x<40-hex>`  → read allow-list (CIT-AGENT-9c-host)
+    ///   `eth_send:0x<40-hex>`  → write allow-list (CIT-AGENT-9c-write-host)
+    /// Other prefixes (e.g. `model_inference:`) are silently
+    /// skipped — they belong to future host-fn families.
+    fn parse_chain_call_allow_lists(
+        &self,
+    ) -> Result<(Vec<wasm::Address>, Vec<wasm::Address>), AgentError> {
+        let mut read = Vec::new();
+        let mut write = Vec::new();
         for entry in &self.manifest.capability.chain_calls {
-            let Some(rest) = entry.strip_prefix("eth_call:") else {
+            let (rest, target) = if let Some(r) = entry.strip_prefix("eth_call:") {
+                (r, &mut read)
+            } else if let Some(r) = entry.strip_prefix("eth_send:") {
+                (r, &mut write)
+            } else {
                 continue;
             };
             let hex_part = rest.strip_prefix("0x").unwrap_or(rest);
             if hex_part.len() != 40 {
                 return Err(AgentError::Capsule(format!(
-                    "chain_calls entry {entry:?} expected eth_call:0x<40 hex>, got {hex_part:?}"
+                    "chain_calls entry {entry:?} expected <prefix>:0x<40 hex>, got {hex_part:?}"
                 )));
             }
             let bytes = hex::decode(hex_part).map_err(|e| {
@@ -213,9 +260,15 @@ impl Capsule {
             })?;
             let mut addr: wasm::Address = [0; 20];
             addr.copy_from_slice(&bytes);
-            out.push(addr);
+            target.push(addr);
         }
-        Ok(out)
+        Ok((read, write))
+    }
+
+    /// Convenience for code paths that only care about the read
+    /// allow-list. Preserves the CIT-AGENT-9c-host API.
+    fn parse_eth_call_allow_list(&self) -> Result<Vec<wasm::Address>, AgentError> {
+        Ok(self.parse_chain_call_allow_lists()?.0)
     }
 
     pub fn name(&self) -> &str {
@@ -2234,6 +2287,368 @@ tier = "bundled"
     }
 
     // ────────────────────── (end CIT-AGENT-9c-1-rpc) ──────────────
+
+    // ────────────────────── CIT-AGENT-9c-write-host ───────────────
+    // Three-layer write-path tests: allow-list, HITL approval gate,
+    // dispatcher. Each layer has its own test that proves the
+    // capsule never reaches the layers below when a layer rejects.
+
+    #[cfg(test)]
+    struct MockGate {
+        decisions: std::sync::Mutex<Vec<dispatcher::ApprovalRequest>>,
+        allow: bool,
+        reason: String,
+    }
+
+    #[cfg(test)]
+    impl dispatcher::ApprovalGate for MockGate {
+        fn request(
+            &self,
+            req: dispatcher::ApprovalRequest,
+        ) -> Result<(), String> {
+            self.decisions.lock().unwrap().push(req);
+            if self.allow {
+                Ok(())
+            } else {
+                Err(self.reason.clone())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    struct MockSendDispatcher {
+        calls: std::sync::Mutex<Vec<([u8; 20], Vec<u8>)>>,
+        tx_hash: [u8; 32],
+    }
+
+    #[cfg(test)]
+    impl dispatcher::EthSendDispatcher for MockSendDispatcher {
+        fn eth_send(
+            &self,
+            to: &wasm::Address,
+            data: &[u8],
+        ) -> Result<[u8; 32], String> {
+            self.calls.lock().unwrap().push((*to, data.to_vec()));
+            Ok(self.tx_hash)
+        }
+    }
+
+    /// Helper to invoke the eth-sender-test capsule's `send` export.
+    /// Returns the result through `Result<Vec<u8> tx_hash, String err>`.
+    #[cfg(test)]
+    fn invoke_eth_sender_send(
+        store: &mut wasmtime::Store<wasm::HostCtx>,
+        instance: wasmtime::component::Instance,
+        to: Vec<u8>,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        use wasmtime::component::Val;
+        let iface_idx = instance
+            .get_export(&mut *store, None, "citrate:eth-sender-test/action@0.1.0")
+            .expect("action interface exists");
+        let func_idx = instance
+            .get_export(&mut *store, Some(&iface_idx), "send")
+            .expect("send func exists");
+        let func = instance.get_func(&mut *store, func_idx).unwrap();
+        let to_val = Val::List(to.into_iter().map(Val::U8).collect());
+        let data_val = Val::List(data.into_iter().map(Val::U8).collect());
+        let mut results = [Val::Bool(false)];
+        func.call(&mut *store, &[to_val, data_val], &mut results)
+            .expect("send call completes");
+        func.post_return(&mut *store).expect("post_return clears");
+        match &results[0] {
+            Val::Result(r) => match r.as_ref() {
+                Ok(Some(boxed)) => match boxed.as_ref() {
+                    Val::List(bytes) => Ok(bytes
+                        .iter()
+                        .map(|b| match b {
+                            Val::U8(b) => *b,
+                            _ => panic!("non-u8"),
+                        })
+                        .collect()),
+                    other => panic!("expected list<u8>, got {other:?}"),
+                },
+                Ok(None) => Ok(Vec::new()),
+                Err(Some(boxed)) => match boxed.as_ref() {
+                    Val::String(s) => Err(s.clone()),
+                    other => panic!("expected string, got {other:?}"),
+                },
+                Err(None) => Err(String::new()),
+            },
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn load_eth_sender_capsule_with(
+        manifest_str: &str,
+        gate: Option<std::sync::Arc<dyn dispatcher::ApprovalGate>>,
+        dispatcher_impl: Option<
+            std::sync::Arc<dyn dispatcher::EthSendDispatcher>,
+        >,
+    ) -> (
+        wasmtime::Store<wasm::HostCtx>,
+        wasmtime::component::Instance,
+    ) {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsule_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+            .join("eth-sender-test");
+        let wasm = std::fs::read(capsule_dir.join("capsule.wasm")).unwrap();
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().unwrap();
+        let linker = capsule.prepare_linker(&engine).unwrap().into_linker();
+        capsule
+            .instantiate_with_write_path(&engine, &linker, None, dispatcher_impl, gate)
+            .expect("instantiate succeeds")
+    }
+
+    const ETH_SENDER_MANIFEST_OK: &str = r#"
+[capsule]
+name = "eth-sender-test"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = ["eth_send:0x4a86659BDab24dc444C72fbbaD4cd83491820E40"]
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = ["PUBLIC"]
+emits = ["PUBLIC"]
+
+[risk]
+tier = "high"
+required_roles = ["Reviewer", "ComplianceOfficer"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9c-write-host"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+
+    /// CIT-AGENT-9c-write-host LAYER 1 — capsule with an
+    /// authorized-address manifest BUT a different `to` arg at
+    /// call time. The host fn rejects at the allow-list check;
+    /// the approval gate is never consulted; the dispatcher is
+    /// never invoked.
+    #[test]
+    fn eth_send_capsule_blocks_when_address_unauthorized() {
+        use std::sync::Arc;
+
+        let gate = Arc::new(MockGate {
+            decisions: std::sync::Mutex::new(Vec::new()),
+            allow: true,
+            reason: String::new(),
+        });
+        let dispatcher_impl = Arc::new(MockSendDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tx_hash: [0xeeu8; 32],
+        });
+        let (mut store, instance) = load_eth_sender_capsule_with(
+            ETH_SENDER_MANIFEST_OK,
+            Some(gate.clone()),
+            Some(dispatcher_impl.clone()),
+        );
+
+        // Call with an address NOT in the manifest allow-list.
+        let unauthorized = vec![0x11u8; 20];
+        let result = invoke_eth_sender_send(&mut store, instance, unauthorized, vec![]);
+
+        let err = result.expect_err("allow-list miss must reject");
+        assert!(
+            err.starts_with("ChainSendNotAuthorized:"),
+            "layer 1 rejection; got: {err}"
+        );
+        // The gate was NOT consulted.
+        assert_eq!(
+            gate.decisions.lock().unwrap().len(),
+            0,
+            "layer 1 rejection MUST short-circuit before the gate"
+        );
+        // The dispatcher was NOT invoked.
+        assert_eq!(
+            dispatcher_impl.calls.lock().unwrap().len(),
+            0,
+            "layer 1 rejection MUST short-circuit before dispatch"
+        );
+    }
+
+    /// CIT-AGENT-9c-write-host LAYER 2 — allow-list passes, but the
+    /// HITL approval gate denies. Dispatcher is never invoked. The
+    /// rejection reason is propagated through the WIT result.
+    #[test]
+    fn eth_send_capsule_blocks_when_approval_denied() {
+        use std::sync::Arc;
+
+        let gate = Arc::new(MockGate {
+            decisions: std::sync::Mutex::new(Vec::new()),
+            allow: false,
+            reason: "compliance officer rejected".to_string(),
+        });
+        let dispatcher_impl = Arc::new(MockSendDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tx_hash: [0xeeu8; 32],
+        });
+        let (mut store, instance) = load_eth_sender_capsule_with(
+            ETH_SENDER_MANIFEST_OK,
+            Some(gate.clone()),
+            Some(dispatcher_impl.clone()),
+        );
+
+        let authorized =
+            hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_eth_sender_send(
+            &mut store,
+            instance,
+            authorized.clone(),
+            vec![0xab],
+        );
+
+        let err = result.expect_err("approval denial must reject");
+        assert!(
+            err.starts_with("ChainSendApprovalRejected:"),
+            "layer 2 rejection; got: {err}"
+        );
+        assert!(
+            err.contains("compliance officer rejected"),
+            "rejection reason must propagate; got: {err}"
+        );
+        // The gate WAS consulted exactly once.
+        let decisions = gate.decisions.lock().unwrap();
+        assert_eq!(decisions.len(), 1, "gate consulted exactly once");
+        assert_eq!(decisions[0].method, "eth-send");
+        assert_eq!(decisions[0].capsule_name, "eth-sender-test");
+        let mut addr_arr = [0u8; 20];
+        addr_arr.copy_from_slice(&authorized);
+        assert_eq!(decisions[0].to, addr_arr);
+        // The dispatcher was NOT invoked.
+        assert_eq!(
+            dispatcher_impl.calls.lock().unwrap().len(),
+            0,
+            "layer 2 rejection MUST short-circuit before dispatch"
+        );
+    }
+
+    /// CIT-AGENT-9c-write-host LAYER 3 (happy path) — allow-list
+    /// passes, approval granted, dispatcher invoked, tx hash flows
+    /// back through the WIT result. The host fn's eth_send_history
+    /// records the call.
+    #[test]
+    fn eth_send_capsule_dispatches_when_approval_granted() {
+        use std::sync::Arc;
+
+        let gate = Arc::new(MockGate {
+            decisions: std::sync::Mutex::new(Vec::new()),
+            allow: true,
+            reason: String::new(),
+        });
+        let tx_hash = [0xdeu8; 32];
+        let dispatcher_impl = Arc::new(MockSendDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tx_hash,
+        });
+        let (mut store, instance) = load_eth_sender_capsule_with(
+            ETH_SENDER_MANIFEST_OK,
+            Some(gate.clone()),
+            Some(dispatcher_impl.clone()),
+        );
+
+        let authorized =
+            hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_eth_sender_send(
+            &mut store,
+            instance,
+            authorized.clone(),
+            vec![0x12, 0x34],
+        );
+
+        assert_eq!(
+            result,
+            Ok(tx_hash.to_vec()),
+            "tx hash flows back to the capsule"
+        );
+        // Gate consulted.
+        assert_eq!(gate.decisions.lock().unwrap().len(), 1);
+        // Dispatcher invoked exactly once with the right args.
+        let calls = dispatcher_impl.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let mut addr_arr = [0u8; 20];
+        addr_arr.copy_from_slice(&authorized);
+        assert_eq!(calls[0].0, addr_arr);
+        assert_eq!(calls[0].1, vec![0x12, 0x34]);
+        // Host fn's audit history populated.
+        let history = store.data().eth_send_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, addr_arr);
+        assert_eq!(history[0].1, vec![0x12, 0x34]);
+    }
+
+    /// CIT-AGENT-9c-write-host — defense-in-depth: when NO approval
+    /// gate is configured, every eth_send call rejects regardless
+    /// of allow-list and dispatcher status. Writes-without-gate
+    /// MUST never reach the chain.
+    #[test]
+    fn eth_send_capsule_rejects_when_no_gate_configured() {
+        use std::sync::Arc;
+
+        let dispatcher_impl = Arc::new(MockSendDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tx_hash: [0xeeu8; 32],
+        });
+        // Note: gate = None.
+        let (mut store, instance) = load_eth_sender_capsule_with(
+            ETH_SENDER_MANIFEST_OK,
+            None,
+            Some(dispatcher_impl.clone()),
+        );
+
+        let authorized =
+            hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_eth_sender_send(&mut store, instance, authorized, vec![]);
+        let err = result.expect_err("no gate ⇒ all writes rejected");
+        assert!(
+            err.contains("no approval gate configured"),
+            "defense-in-depth: missing gate must be a clear error; got: {err}"
+        );
+        // Dispatcher MUST not have been called.
+        assert_eq!(
+            dispatcher_impl.calls.lock().unwrap().len(),
+            0,
+            "missing gate MUST short-circuit before dispatch"
+        );
+    }
+
+    // ────────────────────── (end CIT-AGENT-9c-write-host) ─────────
 
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a

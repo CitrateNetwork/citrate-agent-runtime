@@ -1,0 +1,48 @@
+# CIT-AGENT-9c-write-host — eth-sender-test capsule. NOT a
+# production tool — exists only to drive cit-agent-core's
+# three-layer write-path tests (allow-list + HITL gate +
+# dispatcher).
+
+[capsule]
+name = "eth-sender-test"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+# Single eth_send-allow-listed address (matches the address
+# integration tests use). Tests verify rejections by tampering
+# the manifest at load time.
+chain_calls = ["eth_send:0x4a86659BDab24dc444C72fbbaD4cd83491820E40"]
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = ["PUBLIC"]
+emits = ["PUBLIC"]
+
+# High-risk by default — write tools require Reviewer + ComplianceOfficer
+# under the standard cit-agent policy bundle. Tests pass a simple
+# allow-or-deny ApprovalGate; the real role lattice integration
+# lands in CIT-AGENT-9c-5/6/7 alongside the production tools.
+[risk]
+tier = "high"
+required_roles = ["Reviewer", "ComplianceOfficer"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "2026-05-15-cit-agent-9c-write-host"
+tla_spec = ""
+
+[signing]
+tier = "bundled"

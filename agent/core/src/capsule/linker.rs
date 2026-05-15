@@ -54,6 +54,12 @@ pub enum CapabilityToken {
     /// just gates whether the host fn is registered at all.
     /// CIT-AGENT-9c-host.
     CitrateChainEthCall,
+    /// `citrate:chain/eth-send@0.1.0` (state-changing chain calls).
+    /// Permitted only when `[capability].chain_calls` contains at
+    /// least one `eth_send:<address>` entry. The host fn enforces
+    /// allow-list + HITL approval gate at call time.
+    /// CIT-AGENT-9c-write-host.
+    CitrateChainEthSend,
 }
 
 /// LinkerBuilder for the per-capsule wasmtime Linker. Starts empty;
@@ -122,6 +128,17 @@ impl LinkerBuilder {
             .any(|s| s.starts_with("eth_call:"))
         {
             b.permitted.insert(CapabilityToken::CitrateChainEthCall);
+        }
+        // Citrate chain eth-send — token gates registration; host
+        // fn enforces (1) allow-list + (2) HITL approval gate +
+        // (3) dispatcher availability. CIT-AGENT-9c-write-host.
+        if manifest
+            .capability
+            .chain_calls
+            .iter()
+            .any(|s| s.starts_with("eth_send:"))
+        {
+            b.permitted.insert(CapabilityToken::CitrateChainEthSend);
         }
         Ok(b)
     }
@@ -238,6 +255,11 @@ impl LinkerBuilder {
         if self.permitted.contains(&CapabilityToken::CitrateChainEthCall) {
             self.wire_citrate_chain_eth_call()?;
         }
+        // CIT-AGENT-9c-write-host: eth-send. Layered enforcement —
+        // allow-list, then HITL approval gate, then dispatcher.
+        if self.permitted.contains(&CapabilityToken::CitrateChainEthSend) {
+            self.wire_citrate_chain_eth_send()?;
+        }
         Ok(self)
     }
 
@@ -294,6 +316,96 @@ impl LinkerBuilder {
             },
         )
         .map_err(|e| linker_err("citrate:chain/eth-call call func_wrap", e))?;
+        Ok(())
+    }
+
+    /// Wire `citrate:chain/eth-send@0.1.0`. Three-layer enforcement
+    /// (CIT-AGENT-9c-write-host):
+    ///   1. Allow-list — `to` MUST be in `eth_send_allow_list`.
+    ///   2. HITL approval gate — `ApprovalGate::request(...)` MUST
+    ///      return Ok(()). When no gate is configured, the call is
+    ///      REJECTED (defense-in-depth: writes without a gate are
+    ///      write-disabled).
+    ///   3. Dispatcher — `EthSendDispatcher::eth_send(...)` performs
+    ///      the actual signing + tx submission. Test fixtures may
+    ///      pre-empt via `eth_send_canned_queue`.
+    fn wire_citrate_chain_eth_send(&mut self) -> Result<(), AgentError> {
+        use crate::capsule::dispatcher::ApprovalRequest;
+        let mut inst = self
+            .linker
+            .instance("citrate:chain/eth-send@0.1.0")
+            .map_err(|e| linker_err("citrate:chain/eth-send@0.1.0 instance", e))?;
+        inst.func_wrap(
+            "send",
+            |mut store: wasmtime::StoreContextMut<'_, HostCtx>,
+             (to, data): (Vec<u8>, Vec<u8>)|
+             -> wasmtime::Result<(Result<Vec<u8>, String>,)> {
+                if to.len() != 20 {
+                    return Ok((Err(format!(
+                        "ChainSendNotAuthorized: `to` must be 20 bytes, got {}",
+                        to.len()
+                    )),));
+                }
+                let mut addr: [u8; 20] = [0; 20];
+                addr.copy_from_slice(&to);
+                if !store.data().is_eth_send_authorized(&addr) {
+                    return Ok((Err(format!(
+                        "ChainSendNotAuthorized: 0x{}",
+                        hex::encode(addr)
+                    )),));
+                }
+                // Audit-trail before any decision.
+                store.data_mut().record_eth_send(addr, data.clone());
+
+                // HITL approval gate. Defense-in-depth: if no gate,
+                // reject. A capsule that imports eth-send + a
+                // harness that hasn't wired a gate produces NO
+                // writes — never a write that bypassed the gate.
+                let gate = match store.data().approval_gate() {
+                    Some(g) => g,
+                    None => {
+                        return Ok((Err(
+                            "ChainSendApprovalRejected: no approval gate configured"
+                                .to_string(),
+                        ),));
+                    }
+                };
+                let capsule_name = store.data().capsule_name().to_string();
+                let req = ApprovalRequest {
+                    capsule_name,
+                    method: "eth-send".to_string(),
+                    to: addr,
+                    data: data.clone(),
+                };
+                if let Err(reason) = gate.request(req) {
+                    return Ok((Err(format!("ChainSendApprovalRejected: {reason}")),));
+                }
+
+                // Approval granted. Resolve the tx hash:
+                //   1. Test fixture queue (canned tx hash).
+                //   2. Production dispatcher (real signing + send).
+                //   3. No fallback — without a dispatcher, an
+                //      approved write that has no way to dispatch
+                //      MUST fail rather than silently succeed.
+                if let Some(canned) = store.data_mut().take_eth_send_canned_response() {
+                    return Ok((Ok(canned.to_vec()),));
+                }
+                let dispatcher = match store.data().eth_send_dispatcher() {
+                    Some(d) => d,
+                    None => {
+                        return Ok((Err(
+                            "ChainSendDispatchFailed: no eth_send dispatcher configured"
+                                .to_string(),
+                        ),));
+                    }
+                };
+                match dispatcher.eth_send(&addr, &data) {
+                    Ok(tx_hash) => Ok((Ok(tx_hash.to_vec()),)),
+                    Err(e) => Ok((Err(format!("ChainSendDispatchFailed: {e}")),)),
+                }
+            },
+        )
+        .map_err(|e| linker_err("citrate:chain/eth-send send func_wrap", e))?;
         Ok(())
     }
 
