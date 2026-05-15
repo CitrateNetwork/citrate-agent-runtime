@@ -14,6 +14,7 @@
 //! 2,600 distinct states PASS).
 
 pub mod archive;
+pub mod dispatch;
 pub mod dispatcher;
 pub mod filesystem;
 pub mod linker;
@@ -2944,6 +2945,93 @@ tier = "bundled"
     }
 
     // ────────────────── (end CIT-AGENT-9c-write-tools) ────────────
+
+    // ────────────────── CIT-AGENT-9c-shell-wire-prep ──────────────
+    // Fleet-level readiness: all 7 BFR-INT-12 tool capsules load
+    // under their own per-capsule linkers + instantiate without
+    // collision. Verifies the permitted-set composition matches
+    // the expected read/write split.
+
+    /// CIT-AGENT-9c-shell-wire-prep — load every BFR-INT-12 tool
+    /// capsule sequentially. Each capsule gets its own linker
+    /// (the "build from manifest" invariant requires this — a
+    /// shared linker would conflate capability sets across
+    /// capsules). All 7 must instantiate; the permitted set for
+    /// each must match the read/write tool classification.
+    #[test]
+    fn all_seven_capsules_load_under_per_capsule_linkers() {
+        use crate::capsule::linker::CapabilityToken;
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+        use std::path::PathBuf;
+
+        // (capsule_dir_name, expected: contains EthCall, contains EthSend)
+        let fleet: &[(&str, bool, bool)] = &[
+            // 4 read tools (eth_call only).
+            ("list-compliance-posture", true, false),
+            ("query-decisions-by-tenant", true, false),
+            ("query-supplier-status", true, false),
+            ("verify-provenance-chain", true, false),
+            // 3 write tools (eth_send only).
+            ("provision-user", false, true),
+            ("revoke-role", false, true),
+            ("anchor-session", false, true),
+        ];
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsules_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules");
+        let engine = EngineFactory::build().expect("engine builds");
+
+        for (name, expect_read, expect_write) in fleet {
+            let capsule_dir = capsules_root.join(name);
+            let wasm = std::fs::read(capsule_dir.join("capsule.wasm"))
+                .unwrap_or_else(|e| panic!("{name}: capsule.wasm: {e}"));
+            let manifest_str = std::fs::read_to_string(capsule_dir.join("manifest.toml"))
+                .unwrap_or_else(|e| panic!("{name}: manifest.toml: {e}"));
+            let manifest = Manifest::parse(&manifest_str)
+                .unwrap_or_else(|e| panic!("{name}: manifest parse: {e:?}"));
+            let capsule = Capsule {
+                manifest,
+                archive: archive::ArchiveContents {
+                    wasm,
+                    ..Default::default()
+                },
+            };
+            let builder = capsule
+                .prepare_linker(&engine)
+                .unwrap_or_else(|e| panic!("{name}: linker construct: {e:?}"));
+            let permitted = builder.permitted();
+            assert_eq!(
+                permitted.contains(&CapabilityToken::CitrateChainEthCall),
+                *expect_read,
+                "{name}: eth_call permitted mismatch (got {})",
+                permitted.contains(&CapabilityToken::CitrateChainEthCall),
+            );
+            assert_eq!(
+                permitted.contains(&CapabilityToken::CitrateChainEthSend),
+                *expect_write,
+                "{name}: eth_send permitted mismatch",
+            );
+            // For instantiation we need a HostCtx with the right
+            // wiring for the capsule type. Read tools succeed with
+            // an empty store (canned-queue empty + no dispatcher →
+            // stub Ok(empty)). Write tools need a gate to be
+            // present so the host fn isn't rejected at the
+            // "no gate configured" check — but we're testing LOAD,
+            // not call, so an instantiate against the prepared
+            // linker is sufficient.
+            let linker = builder.into_linker();
+            let (_store, _instance) = capsule
+                .instantiate_with_store(&engine, &linker)
+                .unwrap_or_else(|e| panic!("{name}: instantiate: {e:?}"));
+        }
+    }
+
+    // ────────────────── (end CIT-AGENT-9c-shell-wire-prep) ────────
 
     /// CIT-AGENT-3c — `Capsule::prepare_linker` integrates with
     /// `from_archive`: a loaded capsule + an engine yields a
