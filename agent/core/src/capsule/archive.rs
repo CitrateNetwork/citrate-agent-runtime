@@ -129,17 +129,29 @@ fn validate_structure(a: &ArchiveContents) -> Result<(), AgentError> {
 }
 
 /// Compute the canonical bundle content_hash from the archive
-/// contents. Per planset `03_CAPSULE_MODEL.md`:
-/// `sha256(sorted_concat(<file_hash> || <file_path>))` over every
-/// entry except those under `SIGNATURES/`.
+/// contents. Hash is `sha256(sorted_concat(file_hash || file_path))`
+/// over every entry EXCEPT `manifest.toml` and `SIGNATURES/`.
+///
+/// **Deviation from planset literal wording.** Planset
+/// `03_CAPSULE_MODEL.md` says "every entry except SIGNATURES/", which
+/// would include manifest.toml in the hash. That creates a self-
+/// referential chicken-and-egg: the manifest's `content_hash` field
+/// declares a hash that includes the manifest body that contains the
+/// hash. CIT-AGENT-3b resolves this by hashing the non-manifest
+/// body. The manifest's `content_hash` field is the canonical claim
+/// about that body; the publisher.sig binds the manifest
+/// authoritatively, which in turn binds content_hash.
+///
+/// The CIT-AGENT-3e capsule builder will compute this hash, embed it
+/// in the manifest, sign the manifest (transitively binding the
+/// content_hash), and pack the archive.
 ///
 /// Returned as `"sha256:<64-char-lowercase-hex>"` to match the
 /// manifest's `content_hash` field format.
 pub fn compute_content_hash(a: &ArchiveContents) -> String {
     // BTreeMap iteration is sorted; we collect all non-SIGNATURES
-    // entries with their canonical paths.
+    // and non-manifest entries with their canonical paths.
     let mut entries: Vec<(&str, &[u8])> = Vec::new();
-    entries.push(("manifest.toml", &a.manifest));
     entries.push(("capsule.wit", &a.wit));
     entries.push(("capsule.wasm", &a.wasm));
     entries.push(("procedure.md", &a.procedure));

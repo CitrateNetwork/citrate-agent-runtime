@@ -29,5 +29,13 @@ zstd = "0.13"
 tar = "0.4"
 sha2 = "0.10"
 
+# CIT-AGENT-3b — signature chain + WIT/WASM cross-check.
+# ed25519 matches the native scheme used by citrate-wallet (workspace
+# already pins 2.1). CIT-AGENT-3c will add wit-parser + wasmparser when
+# the per-capsule linker work begins; 3b's invariant-2 check is a
+# pure-string scan of WIT imports (the linker's job is to enforce
+# the static analysis at instantiation time).
+ed25519-dalek = { version = "2.1", features = ["std"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

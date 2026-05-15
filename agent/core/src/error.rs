@@ -18,6 +18,16 @@ pub enum AgentError {
     Policy(String),
     /// Capsule-archive verify / load / instantiate failure.
     Capsule(String),
+    /// RFC §4.5 invariant 1 — signature does not verify against the
+    /// trusted publisher key for the declared tier. CIT-AGENT-3b.
+    CapsuleSignatureInvalid(String),
+    /// RFC §4.5 invariant 1 (sub-case) — declared signing tier doesn't
+    /// match the actual signature chain (e.g. `tier = "bundled"`
+    /// signed by a non-canonical key). CIT-AGENT-3b.
+    CapsuleSigningTierMismatch(String),
+    /// RFC §4.5 invariant 2 — WIT imports don't match the manifest's
+    /// declared capability set. CIT-AGENT-3b.
+    CapsuleWitMismatch(String),
     /// Model-resolver discovery / load failure.
     Model(String),
     /// Doctor check failure surfaced as BLOCKER.
@@ -34,6 +44,11 @@ impl fmt::Display for AgentError {
             AgentError::Audit(m) => write!(f, "audit: {m}"),
             AgentError::Policy(m) => write!(f, "policy: {m}"),
             AgentError::Capsule(m) => write!(f, "capsule: {m}"),
+            AgentError::CapsuleSignatureInvalid(m) => write!(f, "capsule signature invalid: {m}"),
+            AgentError::CapsuleSigningTierMismatch(m) => {
+                write!(f, "capsule signing tier mismatch: {m}")
+            }
+            AgentError::CapsuleWitMismatch(m) => write!(f, "capsule WIT mismatch: {m}"),
             AgentError::Model(m) => write!(f, "model: {m}"),
             AgentError::Doctor(m) => write!(f, "doctor: {m}"),
             AgentError::Other(m) => write!(f, "{m}"),
