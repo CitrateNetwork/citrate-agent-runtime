@@ -34,3 +34,11 @@ pub use audit::RecorderClient;
 pub use hitl::{
     ApprovalOutcomePublic, ApprovalQueue, PendingView, ToolCall, ToolResult,
 };
+
+// CIT-AGENT-9c-shell-wire-cutover — re-export `wasmtime` so the
+// capsule-dispatch consumer (boeing-shell + future agent shells)
+// can pass typed `Val` args to `CapsuleDispatch::call_raw` without
+// taking a direct wasmtime dep. The capsule library OWNS the
+// wasmtime version pinning; consumers SHOULD NOT depend on
+// wasmtime directly to avoid version skew.
+pub use wasmtime;

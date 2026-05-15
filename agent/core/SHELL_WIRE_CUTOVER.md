@@ -2,11 +2,22 @@
 created: 2026-05-15T16:35:00Z
 branch: main
 author: Saul + Claude Opus 4.7 (1M context)
-sprint: CIT-AGENT-9c-shell-wire-prep
-status: active
+sprint: CIT-AGENT-9c-shell-wire-cutover
+status: cutover-landed-pending-visual-proof
 ---
 
 # Shell-Wire Cutover Guide
+
+> **Status (2026-05-15T17:10Z):** The opt-in cutover landed in
+> `CIT-AGENT-9c-shell-wire-cutover`. Both paths coexist in the
+> boeing-shell binary. Default is the legacy in-tree dispatch;
+> set `CITRATE_USE_CAPSULES=1` (and optionally
+> `CITRATE_CAPSULES_DIR=<path>`) to activate the capsule path.
+> Visual proof + `cargo test -p citrate-boeing-shell` pass on
+> the legacy path. The capsule-path verification (run with
+> `CITRATE_USE_CAPSULES=1` against a live testnet RPC) is
+> Saul-driven.
+
 
 > Reference doc for the CIT-AGENT-9c-shell-wire-cutover sprint
 > (visual-proof required, deferred from
