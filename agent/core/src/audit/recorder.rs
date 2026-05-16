@@ -269,6 +269,47 @@ impl RecorderClient {
         // typical cost ~150-200k.
         self.send_tx(registry_addr_hex, calldata, 500_000).await
     }
+
+    /// BFR-INT-poam-A — fire a TripwireRegistry firing on chain.
+    /// Recorder-gated on the contract side; caller must be in
+    /// `is_recorder[]`. Typical cost ~150-200k; budget 400k.
+    pub async fn fire_tripwire(
+        &self,
+        registry_addr_hex: &str,
+        firing_id: [u8; 32],
+        tripwire_id: [u8; 32],
+        scope: [u8; 32],
+        severity: u8,
+        evidence_cid: [u8; 32],
+    ) -> Result<String, String> {
+        let calldata = encode_fire_tripwire(
+            firing_id, tripwire_id, scope, severity, evidence_cid,
+        );
+        self.send_tx(registry_addr_hex, calldata, 400_000).await
+    }
+
+    /// BFR-INT-poam-A — acknowledge a TripwireRegistry firing.
+    /// Resolver-gated; caller must be in `is_resolver[]`. Typical
+    /// cost ~50k; budget 80k.
+    pub async fn acknowledge_tripwire(
+        &self,
+        registry_addr_hex: &str,
+        firing_id: [u8; 32],
+    ) -> Result<String, String> {
+        let calldata = encode_acknowledge_tripwire(firing_id);
+        self.send_tx(registry_addr_hex, calldata, 80_000).await
+    }
+
+    /// BFR-INT-poam-A — resolve a TripwireRegistry firing.
+    /// Resolver-gated. Typical cost ~55k; budget 90k.
+    pub async fn resolve_tripwire(
+        &self,
+        registry_addr_hex: &str,
+        firing_id: [u8; 32],
+    ) -> Result<String, String> {
+        let calldata = encode_resolve_tripwire(firing_id);
+        self.send_tx(registry_addr_hex, calldata, 90_000).await
+    }
 }
 
 // ── BFR-INT-12b WP-3 — Write-tool calldata encoders ────────────────
@@ -327,6 +368,90 @@ pub fn encode_revoke(
     out.extend_from_slice(&tenant);
     out.extend_from_slice(&reason);
     out.extend_from_slice(&corr_id);
+    out
+}
+
+/// BFR-INT-poam-A — `fire(bytes32 firing_id, bytes32 tripwire_id,
+/// bytes32 scope, uint8 severity, bytes32 evidence_cid)`. Targets
+/// `TripwireRegistry` (`boeing_binder::addr::TRIPWIRE_REGISTRY`).
+///
+/// 5-slot static head. Total length: 4 + 5 × 32 = 164 bytes.
+pub fn encode_fire_tripwire(
+    firing_id: [u8; 32],
+    tripwire_id: [u8; 32],
+    scope: [u8; 32],
+    severity: u8,
+    evidence_cid: [u8; 32],
+) -> Vec<u8> {
+    let selector =
+        compute_selector("fire(bytes32,bytes32,bytes32,uint8,bytes32)");
+    let mut out = Vec::with_capacity(4 + 5 * 32);
+    out.extend_from_slice(&selector);
+    out.extend_from_slice(&firing_id);
+    out.extend_from_slice(&tripwire_id);
+    out.extend_from_slice(&scope);
+    out.extend_from_slice(&uint256_from_u64(severity as u64));
+    out.extend_from_slice(&evidence_cid);
+    out
+}
+
+/// BFR-INT-poam-A — `acknowledge(bytes32 firing_id)`. Targets
+/// `TripwireRegistry`. Resolver-gated.
+///
+/// 1-slot static head. Total length: 4 + 32 = 36 bytes.
+pub fn encode_acknowledge_tripwire(firing_id: [u8; 32]) -> Vec<u8> {
+    let selector = compute_selector("acknowledge(bytes32)");
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&selector);
+    out.extend_from_slice(&firing_id);
+    out
+}
+
+/// BFR-INT-poam-A — `resolve(bytes32 firing_id)`. Targets
+/// `TripwireRegistry`. Resolver-gated.
+///
+/// 1-slot static head. Total length: 4 + 32 = 36 bytes.
+pub fn encode_resolve_tripwire(firing_id: [u8; 32]) -> Vec<u8> {
+    let selector = compute_selector("resolve(bytes32)");
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&selector);
+    out.extend_from_slice(&firing_id);
+    out
+}
+
+/// BFR-INT-poam-A — derive a TripwireRegistry `tripwire_id` (bytes32)
+/// from a canonical string id like `"TRIP-AC-001"`.
+/// `keccak256(canonical_id_bytes)`. Matches the cron-side ID and the
+/// on-chain `tripwire_id` field used by `firingsByTripwire`.
+pub fn compute_tripwire_id(canonical_id: &str) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(canonical_id.as_bytes());
+    let d = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
+    out
+}
+
+/// BFR-INT-poam-A — derive a deterministic `firing_id` (bytes32) from
+/// the context that uniquely identifies a single firing instance.
+/// `keccak256(tripwire_id || scope || block_be8)`.
+///
+/// The block-number suffix prevents collision when the same tripwire
+/// fires in the same scope across different blocks. On the same block
+/// the firing_id is identical — the contract's `AlreadyFired` check
+/// then dedupes, which is the desired behavior.
+pub fn compute_firing_id(
+    tripwire_id: [u8; 32],
+    scope: [u8; 32],
+    block_number: u64,
+) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(tripwire_id);
+    h.update(scope);
+    h.update(block_number.to_be_bytes());
+    let d = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&d);
     out
 }
 
@@ -549,6 +674,120 @@ mod tests {
         let last_slot = &cd[4 + 6 * 32..];
         let count = u64::from_be_bytes(last_slot[24..32].try_into().unwrap());
         assert_eq!(count, 1234);
+    }
+
+    // ─── BFR-INT-poam-A — tripwire encoder + helper tests ────────
+
+    #[test]
+    fn encode_fire_tripwire_routes_all_fields_to_correct_slots() {
+        let firing_id = [0xf1u8; 32];
+        let tripwire_id = [0xf2u8; 32];
+        let scope = [0xf3u8; 32];
+        let severity = 0x02u8;
+        let evidence_cid = [0xf4u8; 32];
+
+        let cd = encode_fire_tripwire(
+            firing_id, tripwire_id, scope, severity, evidence_cid,
+        );
+
+        // Selector matches keccak256("fire(bytes32,bytes32,bytes32,uint8,bytes32)")[..4]
+        let expected = {
+            let mut h = Keccak256::new();
+            h.update("fire(bytes32,bytes32,bytes32,uint8,bytes32)".as_bytes());
+            let d = h.finalize();
+            [d[0], d[1], d[2], d[3]]
+        };
+        assert_eq!(&cd[..4], &expected, "selector wrong");
+
+        // Slot 0: firing_id
+        assert_eq!(&cd[4..36], &firing_id, "firing_id wrong slot");
+        // Slot 1: tripwire_id
+        assert_eq!(&cd[36..68], &tripwire_id, "tripwire_id wrong slot");
+        // Slot 2: scope
+        assert_eq!(&cd[68..100], &scope, "scope wrong slot");
+        // Slot 3: severity (uint8, last byte of slot, 31 zero pads)
+        for b in &cd[100..131] {
+            assert_eq!(*b, 0u8, "severity slot has non-zero pad bytes");
+        }
+        assert_eq!(cd[131], severity, "severity wrong value");
+        // Slot 4: evidence_cid
+        assert_eq!(&cd[132..164], &evidence_cid, "evidence_cid wrong slot");
+
+        // Total length: 4 + 5 × 32 = 164 bytes.
+        assert_eq!(cd.len(), 164);
+    }
+
+    #[test]
+    fn encode_acknowledge_tripwire_routes_firing_id() {
+        let firing_id = [0xacu8; 32];
+        let cd = encode_acknowledge_tripwire(firing_id);
+
+        let expected = {
+            let mut h = Keccak256::new();
+            h.update("acknowledge(bytes32)".as_bytes());
+            let d = h.finalize();
+            [d[0], d[1], d[2], d[3]]
+        };
+        assert_eq!(&cd[..4], &expected, "selector wrong");
+        assert_eq!(&cd[4..36], &firing_id, "firing_id wrong slot");
+        assert_eq!(cd.len(), 36, "ack total length");
+    }
+
+    #[test]
+    fn encode_resolve_tripwire_routes_firing_id() {
+        let firing_id = [0x9du8; 32];
+        let cd = encode_resolve_tripwire(firing_id);
+
+        let expected = {
+            let mut h = Keccak256::new();
+            h.update("resolve(bytes32)".as_bytes());
+            let d = h.finalize();
+            [d[0], d[1], d[2], d[3]]
+        };
+        assert_eq!(&cd[..4], &expected, "selector wrong");
+        assert_eq!(&cd[4..36], &firing_id, "firing_id wrong slot");
+        assert_eq!(cd.len(), 36, "resolve total length");
+    }
+
+    #[test]
+    fn compute_tripwire_id_is_keccak256_of_canonical() {
+        // Direct keccak comparison — matches the contract's
+        // tripwire_id field when the cron-side and the
+        // ad-hoc-cast-side both derive from the same canonical.
+        let id = compute_tripwire_id("TRIP-AC-001");
+        let expected = {
+            let mut h = Keccak256::new();
+            h.update(b"TRIP-AC-001");
+            let d = h.finalize();
+            let mut o = [0u8; 32];
+            o.copy_from_slice(&d);
+            o
+        };
+        assert_eq!(id, expected);
+    }
+
+    #[test]
+    fn compute_tripwire_id_is_deterministic_and_distinct() {
+        let a = compute_tripwire_id("TRIP-AC-001");
+        let b = compute_tripwire_id("TRIP-AC-001");
+        let c = compute_tripwire_id("TRIP-AC-002");
+        assert_eq!(a, b, "same input → same output");
+        assert_ne!(a, c, "different input → different output");
+    }
+
+    #[test]
+    fn compute_firing_id_binds_tripwire_scope_and_block() {
+        let tw = [0x11u8; 32];
+        let sc = [0x22u8; 32];
+        let f1 = compute_firing_id(tw, sc, 100);
+        let f2 = compute_firing_id(tw, sc, 100);
+        let f3 = compute_firing_id(tw, sc, 101);
+        let f4 = compute_firing_id([0xaa; 32], sc, 100);
+        let f5 = compute_firing_id(tw, [0xbb; 32], 100);
+        assert_eq!(f1, f2, "same context → same firing_id (dedupe)");
+        assert_ne!(f1, f3, "different block → different firing_id");
+        assert_ne!(f1, f4, "different tripwire → different firing_id");
+        assert_ne!(f1, f5, "different scope → different firing_id");
     }
 
     /// BFR-INT-15b-registry — verify every operator-supplied field
