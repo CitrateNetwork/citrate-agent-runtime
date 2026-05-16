@@ -12,3 +12,8 @@
 pub mod scheduler;
 pub mod sop;
 pub mod citrate_sops;
+
+// BFR-INT-poam-B — Tripwire production cron. Uses the
+// `citrate-recorder` dep (alias for the new agent-core crate at
+// `agent/core/`) rather than the legacy agent-core aliased above.
+pub mod tripwires;
