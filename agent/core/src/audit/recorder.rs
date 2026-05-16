@@ -133,6 +133,117 @@ impl RecorderClient {
             .await
             .map_err(|e| format!("send_raw_transaction failed: {e}"))
     }
+
+    /// BFR-INT-verification-poll — poll
+    /// `eth_getTransactionReceipt(tx_hash)` until the receipt is
+    /// available or `timeout` elapses.
+    ///
+    /// Returns a `TxReceipt` whose `status` reflects the on-chain
+    /// success bit. A `status == false` receipt means the TX was
+    /// mined but reverted. Callers should treat this as failure —
+    /// the broadcast succeeded, but the on-chain action did not.
+    pub async fn wait_for_receipt(
+        &self,
+        tx_hash: &str,
+        timeout: std::time::Duration,
+    ) -> Result<TxReceipt, String> {
+        let rpc = RpcClient::new(&self.rpc_url);
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_secs(1);
+        loop {
+            if start.elapsed() >= timeout {
+                return Err(format!(
+                    "wait_for_receipt: timeout after {:?} (tx {tx_hash})",
+                    timeout
+                ));
+            }
+            match rpc.get_transaction_receipt(tx_hash).await {
+                Ok(Some(value)) => {
+                    return parse_receipt(tx_hash, &value);
+                }
+                Ok(None) => {
+                    // TX not yet mined; wait + retry.
+                    tokio::time::sleep(poll_interval).await;
+                }
+                Err(e) => {
+                    // Transient RPC error; sleep + retry (poll loop
+                    // re-checks timeout on next iteration).
+                    tracing::debug!(
+                        "wait_for_receipt RPC error (will retry): {e}"
+                    );
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        }
+    }
+
+    /// BFR-INT-verification-poll — broadcast + wait for receipt in
+    /// one call. Returns `Err("tx reverted...")` if the receipt's
+    /// `status` is false (post-CANCUN canonical success bit; see
+    /// BFR-VM-1).
+    pub async fn send_tx_and_wait(
+        &self,
+        to_addr_hex: &str,
+        calldata: Vec<u8>,
+        gas_limit: u64,
+        timeout: std::time::Duration,
+    ) -> Result<TxReceipt, String> {
+        let tx_hash = self.send_tx(to_addr_hex, calldata, gas_limit).await?;
+        let receipt = self.wait_for_receipt(&tx_hash, timeout).await?;
+        if !receipt.status {
+            return Err(format!(
+                "tx reverted on chain (gas_used {} block {})",
+                receipt.gas_used, receipt.block_number
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+/// BFR-INT-verification-poll — structured tx receipt fields the
+/// dispatch sites care about. Carries the canonical success bit
+/// (`status`), the mining block, gas used, and the tx hash for
+/// audit-trail logging.
+///
+/// Constructed by `parse_receipt` from the raw JSON-RPC response;
+/// callers shouldn't construct this directly except in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxReceipt {
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub status: bool,
+    pub gas_used: u64,
+}
+
+fn parse_receipt(
+    tx_hash: &str,
+    value: &serde_json::Value,
+) -> Result<TxReceipt, String> {
+    let status_hex = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "receipt missing status".to_string())?;
+    let status = u8::from_str_radix(status_hex.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("receipt status hex: {e}"))?
+        != 0;
+    let block_hex = value
+        .get("blockNumber")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "receipt missing blockNumber".to_string())?;
+    let block_number = u64::from_str_radix(block_hex.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("receipt blockNumber hex: {e}"))?;
+    let gas_hex = value
+        .get("gasUsed")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "receipt missing gasUsed".to_string())?;
+    let gas_used = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("receipt gasUsed hex: {e}"))?;
+    Ok(TxReceipt {
+        tx_hash: tx_hash.to_string(),
+        block_number,
+        status,
+        gas_used,
+    })
 }
 
 // ── BFR-INT-12b WP-2 — Decision-log writes ─────────────────────────
@@ -674,6 +785,67 @@ mod tests {
         let last_slot = &cd[4 + 6 * 32..];
         let count = u64::from_be_bytes(last_slot[24..32].try_into().unwrap());
         assert_eq!(count, 1234);
+    }
+
+    // ─── BFR-INT-verification-poll — receipt parsing tests ──────
+
+    #[test]
+    fn parse_receipt_success_status() {
+        let raw = serde_json::json!({
+            "status":      "0x1",
+            "blockNumber": "0xabcd",
+            "gasUsed":     "0x5208",
+        });
+        let r = parse_receipt("0xtxhash", &raw).expect("parse");
+        assert_eq!(r.tx_hash, "0xtxhash");
+        assert_eq!(r.block_number, 0xabcd);
+        assert!(r.status);
+        assert_eq!(r.gas_used, 0x5208);
+    }
+
+    #[test]
+    fn parse_receipt_revert_status() {
+        let raw = serde_json::json!({
+            "status":      "0x0",
+            "blockNumber": "0x100",
+            "gasUsed":     "0x7d0",
+        });
+        let r = parse_receipt("0xtx", &raw).expect("parse");
+        assert!(!r.status, "reverted tx should have status=false");
+    }
+
+    #[test]
+    fn parse_receipt_missing_status_errors() {
+        let raw = serde_json::json!({
+            "blockNumber": "0x100",
+            "gasUsed":     "0x7d0",
+        });
+        assert!(parse_receipt("0xtx", &raw).is_err());
+    }
+
+    #[test]
+    fn parse_receipt_malformed_block_errors() {
+        let raw = serde_json::json!({
+            "status":      "0x1",
+            "blockNumber": "not-hex",
+            "gasUsed":     "0x7d0",
+        });
+        assert!(parse_receipt("0xtx", &raw).is_err());
+    }
+
+    #[test]
+    fn parse_receipt_no_0x_prefix_still_parses() {
+        // Some RPC implementations omit the 0x prefix on hex
+        // values; accept both shapes.
+        let raw = serde_json::json!({
+            "status":      "1",
+            "blockNumber": "100",
+            "gasUsed":     "7d0",
+        });
+        let r = parse_receipt("0xtx", &raw).expect("parse");
+        assert!(r.status);
+        assert_eq!(r.block_number, 0x100);
+        assert_eq!(r.gas_used, 0x7d0);
     }
 
     // ─── BFR-INT-poam-A — tripwire encoder + helper tests ────────

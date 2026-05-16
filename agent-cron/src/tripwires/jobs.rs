@@ -21,6 +21,13 @@ use super::metric_source::{ChainQuery, MetricSource};
 
 /// Shared call to fire a tripwire on chain. Centralised so the 9
 /// jobs don't each re-derive the firing_id + handle the tx path.
+///
+/// BFR-INT-verification-poll: after broadcast, polls
+/// `eth_getTransactionReceipt` until the TX is mined. Receipts
+/// with `status == false` (reverted) surface as
+/// `JobOutcome::Failed` rather than the previous false-positive
+/// `Fired` — the broadcast succeeded but the on-chain action
+/// didn't.
 async fn fire(
     recorder: &RecorderClient,
     registry_addr: &str,
@@ -32,19 +39,52 @@ async fn fire(
 ) -> JobOutcome {
     let tripwire_id = compute_tripwire_id(canonical_id);
     let firing_id = compute_firing_id(tripwire_id, scope, block_number);
-    match recorder
-        .fire_tripwire(registry_addr, firing_id, tripwire_id, scope, severity, evidence_cid)
+
+    // Broadcast first; if that fails (RPC down, nonce issue), no
+    // need to poll.
+    let tx_hash = match recorder
+        .fire_tripwire(
+            registry_addr,
+            firing_id,
+            tripwire_id,
+            scope,
+            severity,
+            evidence_cid,
+        )
         .await
     {
-        Ok(tx) => {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!("tripwire {canonical_id} broadcast failed: {e}");
+            return JobOutcome::Failed(format!("fire_tripwire broadcast: {e}"));
+        }
+    };
+
+    // Wait for receipt. 60s covers ~30 blocks of headroom.
+    match recorder
+        .wait_for_receipt(&tx_hash, std::time::Duration::from_secs(60))
+        .await
+    {
+        Ok(receipt) if receipt.status => {
             info!(
-                "tripwire {canonical_id} fired (severity {severity}) — tx {tx}"
+                "tripwire {canonical_id} fired (severity {severity}) — tx {} mined at block {} (gas {})",
+                receipt.tx_hash, receipt.block_number, receipt.gas_used
             );
-            JobOutcome::Fired(tx)
+            JobOutcome::Fired(receipt.tx_hash)
+        }
+        Ok(receipt) => {
+            warn!(
+                "tripwire {canonical_id} REVERTED on chain — tx {} (gas {})",
+                receipt.tx_hash, receipt.gas_used
+            );
+            JobOutcome::Failed(format!(
+                "tx reverted (gas_used {}): {}",
+                receipt.gas_used, receipt.tx_hash
+            ))
         }
         Err(e) => {
-            warn!("tripwire {canonical_id} fire failed: {e}");
-            JobOutcome::Failed(format!("fire_tripwire: {e}"))
+            warn!("tripwire {canonical_id} wait_for_receipt failed: {e}");
+            JobOutcome::Failed(format!("wait_for_receipt: {e}"))
         }
     }
 }
