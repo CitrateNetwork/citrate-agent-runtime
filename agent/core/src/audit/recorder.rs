@@ -330,6 +330,27 @@ pub fn encode_revoke(
     out
 }
 
+/// `registerModel(bytes32 modelHash, bytes32 manifestHash)
+/// returns (bytes32 modelId)`. Targets
+/// `AIModelRegistryPortable` (see `boeing_binder::addr::AI_MODEL_REGISTRY`).
+///
+/// All-static 2-slot calldata. Total length: 4 + 2 × 32 = 68 bytes.
+/// The contract returns a derived `modelId = keccak256(chainid ||
+/// registry_addr || modelCount)` — callers that need the id should
+/// parse it out of the receipt's return data or watch the
+/// `ModelRegistered` event.
+pub fn encode_register_model(
+    model_hash: [u8; 32],
+    manifest_hash: [u8; 32],
+) -> Vec<u8> {
+    let selector = compute_selector("registerModel(bytes32,bytes32)");
+    let mut out = Vec::with_capacity(4 + 2 * 32);
+    out.extend_from_slice(&selector);
+    out.extend_from_slice(&model_hash);
+    out.extend_from_slice(&manifest_hash);
+    out
+}
+
 /// `anchor(uint8 kind, bytes32 bundle_id, bytes32 session_id,
 /// bytes32 scope, bytes32 merkle_root, bytes32 ipfs_cid,
 /// uint256 entry_count)`.
@@ -528,6 +549,36 @@ mod tests {
         let last_slot = &cd[4 + 6 * 32..];
         let count = u64::from_be_bytes(last_slot[24..32].try_into().unwrap());
         assert_eq!(count, 1234);
+    }
+
+    /// BFR-INT-15b-registry — verify every operator-supplied field
+    /// reaches the right calldata slot of
+    /// `registerModel(bytes32 modelHash, bytes32 manifestHash)`.
+    /// Same shape as the AT-15b-tail-1 field-routing test.
+    #[test]
+    fn encode_register_model_routes_all_fields_to_correct_slots() {
+        let model_hash = [0xa1u8; 32];
+        let manifest_hash = [0xb2u8; 32];
+
+        let cd = encode_register_model(model_hash, manifest_hash);
+
+        // Selector matches the canonical signature.
+        let expected_selector = {
+            let mut h = Keccak256::new();
+            h.update("registerModel(bytes32,bytes32)".as_bytes());
+            let d = h.finalize();
+            [d[0], d[1], d[2], d[3]]
+        };
+        assert_eq!(&cd[..4], &expected_selector, "selector wrong");
+
+        // Head layout: 2 × 32-byte slots after the selector.
+        // Slot 0: modelHash
+        assert_eq!(&cd[4..36], &model_hash, "modelHash wrong slot");
+        // Slot 1: manifestHash
+        assert_eq!(&cd[36..68], &manifest_hash, "manifestHash wrong slot");
+
+        // Total length: 4 (selector) + 2 × 32 (head) = 68 bytes.
+        assert_eq!(cd.len(), 68);
     }
 
     /// AT-15b-tail-1 — verify every operator-supplied field reaches
