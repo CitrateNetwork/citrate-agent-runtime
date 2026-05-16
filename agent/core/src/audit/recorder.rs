@@ -530,6 +530,70 @@ mod tests {
         assert_eq!(count, 1234);
     }
 
+    /// AT-15b-tail-1 — verify every operator-supplied field reaches
+    /// the exact calldata slot the contract reads from. Catches future
+    /// field-reorder regressions that wouldn't surface in the
+    /// kind/entry_count test above (those two are at the endpoints;
+    /// the four bytes32 slots in between are easier to swap by
+    /// accident).
+    #[test]
+    fn encode_anchor_bundle_routes_all_fields_to_correct_slots() {
+        let kind = 0x07u8;
+        let bundle_id = [0xaau8; 32];
+        let session_id = [0xbbu8; 32];
+        let scope = [0xccu8; 32];
+        let merkle_root = [0xddu8; 32];
+        let ipfs_cid = [0xeeu8; 32];
+        let entry_count = 42u64;
+
+        let cd = encode_anchor_bundle(
+            kind, bundle_id, session_id, scope, merkle_root, ipfs_cid, entry_count,
+        );
+
+        // Selector matches the canonical signature.
+        let expected_selector = {
+            let mut h = Keccak256::new();
+            h.update(
+                "anchor(uint8,bytes32,bytes32,bytes32,bytes32,bytes32,uint256)"
+                    .as_bytes(),
+            );
+            let d = h.finalize();
+            [d[0], d[1], d[2], d[3]]
+        };
+        assert_eq!(&cd[..4], &expected_selector, "selector wrong");
+
+        // Head layout: 7 × 32-byte slots after the selector.
+        // Slot 0: kind (uint8 padded), bytes [4..36], value in last byte
+        assert_eq!(cd[4 + 31], kind, "kind not in slot 0");
+        for b in &cd[4..4 + 31] {
+            assert_eq!(*b, 0u8, "kind slot has non-zero pad bytes");
+        }
+
+        // Slot 1: bundle_id
+        assert_eq!(&cd[36..68], &bundle_id, "bundle_id wrong slot");
+        // Slot 2: session_id
+        assert_eq!(&cd[68..100], &session_id, "session_id wrong slot");
+        // Slot 3: scope
+        assert_eq!(&cd[100..132], &scope, "scope wrong slot");
+        // Slot 4: merkle_root  ← the BFR-INT-15b-tail field
+        assert_eq!(&cd[132..164], &merkle_root, "merkle_root wrong slot");
+        // Slot 5: ipfs_cid
+        assert_eq!(&cd[164..196], &ipfs_cid, "ipfs_cid wrong slot");
+
+        // Slot 6: entry_count (uint256 — last 8 bytes)
+        let count_slot = &cd[196..228];
+        for b in &count_slot[..24] {
+            assert_eq!(*b, 0u8, "entry_count slot has non-zero pad bytes");
+        }
+        let count = u64::from_be_bytes(count_slot[24..32].try_into().expect(
+            "count_slot last 8 bytes always present — head is fixed-size",
+        ));
+        assert_eq!(count, entry_count, "entry_count wrong value");
+
+        // Total length: 4 (selector) + 7 × 32 (head) = 228 bytes.
+        assert_eq!(cd.len(), 228);
+    }
+
     #[test]
     fn encode_request_elevation_layout_is_correct() {
         let cd = encode_request_elevation(
