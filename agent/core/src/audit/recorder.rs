@@ -1107,4 +1107,271 @@ mod tests {
         assert_eq!(read_env_var(&tmp, "MISSING"), None);
         let _ = std::fs::remove_file(tmp);
     }
+
+    // ─── BFR-INT-wiremock-harness — JSON-RPC mocked tests ───────
+    //
+    // wiremock + a small "matches on JSON-RPC method field"
+    // dispatcher: each test mounts handlers for the specific
+    // eth_* methods its code path will invoke.
+
+    use serde_json::json;
+    use wiremock::matchers::{body_partial_json, method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Standard JSON-RPC success envelope.
+    fn rpc_result(result: serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": result,
+            "id": 1,
+        }))
+    }
+
+    /// Standard JSON-RPC error envelope.
+    fn rpc_error(msg: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32000, "message": msg },
+            "id": 1,
+        }))
+    }
+
+    /// Mount a per-method JSON-RPC mock. wiremock's
+    /// `body_partial_json` matcher hits whichever request body
+    /// contains the specified `method`.
+    async fn mount_rpc(server: &MockServer, rpc_method: &str, response: ResponseTemplate) {
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/"))
+            .and(body_partial_json(json!({ "method": rpc_method })))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    /// Construct a `RecorderClient` pointed at a `MockServer`.
+    /// The key is deterministic; tests don't care about the
+    /// derived from-address beyond the fact that
+    /// `eth_getTransactionCount` is mockable on it.
+    fn recorder_for(server: &MockServer) -> RecorderClient {
+        RecorderClient::from_hex_key(
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            &server.uri(),
+        )
+        .expect("recorder from MockServer")
+    }
+
+    #[tokio::test]
+    async fn send_tx_returns_broadcast_tx_hash() {
+        let server = MockServer::start().await;
+        mount_rpc(&server, "eth_getTransactionCount", rpc_result(json!("0x0"))).await;
+        mount_rpc(
+            &server,
+            "eth_sendRawTransaction",
+            rpc_result(json!("0xfeed1234")),
+        )
+        .await;
+
+        let r = recorder_for(&server);
+        let tx = r
+            .send_tx("0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead", vec![0xaa], 100_000)
+            .await
+            .expect("send_tx ok");
+        assert_eq!(tx, "0xfeed1234");
+    }
+
+    #[tokio::test]
+    async fn send_tx_propagates_rpc_error_on_send_raw() {
+        let server = MockServer::start().await;
+        mount_rpc(&server, "eth_getTransactionCount", rpc_result(json!("0x0"))).await;
+        mount_rpc(
+            &server,
+            "eth_sendRawTransaction",
+            rpc_error("nonce too low"),
+        )
+        .await;
+
+        let r = recorder_for(&server);
+        let err = r
+            .send_tx("0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead", vec![0xaa], 100_000)
+            .await
+            .expect_err("send should err");
+        assert!(
+            err.to_lowercase().contains("nonce too low"),
+            "err = {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_receipt_returns_on_first_success() {
+        let server = MockServer::start().await;
+        mount_rpc(
+            &server,
+            "eth_getTransactionReceipt",
+            rpc_result(json!({
+                "status": "0x1",
+                "blockNumber": "0x64",
+                "gasUsed": "0x5208",
+            })),
+        )
+        .await;
+
+        let r = recorder_for(&server);
+        let receipt = r
+            .wait_for_receipt("0xfeed1234", std::time::Duration::from_secs(5))
+            .await
+            .expect("receipt ok");
+        assert!(receipt.status);
+        assert_eq!(receipt.block_number, 0x64);
+        assert_eq!(receipt.gas_used, 0x5208);
+        assert_eq!(receipt.tx_hash, "0xfeed1234");
+    }
+
+    #[tokio::test]
+    async fn wait_for_receipt_handles_pending_then_success() {
+        let server = MockServer::start().await;
+        // First 2 polls → null (TX not yet mined).
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/"))
+            .and(body_partial_json(json!({ "method": "eth_getTransactionReceipt" })))
+            .respond_with(rpc_result(json!(null)))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        // Subsequent polls → success receipt.
+        mount_rpc(
+            &server,
+            "eth_getTransactionReceipt",
+            rpc_result(json!({
+                "status": "0x1",
+                "blockNumber": "0x80",
+                "gasUsed": "0x7d0",
+            })),
+        )
+        .await;
+
+        let r = recorder_for(&server);
+        let receipt = r
+            .wait_for_receipt("0xtxhash", std::time::Duration::from_secs(10))
+            .await
+            .expect("receipt converges");
+        assert!(receipt.status);
+        assert_eq!(receipt.block_number, 0x80);
+    }
+
+    #[tokio::test]
+    async fn wait_for_receipt_returns_err_on_timeout() {
+        let server = MockServer::start().await;
+        // Always null — receipt never available.
+        mount_rpc(
+            &server,
+            "eth_getTransactionReceipt",
+            rpc_result(json!(null)),
+        )
+        .await;
+
+        let r = recorder_for(&server);
+        let err = r
+            .wait_for_receipt("0xtxhash", std::time::Duration::from_millis(200))
+            .await
+            .expect_err("timeout");
+        assert!(err.contains("timeout"), "err = {err}");
+    }
+
+    #[tokio::test]
+    async fn send_tx_and_wait_reports_revert_status() {
+        let server = MockServer::start().await;
+        mount_rpc(&server, "eth_getTransactionCount", rpc_result(json!("0x0"))).await;
+        mount_rpc(
+            &server,
+            "eth_sendRawTransaction",
+            rpc_result(json!("0xreverted_tx")),
+        )
+        .await;
+        mount_rpc(
+            &server,
+            "eth_getTransactionReceipt",
+            rpc_result(json!({
+                "status": "0x0",       // ← reverted
+                "blockNumber": "0x10",
+                "gasUsed": "0x2710",
+            })),
+        )
+        .await;
+
+        let r = recorder_for(&server);
+        let err = r
+            .send_tx_and_wait(
+                "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+                vec![0xaa],
+                100_000,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("revert should be Err");
+        assert!(err.contains("reverted"), "err = {err}");
+        assert!(err.contains("gas_used"), "err = {err}");
+    }
+
+    // ─── BFR-INT-wiremock-harness / WP-3 — Tripwire wrapper smokes ─
+
+    /// Common setup for a successful tripwire write: mocks nonce
+    /// + sendRawTransaction; returns the expected tx hash.
+    async fn mock_successful_write(server: &MockServer, tx_hash: &str) {
+        mount_rpc(server, "eth_getTransactionCount", rpc_result(json!("0x0"))).await;
+        mount_rpc(
+            server,
+            "eth_sendRawTransaction",
+            rpc_result(json!(tx_hash)),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fire_tripwire_via_mock_rpc_returns_tx_hash() {
+        let server = MockServer::start().await;
+        mock_successful_write(&server, "0xfire_tx").await;
+        let r = recorder_for(&server);
+        let tx = r
+            .fire_tripwire(
+                "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+                [0xa1; 32],
+                [0xa2; 32],
+                [0xa3; 32],
+                2,
+                [0xa4; 32],
+            )
+            .await
+            .expect("fire ok");
+        assert_eq!(tx, "0xfire_tx");
+    }
+
+    #[tokio::test]
+    async fn acknowledge_tripwire_via_mock_rpc_returns_tx_hash() {
+        let server = MockServer::start().await;
+        mock_successful_write(&server, "0xack_tx").await;
+        let r = recorder_for(&server);
+        let tx = r
+            .acknowledge_tripwire(
+                "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+                [0xbb; 32],
+            )
+            .await
+            .expect("ack ok");
+        assert_eq!(tx, "0xack_tx");
+    }
+
+    #[tokio::test]
+    async fn resolve_tripwire_via_mock_rpc_returns_tx_hash() {
+        let server = MockServer::start().await;
+        mock_successful_write(&server, "0xresolve_tx").await;
+        let r = recorder_for(&server);
+        let tx = r
+            .resolve_tripwire(
+                "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead",
+                [0xcc; 32],
+            )
+            .await
+            .expect("resolve ok");
+        assert_eq!(tx, "0xresolve_tx");
+    }
 }

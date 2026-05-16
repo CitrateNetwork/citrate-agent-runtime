@@ -53,3 +53,7 @@ tokio = { version = "1", features = ["full", "test-util", "macros"] }
 # WAT → WASM at test time for the CIT-AGENT-3d component-instantiation
 # tests. Pinned to a version aligned with wasmtime 26.
 wat = "1.224"
+
+# BFR-INT-wiremock-harness — JSON-RPC mock server for
+# RecorderClient async-method tests. Drains AT-poam-A-3 + AT-vp-1.
+wiremock = "0.6"

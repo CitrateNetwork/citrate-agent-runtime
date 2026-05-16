@@ -31,6 +31,11 @@ sha3 = "0.10"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 
+# BFR-INT-wiremock-harness — JSON-RPC mock for the fire() helper's
+# revert + timeout paths. Drains the agent-cron tail of the
+# verification-poll deferral.
+wiremock = "0.6"
+
 [[bin]]
 name = "citrate-tripwire-daemon"
 path = "src/bin/tripwire_daemon.rs"
