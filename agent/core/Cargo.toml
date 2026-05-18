@@ -12,7 +12,10 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 # RecorderClient (audit/) needs chain-client + signing primitives.
-citrate-wallet-core = { path = "../../wallet-core" }
+# Consumed from CitrateNetwork/citrate-chain via SSH deploy key during
+# the federation transition. Swap to crates.io after chain's first
+# audited release.
+citrate-wallet-core = { git = "ssh://git@github.com/CitrateNetwork/citrate-chain", branch = "main" }
 k256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
 hex = "0.4"
