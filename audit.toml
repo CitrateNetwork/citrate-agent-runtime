@@ -1,0 +1,66 @@
+# cargo-audit configuration — citrate-agent-runtime
+# REM-16 / REM-12 tripwire — 2026-05-20 federation-split audit
+#
+# Per the SOP at citrate-agentile-archive/sops/vulnerability-scanning.md
+# every dep advisory must either be (a) closed by a dep bump/removal,
+# or (b) ignored here with a documented REM tracker + reason.
+#
+# cargo-audit reads ~/.cargo/audit.toml NOT project-local, so the
+# actual ignore list is passed via --ignore flags in
+# .github/workflows/cargo-audit.yml. This file is the documentation
+# source-of-truth for assessors.
+
+[advisories]
+ignore = [
+    # ─────────────────────────────────────────────────────────────────
+    # REM-16b — tracing-subscriber 0.2.25 via arkworks (deferred)
+    # ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2025-0055 — tracing-subscriber <0.3.20 ANSI escape
+    # injection (CWE-117 log injection).
+    # fp-check F-08 verdict: TRUE POSITIVE Low.
+    #
+    # Direct dep was already on 0.3.x — the vulnerable 0.2.25 comes
+    # transitively via ark-relations 0.4.0's `std` feature
+    # (ark-groth16 0.4 → ark-crypto-primitives 0.4 → ark-relations 0.4
+    # → tracing-subscriber 0.2 when `std` feature is on, which is the
+    # default).
+    #
+    # Closing this advisory requires bumping arkworks (ark-relations
+    # 0.4 → 0.6) across the citrate-chain dep tree. arkworks bumps
+    # have cryptographic compatibility implications (Groth16
+    # verifier/prover constants); needs ZK-engineering review. Tracked
+    # as REM-16b in the audit's 06_REMEDIATION_PLAN.md.
+    "RUSTSEC-2025-0055",
+
+    # ─────────────────────────────────────────────────────────────────
+    # REM-12 — wasmtime 26.0.1 cluster (open, multi-day port)
+    # ─────────────────────────────────────────────────────────────────
+    # 16 wasmtime advisories. fp-check F-04 verdict: TRUE POSITIVE for
+    # 7 of 16 (the other 9 don't apply due to config — no Winch, no
+    # pooling allocator, no shared memory, no wasi-http, no WASI p1).
+    # REM-12 interim hardenings landed in agent/core/src/capsule/{wasm,
+    # dispatch}.rs (commit 0c108c9): epoch_interruption + Store::limiter
+    # placeholder + catch_unwind + wasm_simd(false). The full bump
+    # (wasmtime 26 → 36+) is multi-day porting work blocked partly by
+    # F-14 (SSH alias).
+    "RUSTSEC-2025-0046",  # WASIp1 fd_renumber panic
+    "RUSTSEC-2025-0118",  # SharedMemory unsound API
+    "RUSTSEC-2026-0020",  # WASI resource exhaustion
+    "RUSTSEC-2026-0021",  # wasi-http types.fields panic
+    "RUSTSEC-2026-0085",  # flags lift panic
+    "RUSTSEC-2026-0086",  # Winch 64-bit table data leakage
+    "RUSTSEC-2026-0087",  # Cranelift x86-64 f64x2.splat
+    "RUSTSEC-2026-0088",  # Pooling allocator instance leakage
+    "RUSTSEC-2026-0089",  # Winch table.fill panic
+    "RUSTSEC-2026-0091",  # UTF-16 transcoder OOB write (SANDBOX ESCAPE)
+    "RUSTSEC-2026-0092",  # UTF-16 misalignment panic
+    "RUSTSEC-2026-0093",  # latin1+utf16 OOB read
+    "RUSTSEC-2026-0094",  # Winch table.grow masking
+    "RUSTSEC-2026-0095",  # Winch sandbox-escape memory access
+    "RUSTSEC-2026-0096",  # Cranelift aarch64 sandbox escape
+]
+
+# ─── Unmaintained-warning ignores (REM-21 hygiene) ─────────────────
+# bincode, derivative, instant, paste, etc. — appear as `warning:`
+# in cargo-audit output. Default policy is to not fail the build on
+# warnings. Tracked under REM-21 for rolling replacement.

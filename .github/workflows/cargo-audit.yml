@@ -1,0 +1,105 @@
+name: cargo audit (tripwire)
+
+# REM-16 / REM-12 tripwire (2026-05-20 federation-split audit):
+# Runs cargo-audit per-PR + weekly. Catches regression of closed
+# advisory clusters and surfaces new advisories early. Per the SOP
+# at citrate-agentile-archive/sops/vulnerability-scanning.md.
+#
+# Failure policy:
+#   * `cargo audit` fails on any unallowed advisory.
+#   * Known-deferred advisories listed in `audit.toml` with REM
+#     tracker references; actual ignores are passed inline below
+#     (cargo-audit reads only ~/.cargo/audit.toml, not project-local).
+#   * Adding a new --ignore here requires a deliberate PR that
+#     points at an open REM tracker.
+#
+# NOTE: agent-runtime requires an SSH host alias `github-citrate-chain`
+# to resolve `citrate-wallet-core` from `citrate-chain` (F-14 / REM-22).
+# CI must provision this alias before cargo-audit can run. If the
+# bootstrap step fails, fix REM-22 first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly Monday 08:00 UTC.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-audit-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # REM-22 — required SSH alias for transitive citrate-chain dep.
+      # Without this, cargo cannot fetch citrate-wallet-core and
+      # the audit step exits 1 before reading any advisory data.
+      - name: Configure SSH host alias (REM-22 workaround)
+        env:
+          DEPLOY_KEY: ${{ secrets.CITRATE_CHAIN_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [ -n "$DEPLOY_KEY" ]; then
+            echo "$DEPLOY_KEY" > ~/.ssh/citrate_chain_deploy
+            chmod 600 ~/.ssh/citrate_chain_deploy
+            cat >> ~/.ssh/config <<EOF
+          Host github-citrate-chain
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/citrate_chain_deploy
+            StrictHostKeyChecking accept-new
+          EOF
+          else
+            echo "::warning::CITRATE_CHAIN_DEPLOY_KEY secret not set. cargo will fail to fetch citrate-wallet-core. See REM-22 in the federation audit."
+          fi
+
+      - name: Run cargo audit
+        # See audit.toml for the documented reason for each --ignore.
+        # When any of these closes upstream, REMOVE the --ignore here
+        # + the entry in audit.toml. Failure is the tripwire that
+        # catches regression.
+        #
+        # REM-16b (arkworks bump needed):
+        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI injection.
+        #
+        # REM-12 (wasmtime bump 26 → 36+, multi-day):
+        #   RUSTSEC-2025-0046, 2025-0118
+        #   RUSTSEC-2026-0020, 0021, 0085, 0086, 0087, 0088, 0089,
+        #                       0091, 0092, 0093, 0094, 0095, 0096
+        run: |
+          cargo audit \
+            --color always \
+            --ignore RUSTSEC-2025-0055 \
+            --ignore RUSTSEC-2025-0046 \
+            --ignore RUSTSEC-2025-0118 \
+            --ignore RUSTSEC-2026-0020 \
+            --ignore RUSTSEC-2026-0021 \
+            --ignore RUSTSEC-2026-0085 \
+            --ignore RUSTSEC-2026-0086 \
+            --ignore RUSTSEC-2026-0087 \
+            --ignore RUSTSEC-2026-0088 \
+            --ignore RUSTSEC-2026-0089 \
+            --ignore RUSTSEC-2026-0091 \
+            --ignore RUSTSEC-2026-0092 \
+            --ignore RUSTSEC-2026-0093 \
+            --ignore RUSTSEC-2026-0094 \
+            --ignore RUSTSEC-2026-0095 \
+            --ignore RUSTSEC-2026-0096
