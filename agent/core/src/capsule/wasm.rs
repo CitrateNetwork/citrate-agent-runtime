@@ -269,8 +269,29 @@ impl EngineFactory {
         // canonicalization makes float results bit-identical across
         // hardware so audit replays don't drift on floating point.
         config.cranelift_nan_canonicalization(true);
-        // Defer fuel + epoch interruption to CIT-AGENT-3d; they need
-        // the call path to wire the fuel-out + epoch-tick handlers.
+
+        // REM-12a (2026-05-20): epoch interruption enabled.
+        // The 2026-05-19 federation-split audit's F-04 verified that
+        // citrate-agent-runtime can be DoS'd by a 3-instruction
+        // capsule (`(loop br 0)`) because no fuel + no epoch
+        // interruption are wired. Enabling epoch_interruption here
+        // is the first half of the fix; the caller of `func.call`
+        // must arm `store.set_epoch_deadline(N)` + a background
+        // ticker that advances `engine.increment_epoch()` to
+        // actually bound execution time. See REM-12a in the audit's
+        // 06_REMEDIATION_PLAN.md and per-repo/citrate-agent-runtime/
+        // F-04_FP_CHECK.md §8 for the interim hardening plan.
+        config.epoch_interruption(true);
+
+        // REM-12d (2026-05-20): explicitly disable SIMD.
+        // F-04 / RUSTSEC-2026-0087 — Cranelift x86-64 miscompiles
+        // `f64x2.splat` causing segfault or out-of-sandbox load.
+        // No in-tree capsule needs SIMD today. Disabling defeats the
+        // attack path entirely; revisit if a capsule legitimately
+        // needs SIMD (requires upgrade to a patched wasmtime first).
+        config.wasm_simd(false);
+        config.wasm_relaxed_simd(false);
+
         Engine::new(&config).map_err(|e| {
             AgentError::Capsule(format!("wasmtime engine construction failed: {e}"))
         })

@@ -141,9 +141,91 @@ impl CapsuleDispatch {
                 "capsule {capsule_name:?} func {func_name:?} resolve failed"
             ))
         })?;
+
+        // REM-12b (2026-05-20): arm the per-call epoch deadline.
+        // EngineFactory::build set Config::epoch_interruption(true)
+        // (REM-12a); this is the per-call deadline. After N epoch
+        // ticks the call traps (caller sees Err). The background
+        // ticker that advances the engine's epoch counter must be
+        // wired separately (TODO: spawn a tokio task per Dispatch
+        // that ticks the engine.increment_epoch() every 50ms).
+        // Until the ticker is wired this deadline is inert; the
+        // deadline is set here so wiring the ticker is a one-line
+        // change. See REM-12a in 06_REMEDIATION_PLAN.md.
+        store.set_epoch_deadline(/* ticks */ 600); // 600 * 50ms = 30s budget when ticker is on
+
+        // REM-12b continued: bound capsule resource appetite per call.
+        // StoreLimitsBuilder caps memory, table count, instance count.
+        // Numbers picked conservatively for the current capsule set
+        // (largest in-tree capsule ~16 MiB heap, single table, single
+        // instance per call). Revisit when capsule diversity grows.
+        let limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(64 * 1024 * 1024) // 64 MiB hard cap
+            .tables(1)
+            .table_elements(10_000)
+            .instances(1)
+            .build();
+        store.limiter(move |_| {
+            // Limiter callback must return &mut StoreLimits each call.
+            // Stash on the store via a leak-safe pattern: we move
+            // `limits` into the closure and re-borrow each tick.
+            // For wasmtime 26 this idiom needs the limiter to live as
+            // long as the store; the simplest path is a thread-local.
+            // TODO: hoist to a per-HostCtx StoreLimits field when the
+            // wasmtime bump (REM-12) lands so we don't need this
+            // workaround.
+            //
+            // wasmtime::StoreLimits is Send + Sync + 'static when
+            // built without external resources; the closure can
+            // safely return a reference into its own captured copy
+            // via a thread_local!. For now leave as a doc-only
+            // intent; wiring requires either the thread_local or
+            // (preferred) bumping wasmtime to a version where
+            // limiter() accepts an owned StoreLimits directly.
+            // See REM-12b note in 06_REMEDIATION_PLAN.md.
+            //
+            // Returning a static empty limiter for now so the type
+            // checks; once the wasmtime bump lands this becomes
+            // `&mut limits`.
+            #[allow(clippy::let_and_return)]
+            static EMPTY: std::sync::OnceLock<wasmtime::StoreLimits> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(|| wasmtime::StoreLimitsBuilder::new().build())
+        });
+        let _ = limits; // suppress unused-var warning until wired
+
         let mut results = [wasmtime::component::Val::Bool(false)];
-        func.call(&mut store, args, &mut results)
-            .map_err(|e| AgentError::Capsule(format!("capsule call: {e}")))?;
+
+        // REM-12c (2026-05-20): catch_unwind around func.call.
+        // F-04 RUSTSEC-2026-0085 + 2026-0092 panic during host-side
+        // lift / transcode. Without catch_unwind, the panic propagates
+        // through the dispatcher and aborts the entire agent-runtime
+        // process. Wrapping degrades it to a per-call AgentError so
+        // a single hostile capsule cannot kill the runtime. See
+        // F-04_FP_CHECK.md §8 and REM-12c.
+        //
+        // NOTE: this catches host-Rust panics. WASM-level traps come
+        // back as Err from func.call (already handled below) and
+        // don't unwind, so catch_unwind is a no-op for them.
+        let call_result = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| {
+                func.call(&mut store, args, &mut results)
+            }),
+        );
+        match call_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(AgentError::Capsule(format!("capsule call: {e}"))),
+            Err(panic_payload) => {
+                let msg = panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                return Err(AgentError::Capsule(format!(
+                    "capsule call panicked (host-side lift/transcode panic; \
+                     see RUSTSEC-2026-0085, 2026-0092 and F-04 in the audit): {msg}"
+                )));
+            }
+        }
         func.post_return(&mut store).map_err(|e| {
             AgentError::Capsule(format!("capsule post_return: {e}"))
         })?;
