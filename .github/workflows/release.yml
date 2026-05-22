@@ -1,0 +1,282 @@
+name: Release (agent-runtime)
+
+# Modeled on citrate-chain release.yml. Cross-compiles agent
+# binaries for linux/macos/windows; produces tar.gz/zip archives
+# + SHA256 + CycloneDX SBOM; attaches to draft GitHub Release.
+#
+# Triggers:
+#   - tag push `v*` (creates a DRAFT release; promote manually)
+#   - workflow_dispatch with release_tag input (rebuild existing
+#     tag OR dry-run when running with a non-existent tag)
+#
+# Signing: optional. Workflow consumes signing secrets if present;
+# produces unsigned artifacts marked "unsigned-pre-release" if not.
+# See release ceremony prep audit (2026-05-21) for signing-cert
+# acquisition checklist.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to publish or rebuild (e.g. v0.5.0-beta1). Use any string for dry-run.'
+        required: true
+        type: string
+      publish_release:
+        description: 'Publish immediately instead of creating a draft'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+
+      - name: Install cross (for aarch64-linux)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      # REM-22 — agent-runtime requires SSH alias `github-citrate-chain`
+      # to resolve citrate-wallet-core. See README.md "Chain dependency"
+      # section. CI must provision this alias before cargo can fetch.
+      - name: Configure SSH host alias (REM-22)
+        env:
+          CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "$CHAIN_DEPLOY_KEY" ]; then
+            echo "$CHAIN_DEPLOY_KEY" > ~/.ssh/chain_deploy
+            chmod 600 ~/.ssh/chain_deploy
+            cat >> ~/.ssh/config <<EOF
+          Host github-citrate-chain
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/chain_deploy
+            StrictHostKeyChecking accept-new
+          EOF
+            ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          else
+            echo "::error::CHAIN_DEPLOY_KEY secret not set — cargo will fail to fetch citrate-wallet-core. See REM-22."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build agent-runtime binaries
+        shell: bash
+        run: |
+          set -e
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --locked --target ${{ matrix.target }} \
+              -p citrate-agent-cli -p citrate-agent-cron
+          else
+            cargo build --release --locked --target ${{ matrix.target }} \
+              -p citrate-agent-cli -p citrate-agent-cron
+          fi
+          ls -la "target/${{ matrix.target }}/release" | head -20
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -e
+          STAGE="citrate-agent-runtime-${{ matrix.target }}"
+          mkdir -p "dist/$STAGE"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          for bin in citrate-agent-cli citrate-agent-cron tripwire_daemon; do
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
+              cp "$TARGET_DIR/$bin.exe" "dist/$STAGE/" 2>/dev/null || true
+            else
+              cp "$TARGET_DIR/$bin" "dist/$STAGE/" 2>/dev/null || true
+            fi
+          done
+          cp LICENSE README.md "dist/$STAGE/" 2>/dev/null || true
+
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a -tzip "${STAGE}.zip" "$STAGE/"
+          else
+            tar -czf "${STAGE}.tar.gz" "$STAGE/"
+          fi
+          ls -la
+
+      - name: Generate SHA256SUM
+        shell: bash
+        run: |
+          cd dist
+          for f in citrate-agent-runtime-${{ matrix.target }}.*; do
+            if [[ -f "$f" ]]; then
+              if [[ "${{ runner.os }}" == "macOS" ]]; then
+                shasum -a 256 "$f" > "$f.sha256"
+              else
+                sha256sum "$f" > "$f.sha256"
+              fi
+            fi
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: citrate-agent-runtime-${{ matrix.target }}
+          path: dist/citrate-agent-runtime-${{ matrix.target }}.*
+          retention-days: 30
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Configure SSH host alias (REM-22)
+        env:
+          CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "$CHAIN_DEPLOY_KEY" ]; then
+            echo "$CHAIN_DEPLOY_KEY" > ~/.ssh/chain_deploy
+            chmod 600 ~/.ssh/chain_deploy
+            cat >> ~/.ssh/config <<EOF
+          Host github-citrate-chain
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/chain_deploy
+            StrictHostKeyChecking accept-new
+          EOF
+          fi
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx --format json --override-filename citrate-agent-runtime-sbom
+          ls -la *.json | head -5
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: citrate-agent-runtime-sbom
+          path: 'citrate-agent-runtime-sbom*.json'
+          retention-days: 90
+
+  release:
+    name: Create Draft Release
+    runs-on: ubuntu-latest
+    needs: [build, sbom]
+    permissions:
+      contents: write
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts for upload
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name '*.json' \) -exec cp {} release-files/ \;
+          ls -la release-files
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create or update draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: citrate-agent-runtime ${{ steps.tag.outputs.tag }}
+          draft: ${{ !github.event.inputs.publish_release }}
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          files: release-files/*
+          body: |
+            ## citrate-agent-runtime ${{ steps.tag.outputs.tag }}
+
+            Cross-platform agent runtime binaries.
+
+            ### Artifacts
+            - `citrate-agent-runtime-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64
+            - `citrate-agent-runtime-aarch64-unknown-linux-gnu.tar.gz` — Linux ARM64
+            - `citrate-agent-runtime-x86_64-apple-darwin.tar.gz` — macOS Intel
+            - `citrate-agent-runtime-aarch64-apple-darwin.tar.gz` — macOS Apple Silicon
+            - `citrate-agent-runtime-x86_64-pc-windows-msvc.zip` — Windows x86_64
+            - `*.sha256` — SHA-256 checksums
+            - `citrate-agent-runtime-sbom.json` — CycloneDX SBOM
+
+            ### Runbook
+
+            See `citrate-compliance/runbooks/releases/agent-runtime.md` for
+            install + run instructions.
+
+            ### Signing
+
+            **Status**: unsigned-pre-release (signing wired but optional;
+            see release ceremony prep audit's SIGNING_CHECKLIST.md).
