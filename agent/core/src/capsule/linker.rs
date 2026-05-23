@@ -160,54 +160,82 @@ impl LinkerBuilder {
     /// capsule because the per-capsule linker never called the
     /// sockets add_to_linker family. CIT-AGENT-3d.
     pub fn wire_wasi_host_fns(mut self) -> Result<Self, AgentError> {
-        use wasmtime_wasi::bindings as b;
-        use wasmtime_wasi::{WasiImpl, WasiView};
+        // REM-12 (wasmtime 26 → 45): the wasmtime-wasi v45 API replaces
+        // the `WasiImpl(t)` closure pattern with per-subsystem marker
+        // types (WasiCli / WasiClocks / WasiRandom / WasiFilesystem /
+        // WasiSockets) plus method references (`HostCtx::cli`, etc.)
+        // that are auto-impl'd from `impl WasiView for HostCtx`. The
+        // module path also moved from `wasmtime_wasi::bindings` to
+        // `wasmtime_wasi::p2::bindings` (Preview 2 namespacing for the
+        // upcoming Preview 3 work).
+        //
+        // The "build from manifest, NOT filter default" invariant is
+        // PRESERVED: each call is still per-subsystem and still gated
+        // on a CapabilityToken the manifest produced. The only thing
+        // that changed is the per-call shape.
+        use wasmtime::component::{HasData, ResourceTable};
+        use wasmtime_wasi::cli::{WasiCli, WasiCliView};
+        use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
+        use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView};
+        use wasmtime_wasi::p2::bindings as b;
+        use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
+        use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
+        use wasmtime_wasi::WasiView;
 
-        // The `closure` pattern + `type_annotate` workaround is
-        // copied verbatim from wasmtime_wasi::add_to_linker_sync.
-        fn type_annotate<T: WasiView, F>(val: F) -> F
-        where
-            F: Fn(&mut T) -> WasiImpl<&mut T>,
-        {
-            val
+        // The IO bindings need a `HasData` impl pointing at
+        // `&mut ResourceTable`. wasmtime-wasi's internal `HasIo` marker
+        // is private (see the FIXME at wasmtime_wasi::p2::mod.rs:494),
+        // so we define our own equivalent. The `|t| t.ctx().table`
+        // closure drills into the WasiCtxView to get the resource
+        // table on demand.
+        struct HasIo;
+        impl HasData for HasIo {
+            type Data<'a> = &'a mut ResourceTable;
         }
-        let closure = type_annotate::<HostCtx, _>(|t| WasiImpl(t));
+
         let l = &mut self.linker;
 
         if self.permitted.contains(&CapabilityToken::WasiCli) {
-            b::cli::exit::add_to_linker_get_host(l, closure)
+            let opts = b::cli::exit::LinkOptions::default();
+            b::cli::exit::add_to_linker::<HostCtx, WasiCli>(l, &opts, HostCtx::cli)
                 .map_err(|e| linker_err("cli::exit", e))?;
-            b::cli::environment::add_to_linker_get_host(l, closure)
+            b::cli::environment::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::environment", e))?;
-            b::cli::stdin::add_to_linker_get_host(l, closure)
+            b::cli::stdin::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::stdin", e))?;
-            b::cli::stdout::add_to_linker_get_host(l, closure)
+            b::cli::stdout::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::stdout", e))?;
-            b::cli::stderr::add_to_linker_get_host(l, closure)
+            b::cli::stderr::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::stderr", e))?;
-            b::cli::terminal_input::add_to_linker_get_host(l, closure)
+            b::cli::terminal_input::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::terminal_input", e))?;
-            b::cli::terminal_output::add_to_linker_get_host(l, closure)
+            b::cli::terminal_output::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::terminal_output", e))?;
-            b::cli::terminal_stdin::add_to_linker_get_host(l, closure)
+            b::cli::terminal_stdin::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::terminal_stdin", e))?;
-            b::cli::terminal_stdout::add_to_linker_get_host(l, closure)
+            b::cli::terminal_stdout::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::terminal_stdout", e))?;
-            b::cli::terminal_stderr::add_to_linker_get_host(l, closure)
+            b::cli::terminal_stderr::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::terminal_stderr", e))?;
         }
         if self.permitted.contains(&CapabilityToken::WasiClocks) {
-            b::clocks::wall_clock::add_to_linker_get_host(l, closure)
+            b::clocks::wall_clock::add_to_linker::<HostCtx, WasiClocks>(l, HostCtx::clocks)
                 .map_err(|e| linker_err("clocks::wall_clock", e))?;
-            b::clocks::monotonic_clock::add_to_linker_get_host(l, closure)
+            b::clocks::monotonic_clock::add_to_linker::<HostCtx, WasiClocks>(l, HostCtx::clocks)
                 .map_err(|e| linker_err("clocks::monotonic_clock", e))?;
         }
         if self.permitted.contains(&CapabilityToken::WasiRandom) {
-            b::random::random::add_to_linker_get_host(l, closure)
+            // The auto-impl `WasiRandomView for T: WasiView` exposes
+            // `random(&mut self) -> &mut WasiRandomCtx`, so we use the
+            // same `HostCtx::random` method-reference pattern as the
+            // other subsystems. The `WasiCtx.random` field is private
+            // to wasmtime-wasi (only the in-crate canonical add_to_linker
+            // can touch it directly); the View trait is the public path.
+            b::random::random::add_to_linker::<HostCtx, WasiRandom>(l, HostCtx::random)
                 .map_err(|e| linker_err("random::random", e))?;
-            b::random::insecure::add_to_linker_get_host(l, closure)
+            b::random::insecure::add_to_linker::<HostCtx, WasiRandom>(l, HostCtx::random)
                 .map_err(|e| linker_err("random::insecure", e))?;
-            b::random::insecure_seed::add_to_linker_get_host(l, closure)
+            b::random::insecure_seed::add_to_linker::<HostCtx, WasiRandom>(l, HostCtx::random)
                 .map_err(|e| linker_err("random::insecure_seed", e))?;
         }
         // I/O streams + io::error are foundational for filesystem
@@ -216,34 +244,62 @@ impl LinkerBuilder {
             || self.permitted.contains(&CapabilityToken::WasiSockets)
             || self.permitted.contains(&CapabilityToken::WasiCli);
         if needs_io {
-            b::io::error::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("io::error", e))?;
-            b::sync::io::poll::add_to_linker_get_host(l, closure)
+            // io::error lives in the separate wasmtime-wasi-io crate;
+            // its bindings still feed our HasIo marker.
+            wasmtime_wasi_io::bindings::wasi::io::error::add_to_linker::<HostCtx, HasIo>(
+                l,
+                |t| t.ctx().table,
+            )
+            .map_err(|e| linker_err("io::error", e))?;
+            b::sync::io::poll::add_to_linker::<HostCtx, HasIo>(l, |t| t.ctx().table)
                 .map_err(|e| linker_err("io::poll", e))?;
-            b::sync::io::streams::add_to_linker_get_host(l, closure)
+            b::sync::io::streams::add_to_linker::<HostCtx, HasIo>(l, |t| t.ctx().table)
                 .map_err(|e| linker_err("io::streams", e))?;
         }
         if self.permitted.contains(&CapabilityToken::WasiFilesystem) {
-            b::sync::filesystem::types::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("filesystem::types", e))?;
-            b::filesystem::preopens::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("filesystem::preopens", e))?;
+            b::sync::filesystem::types::add_to_linker::<HostCtx, WasiFilesystem>(
+                l,
+                HostCtx::filesystem,
+            )
+            .map_err(|e| linker_err("filesystem::types", e))?;
+            b::filesystem::preopens::add_to_linker::<HostCtx, WasiFilesystem>(
+                l,
+                HostCtx::filesystem,
+            )
+            .map_err(|e| linker_err("filesystem::preopens", e))?;
         }
         if self.permitted.contains(&CapabilityToken::WasiSockets) {
-            b::sync::sockets::tcp::add_to_linker_get_host(l, closure)
+            b::sync::sockets::tcp::add_to_linker::<HostCtx, WasiSockets>(l, HostCtx::sockets)
                 .map_err(|e| linker_err("sockets::tcp", e))?;
-            b::sockets::tcp_create_socket::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("sockets::tcp_create_socket", e))?;
-            b::sync::sockets::udp::add_to_linker_get_host(l, closure)
+            b::sockets::tcp_create_socket::add_to_linker::<HostCtx, WasiSockets>(
+                l,
+                HostCtx::sockets,
+            )
+            .map_err(|e| linker_err("sockets::tcp_create_socket", e))?;
+            b::sync::sockets::udp::add_to_linker::<HostCtx, WasiSockets>(l, HostCtx::sockets)
                 .map_err(|e| linker_err("sockets::udp", e))?;
-            b::sockets::udp_create_socket::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("sockets::udp_create_socket", e))?;
-            b::sockets::instance_network::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("sockets::instance_network", e))?;
-            b::sockets::network::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("sockets::network", e))?;
-            b::sockets::ip_name_lookup::add_to_linker_get_host(l, closure)
-                .map_err(|e| linker_err("sockets::ip_name_lookup", e))?;
+            b::sockets::udp_create_socket::add_to_linker::<HostCtx, WasiSockets>(
+                l,
+                HostCtx::sockets,
+            )
+            .map_err(|e| linker_err("sockets::udp_create_socket", e))?;
+            b::sockets::instance_network::add_to_linker::<HostCtx, WasiSockets>(
+                l,
+                HostCtx::sockets,
+            )
+            .map_err(|e| linker_err("sockets::instance_network", e))?;
+            let sockets_opts = b::sockets::network::LinkOptions::default();
+            b::sockets::network::add_to_linker::<HostCtx, WasiSockets>(
+                l,
+                &sockets_opts,
+                HostCtx::sockets,
+            )
+            .map_err(|e| linker_err("sockets::network", e))?;
+            b::sockets::ip_name_lookup::add_to_linker::<HostCtx, WasiSockets>(
+                l,
+                HostCtx::sockets,
+            )
+            .map_err(|e| linker_err("sockets::ip_name_lookup", e))?;
         }
         // CIT-AGENT-9c-host: citrate:chain/eth-call. Two-layer
         // enforcement: the token in `permitted` means the host fn

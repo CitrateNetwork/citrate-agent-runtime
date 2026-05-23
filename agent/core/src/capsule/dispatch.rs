@@ -15,7 +15,7 @@ use crate::capsule::dispatcher::{
     ApprovalGate, EthCallDispatcher, EthSendDispatcher,
 };
 use crate::capsule::manifest::Manifest;
-use crate::capsule::wasm::{EngineFactory, HostCtx};
+use crate::capsule::wasm::EngineFactory;
 use crate::capsule::{archive, Capsule};
 use crate::error::AgentError;
 use std::collections::HashMap;
@@ -122,6 +122,13 @@ impl CapsuleDispatch {
             self.eth_send_dispatcher.clone(),
             self.approval_gate.clone(),
         )?;
+        // REM-12 (wasmtime 26 → 45): `Instance::get_export` now returns
+        // `(ComponentItem, ComponentExportIndex)`. The second `get_export`
+        // call (looking up a func within an iface) takes only the index,
+        // not the tuple — so we pluck `.1` from the iface lookup before
+        // passing it through. `Instance::get_func` likewise wants the
+        // index alone now (the `InstanceExportLookup` trait is impl'd
+        // for `ComponentExportIndex`, not the tuple).
         let iface = instance
             .get_export(&mut store, None, iface_name)
             .ok_or_else(|| {
@@ -129,13 +136,15 @@ impl CapsuleDispatch {
                     "capsule {capsule_name:?} missing interface {iface_name:?}"
                 ))
             })?;
-        let func_idx = instance
-            .get_export(&mut store, Some(&iface), func_name)
+        let (_, iface_idx) = iface;
+        let func_export = instance
+            .get_export(&mut store, Some(&iface_idx), func_name)
             .ok_or_else(|| {
                 AgentError::Capsule(format!(
                     "capsule {capsule_name:?} interface {iface_name:?} missing func {func_name:?}"
                 ))
             })?;
+        let (_, func_idx) = func_export;
         let func = instance.get_func(&mut store, func_idx).ok_or_else(|| {
             AgentError::Capsule(format!(
                 "capsule {capsule_name:?} func {func_name:?} resolve failed"
@@ -154,44 +163,31 @@ impl CapsuleDispatch {
         // change. See REM-12a in 06_REMEDIATION_PLAN.md.
         store.set_epoch_deadline(/* ticks */ 600); // 600 * 50ms = 30s budget when ticker is on
 
-        // REM-12b continued: bound capsule resource appetite per call.
-        // StoreLimitsBuilder caps memory, table count, instance count.
-        // Numbers picked conservatively for the current capsule set
+        // REM-12b CLOSED (2026-05-23, wasmtime-45 bump): bound capsule
+        // resource appetite per call. The previous (wasmtime-26)
+        // OnceLock<StoreLimits> placeholder returned a `&StoreLimits`
+        // where the `Store::limiter` API expects `&mut dyn
+        // ResourceLimiter`; that was a documented "doc-only intent"
+        // gap waiting for the wasmtime bump.
+        //
+        // The bump lands the real binding by hoisting StoreLimits to
+        // a `HostCtx::store_limits` field. The limiter closure now
+        // returns `&mut state.store_limits` where `state: &mut HostCtx`
+        // is the closure's per-call argument — which lives as long as
+        // the Store and is independently borrow-checkable. This is the
+        // canonical wasmtime pattern (see wasmtime::Store::limiter
+        // docs).
+        //
+        // Numbers chosen conservatively for the current capsule set
         // (largest in-tree capsule ~16 MiB heap, single table, single
         // instance per call). Revisit when capsule diversity grows.
-        let limits = wasmtime::StoreLimitsBuilder::new()
+        store.data_mut().store_limits = wasmtime::StoreLimitsBuilder::new()
             .memory_size(64 * 1024 * 1024) // 64 MiB hard cap
             .tables(1)
             .table_elements(10_000)
             .instances(1)
             .build();
-        store.limiter(move |_| {
-            // Limiter callback must return &mut StoreLimits each call.
-            // Stash on the store via a leak-safe pattern: we move
-            // `limits` into the closure and re-borrow each tick.
-            // For wasmtime 26 this idiom needs the limiter to live as
-            // long as the store; the simplest path is a thread-local.
-            // TODO: hoist to a per-HostCtx StoreLimits field when the
-            // wasmtime bump (REM-12) lands so we don't need this
-            // workaround.
-            //
-            // wasmtime::StoreLimits is Send + Sync + 'static when
-            // built without external resources; the closure can
-            // safely return a reference into its own captured copy
-            // via a thread_local!. For now leave as a doc-only
-            // intent; wiring requires either the thread_local or
-            // (preferred) bumping wasmtime to a version where
-            // limiter() accepts an owned StoreLimits directly.
-            // See REM-12b note in 06_REMEDIATION_PLAN.md.
-            //
-            // Returning a static empty limiter for now so the type
-            // checks; once the wasmtime bump lands this becomes
-            // `&mut limits`.
-            #[allow(clippy::let_and_return)]
-            static EMPTY: std::sync::OnceLock<wasmtime::StoreLimits> = std::sync::OnceLock::new();
-            EMPTY.get_or_init(|| wasmtime::StoreLimitsBuilder::new().build())
-        });
-        let _ = limits; // suppress unused-var warning until wired
+        store.limiter(|state| &mut state.store_limits);
 
         let mut results = [wasmtime::component::Val::Bool(false)];
 
@@ -226,9 +222,12 @@ impl CapsuleDispatch {
                 )));
             }
         }
-        func.post_return(&mut store).map_err(|e| {
-            AgentError::Capsule(format!("capsule post_return: {e}"))
-        })?;
+        // REM-12 (wasmtime 26 → 45): `Func::post_return` is now a
+        // documented no-op (per the v45 deprecation notice on the
+        // method: "no longer needs to be called; this function has
+        // no effect"). The component-model runtime handles the
+        // post-return state internally. Removing the call eliminates
+        // the deprecation warning without behavior change.
         Ok(std::mem::replace(
             &mut results[0],
             wasmtime::component::Val::Bool(false),

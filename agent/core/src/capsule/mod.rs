@@ -158,6 +158,16 @@ impl Capsule {
             engine,
             wasm::HostCtx::with_eth_call_allow_list(allow_list),
         );
+        // REM-12a (wasmtime 26 → 45 follow-up): `Config::epoch_interruption(true)`
+        // is set by EngineFactory; v45 default Store deadline is 0, which
+        // traps every wasm-side epoch check immediately. Set a permissive
+        // default here so callers that don't tighten the deadline (tests,
+        // low-budget call paths) don't trip the interrupt. `dispatch.rs`
+        // overrides this per-call with `set_epoch_deadline(600)`. The real
+        // bound on compute-DoS becomes effective only once a background
+        // `engine.increment_epoch()` ticker is wired (deferred follow-up to
+        // REM-12a per `06_REMEDIATION_PLAN.md`).
+        store.set_epoch_deadline(u64::MAX);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
@@ -197,6 +207,8 @@ impl Capsule {
                 self.manifest.capsule.name.clone(),
             ),
         );
+        // REM-12a — see instantiate_with_store for rationale.
+        store.set_epoch_deadline(u64::MAX);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
@@ -226,6 +238,8 @@ impl Capsule {
             engine,
             wasm::HostCtx::with_dispatcher(allow_list, dispatcher),
         );
+        // REM-12a — see instantiate_with_store for rationale.
+        store.set_epoch_deadline(u64::MAX);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
@@ -809,18 +823,17 @@ tier = "bundled"
             .get_export(&mut *store, None, "citrate:echo-chain-capsule/query@0.1.0")
             .expect("capsule exports `query` interface");
         let func_index = instance
-            .get_export(&mut *store, Some(&iface_index), "query")
+            .get_export(&mut *store, Some(&iface_index.1), "query")
             .expect("query interface exports `query` func");
         let func = instance
-            .get_func(&mut *store, func_index)
+            .get_func(&mut *store, func_index.1)
             .expect("query func resolves");
         let to_val = Val::List(to.into_iter().map(Val::U8).collect());
         let data_val = Val::List(data.into_iter().map(Val::U8).collect());
         let mut results = [Val::Bool(false)]; // placeholder; replaced by call
         func.call(&mut *store, &[to_val, data_val], &mut results)
             .expect("query call completes");
-        func.post_return(&mut *store)
-            .expect("post_return clears the call");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated); component-model runtime handles it internally.
         match &results[0] {
             Val::Result(r) => match r.as_ref() {
                 Ok(Some(boxed)) => match boxed.as_ref() {
@@ -982,10 +995,10 @@ tier = "bundled"
             )
             .expect("capsule exports `query` interface");
         let func_index = instance
-            .get_export(&mut *store, Some(&iface_index), "query")
+            .get_export(&mut *store, Some(&iface_index.1), "query")
             .expect("query interface exports `query` func");
         let func = instance
-            .get_func(&mut *store, func_index)
+            .get_func(&mut *store, func_index.1)
             .expect("query func resolves");
         let args = vec![
             Val::String(framework.to_string()),
@@ -994,7 +1007,7 @@ tier = "bundled"
         let mut results = [Val::Bool(false)];
         func.call(&mut *store, &args, &mut results)
             .expect("query call completes");
-        func.post_return(&mut *store).expect("post_return clears");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated).
         // Unwrap the result<posture-row, string>.
         match &results[0] {
             Val::Result(r) => match r.as_ref() {
@@ -1358,16 +1371,16 @@ tier = "bundled"
             )
             .expect("capsule exports `query` interface");
         let func_index = instance
-            .get_export(&mut *store, Some(&iface_index), "query")
+            .get_export(&mut *store, Some(&iface_index.1), "query")
             .expect("query interface exports `query` func");
         let func = instance
-            .get_func(&mut *store, func_index)
+            .get_func(&mut *store, func_index.1)
             .expect("query func resolves");
         let args = vec![Val::String(tenant.to_string()), Val::U32(n)];
         let mut results = [Val::Bool(false)];
         func.call(&mut *store, &args, &mut results)
             .expect("query call completes");
-        func.post_return(&mut *store).expect("post_return clears");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated).
 
         fn bytes32_from_val(v: &Val) -> [u8; 32] {
             match v {
@@ -1689,16 +1702,16 @@ tier = "bundled"
             )
             .expect("capsule exports `query` interface");
         let func_index = instance
-            .get_export(&mut *store, Some(&iface_index), "query")
+            .get_export(&mut *store, Some(&iface_index.1), "query")
             .expect("query interface exports `query` func");
         let func = instance
-            .get_func(&mut *store, func_index)
+            .get_func(&mut *store, func_index.1)
             .expect("query func resolves");
         let args = vec![Val::String(supplier_id.to_string())];
         let mut results = [Val::Bool(false)];
         func.call(&mut *store, &args, &mut results)
             .expect("query call completes");
-        func.post_return(&mut *store).expect("post_return clears");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated).
 
         fn bytes32_from_val(v: &Val) -> [u8; 32] {
             match v {
@@ -1909,16 +1922,16 @@ tier = "bundled"
             )
             .expect("capsule exports `query` interface");
         let func_index = instance
-            .get_export(&mut *store, Some(&iface_index), "query")
+            .get_export(&mut *store, Some(&iface_index.1), "query")
             .expect("query interface exports `query` func");
         let func = instance
-            .get_func(&mut *store, func_index)
+            .get_func(&mut *store, func_index.1)
             .expect("query func resolves");
         let args = vec![Val::String(part_hash.to_string())];
         let mut results = [Val::Bool(false)];
         func.call(&mut *store, &args, &mut results)
             .expect("query call completes");
-        func.post_return(&mut *store).expect("post_return clears");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated).
 
         fn bytes32_from_val(v: &Val) -> [u8; 32] {
             match v {
@@ -2349,15 +2362,15 @@ tier = "bundled"
             .get_export(&mut *store, None, "citrate:eth-sender-test/action@0.1.0")
             .expect("action interface exists");
         let func_idx = instance
-            .get_export(&mut *store, Some(&iface_idx), "send")
+            .get_export(&mut *store, Some(&iface_idx.1), "send")
             .expect("send func exists");
-        let func = instance.get_func(&mut *store, func_idx).unwrap();
+        let func = instance.get_func(&mut *store, func_idx.1).unwrap();
         let to_val = Val::List(to.into_iter().map(Val::U8).collect());
         let data_val = Val::List(data.into_iter().map(Val::U8).collect());
         let mut results = [Val::Bool(false)];
         func.call(&mut *store, &[to_val, data_val], &mut results)
             .expect("send call completes");
-        func.post_return(&mut *store).expect("post_return clears");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated).
         match &results[0] {
             Val::Result(r) => match r.as_ref() {
                 Ok(Some(boxed)) => match boxed.as_ref() {
@@ -2732,13 +2745,13 @@ tier = "bundled"
             .get_export(&mut *store, None, iface_name)
             .expect("interface export");
         let func_idx = instance
-            .get_export(&mut *store, Some(&iface), func_name)
+            .get_export(&mut *store, Some(&iface.1), func_name)
             .expect("func export");
-        let func = instance.get_func(&mut *store, func_idx).unwrap();
+        let func = instance.get_func(&mut *store, func_idx.1).unwrap();
         let mut results = [Val::Bool(false)];
         func.call(&mut *store, &args, &mut results)
             .expect("call completes");
-        func.post_return(&mut *store).expect("post_return clears");
+        // REM-12: Func::post_return is a no-op in wasmtime 45 (deprecated).
         match &results[0] {
             Val::Result(r) => match r.as_ref() {
                 Ok(Some(boxed)) => match boxed.as_ref() {

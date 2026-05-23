@@ -10,8 +10,8 @@ use crate::capsule::dispatcher::{ApprovalGate, EthCallDispatcher, EthSendDispatc
 use crate::error::AgentError;
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
-use wasmtime::{Config, Engine};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime::{Config, Engine, StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// A 20-byte EVM address.
 pub type Address = [u8; 20];
@@ -75,6 +75,16 @@ pub struct HostCtx {
     /// from the manifest's `[capsule].name`. Empty when not yet
     /// instantiated.
     capsule_name: String,
+    /// REM-12b real binding — per-store resource caps. Lives ON
+    /// `HostCtx` (not in the limiter closure) so the `Store::limiter`
+    /// callback can return `&mut self.store_limits` without the
+    /// borrow-escapes-closure problem the old wasmtime-26 OnceLock
+    /// placeholder ran into. Configured before each capsule call in
+    /// `dispatch.rs` per RFC §4.5 invariant 3 ("bounded resource
+    /// appetite per call"). Default values are the per-call caps
+    /// (64 MiB heap, 1 table, 1 instance) — `dispatch.rs` may
+    /// override per workload.
+    pub store_limits: StoreLimits,
 }
 
 impl HostCtx {
@@ -97,6 +107,16 @@ impl HostCtx {
             eth_send_dispatcher: None,
             approval_gate: None,
             capsule_name: String::new(),
+            // REM-12b — per-capsule call resource caps.
+            // dispatch.rs may reconfigure before each call; this is
+            // the conservative default that applies even if the
+            // dispatcher forgets to set it.
+            store_limits: StoreLimitsBuilder::new()
+                .memory_size(64 * 1024 * 1024) // 64 MiB hard cap
+                .tables(1)
+                .table_elements(10_000)
+                .instances(1)
+                .build(),
         }
     }
 
@@ -247,11 +267,19 @@ impl HostCtx {
 }
 
 impl WasiView for HostCtx {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
-    }
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
+    // REM-12 (wasmtime 26 → 45): WasiView trait now returns a
+    // `WasiCtxView` struct that bundles ctx + table together. The
+    // separate `fn table()` method is gone — the new view exposes
+    // both via field access. The auto-impl at
+    // wasmtime_wasi::view::impl<T: WasiView> WasiCliView/etc. for T
+    // picks up cli / clocks / random / filesystem / sockets for free
+    // from this one `ctx()` method, so the per-subsystem View traits
+    // we used to need to satisfy explicitly are now derived.
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 

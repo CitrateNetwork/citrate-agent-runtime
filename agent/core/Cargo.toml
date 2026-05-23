@@ -44,18 +44,31 @@ base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["std"] }
 
 # CIT-AGENT-3c — wasmtime engine + per-capsule linker.
-# Pinned to wasmtime 26.x (current 2026 stable). The component-model
-# feature is required for the WASM Component Model that capsules use.
-# wasmtime-wasi provides the standard WASI host implementations we'll
-# wire selectively per manifest in CIT-AGENT-3d.
-wasmtime = { version = "26", features = ["component-model"] }
-wasmtime-wasi = "26"
+# REM-12 (2026-05-23 sprint): bumped 26 → 45 to close the F-04 cluster.
+# Per audit's per-repo F-04_FP_CHECK.md, the 26.x line was abandoned with
+# no backport for RUSTSEC-2026-0091 (sandbox escape), 0093 (OOB read), or
+# 0020 (resource exhaustion). The 36.0.7 / 42.0.2 / 43.0.1 / 45.0.0
+# lines all carry the fix; chose 45.0.0 (latest stable) to future-proof
+# for the next 6-12 months. See
+# citrate-federation/agentile/sprints/active/2026-05-23-rem-12-wasmtime-bump.md.
+#
+# The component-model feature is required for the WASM Component Model
+# that capsules use. wasmtime-wasi provides the standard WASI host
+# implementations we wire selectively per manifest in CIT-AGENT-3d.
+wasmtime = { version = "45", features = ["component-model"] }
+wasmtime-wasi = "45"
+# wasmtime-wasi-io is a peer crate of wasmtime-wasi that hosts the
+# `wasi:io/error` binding. Required to wire io::error per-subsystem
+# in linker.rs (the wasmtime-wasi internal HasIo marker is private,
+# so we depend on the io crate directly). REM-12 wasmtime-26 → 45.
+wasmtime-wasi-io = "45"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
 # WAT → WASM at test time for the CIT-AGENT-3d component-instantiation
-# tests. Pinned to a version aligned with wasmtime 26.
-wat = "1.224"
+# tests. Bumped alongside wasmtime to maintain WAT parser compatibility
+# with whatever component-model WAT syntax current wasmtime expects.
+wat = "1"
 
 # BFR-INT-wiremock-harness — JSON-RPC mock server for
 # RecorderClient async-method tests. Drains AT-poam-A-3 + AT-vp-1.
