@@ -19,6 +19,7 @@ pub mod dispatcher;
 pub mod filesystem;
 pub mod linker;
 pub mod manifest;
+pub mod pack;
 pub mod prod_impls;
 pub mod tiers;
 pub mod verify;
