@@ -20,7 +20,67 @@ use crate::capsule::{archive, Capsule};
 use crate::error::AgentError;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Interval between `engine.increment_epoch()` advances. With the per-call
+/// `set_epoch_deadline(600)` armed in `call_raw`, this gives a ~30 s
+/// wall-clock compute budget per capsule call (600 × 50 ms).
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// RM-E.2 / AGENT_RUNTIME-002: the background epoch ticker.
+///
+/// `EngineFactory::build` enables `Config::epoch_interruption(true)` and
+/// `call_raw` arms `set_epoch_deadline(600)`, but that deadline is INERT
+/// unless something advances the engine's epoch counter — otherwise a
+/// capsule that enters `(loop (br 0))` runs forever on the worker thread
+/// (fuel is disabled), a persistent DoS. This ticker advances the counter
+/// on a fixed interval for the lifetime of the owning `CapsuleDispatch`,
+/// so the armed deadline actually traps. Stops cleanly on `Drop`.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn spawn(engine: &wasmtime::Engine) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        // `Engine` is `Arc`-backed and `Send + Sync`; the clone shares the
+        // same epoch counter the call path observes.
+        let engine = engine.clone();
+        let handle = std::thread::Builder::new()
+            .name("capsule-epoch-ticker".to_string())
+            .spawn(move || {
+                while !stop_for_thread.load(Ordering::Relaxed) {
+                    std::thread::sleep(EPOCH_TICK_INTERVAL);
+                    engine.increment_epoch();
+                }
+            })
+            .ok();
+        if handle.is_none() {
+            // Fail loud (not closed-but-silent): if the OS refuses the
+            // thread, the compute-DoS bound is NOT in effect. Operators
+            // must see this rather than discover an inert deadline later.
+            eprintln!(
+                "[citrate-agent-core] WARNING: failed to spawn capsule epoch ticker; \
+                 per-call compute-time bound (AGENT_RUNTIME-002) is INACTIVE"
+            );
+        }
+        Self { stop, handle }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            // Joins within one tick interval; bounded and cheap.
+            let _ = handle.join();
+        }
+    }
+}
 
 /// All-zero placeholder `content_hash` means the capsule was never run through
 /// the CIT-AGENT-3e packer (which computes + embeds the real hash and signs the
@@ -67,6 +127,10 @@ pub struct CapsuleDispatch {
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
     approval_gate: Option<Arc<dyn ApprovalGate>>,
+    // RM-E.2 / AGENT_RUNTIME-002: keeps the epoch ticker alive for the
+    // dispatch's lifetime so the per-call `set_epoch_deadline` traps
+    // runaway capsules. Dropped (stopping the thread) with the dispatch.
+    _epoch_ticker: EpochTicker,
 }
 
 impl CapsuleDispatch {
@@ -83,6 +147,9 @@ impl CapsuleDispatch {
         approval_gate: Option<Arc<dyn ApprovalGate>>,
     ) -> Result<Self, AgentError> {
         let engine = EngineFactory::build()?;
+        // RM-E.2 / AGENT_RUNTIME-002: arm the background epoch ticker so the
+        // per-call deadline in `call_raw` is no longer inert.
+        let _epoch_ticker = EpochTicker::spawn(&engine);
         let mut capsules = HashMap::new();
         let mut unverified = HashSet::new();
         let entries = std::fs::read_dir(dir).map_err(|e| {
@@ -127,6 +194,7 @@ impl CapsuleDispatch {
             eth_call_dispatcher,
             eth_send_dispatcher,
             approval_gate,
+            _epoch_ticker,
         })
     }
 
@@ -318,6 +386,63 @@ impl CapsuleDispatch {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn capsules_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to citrate_v0.01.1/")
+            .join("capsules")
+    }
+
+    /// RM-E.2 / AGENT_RUNTIME-002 tripwire: a CapsuleDispatch built via the
+    /// production constructor MUST have a live background epoch ticker, so
+    /// the per-call `set_epoch_deadline(600)` armed in `call_raw` actually
+    /// traps a runaway guest. We prove the mechanism on the dispatch's OWN
+    /// engine: a `(loop (br 0))` module with a tiny deadline must trap within
+    /// a few ticker intervals. Pre-fix (deadline armed but no ticker) the
+    /// call never returns and this test fails on the 5s timeout.
+    #[test]
+    fn tripwire_002_dispatch_epoch_ticker_bounds_busy_loop() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dispatch =
+            CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+                .expect("dispatch loads");
+        let engine = dispatch.engine().clone();
+
+        let wasm = wat::parse_str(r#"(module (func (export "spin") (loop (br 0))))"#)
+            .expect("wat compiles");
+        let module = wasmtime::Module::new(&engine, &wasm).expect("module builds");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut store = wasmtime::Store::new(&engine, ());
+            // Tiny deadline — a couple of ticker intervals (~100ms at 50ms/tick).
+            store.set_epoch_deadline(2);
+            let instance = match wasmtime::Instance::new(&mut store, &module, &[]) {
+                Ok(i) => i,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("instantiate: {e}")));
+                    return;
+                }
+            };
+            let spin = instance
+                .get_typed_func::<(), ()>(&mut store, "spin")
+                .expect("typed func");
+            let _ = tx.send(Ok(spin.call(&mut store, ()).is_err()));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(true)) => {} // trapped — the dispatch's ticker advanced the epoch
+            Ok(Ok(false)) => panic!("busy loop returned Ok — epoch deadline never tripped"),
+            Ok(Err(e)) => panic!("tripwire setup failed: {e}"),
+            Err(_) => panic!(
+                "busy loop never returned within 5s — epoch ticker not wired (AGENT_RUNTIME-002)"
+            ),
+        }
+    }
 
     /// Loading the full BFR-INT-12 fleet from disk: all 7 capsules
     /// present + correctly named.
