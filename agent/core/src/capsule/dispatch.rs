@@ -18,9 +18,41 @@ use crate::capsule::manifest::Manifest;
 use crate::capsule::wasm::EngineFactory;
 use crate::capsule::{archive, Capsule};
 use crate::error::AgentError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+
+/// All-zero placeholder `content_hash` means the capsule was never run through
+/// the CIT-AGENT-3e packer (which computes + embeds the real hash and signs the
+/// manifest). Such a capsule carries no integrity proof and cannot be verified.
+fn is_placeholder_content_hash(h: &str) -> bool {
+    h.strip_prefix("sha256:")
+        .map(|hex| !hex.is_empty() && hex.bytes().all(|b| b == b'0'))
+        .unwrap_or(false)
+}
+
+/// A loose-dir capsule is integrity-verified iff its manifest declares a real
+/// (non-placeholder) `content_hash` AND that hash matches the hash recomputed
+/// over the loaded executable body. This binds the wasm that actually runs to
+/// the signed manifest the harness makes policy decisions from.
+fn capsule_body_verified(manifest: &Manifest, wasm: &[u8]) -> bool {
+    if is_placeholder_content_hash(&manifest.capsule.content_hash) {
+        return false;
+    }
+    let recomputed = archive::compute_content_hash(&archive::ArchiveContents {
+        wasm: wasm.to_vec(),
+        ..Default::default()
+    });
+    recomputed == manifest.capsule.content_hash
+}
+
+/// Operator opt-in to run capsules that failed integrity verification — intended
+/// ONLY for the pre-packer placeholder period. Default (unset) is fail-closed.
+fn allow_unverified_capsules() -> bool {
+    std::env::var("CITRATE_ALLOW_UNVERIFIED_CAPSULES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// Pre-loaded fleet of capsules sharing one engine + one set of
 /// production dispatchers + one approval gate. Build once at
@@ -28,6 +60,10 @@ use std::sync::Arc;
 pub struct CapsuleDispatch {
     engine: wasmtime::Engine,
     capsules: HashMap<String, Capsule>,
+    /// Names of loaded capsules that FAILED integrity verification at load
+    /// (placeholder or mismatched content_hash). `call_raw` refuses to
+    /// instantiate these unless `CITRATE_ALLOW_UNVERIFIED_CAPSULES` is set.
+    unverified: HashSet<String>,
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
     approval_gate: Option<Arc<dyn ApprovalGate>>,
@@ -48,6 +84,7 @@ impl CapsuleDispatch {
     ) -> Result<Self, AgentError> {
         let engine = EngineFactory::build()?;
         let mut capsules = HashMap::new();
+        let mut unverified = HashSet::new();
         let entries = std::fs::read_dir(dir).map_err(|e| {
             AgentError::Capsule(format!("read capsule dir {dir:?}: {e}"))
         })?;
@@ -68,6 +105,12 @@ impl CapsuleDispatch {
             let manifest = Manifest::parse(&manifest_str)?;
             let wasm = std::fs::read(&wasm_path)
                 .map_err(|e| AgentError::Capsule(format!("read wasm: {e}")))?;
+            // RM-A WP-AGENT_RUNTIME-001: record integrity status at load.
+            // Enforcement is deferred to `call_raw` so the doctor/inspection
+            // paths can still enumerate the fleet without executing it.
+            if !capsule_body_verified(&manifest, &wasm) {
+                unverified.insert(manifest.capsule.name.clone());
+            }
             let capsule = Capsule {
                 manifest: manifest.clone(),
                 archive: archive::ArchiveContents {
@@ -80,6 +123,7 @@ impl CapsuleDispatch {
         Ok(Self {
             engine,
             capsules,
+            unverified,
             eth_call_dispatcher,
             eth_send_dispatcher,
             approval_gate,
@@ -114,6 +158,32 @@ impl CapsuleDispatch {
         let capsule = self.capsules.get(capsule_name).ok_or_else(|| {
             AgentError::Capsule(format!("capsule {capsule_name:?} not loaded"))
         })?;
+
+        // RM-A WP-AGENT_RUNTIME-2026-05-31-001 (CRITICAL): fail-closed integrity
+        // gate. Refuse to instantiate a capsule whose executable wasm is not
+        // bound to a valid manifest `content_hash` (no integrity proof). Until
+        // the CIT-AGENT-3e packer embeds real hashes + signatures (today every
+        // capsule carries the all-zero placeholder), running an unverified
+        // capsule requires an explicit, loudly-logged operator opt-in — never
+        // the silent default that this path used to be.
+        if self.unverified.contains(capsule_name) {
+            if allow_unverified_capsules() {
+                tracing::warn!(
+                    capsule = capsule_name,
+                    "INSTANTIATING UNVERIFIED CAPSULE: wasm is not bound to a valid manifest \
+                     content_hash. Permitted only because CITRATE_ALLOW_UNVERIFIED_CAPSULES is \
+                     set — this MUST NOT be set in production once capsules are packed/signed."
+                );
+            } else {
+                return Err(AgentError::Capsule(format!(
+                    "refusing to instantiate unverified capsule {capsule_name:?}: its wasm is not \
+                     bound to a valid manifest content_hash (no integrity proof). Pack and sign \
+                     the capsule (CIT-AGENT-3e), or set CITRATE_ALLOW_UNVERIFIED_CAPSULES=1 for \
+                     development only."
+                )));
+            }
+        }
+
         let linker = capsule.prepare_linker(&self.engine)?.into_linker();
         let (mut store, instance) = capsule.instantiate_with_write_path(
             &self.engine,
@@ -279,6 +349,95 @@ mod tests {
             assert!(
                 dispatch.has(expected),
                 "fleet must include {expected}; loaded: {names:?}"
+            );
+        }
+    }
+
+    // ── RM-A WP-AGENT_RUNTIME-001 tripwires (red on the unfixed dispatch) ──
+
+    const PLACEHOLDER_HASH: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn manifest_with_hash(content_hash: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[capsule]
+name = "tripwire-cap"
+version = "0.1.0"
+content_hash = "{content_hash}"
+[capability]
+network = "none"
+subagent_spawn = false
+[data_class]
+[risk]
+tier = "low"
+break_glass_eligible = false
+[overlay]
+[provenance]
+publisher = "did:citrate:test"
+build_reproducible = true
+agentile_sprint = "rm-a-tripwire"
+[signing]
+tier = "bundled"
+"#
+        );
+        Manifest::parse(&toml).expect("tripwire manifest parses")
+    }
+
+    #[test]
+    fn tripwire_placeholder_content_hash_is_unverified() {
+        assert!(is_placeholder_content_hash(PLACEHOLDER_HASH));
+        assert!(!is_placeholder_content_hash(
+            "sha256:deadbeef00000000000000000000000000000000000000000000000000000000"
+        ));
+        // A capsule shipped with the placeholder hash carries no integrity proof.
+        let m = manifest_with_hash(PLACEHOLDER_HASH);
+        assert!(!capsule_body_verified(&m, b"\x00asm\x01\x00\x00\x00"));
+    }
+
+    #[test]
+    fn tripwire_matching_content_hash_is_verified_and_tamper_is_not() {
+        let wasm = b"\x00asm\x01\x00\x00\x00".to_vec();
+        let real = archive::compute_content_hash(&archive::ArchiveContents {
+            wasm: wasm.clone(),
+            ..Default::default()
+        });
+        let m = manifest_with_hash(&real);
+        // Honest wasm bound to the declared hash → verified.
+        assert!(capsule_body_verified(&m, &wasm));
+        // Tampered wasm under the same manifest → not verified.
+        assert!(!capsule_body_verified(&m, b"\x00asm\x01\x00\x00\xff"));
+    }
+
+    #[test]
+    fn tripwire_unverified_capsule_refused_by_default() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capsules_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk up to repo root")
+            .join("capsules");
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root, None, None, None)
+            .expect("loads cleanly");
+        // The shipped fleet carries placeholder hashes → all flagged unverified.
+        assert!(
+            !dispatch.unverified.is_empty(),
+            "placeholder-hashed capsules must be flagged unverified"
+        );
+        // With the override unset (normal/CI default), call_raw refuses to
+        // instantiate an unverified capsule BEFORE touching the linker.
+        if !allow_unverified_capsules() {
+            let name = dispatch
+                .capsule_names()
+                .into_iter()
+                .next()
+                .expect("fleet is non-empty");
+            let err = dispatch
+                .call_raw(&name, "iface", "func", &[])
+                .expect_err("unverified capsule must be refused by default");
+            assert!(
+                err.to_string().to_lowercase().contains("unverified"),
+                "refusal must cite the missing integrity proof, got: {err}"
             );
         }
     }
