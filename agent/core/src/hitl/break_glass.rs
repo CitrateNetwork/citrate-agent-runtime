@@ -21,9 +21,10 @@
 //!   * `SurfacedWasInvoked`: phase = Surfaced implies notified was filled (i.e. invoke happened).
 
 use crate::capsule::manifest::{DataClass, Manifest, Role};
+use crate::hitl::signing::{signer_is_authorized, verify_attestation, AttestedSignature, SignerRoster};
 use crate::hitl::Signer;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 72-hour post-hoc affirmation window per RFC §5.5.
@@ -110,6 +111,14 @@ pub enum BreakGlassError {
     AffirmationWindowExpired,
     /// Unknown action_id (no entry exists).
     UnknownActionId,
+    /// RM-G.2 — the supplied attestation does not verify over the action_id
+    /// (bad signature/pubkey/length, or signer.id ≠ pubkey fingerprint).
+    AttestationInvalid(String),
+    /// RM-G.2 — the signature verifies but the pubkey is not on the
+    /// authorized-signer roster for the claimed role (or no roster is
+    /// configured in a release build). A self-minted key cannot invoke or
+    /// affirm break-glass.
+    SignerNotAuthorized,
 }
 
 impl std::fmt::Display for BreakGlassError {
@@ -130,6 +139,11 @@ impl std::fmt::Display for BreakGlassError {
             ),
             InvokerCannotAffirm => write!(f, "SecurityOfficer (invoker) cannot self-affirm"),
             DuplicateAffirmer => write!(f, "signer already affirmed"),
+            AttestationInvalid(m) => write!(f, "break-glass attestation invalid: {m}"),
+            SignerNotAuthorized => write!(
+                f,
+                "break-glass signer pubkey is not on the authorized-signer roster for the role"
+            ),
             AffirmationWindowExpired => {
                 write!(f, "affirmation arrived after 72-hour window")
             }
@@ -143,12 +157,16 @@ impl std::fmt::Display for BreakGlassError {
 /// underlying map to an audit-chain-backed store (CIT-AGENT-5).
 pub struct BreakGlassRegistry {
     entries: Mutex<HashMap<String, BreakGlassEntry>>,
+    // RM-G.2 — authorized-signer roster (shared with the quorum path).
+    // When `None`, invoke/affirm fail closed in release builds.
+    signer_roster: Option<Arc<dyn SignerRoster>>,
 }
 
 impl Default for BreakGlassRegistry {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            signer_roster: None,
         }
     }
 }
@@ -158,16 +176,47 @@ impl BreakGlassRegistry {
         Self::default()
     }
 
+    /// Install the authorized-signer roster (RM-G.2). Production MUST set
+    /// this; without it a release build refuses all invoke/affirm.
+    pub fn with_signer_roster(mut self, roster: Arc<dyn SignerRoster>) -> Self {
+        self.signer_roster = Some(roster);
+        self
+    }
+
+    /// Verify a break-glass attestation over `action_id` and roster-authorize
+    /// the signer for `role`. Returns the verified `Signer` on success.
+    fn authorize(
+        &self,
+        action_id: &str,
+        attested: &AttestedSignature,
+    ) -> Result<Signer, BreakGlassError> {
+        verify_attestation(action_id.as_bytes(), attested)
+            .map_err(|e| BreakGlassError::AttestationInvalid(e.to_string()))?;
+        let dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-hitl");
+        if !signer_is_authorized(
+            self.signer_roster.as_deref(),
+            &attested.pubkey,
+            attested.signer.role,
+            dev_allowed,
+        ) {
+            return Err(BreakGlassError::SignerNotAuthorized);
+        }
+        Ok(attested.signer.clone())
+    }
+
     /// SecurityOfficer invokes break-glass on an action. Validates
     /// the ITAR / eligibility / role preconditions, then transitions
     /// Pending → Invoked and fills `notified` with all 5 approvers.
     pub fn invoke(
         &self,
         action_id: &str,
-        signer: Signer,
+        attested: AttestedSignature,
         manifest: &Manifest,
         now: Instant,
     ) -> Result<(), BreakGlassError> {
+        // RM-G.2: a caller-asserted role is not enough — require a verified
+        // attestation over the action_id from a roster-authorized key.
+        let signer = self.authorize(action_id, &attested)?;
         if signer.role != Role::SecurityOfficer {
             return Err(BreakGlassError::NotSecurityOfficer);
         }
@@ -200,9 +249,11 @@ impl BreakGlassRegistry {
     pub fn affirm(
         &self,
         action_id: &str,
-        signer: Signer,
+        attested: AttestedSignature,
         now: Instant,
     ) -> Result<(), BreakGlassError> {
+        // RM-G.2: verified attestation + roster authorization required.
+        let signer = self.authorize(action_id, &attested)?;
         if !matches!(signer.role, Role::Reviewer | Role::ComplianceOfficer) {
             return Err(BreakGlassError::NotAffirmationRole);
         }
@@ -302,7 +353,33 @@ mod tests {
         CapabilitySet, CapsuleMetadata, DataClassDecl, NetworkPolicy, OverlayDecl,
         ProcedureDecl, ProvenanceDecl, RiskDecl, RiskTier, SigningDecl, SigningTier,
     };
-    use crate::hitl::signing::{signer_id_from_pubkey, Ed25519FileSurface, SigningSurface};
+    use crate::hitl::signing::{
+        AttestedSignature, Ed25519FileSurface, SigningSurface, StaticSignerRoster,
+    };
+
+    /// RM-G.2 tripwire: with a roster configured, a break-glass invoke from a
+    /// self-minted SecurityOfficer key (valid signature, NOT enrolled) is
+    /// rejected; the enrolled key works. Pre-fix invoke trusted the
+    /// caller-asserted role with zero signature/roster check.
+    #[test]
+    fn rm_g2_breakglass_requires_rostered_signer() {
+        let good = attest("good-so", Role::SecurityOfficer, "act1");
+        let reg = BreakGlassRegistry::new().with_signer_roster(std::sync::Arc::new(
+            StaticSignerRoster::new().authorize(good.pubkey, Role::SecurityOfficer),
+        ));
+        let m = manifest(true, vec![], vec![], vec![]);
+
+        // Self-minted SO key, NOT on the roster → rejected even with a valid sig.
+        let evil = attest("evil-so", Role::SecurityOfficer, "act1");
+        let err = reg
+            .invoke("act1", evil, &m, Instant::now())
+            .expect_err("unauthorized SO must be rejected");
+        assert!(matches!(err, BreakGlassError::SignerNotAuthorized));
+
+        // Enrolled SO key → invoke succeeds.
+        reg.invoke("act1", good, &m, Instant::now())
+            .expect("rostered SO invokes");
+    }
 
     fn manifest(
         break_glass_eligible: bool,
@@ -349,16 +426,13 @@ mod tests {
         }
     }
 
-    fn signer(name: &str, role: Role) -> Signer {
+    fn attest(name: &str, role: Role, action_id: &str) -> AttestedSignature {
         let mut seed = [0u8; 32];
         let bytes = name.as_bytes();
         let n = bytes.len().min(32);
         seed[..n].copy_from_slice(&bytes[..n]);
         let s = Ed25519FileSurface::from_seed(seed, role);
-        Signer {
-            id: signer_id_from_pubkey(&s.pubkey()),
-            role,
-        }
+        s.sign(action_id.as_bytes()).expect("attest sign")
     }
 
     #[test]
@@ -368,7 +442,7 @@ mod tests {
         let err = reg
             .invoke(
                 "act1",
-                signer("alice", Role::Reviewer),
+                attest("alice", Role::Reviewer, "act1"),
                 &m,
                 Instant::now(),
             )
@@ -381,7 +455,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![DataClass::Itar], vec![], vec![]);
         let err = reg
-            .invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("ITAR reads block");
         assert_eq!(err, BreakGlassError::ItarBlocked);
     }
@@ -391,7 +465,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![DataClass::Itar], vec![]);
         let err = reg
-            .invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("ITAR writes block");
         assert_eq!(err, BreakGlassError::ItarBlocked);
     }
@@ -401,7 +475,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![DataClass::Itar]);
         let err = reg
-            .invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("ITAR emits block");
         assert_eq!(err, BreakGlassError::ItarBlocked);
     }
@@ -411,7 +485,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(false, vec![], vec![], vec![]);
         let err = reg
-            .invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("not eligible");
         assert_eq!(err, BreakGlassError::NotEligible);
     }
@@ -420,7 +494,7 @@ mod tests {
     fn invoke_happy_path_notifies_all_approvers() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![DataClass::Cui], vec![], vec![]);
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect("invoke succeeds");
         let entry = reg.get("act1").expect("entry exists");
         assert_eq!(entry.phase, BreakGlassPhase::Invoked);
@@ -440,10 +514,10 @@ mod tests {
     fn double_invoke_rejected() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect("first");
         let err = reg
-            .invoke("act1", signer("so", Role::SecurityOfficer), &m, Instant::now())
+            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("second");
         assert_eq!(err, BreakGlassError::AlreadyInvoked);
     }
@@ -453,12 +527,12 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, t0)
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
-        reg.affirm("act1", signer("rv", Role::Reviewer), t0)
+        reg.affirm("act1", attest("rv", Role::Reviewer, "act1"), t0)
             .expect("rv affirms");
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Invoked);
-        reg.affirm("act1", signer("co", Role::ComplianceOfficer), t0)
+        reg.affirm("act1", attest("co", Role::ComplianceOfficer, "act1"), t0)
             .expect("co affirms");
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Affirmed);
     }
@@ -467,7 +541,7 @@ mod tests {
     fn invoker_cannot_self_affirm() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
-        let so = signer("so", Role::SecurityOfficer);
+        let so = attest("so", Role::SecurityOfficer, "act1");
         reg.invoke("act1", so.clone(), &m, Instant::now())
             .expect("invoke");
         // SecurityOfficer isn't an affirmation role anyway, but
@@ -486,13 +560,13 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, t0)
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
-        reg.affirm("act1", signer("rv1", Role::Reviewer), t0)
+        reg.affirm("act1", attest("rv1", Role::Reviewer, "act1"), t0)
             .expect("first rv");
         // Same role again — DuplicateAffirmer.
         let err = reg
-            .affirm("act1", signer("rv2", Role::Reviewer), t0)
+            .affirm("act1", attest("rv2", Role::Reviewer, "act1"), t0)
             .expect_err("two reviewers blocked");
         assert_eq!(err, BreakGlassError::DuplicateAffirmer);
         // Phase still Invoked.
@@ -504,7 +578,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, t0)
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         // Tick at t0 + 71h — still Invoked.
         let t_pre = t0 + Duration::from_secs(71 * 3600);
@@ -521,11 +595,11 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, t0)
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         let t_late = t0 + Duration::from_secs(73 * 3600);
         let err = reg
-            .affirm("act1", signer("rv", Role::Reviewer), t_late)
+            .affirm("act1", attest("rv", Role::Reviewer, "act1"), t_late)
             .expect_err("late affirm rejected");
         assert_eq!(err, BreakGlassError::AffirmationWindowExpired);
     }
@@ -535,7 +609,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", signer("so", Role::SecurityOfficer), &m, t0)
+        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         reg.tick(t0 + Duration::from_secs(73 * 3600));
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Unaffirmed);
