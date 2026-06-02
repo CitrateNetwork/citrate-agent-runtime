@@ -31,8 +31,8 @@ pub use break_glass::{
 pub use quorum::Quorum;
 pub use roles::{can_approve, is_conflict};
 pub use signing::{
-    signer_id_from_pubkey, verify_attestation, AttestedSignature, Ed25519FileSurface,
-    SigningSurface,
+    signer_id_from_pubkey, signer_is_authorized, verify_attestation, AttestedSignature,
+    Ed25519FileSurface, SignerRoster, SigningSurface, StaticSignerRoster,
 };
 // Role is also re-exported here for ergonomics — same enum as
 // `capsule::manifest::Role`.
@@ -169,6 +169,11 @@ pub enum SignatureError {
     /// not verify under the claimed pubkey, signer.id doesn't match
     /// the pubkey fingerprint, or signature length is wrong.
     AttestationInvalid(String),
+    /// RM-G.1 — the signature verifies cryptographically but its pubkey is
+    /// NOT on the authorized-signer roster for the claimed role (or no
+    /// roster is configured in a production build). A self-minted key can
+    /// never satisfy a quorum.
+    SignerNotAuthorized,
 }
 
 impl std::fmt::Display for SignatureError {
@@ -192,6 +197,10 @@ impl std::fmt::Display for SignatureError {
             SignatureError::AttestationInvalid(m) => {
                 write!(f, "attestation invalid: {m}")
             }
+            SignatureError::SignerNotAuthorized => write!(
+                f,
+                "signer pubkey is not on the authorized-signer roster for the claimed role"
+            ),
         }
     }
 }
@@ -229,11 +238,24 @@ pub struct ApprovalQueue {
     // CIT-AGENT-4a — role-aware track. Keyed by call_id so the UI
     // can present per-action approval surfaces.
     role_pending: Mutex<HashMap<String, RoleAwareEntry>>,
+    // RM-G.1 — authorized-signer roster. When `Some`, a quorum signature
+    // counts only if its pubkey is enrolled for the claimed role. When
+    // `None`, `add_signature` fails closed in release builds (see
+    // `signer_is_authorized`).
+    signer_roster: Option<std::sync::Arc<dyn SignerRoster>>,
 }
 
 impl ApprovalQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the authorized-signer roster (RM-G.1). Production
+    /// deployments MUST set this; without it a release build refuses all
+    /// quorum signatures (fail closed).
+    pub fn with_signer_roster(mut self, roster: std::sync::Arc<dyn SignerRoster>) -> Self {
+        self.signer_roster = Some(roster);
+        self
     }
 
     /// Submit a tool call for approval. Returns `true` for
@@ -418,6 +440,19 @@ impl ApprovalQueue {
         };
         if let Err(e) = verify_attestation(&entry.payload, &attested) {
             return Err(SignatureError::AttestationInvalid(e.to_string()));
+        }
+        // RM-G.1: the signature verifies cryptographically, but a valid
+        // signature from a SELF-MINTED key proves nothing about authority.
+        // The pubkey MUST be on the authorized-signer roster for the role
+        // it claims; without a roster a release build fails closed.
+        let dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-hitl");
+        if !signer_is_authorized(
+            self.signer_roster.as_deref(),
+            &sig.pubkey,
+            sig.signer.role,
+            dev_allowed,
+        ) {
+            return Err(SignatureError::SignerNotAuthorized);
         }
         // SoD: proposer cannot also approve.
         if entry.proposer.id == sig.signer.id {

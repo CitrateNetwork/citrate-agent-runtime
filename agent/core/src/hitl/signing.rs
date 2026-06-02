@@ -175,6 +175,98 @@ impl SigningSurface for Ed25519FileSurface {
     }
 }
 
+// ── Authorized-signer roster (RM-G.1 / AGENT_RUNTIME HITL quorum) ──
+//
+// `verify_attestation` proves a signature verifies under the SUPPLIED
+// pubkey and that signer.id == fingerprint(pubkey). It does NOT prove the
+// pubkey belongs to an AUTHORIZED signer. Without that check, an attacker
+// mints a fresh keypair, labels its `Signer.role` with whatever role a
+// quorum requires, signs the payload, and is accepted — a full
+// human-in-the-loop consent bypass (the TLA+ SoD/quorum model assumes
+// "only authorized keys exist", which nothing enforced). This roster is
+// that enforcement: a quorum signature counts only if its pubkey is on the
+// roster FOR the role it claims.
+
+/// Registry of public keys authorized to sign under given roles. Backed in
+/// production by the operator's PIV/CAC / FIDO2 enrollment; `StaticSignerRoster`
+/// serves tests and the bundled deployment.
+pub trait SignerRoster: Send + Sync {
+    /// True iff `pubkey` is enrolled as an authorized signer for `role`.
+    fn is_authorized(&self, pubkey: &[u8; 32], role: Role) -> bool;
+}
+
+/// Static, compile-time / config-time roster: pubkey → the set of roles it
+/// may sign under.
+#[derive(Debug, Clone, Default)]
+pub struct StaticSignerRoster {
+    authorized: std::collections::HashMap<[u8; 32], std::collections::HashSet<Role>>,
+}
+
+impl StaticSignerRoster {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enroll `pubkey` as authorized for `role`.
+    pub fn authorize(mut self, pubkey: [u8; 32], role: Role) -> Self {
+        self.authorized.entry(pubkey).or_default().insert(role);
+        self
+    }
+}
+
+impl SignerRoster for StaticSignerRoster {
+    fn is_authorized(&self, pubkey: &[u8; 32], role: Role) -> bool {
+        self.authorized
+            .get(pubkey)
+            .is_some_and(|roles| roles.contains(&role))
+    }
+}
+
+/// Decide whether a quorum signer is authorized. With a roster configured,
+/// the pubkey MUST be enrolled for the claimed role. With NO roster, this
+/// FAILS CLOSED in production (`dev_allowed == false`) — a release build
+/// will not accept any quorum signature until a roster is wired — while
+/// `dev_allowed == true` (debug/test or an explicit dev feature) keeps
+/// local flows working.
+pub fn signer_is_authorized(
+    roster: Option<&dyn SignerRoster>,
+    pubkey: &[u8; 32],
+    role: Role,
+    dev_allowed: bool,
+) -> bool {
+    match roster {
+        Some(r) => r.is_authorized(pubkey, role),
+        None => dev_allowed,
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    /// RM-G.1 / HITL quorum CRITICAL tripwire: a cryptographically-valid
+    /// signature from a key that is NOT on the roster (a self-minted key —
+    /// the bypass) must be rejected, and a production build with no roster
+    /// must fail closed.
+    #[test]
+    fn roster_gates_self_minted_and_fails_closed() {
+        let authorized = [0xAAu8; 32];
+        let self_minted = [0xEEu8; 32]; // attacker's fresh key
+        let roster = StaticSignerRoster::new().authorize(authorized, Role::SecurityOfficer);
+
+        // Enrolled key, correct role → authorized.
+        assert!(signer_is_authorized(Some(&roster), &authorized, Role::SecurityOfficer, false));
+        // Enrolled key, WRONG role → rejected (role binding).
+        assert!(!signer_is_authorized(Some(&roster), &authorized, Role::Reviewer, false));
+        // Self-minted key (the consent-bypass) → rejected even with a valid sig.
+        assert!(!signer_is_authorized(Some(&roster), &self_minted, Role::SecurityOfficer, false));
+        // No roster + production (dev_allowed=false) → FAIL CLOSED.
+        assert!(!signer_is_authorized(None, &authorized, Role::SecurityOfficer, false));
+        // No roster + dev/test → permitted so local flows work.
+        assert!(signer_is_authorized(None, &authorized, Role::SecurityOfficer, true));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
