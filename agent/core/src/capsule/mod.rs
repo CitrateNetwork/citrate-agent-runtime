@@ -14,6 +14,7 @@
 //! 2,600 distinct states PASS).
 
 pub mod archive;
+pub mod bundled_key;
 pub mod dispatch;
 pub mod dispatcher;
 pub mod filesystem;

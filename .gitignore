@@ -5,5 +5,7 @@ release/
 .env
 .env.*
 !.env.example
+# CIT-AGENT-3e: capsule publisher signing seed (BUNDLED tier). Private key — never commit.
+.capsule-signing-key.env
 *.log
 .DS_Store

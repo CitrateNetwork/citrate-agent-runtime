@@ -16,7 +16,7 @@ use crate::capsule::dispatcher::{
 };
 use crate::capsule::manifest::Manifest;
 use crate::capsule::wasm::EngineFactory;
-use crate::capsule::{archive, Capsule};
+use crate::capsule::{archive, bundled_key, Capsule};
 use crate::error::AgentError;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -106,23 +106,15 @@ fn capsule_body_verified(manifest: &Manifest, wasm: &[u8]) -> bool {
     recomputed == manifest.capsule.content_hash
 }
 
-/// Operator opt-in to run capsules that failed integrity verification — intended
-/// ONLY for the pre-packer placeholder period. Default (unset) is fail-closed.
-fn allow_unverified_capsules() -> bool {
-    std::env::var("CITRATE_ALLOW_UNVERIFIED_CAPSULES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 /// Pre-loaded fleet of capsules sharing one engine + one set of
 /// production dispatchers + one approval gate. Build once at
 /// startup; call `call_raw(name, ...)` per tool invocation.
 pub struct CapsuleDispatch {
     engine: wasmtime::Engine,
     capsules: HashMap<String, Capsule>,
-    /// Names of loaded capsules that FAILED integrity verification at load
-    /// (placeholder or mismatched content_hash). `call_raw` refuses to
-    /// instantiate these unless `CITRATE_ALLOW_UNVERIFIED_CAPSULES` is set.
+    /// Names of loose-dir capsules that FAILED integrity verification at load
+    /// (placeholder or mismatched content_hash, and no signed `.cps`). `call_raw`
+    /// refuses to instantiate these — fail-closed, with no override (CIT-AGENT-3e).
     unverified: HashSet<String>,
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
@@ -152,6 +144,7 @@ impl CapsuleDispatch {
         let _epoch_ticker = EpochTicker::spawn(&engine);
         let mut capsules = HashMap::new();
         let mut unverified = HashSet::new();
+        let registry = bundled_key::registry();
         let entries = std::fs::read_dir(dir).map_err(|e| {
             AgentError::Capsule(format!("read capsule dir {dir:?}: {e}"))
         })?;
@@ -162,6 +155,26 @@ impl CapsuleDispatch {
             if !path.is_dir() {
                 continue;
             }
+            // CIT-AGENT-3e: prefer the signed `.cps` archive. It loads through the FULL
+            // verified path — content_hash + ed25519 publisher signature under the
+            // bundled-tier key + WIT/capability cross-check — with NO env override. A
+            // present-but-invalid archive is a hard error, never a silent downgrade to
+            // the loose-dir path (that would be an integrity-downgrade attack).
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let cps_path = path.join(format!("{dir_name}.cps"));
+            if cps_path.exists() {
+                let file = std::fs::File::open(&cps_path)
+                    .map_err(|e| AgentError::Capsule(format!("open {cps_path:?}: {e}")))?;
+                let capsule = Capsule::from_archive_verified(file, &registry)?;
+                capsules.insert(capsule.manifest.capsule.name.clone(), capsule);
+                continue;
+            }
+            // Loose-dir fallback (development only): manifest + wasm, no signature.
+            // Integrity is still checked; a capsule that fails is recorded `unverified`
+            // and `call_raw` refuses it fail-closed — there is no escape hatch.
             let manifest_path = path.join("manifest.toml");
             let wasm_path = path.join("capsule.wasm");
             if !manifest_path.exists() || !wasm_path.exists() {
@@ -172,9 +185,6 @@ impl CapsuleDispatch {
             let manifest = Manifest::parse(&manifest_str)?;
             let wasm = std::fs::read(&wasm_path)
                 .map_err(|e| AgentError::Capsule(format!("read wasm: {e}")))?;
-            // RM-A WP-AGENT_RUNTIME-001: record integrity status at load.
-            // Enforcement is deferred to `call_raw` so the doctor/inspection
-            // paths can still enumerate the fleet without executing it.
             if !capsule_body_verified(&manifest, &wasm) {
                 unverified.insert(manifest.capsule.name.clone());
             }
@@ -227,29 +237,17 @@ impl CapsuleDispatch {
             AgentError::Capsule(format!("capsule {capsule_name:?} not loaded"))
         })?;
 
-        // RM-A WP-AGENT_RUNTIME-2026-05-31-001 (CRITICAL): fail-closed integrity
-        // gate. Refuse to instantiate a capsule whose executable wasm is not
-        // bound to a valid manifest `content_hash` (no integrity proof). Until
-        // the CIT-AGENT-3e packer embeds real hashes + signatures (today every
-        // capsule carries the all-zero placeholder), running an unverified
-        // capsule requires an explicit, loudly-logged operator opt-in — never
-        // the silent default that this path used to be.
+        // CIT-AGENT-3e (closes RM-A WP-AGENT_RUNTIME-2026-05-31-001): fail-closed
+        // integrity gate with NO escape hatch. A loose-dir capsule that is not bound to
+        // a valid manifest content_hash is refused outright. The shipped fleet now loads
+        // through the verified `.cps` path (signed content_hash), so the interim
+        // CITRATE_ALLOW_UNVERIFIED_CAPSULES opt-in has been REMOVED.
         if self.unverified.contains(capsule_name) {
-            if allow_unverified_capsules() {
-                tracing::warn!(
-                    capsule = capsule_name,
-                    "INSTANTIATING UNVERIFIED CAPSULE: wasm is not bound to a valid manifest \
-                     content_hash. Permitted only because CITRATE_ALLOW_UNVERIFIED_CAPSULES is \
-                     set — this MUST NOT be set in production once capsules are packed/signed."
-                );
-            } else {
-                return Err(AgentError::Capsule(format!(
-                    "refusing to instantiate unverified capsule {capsule_name:?}: its wasm is not \
-                     bound to a valid manifest content_hash (no integrity proof). Pack and sign \
-                     the capsule (CIT-AGENT-3e), or set CITRATE_ALLOW_UNVERIFIED_CAPSULES=1 for \
-                     development only."
-                )));
-            }
+            return Err(AgentError::Capsule(format!(
+                "refusing to instantiate unverified capsule {capsule_name:?}: it is not bound to a \
+                 valid manifest content_hash + publisher signature. Pack and sign it with \
+                 cit-capsule-pack (CIT-AGENT-3e)."
+            )));
         }
 
         let linker = capsule.prepare_linker(&self.engine)?.into_linker();
@@ -535,7 +533,9 @@ tier = "bundled"
     }
 
     #[test]
-    fn tripwire_unverified_capsule_refused_by_default() {
+    fn shipped_fleet_loads_verified_no_override() {
+        // CIT-AGENT-3e: the in-tree fleet is now packed + signed (.cps), so it loads
+        // through the verified path with an EMPTY unverified set and no env override.
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let capsules_root = manifest_dir
             .parent()
@@ -543,27 +543,58 @@ tier = "bundled"
             .expect("walk up to repo root")
             .join("capsules");
         let dispatch = CapsuleDispatch::load_from_dir(&capsules_root, None, None, None)
-            .expect("loads cleanly");
-        // The shipped fleet carries placeholder hashes → all flagged unverified.
+            .expect("signed fleet loads cleanly");
         assert!(
-            !dispatch.unverified.is_empty(),
-            "placeholder-hashed capsules must be flagged unverified"
+            dispatch.unverified.is_empty(),
+            "the signed .cps fleet must load fully verified; unverified: {:?}",
+            dispatch.unverified
         );
-        // With the override unset (normal/CI default), call_raw refuses to
-        // instantiate an unverified capsule BEFORE touching the linker.
-        if !allow_unverified_capsules() {
-            let name = dispatch
-                .capsule_names()
-                .into_iter()
-                .next()
-                .expect("fleet is non-empty");
-            let err = dispatch
-                .call_raw(&name, "iface", "func", &[])
-                .expect_err("unverified capsule must be refused by default");
-            assert!(
-                err.to_string().to_lowercase().contains("unverified"),
-                "refusal must cite the missing integrity proof, got: {err}"
-            );
-        }
+        assert!(dispatch.has("hello"), "fleet loaded via the verified .cps path");
+    }
+
+    #[test]
+    fn unverified_loose_dir_capsule_refused_fail_closed() {
+        // A loose-dir capsule with a placeholder hash and NO signed .cps is refused
+        // with no escape hatch (the CITRATE_ALLOW_UNVERIFIED_CAPSULES opt-in is gone).
+        let root = std::env::temp_dir().join(format!("cit-cap-unverified-{}", std::process::id()));
+        let cap = root.join("placeholdercap");
+        std::fs::create_dir_all(&cap).expect("mkdir");
+        let manifest = format!(
+            r#"[capsule]
+name = "placeholdercap"
+version = "0.1.0"
+content_hash = "{PLACEHOLDER_HASH}"
+[capability]
+network = "none"
+subagent_spawn = false
+[data_class]
+[risk]
+tier = "low"
+break_glass_eligible = false
+[overlay]
+[provenance]
+publisher = "did:citrate:test"
+build_reproducible = true
+agentile_sprint = "cit-agent-3e"
+[signing]
+tier = "bundled"
+"#
+        );
+        std::fs::write(cap.join("manifest.toml"), manifest).expect("write manifest");
+        std::fs::write(cap.join("capsule.wasm"), b"\x00asm\x01\x00\x00\x00").expect("write wasm");
+
+        let dispatch = CapsuleDispatch::load_from_dir(&root, None, None, None).expect("loads");
+        assert!(
+            dispatch.unverified.contains("placeholdercap"),
+            "placeholder loose-dir capsule must be flagged unverified"
+        );
+        let err = dispatch
+            .call_raw("placeholdercap", "iface", "func", &[])
+            .expect_err("unverified capsule must be refused, fail-closed");
+        assert!(
+            err.to_string().to_lowercase().contains("unverified"),
+            "refusal must cite the missing integrity proof, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
