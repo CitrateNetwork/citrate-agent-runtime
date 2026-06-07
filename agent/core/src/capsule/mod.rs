@@ -14,11 +14,13 @@
 //! 2,600 distinct states PASS).
 
 pub mod archive;
+pub mod bundled_key;
 pub mod dispatch;
 pub mod dispatcher;
 pub mod filesystem;
 pub mod linker;
 pub mod manifest;
+pub mod pack;
 pub mod prod_impls;
 pub mod tiers;
 pub mod verify;
