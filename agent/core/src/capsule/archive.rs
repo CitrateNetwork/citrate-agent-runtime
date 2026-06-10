@@ -56,10 +56,25 @@ pub struct ArchiveContents {
 /// top-level files) but does NOT verify signatures or the
 /// content_hash against the manifest — those steps live in
 /// `Capsule::from_archive` and `CIT-AGENT-3b::verify` respectively.
+/// FUA-AGENT-RUNTIME-01: a `.cps` is read (and decompressed) BEFORE any
+/// hash/signature check, so an unbounded read is a pre-auth OOM bomb (a tiny
+/// zstd payload can expand to gigabytes). The total DECOMPRESSED bytes are
+/// capped; tar hits EOF past the cap and the archive fails closed (and would
+/// fail the downstream hash check anyway). 256 MiB is far above any real capsule.
+pub const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
 pub fn read_archive(reader: impl Read) -> Result<ArchiveContents, AgentError> {
+    read_archive_capped(reader, MAX_DECOMPRESSED_BYTES)
+}
+
+/// Like [`read_archive`] but with an explicit decompression cap (for tests).
+pub fn read_archive_capped(
+    reader: impl Read,
+    max_decompressed: u64,
+) -> Result<ArchiveContents, AgentError> {
     let decoder = zstd::Decoder::new(reader)
         .map_err(|e| AgentError::Capsule(format!("zstd init: {e}")))?;
-    let mut archive = tar::Archive::new(decoder);
+    let mut archive = tar::Archive::new(decoder.take(max_decompressed));
     let mut out = ArchiveContents::default();
 
     for entry in archive
@@ -222,6 +237,20 @@ mod tests {
         let archive = read_archive(&cps[..]).expect("minimal archive reads");
         assert!(!archive.manifest.is_empty());
         assert_eq!(archive.signatures.get("publisher.sig").map(|v| v.as_slice()), Some(&b"stub-sig"[..]));
+    }
+
+    #[test]
+    fn read_archive_caps_decompression_bomb() {
+        // FUA-AGENT-RUNTIME-01: an archive that decompresses past the cap fails
+        // closed instead of reading unboundedly into memory. (A real bomb is a
+        // tiny zstd payload that expands to GBs; here a small over-cap fixture +
+        // a tiny test cap exercises the same guard cheaply.)
+        let big_manifest = format!("[capsule]\nname = \"x\"\n# {}\n", "A".repeat(64 * 1024));
+        let cps = build_minimal_cps(&big_manifest);
+        // Under a tiny cap, the read fails (tar hits EOF past the cap).
+        assert!(read_archive_capped(&cps[..], 1024).is_err());
+        // Under the real cap it reads fine.
+        assert!(read_archive(&cps[..]).is_ok());
     }
 
     #[test]
