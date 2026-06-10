@@ -1,4 +1,32 @@
-//! ShellExec tool — execute a allowlisted binary in the workspace directory.
+//! ShellExec tool — execute an allowlisted binary in the workspace directory.
+//!
+//! ## SECREM-01 SVC-3: the allowlist is a SPEED BUMP, not a security boundary
+//!
+//! Several allowlisted binaries execute arbitrary code BY DESIGN:
+//! `cargo` (build.rs / proc macros), `make` (recipes), `npm`/`npx`/
+//! `pnpm` (lifecycle scripts), `node`, `python`/`python3`, `pip`,
+//! `git` (hooks, `core.fsmonitor`), and `forge` (ffi / solc plugins).
+//! Combined with the `file_write` tool, an agent that can run any of
+//! these can stage and execute arbitrary code in the workspace. The
+//! allowlist therefore only filters out *obviously* hostile direct
+//! invocations (`sudo`, `nc`, `dd`, ...) and the metachar reject only
+//! rules out shell chaining — neither is the enforced control.
+//!
+//! The ENFORCED control is human-in-the-loop re-authorization:
+//! `ShellExec::risk_level()` is `RiskLevel::Critical`, and every tool
+//! call is gated by `ApprovalFlow::check` in
+//! `agent-legacy/src/approval.rs` (invoked from
+//! `CodeAgentBridge::execute_tool` in `agent-code/src/bridge.rs`,
+//! mandatory in all live paths per S-03/H-01). For Critical risk that
+//! means: explicit per-call user approval PLUS password
+//! re-authentication (`ApprovalHandler::request_reauth`) on EVERY
+//! call — session grants and auto-approve never bypass it.
+//!
+//! As part of SVC-3 we also tightened the one allowlisted binary whose
+//! danger was *not* by-design-obvious: `find` is kept for read-only
+//! use, but its exec/write primitives (`-exec`, `-execdir`, `-ok`,
+//! `-okdir`, `-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`)
+//! are rejected — see `FORBIDDEN_FIND_FLAGS`.
 //!
 //! RM-B1 / WP-E4.4 (audit AGT-04): allowlist replaces the previous
 //! denylist. Pre-fix `DENIED_COMMANDS` checked for ~10 substrings;
@@ -54,6 +82,19 @@ pub const ALLOWED_BINARIES: &[&str] = &[
 /// the audit found.
 const FORBIDDEN_METACHARS: &[char] = &[
     '|', ';', '&', '>', '<', '`', '$', '(', ')', '\n', '\r',
+];
+
+/// SECREM-01 SVC-3: `find` flags that execute arbitrary binaries
+/// (`-exec`/`-execdir`/`-ok`/`-okdir`) or write to the filesystem
+/// (`-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`). `find`
+/// stays allowlisted for read-only traversal; any of these flags
+/// rejects the whole command. Matching is exact-token: find's CLI
+/// grammar requires each primary as its own argv token (no
+/// `--exec=`/combined forms), and whitespace tokenization plus the
+/// metachar reject above means no token can smuggle one in.
+const FORBIDDEN_FIND_FLAGS: &[&str] = &[
+    "-exec", "-execdir", "-ok", "-okdir",
+    "-delete", "-fprint", "-fprint0", "-fprintf", "-fls",
 ];
 
 /// PATH the spawned process sees. Constrained to system binary
@@ -122,6 +163,21 @@ pub fn parse_and_validate_command(
                 "absolute binary path '{}' is outside the safe PATH directories ({})",
                 binary_raw, SAFE_PATH
             ));
+        }
+    }
+
+    // SECREM-01 SVC-3: per-binary argument validation. `find` is
+    // allowlisted for read-only traversal only; its exec/write
+    // primitives turn it into an arbitrary-code-execution vector
+    // for non-allowlisted binaries.
+    if basename == "find" {
+        for arg in &args {
+            if FORBIDDEN_FIND_FLAGS.contains(&arg.as_str()) {
+                return Err(format!(
+                    "find flag '{}' is not permitted; find is allowlisted for read-only use only (SECREM-01 SVC-3)",
+                    arg
+                ));
+            }
         }
     }
 
