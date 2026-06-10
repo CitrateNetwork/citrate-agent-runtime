@@ -373,11 +373,16 @@ tier = "bundled"
 "#
             )
         };
-        // Compute the body hash once (excludes manifest.toml).
-        let body_hash = archive::compute_content_hash(&archive_contents);
-        let manifest_with_hash = make_manifest(&body_hash);
+        // Compute the hash over the FULL archive (body + manifest). The
+        // manifest's own content_hash field is zeroed by compute_content_hash
+        // (prior-003), so the declared value doesn't affect the result — compute
+        // once with a placeholder manifest, then embed the real hash.
         let mut working = archive_contents.clone();
-        working.manifest = manifest_with_hash.as_bytes().to_vec();
+        working.manifest =
+            make_manifest("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                .into_bytes();
+        let body_hash = archive::compute_content_hash(&working);
+        working.manifest = make_manifest(&body_hash).into_bytes();
         working
             .signatures
             .insert("publisher.sig".to_string(), b"stub-sig".to_vec());
@@ -3169,18 +3174,19 @@ tier = "bundled"
 "#
             )
         };
-        // 3b semantic: content_hash is over everything EXCEPT
-        // manifest.toml (and SIGNATURES/). The manifest declares the
-        // hash; the publisher signs the manifest; the signature
-        // transitively binds content_hash. No fixed-point dance.
-        let unsigned_archive = archive::ArchiveContents {
-            manifest: vec![], // placeholder; not included in hash
+        // prior-003 semantic: content_hash binds the body AND the manifest (with
+        // the manifest's own content_hash field zeroed). So it's a stable fixed
+        // point — compute once over a placeholder-hash manifest, then embed.
+        let placeholder =
+            manifest_template("sha256:0000000000000000000000000000000000000000000000000000000000000000");
+        let working = archive::ArchiveContents {
+            manifest: placeholder.as_bytes().to_vec(),
             wit: wit.clone(),
             wasm: wasm.clone(),
             procedure: procedure.clone(),
             ..Default::default()
         };
-        let truth_hash = archive::compute_content_hash(&unsigned_archive);
+        let truth_hash = archive::compute_content_hash(&working);
         let manifest_body = manifest_template(&truth_hash);
         let final_archive = archive::ArchiveContents {
             manifest: manifest_body.as_bytes().to_vec(),
@@ -3189,8 +3195,8 @@ tier = "bundled"
             procedure: procedure.clone(),
             ..Default::default()
         };
-        // The hash is over the non-manifest body, so re-hashing with
-        // the manifest present yields the same value.
+        // Embedding the real hash does not change the computed hash (the
+        // manifest's content_hash field is zeroed in the hash construction).
         assert_eq!(archive::compute_content_hash(&final_archive), truth_hash);
 
         // Sign the truth_hash with a known key.

@@ -19,23 +19,14 @@ baseline_test_count: 225
 |---|---|---|---|---|---|---|
 | FUA-AGENT-RUNTIME-01 | Med | `capsule::archive::tests::read_archive_caps_decompression_bomb` | `read_archive` caps total DECOMPRESSED bytes (`MAX_DECOMPRESSED_BYTES` = 256 MiB) via `decoder.take(..)` before any hash/sig check — a `.cps` bomb fails closed instead of OOM. Injectable cap (`read_archive_capped`) for the test — `agent/core/src/capsule/archive.rs` | 226 ✓ | killed (remove cap → bomb test FAIL) | **FIXED** |
 
-## Remaining WP 3.4 — the capsule-load CRITICAL re-open (DEFERRED, breaking change)
+## WP 3.4 — capsule-load CRITICAL re-open (DONE)
 
-These three are a **coordinated breaking capsule-format change** and were
-deliberately NOT attempted at the tail of a long session — rushing them risks
-bricking the loader / leaving fixtures inconsistent. Scoped for a fresh pass,
-in this order (per the sprint's "version + re-sign → enforce" rule):
-
-1. **prior -003 (HIGH)** — fold `manifest.toml` into the signed `content_hash`
-   (`pack.rs` / `tiers.rs` hash domain). Today a validly-signed capsule's
-   capabilities / risk-tier / required-roles can be swapped post-signature.
-2. **(b)** re-sign all test fixtures + **bump the capsule format version**.
-3. **prior -001 (CRITICAL)** — close the loose-directory WASM fallback
-   (`dispatch.rs:175-198`): require a publisher signature on *every* load path,
-   not just the `.cps` archive path; delete the `content_hash`-only gate (the
-   hash is attacker-computable).
-4. **FUA-AGENT-RUNTIME-02 (Low)** — stop `cit-capsule-pack` minting + persisting
-   a signing key to a working-tree dotfile (overlaps KEYSAFE).
+| Finding | Sev | Red test(s) | Fix | Mutation | Disposition |
+|---|---|---|---|---|---|
+| prior-003 | High | `archive::tests::content_hash_binds_manifest_fields` + both round-trip tests | `compute_content_hash` now binds `manifest.toml` (its self-referential `content_hash` field zeroed) under a **v2 domain tag**; `pack.rs` hashes the manifest too. A signed capsule's capabilities/risk-tier/roles can no longer be swapped post-signature — `archive.rs`, `pack.rs` | killed (drop manifest from hash → test FAIL) | **FIXED** |
+| re-sign + version bump | — | `shipped_fleet_loads_verified_no_override`, `load_full_fleet` | v2 domain tag fails pre-v2 (body-only) hashes closed; the 10-capsule in-tree fleet re-packed with `cit-capsule-pack` (PUBKEY unchanged = `4a4a0c85…` = `BUNDLED_PUBLISHER_KEY`) | — | **FIXED** |
+| prior-001 | **Crit** | `dispatch::tests::loose_dir_with_matching_hash_is_still_unverified` | The loose-dir fallback no longer runs unsigned WASM: a loose dir (no publisher signature) is **always** `unverified` and `call_raw` refuses it — even when its self-computed `content_hash` matches. Removed the attacker-controllable `capsule_body_verified`/`is_placeholder_content_hash` helpers — `dispatch.rs` | killed by the new test (old code → "verified") | **FIXED** |
+| FUA-AGENT-RUNTIME-02 | Low | (behavior change) | `cit-capsule-pack` no longer mints a signing key into the working tree — it requires `CITRATE_CAPSULE_SIGNING_SEED` (env or pre-existing gitignored file) and exits with instructions otherwise — `bin/cit-capsule-pack.rs` | — | **FIXED** |
 
 ## Notes
 - Baseline (Phase 0): **225** → **226** (+1 bomb test, mutation-proven).

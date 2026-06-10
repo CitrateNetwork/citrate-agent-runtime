@@ -82,29 +82,12 @@ impl Drop for EpochTicker {
     }
 }
 
-/// All-zero placeholder `content_hash` means the capsule was never run through
-/// the CIT-AGENT-3e packer (which computes + embeds the real hash and signs the
-/// manifest). Such a capsule carries no integrity proof and cannot be verified.
-fn is_placeholder_content_hash(h: &str) -> bool {
-    h.strip_prefix("sha256:")
-        .map(|hex| !hex.is_empty() && hex.bytes().all(|b| b == b'0'))
-        .unwrap_or(false)
-}
-
-/// A loose-dir capsule is integrity-verified iff its manifest declares a real
-/// (non-placeholder) `content_hash` AND that hash matches the hash recomputed
-/// over the loaded executable body. This binds the wasm that actually runs to
-/// the signed manifest the harness makes policy decisions from.
-fn capsule_body_verified(manifest: &Manifest, wasm: &[u8]) -> bool {
-    if is_placeholder_content_hash(&manifest.capsule.content_hash) {
-        return false;
-    }
-    let recomputed = archive::compute_content_hash(&archive::ArchiveContents {
-        wasm: wasm.to_vec(),
-        ..Default::default()
-    });
-    recomputed == manifest.capsule.content_hash
-}
+// prior-001 (SECREM-02): the former `capsule_body_verified` / `is_placeholder_
+// content_hash` helpers were REMOVED. They recomputed a content_hash over a body
+// whose inputs (wasm + the declared hash) are fully controlled by whoever wrote
+// the loose dir, so they could never authorize execution — keeping them invited
+// the integrity-downgrade reading the audit flagged. Loose-dir capsules are now
+// unconditionally `unverified` and only the signed `.cps` path can run.
 
 /// Pre-loaded fleet of capsules sharing one engine + one set of
 /// production dispatchers + one approval gate. Build once at
@@ -172,9 +155,14 @@ impl CapsuleDispatch {
                 capsules.insert(capsule.manifest.capsule.name.clone(), capsule);
                 continue;
             }
-            // Loose-dir fallback (development only): manifest + wasm, no signature.
-            // Integrity is still checked; a capsule that fails is recorded `unverified`
-            // and `call_raw` refuses it fail-closed — there is no escape hatch.
+            // Loose-dir fallback (development only): manifest + wasm, NO signature.
+            // prior-001 (CRITICAL, SECREM-02): a loose dir carries no publisher
+            // signature, and the `content_hash` it declares is computed by — and
+            // fully under the control of — whoever wrote the dir, so it can NEVER
+            // authorize execution. Load the capsule for listing/introspection but
+            // ALWAYS mark it unverified; `call_raw` refuses to instantiate an
+            // unverified capsule, with no override. Only the signed `.cps` path
+            // (above) produces a runnable capsule.
             let manifest_path = path.join("manifest.toml");
             let wasm_path = path.join("capsule.wasm");
             if !manifest_path.exists() || !wasm_path.exists() {
@@ -185,9 +173,7 @@ impl CapsuleDispatch {
             let manifest = Manifest::parse(&manifest_str)?;
             let wasm = std::fs::read(&wasm_path)
                 .map_err(|e| AgentError::Capsule(format!("read wasm: {e}")))?;
-            if !capsule_body_verified(&manifest, &wasm) {
-                unverified.insert(manifest.capsule.name.clone());
-            }
+            unverified.insert(manifest.capsule.name.clone());
             let capsule = Capsule {
                 manifest: manifest.clone(),
                 archive: archive::ArchiveContents {
@@ -481,13 +467,28 @@ mod tests {
     const PLACEHOLDER_HASH: &str =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-    fn manifest_with_hash(content_hash: &str) -> Manifest {
-        let toml = format!(
-            r#"
-[capsule]
-name = "tripwire-cap"
+
+    #[test]
+    fn loose_dir_with_matching_hash_is_still_unverified() {
+        // prior-001 (CRITICAL, SECREM-02): the old loose-dir path treated a
+        // capsule whose declared content_hash matched its own (writer-supplied)
+        // wasm as "verified" — i.e. it RAN UNSIGNED WASM. A loose dir carries no
+        // publisher signature, so it must NEVER run, even with a self-consistent
+        // hash. It is loaded (for listing) but always unverified + refused.
+        let root = std::env::temp_dir().join(format!("cit-cap-matchhash-{}", std::process::id()));
+        let cap = root.join("matchcap");
+        std::fs::create_dir_all(&cap).expect("mkdir");
+        let wasm = b"\x00asm\x01\x00\x00\x00".to_vec();
+        // The attacker computes a content_hash that matches their own body.
+        let real = archive::compute_content_hash(&archive::ArchiveContents {
+            wasm: wasm.clone(),
+            ..Default::default()
+        });
+        let manifest = format!(
+            r#"[capsule]
+name = "matchcap"
 version = "0.1.0"
-content_hash = "{content_hash}"
+content_hash = "{real}"
 [capability]
 network = "none"
 subagent_spawn = false
@@ -499,37 +500,24 @@ break_glass_eligible = false
 [provenance]
 publisher = "did:citrate:test"
 build_reproducible = true
-agentile_sprint = "rm-a-tripwire"
+agentile_sprint = "cit-agent-3e"
 [signing]
 tier = "bundled"
 "#
         );
-        Manifest::parse(&toml).expect("tripwire manifest parses")
-    }
+        std::fs::write(cap.join("manifest.toml"), manifest).expect("write manifest");
+        std::fs::write(cap.join("capsule.wasm"), &wasm).expect("write wasm");
 
-    #[test]
-    fn tripwire_placeholder_content_hash_is_unverified() {
-        assert!(is_placeholder_content_hash(PLACEHOLDER_HASH));
-        assert!(!is_placeholder_content_hash(
-            "sha256:deadbeef00000000000000000000000000000000000000000000000000000000"
-        ));
-        // A capsule shipped with the placeholder hash carries no integrity proof.
-        let m = manifest_with_hash(PLACEHOLDER_HASH);
-        assert!(!capsule_body_verified(&m, b"\x00asm\x01\x00\x00\x00"));
-    }
-
-    #[test]
-    fn tripwire_matching_content_hash_is_verified_and_tamper_is_not() {
-        let wasm = b"\x00asm\x01\x00\x00\x00".to_vec();
-        let real = archive::compute_content_hash(&archive::ArchiveContents {
-            wasm: wasm.clone(),
-            ..Default::default()
-        });
-        let m = manifest_with_hash(&real);
-        // Honest wasm bound to the declared hash → verified.
-        assert!(capsule_body_verified(&m, &wasm));
-        // Tampered wasm under the same manifest → not verified.
-        assert!(!capsule_body_verified(&m, b"\x00asm\x01\x00\x00\xff"));
+        let dispatch = CapsuleDispatch::load_from_dir(&root, None, None, None).expect("loads");
+        assert!(
+            dispatch.unverified.contains("matchcap"),
+            "a loose dir with a matching hash must STILL be unverified (no signature)"
+        );
+        assert!(
+            dispatch.call_raw("matchcap", "iface", "func", &[]).is_err(),
+            "an unverified loose-dir capsule must be refused fail-closed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

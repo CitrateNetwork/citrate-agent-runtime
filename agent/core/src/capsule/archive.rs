@@ -163,10 +163,44 @@ fn validate_structure(a: &ArchiveContents) -> Result<(), AgentError> {
 ///
 /// Returned as `"sha256:<64-char-lowercase-hex>"` to match the
 /// manifest's `content_hash` field format.
+/// Domain tag for the content-hash construction. **v2** (CIT-AGENT-3b / SECREM-02
+/// prior-003): the hash now binds `manifest.toml` (with its self-referential
+/// `content_hash` field zeroed), so a validly-signed capsule's capabilities /
+/// risk tier / required_roles can no longer be swapped post-signature. The tag
+/// makes the construction explicit and fails pre-v2 (body-only) hashes closed —
+/// those capsules must be re-packed.
+const CONTENT_HASH_DOMAIN: &[u8] = b"CIT-AGENT-CAPSULE-CONTENT-HASH-v2";
+
+/// Normalize a manifest for inclusion in the content hash: the self-referential
+/// `content_hash` field is set to empty so the hash binds every OTHER field
+/// without circularity. Line-based, matching the packer's
+/// `set_manifest_content_hash`, so pack and verify produce identical bytes.
+fn normalize_manifest_for_hash(manifest: &[u8]) -> Vec<u8> {
+    let toml = String::from_utf8_lossy(manifest);
+    let mut out = String::with_capacity(toml.len());
+    let mut replaced = false;
+    for line in toml.lines() {
+        let trimmed = line.trim_start();
+        if !replaced && trimmed.starts_with("content_hash") && trimmed.contains('=') {
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(indent);
+            out.push_str("content_hash = \"\"");
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
 pub fn compute_content_hash(a: &ArchiveContents) -> String {
-    // BTreeMap iteration is sorted; we collect all non-SIGNATURES
-    // and non-manifest entries with their canonical paths.
+    // prior-003: bind the manifest (normalized) so its security-relevant fields
+    // are covered by the signature, alongside the body files.
+    let norm_manifest = normalize_manifest_for_hash(&a.manifest);
     let mut entries: Vec<(&str, &[u8])> = Vec::new();
+    entries.push(("manifest.toml", &norm_manifest));
     entries.push(("capsule.wit", &a.wit));
     entries.push(("capsule.wasm", &a.wasm));
     entries.push(("procedure.md", &a.procedure));
@@ -181,6 +215,7 @@ pub fn compute_content_hash(a: &ArchiveContents) -> String {
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut bundle = Sha256::new();
+    bundle.update(CONTENT_HASH_DOMAIN);
     for (path, bytes) in entries {
         let mut entry_hash = Sha256::new();
         entry_hash.update(bytes);
@@ -237,6 +272,29 @@ mod tests {
         let archive = read_archive(&cps[..]).expect("minimal archive reads");
         assert!(!archive.manifest.is_empty());
         assert_eq!(archive.signatures.get("publisher.sig").map(|v| v.as_slice()), Some(&b"stub-sig"[..]));
+    }
+
+    #[test]
+    fn content_hash_binds_manifest_fields() {
+        // prior-003 (SECREM-02): the content hash must cover the manifest's
+        // security-relevant fields, so a post-signature swap is rejected by the
+        // content_hash check — while the self-referential content_hash field
+        // itself must NOT affect the hash (no circularity).
+        let body = |manifest: &str| ArchiveContents {
+            manifest: manifest.as_bytes().to_vec(),
+            wit: b"w".to_vec(),
+            wasm: b"a".to_vec(),
+            procedure: b"p".to_vec(),
+            ..Default::default()
+        };
+        // Changing the risk tier changes the hash (the field is now bound).
+        let low = "[capsule]\ncontent_hash = \"\"\n\n[risk]\ntier = \"low\"\n";
+        let high = "[capsule]\ncontent_hash = \"\"\n\n[risk]\ntier = \"high\"\n";
+        assert_ne!(compute_content_hash(&body(low)), compute_content_hash(&body(high)));
+        // The content_hash field value itself is normalized out (stable hash).
+        let a = "[capsule]\ncontent_hash = \"sha256:aaa\"\n\n[risk]\ntier = \"low\"\n";
+        let b = "[capsule]\ncontent_hash = \"sha256:bbb\"\n\n[risk]\ntier = \"low\"\n";
+        assert_eq!(compute_content_hash(&body(a)), compute_content_hash(&body(b)));
     }
 
     #[test]

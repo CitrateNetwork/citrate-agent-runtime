@@ -61,11 +61,12 @@ pub struct CapsuleSource {
 /// 4. Write a reproducible Zstd-compressed tar (entry order sorted,
 ///    mtimes pinned to epoch 0, mode 0644).
 pub fn pack(source: &CapsuleSource, signing_key: &SigningKey) -> Result<Vec<u8>, AgentError> {
-    // 1. content_hash over the body. The manifest field is excluded from
-    //    the hash by compute_content_hash, so an empty manifest here is
-    //    correct — the hash binds the body, the signature binds the hash.
+    // 1. content_hash over the body + the manifest (prior-003). The manifest's
+    //    self-referential content_hash field is zeroed by compute_content_hash,
+    //    so passing the placeholder source manifest here yields the SAME hash the
+    //    verifier recomputes from the packed (real-hash) manifest.
     let body = ArchiveContents {
-        manifest: Vec::new(),
+        manifest: source.manifest_toml.clone().into_bytes(),
         wit: source.wit.clone(),
         wasm: source.wasm.clone(),
         procedure: source.procedure.clone(),
