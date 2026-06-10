@@ -56,10 +56,25 @@ pub struct ArchiveContents {
 /// top-level files) but does NOT verify signatures or the
 /// content_hash against the manifest — those steps live in
 /// `Capsule::from_archive` and `CIT-AGENT-3b::verify` respectively.
+/// FUA-AGENT-RUNTIME-01: a `.cps` is read (and decompressed) BEFORE any
+/// hash/signature check, so an unbounded read is a pre-auth OOM bomb (a tiny
+/// zstd payload can expand to gigabytes). The total DECOMPRESSED bytes are
+/// capped; tar hits EOF past the cap and the archive fails closed (and would
+/// fail the downstream hash check anyway). 256 MiB is far above any real capsule.
+pub const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
 pub fn read_archive(reader: impl Read) -> Result<ArchiveContents, AgentError> {
+    read_archive_capped(reader, MAX_DECOMPRESSED_BYTES)
+}
+
+/// Like [`read_archive`] but with an explicit decompression cap (for tests).
+pub fn read_archive_capped(
+    reader: impl Read,
+    max_decompressed: u64,
+) -> Result<ArchiveContents, AgentError> {
     let decoder = zstd::Decoder::new(reader)
         .map_err(|e| AgentError::Capsule(format!("zstd init: {e}")))?;
-    let mut archive = tar::Archive::new(decoder);
+    let mut archive = tar::Archive::new(decoder.take(max_decompressed));
     let mut out = ArchiveContents::default();
 
     for entry in archive
@@ -148,10 +163,44 @@ fn validate_structure(a: &ArchiveContents) -> Result<(), AgentError> {
 ///
 /// Returned as `"sha256:<64-char-lowercase-hex>"` to match the
 /// manifest's `content_hash` field format.
+/// Domain tag for the content-hash construction. **v2** (CIT-AGENT-3b / SECREM-02
+/// prior-003): the hash now binds `manifest.toml` (with its self-referential
+/// `content_hash` field zeroed), so a validly-signed capsule's capabilities /
+/// risk tier / required_roles can no longer be swapped post-signature. The tag
+/// makes the construction explicit and fails pre-v2 (body-only) hashes closed —
+/// those capsules must be re-packed.
+const CONTENT_HASH_DOMAIN: &[u8] = b"CIT-AGENT-CAPSULE-CONTENT-HASH-v2";
+
+/// Normalize a manifest for inclusion in the content hash: the self-referential
+/// `content_hash` field is set to empty so the hash binds every OTHER field
+/// without circularity. Line-based, matching the packer's
+/// `set_manifest_content_hash`, so pack and verify produce identical bytes.
+fn normalize_manifest_for_hash(manifest: &[u8]) -> Vec<u8> {
+    let toml = String::from_utf8_lossy(manifest);
+    let mut out = String::with_capacity(toml.len());
+    let mut replaced = false;
+    for line in toml.lines() {
+        let trimmed = line.trim_start();
+        if !replaced && trimmed.starts_with("content_hash") && trimmed.contains('=') {
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(indent);
+            out.push_str("content_hash = \"\"");
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
+}
+
 pub fn compute_content_hash(a: &ArchiveContents) -> String {
-    // BTreeMap iteration is sorted; we collect all non-SIGNATURES
-    // and non-manifest entries with their canonical paths.
+    // prior-003: bind the manifest (normalized) so its security-relevant fields
+    // are covered by the signature, alongside the body files.
+    let norm_manifest = normalize_manifest_for_hash(&a.manifest);
     let mut entries: Vec<(&str, &[u8])> = Vec::new();
+    entries.push(("manifest.toml", &norm_manifest));
     entries.push(("capsule.wit", &a.wit));
     entries.push(("capsule.wasm", &a.wasm));
     entries.push(("procedure.md", &a.procedure));
@@ -166,6 +215,7 @@ pub fn compute_content_hash(a: &ArchiveContents) -> String {
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut bundle = Sha256::new();
+    bundle.update(CONTENT_HASH_DOMAIN);
     for (path, bytes) in entries {
         let mut entry_hash = Sha256::new();
         entry_hash.update(bytes);
@@ -222,6 +272,43 @@ mod tests {
         let archive = read_archive(&cps[..]).expect("minimal archive reads");
         assert!(!archive.manifest.is_empty());
         assert_eq!(archive.signatures.get("publisher.sig").map(|v| v.as_slice()), Some(&b"stub-sig"[..]));
+    }
+
+    #[test]
+    fn content_hash_binds_manifest_fields() {
+        // prior-003 (SECREM-02): the content hash must cover the manifest's
+        // security-relevant fields, so a post-signature swap is rejected by the
+        // content_hash check — while the self-referential content_hash field
+        // itself must NOT affect the hash (no circularity).
+        let body = |manifest: &str| ArchiveContents {
+            manifest: manifest.as_bytes().to_vec(),
+            wit: b"w".to_vec(),
+            wasm: b"a".to_vec(),
+            procedure: b"p".to_vec(),
+            ..Default::default()
+        };
+        // Changing the risk tier changes the hash (the field is now bound).
+        let low = "[capsule]\ncontent_hash = \"\"\n\n[risk]\ntier = \"low\"\n";
+        let high = "[capsule]\ncontent_hash = \"\"\n\n[risk]\ntier = \"high\"\n";
+        assert_ne!(compute_content_hash(&body(low)), compute_content_hash(&body(high)));
+        // The content_hash field value itself is normalized out (stable hash).
+        let a = "[capsule]\ncontent_hash = \"sha256:aaa\"\n\n[risk]\ntier = \"low\"\n";
+        let b = "[capsule]\ncontent_hash = \"sha256:bbb\"\n\n[risk]\ntier = \"low\"\n";
+        assert_eq!(compute_content_hash(&body(a)), compute_content_hash(&body(b)));
+    }
+
+    #[test]
+    fn read_archive_caps_decompression_bomb() {
+        // FUA-AGENT-RUNTIME-01: an archive that decompresses past the cap fails
+        // closed instead of reading unboundedly into memory. (A real bomb is a
+        // tiny zstd payload that expands to GBs; here a small over-cap fixture +
+        // a tiny test cap exercises the same guard cheaply.)
+        let big_manifest = format!("[capsule]\nname = \"x\"\n# {}\n", "A".repeat(64 * 1024));
+        let cps = build_minimal_cps(&big_manifest);
+        // Under a tiny cap, the read fails (tar hits EOF past the cap).
+        assert!(read_archive_capped(&cps[..], 1024).is_err());
+        // Under the real cap it reads fine.
+        assert!(read_archive(&cps[..]).is_ok());
     }
 
     #[test]
