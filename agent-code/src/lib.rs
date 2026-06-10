@@ -464,6 +464,52 @@ mod tests {
         assert_rejected("ls\rrm -rf /");
     }
 
+    // ── SECREM-01 SVC-3: find exec/write primitives rejected ────────
+
+    #[tokio::test]
+    async fn test_svc3_rejects_find_exec_variants() {
+        // -exec and friends invoke arbitrary non-allowlisted binaries.
+        assert_rejected("find . -name x -exec rm -rf {} +");
+        assert_rejected("find . -execdir touch pwned {} +");
+        assert_rejected("find . -name x -ok rm {} +");
+        assert_rejected("find . -okdir mv {} /tmp +");
+    }
+
+    #[tokio::test]
+    async fn test_svc3_rejects_find_write_primitives() {
+        assert_rejected("find . -name x -delete");
+        assert_rejected("find . -fprintf /etc/cron.d/evil %p");
+        assert_rejected("find . -fprint /tmp/out");
+        assert_rejected("find . -fprint0 /tmp/out");
+        assert_rejected("find . -fls /tmp/out");
+    }
+
+    #[tokio::test]
+    async fn test_svc3_allows_readonly_find() {
+        use crate::tools::shell_exec::parse_and_validate_command;
+        let cases = &[
+            "find . -name x",
+            "find src -type f -name *.rs",
+            "find . -maxdepth 2 -name Cargo.toml -print",
+        ];
+        for c in cases {
+            assert!(
+                parse_and_validate_command(c).is_ok(),
+                "SVC-3: read-only find must stay allowed: {}",
+                c
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_svc3_find_flags_only_constrain_find() {
+        use crate::tools::shell_exec::parse_and_validate_command;
+        // `-exec` as an argument to another allowlisted binary is a
+        // plain string, not an execution primitive.
+        assert!(parse_and_validate_command("grep -r -exec src").is_ok());
+        assert!(parse_and_validate_command("rg -- -delete src").is_ok());
+    }
+
     /// AGT-05: invalid workspace_dir rejects.
     #[tokio::test]
     async fn test_agt05_invalid_workspace_dir_rejects() {
