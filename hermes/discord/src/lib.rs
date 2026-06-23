@@ -8,10 +8,12 @@ pub mod classify;
 pub mod handler;
 pub mod preflight;
 pub mod sink;
+pub mod store;
 
 use std::sync::Arc;
 
 use hermes_core::guard::OwnerAuth;
+use hermes_core::memory::{restore_into, MemoryStore, NullMemoryStore};
 use hermes_core::{AgendaStore, ApprovalQueue, RoomScope};
 use hermes_llm::LlmClient;
 use serenity::all::{Client, GatewayIntents, Http};
@@ -20,6 +22,7 @@ use tokio::sync::Mutex;
 pub use handler::Handler;
 pub use preflight::{preflight, PreflightError};
 pub use sink::{FanoutDecisionSink, TracingDecisionSink, TracingTrail};
+pub use store::JsonMemoryStore;
 
 /// Run the Hermes daemon: preflight the config (fail-closed), resolve the bot's own id,
 /// then connect to the gateway with least-privilege intents and dispatch events through
@@ -85,7 +88,35 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
         None => tracing::info!("research room → DMs only (set HERMES_RESEARCH_CHANNEL to add a channel)"),
     }
     let room = RoomScope::new(research_channel);
-    let agendas = Arc::new(Mutex::new(AgendaStore::new()));
+
+    // WP-S2.3 — durable memory. With HERMES_MEMORY_PATH set, agenda + approval-queue state
+    // is persisted (crash-atomically) and restored on startup, so a restart or context
+    // clear resumes exactly where it left off. Restored state is re-validated through the
+    // guard (restore_into, T21) — never trusted as resumed intent. Without the env var,
+    // memory is in-process only.
+    let memory: Arc<dyn MemoryStore> = match std::env::var("HERMES_MEMORY_PATH") {
+        Ok(p) if !p.trim().is_empty() => {
+            tracing::info!(path = %p.trim(), "durable memory → JSON file");
+            Arc::new(JsonMemoryStore::new(p.trim()))
+        }
+        _ => {
+            tracing::info!("durable memory → disabled (set HERMES_MEMORY_PATH to persist agendas)");
+            Arc::new(NullMemoryStore)
+        }
+    };
+
+    let mut agenda_store = AgendaStore::new();
+    match memory.load() {
+        Ok(Some(snapshot)) => {
+            let agenda_count = snapshot.agendas.len();
+            let pending_count = snapshot.pending.len();
+            restore_into(snapshot, &mut agenda_store, &queue);
+            tracing::info!(agenda_count, pending_count, "restored durable memory (re-validated)");
+        }
+        Ok(None) => tracing::info!("no prior memory snapshot — starting fresh"),
+        Err(e) => tracing::warn!(error = %e, "failed to load memory — starting fresh"),
+    }
+    let agendas = Arc::new(Mutex::new(agenda_store));
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler::new(
@@ -98,6 +129,7 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
             approval_channel,
             room,
             agendas,
+            memory,
         ))
         .await?;
 

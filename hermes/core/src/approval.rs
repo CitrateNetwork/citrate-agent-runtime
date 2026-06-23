@@ -141,6 +141,27 @@ impl ApprovalQueue {
     pub fn pending_count(&self) -> usize {
         self.inner.lock().unwrap().pending.len()
     }
+
+    /// Snapshot the queue for durable persistence (WP-S2.3): the pending actions and the
+    /// `next_id` high-water mark. Restoring `next_id` is what stops a post-restart proposal
+    /// from reusing an id that a still-displayed button refers to.
+    pub fn snapshot(&self) -> (Vec<PendingAction>, ActionId) {
+        let g = self.inner.lock().unwrap();
+        (g.pending.values().cloned().collect(), g.next_id)
+    }
+
+    /// Restore a persisted snapshot into an empty queue (WP-S2.3). `next_id` is advanced to
+    /// at least the max restored id, so a new proposal never collides with a restored one.
+    /// Restored actions are inert until the owner approves — and approval re-runs the guard
+    /// on the interacting user (T15) — so a tampered snapshot still cannot self-execute.
+    pub fn restore(&self, pending: Vec<PendingAction>, next_id: ActionId) {
+        let mut g = self.inner.lock().unwrap();
+        let max_id = pending.iter().map(|a| a.id).max().unwrap_or(0);
+        g.next_id = next_id.max(max_id);
+        for a in pending {
+            g.pending.insert(a.id, a);
+        }
+    }
 }
 
 /// Encode a button's `custom_id` for a decision on an action: `"approve:<id>"` /

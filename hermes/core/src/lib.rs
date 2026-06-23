@@ -30,6 +30,7 @@ pub mod cooldown;
 pub mod decision;
 pub mod event;
 pub mod guard;
+pub mod memory;
 pub mod principal;
 pub mod room;
 pub mod trail;
@@ -42,6 +43,7 @@ pub use approval::{
 };
 pub use cooldown::RefusalCooldown;
 pub use decision::{ApprovalDecision, DecisionSink, InMemoryDecisionSink, NullDecisionSink};
+pub use memory::{restore_into, MemoryError, MemorySnapshot, MemoryStore, NullMemoryStore};
 pub use room::{is_new_agenda_post, is_private_surface, RoomScope};
 pub use trail::{InMemoryTrail, NullTrail, Outcome, Trail, TrailEntry};
 pub use event::{

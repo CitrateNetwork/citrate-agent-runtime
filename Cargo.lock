@@ -2381,6 +2381,8 @@ dependencies = [
  "hermes-anchor",
  "hermes-core",
  "hermes-llm",
+ "serde",
+ "serde_json",
  "serenity",
  "tokio",
  "tracing",

@@ -10,6 +10,7 @@ use hermes_core::approval::{custom_id, parse_custom_id};
 use hermes_core::decision::{ApprovalDecision, DecisionSink};
 use hermes_core::event::{Addressed, InteractionEvent, InteractionKind, MessageEvent};
 use hermes_core::guard::{route_interaction, InteractionDecision, OwnerAuth, REFUSAL};
+use hermes_core::memory::{MemorySnapshot, MemoryStore};
 use hermes_core::principal::Principal;
 use hermes_core::room::{is_new_agenda_post, is_private_surface, RoomScope};
 use hermes_core::trail::{Outcome, Trail, TrailEntry};
@@ -64,6 +65,8 @@ pub struct Handler {
     room: RoomScope,
     /// Open agendas (one thread each) with their running owner-authored context (S2.5).
     agendas: Arc<Mutex<AgendaStore>>,
+    /// Durable memory backend (S2.3); persisted after every agenda/queue mutation.
+    memory: Arc<dyn MemoryStore>,
 }
 
 impl Handler {
@@ -83,6 +86,7 @@ impl Handler {
         approval_channel: Option<u64>,
         room: RoomScope,
         agendas: Arc<Mutex<AgendaStore>>,
+        memory: Arc<dyn MemoryStore>,
     ) -> Self {
         Self {
             auth,
@@ -96,11 +100,25 @@ impl Handler {
             approval_channel,
             room,
             agendas,
+            memory,
         }
     }
 
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Persist the current agenda + approval-queue state to durable memory (S2.3). Snapshots
+    /// under the agenda lock, then writes outside it (the write is crash-atomic). A write
+    /// failure is a warning, never a dropped event — the live state stands.
+    async fn persist(&self) {
+        let snapshot = {
+            let store = self.agendas.lock().await;
+            MemorySnapshot::capture(&store, &self.queue)
+        };
+        if let Err(e) = self.memory.save(&snapshot) {
+            tracing::warn!(error = %e, "failed to persist memory snapshot");
+        }
     }
 
     fn strip_self_mention(&self, content: &str) -> String {
@@ -214,6 +232,7 @@ impl Handler {
             let mut store = self.agendas.lock().await;
             store.open(ev.message_id, thread_id, &content, TITLE_MAX, self.now_ms());
         }
+        self.persist().await;
         let _ = thread
             .id
             .say(&ctx.http, format!("📌 **Agenda:** {title}\nWorking this here. Add intent any time; I'll keep the thread as the running record."))
@@ -242,6 +261,7 @@ impl Handler {
                 .map(|a| a.context_window(MAX_CONTEXT_TURNS))
                 .unwrap_or_else(|| vec![content.clone()])
         };
+        self.persist().await;
         self.respond_with_turns(ctx, msg, ev, &turns, ev.channel).await;
     }
 
@@ -296,6 +316,7 @@ impl Handler {
             triggered_in_channel: Some(ev.channel),
         };
         let action = self.queue.propose(effect, provenance, self.now_ms());
+        self.persist().await;
         let dest = self.approval_channel.unwrap_or(ev.channel);
         match self.post_proposal(ctx, dest, &action).await {
             Ok(()) => {
@@ -402,6 +423,8 @@ impl Handler {
         // denied action is recorded too. resolve() already guaranteed this fires once.
         self.decisions
             .record(ApprovalDecision::from_resolved(&action, dec, self.now_ms()));
+        // The queue changed — persist so a restart doesn't resurrect a resolved action.
+        self.persist().await;
 
         let result_line = match dec {
             Decision::Approve => match self.execute(ctx, &action.effect).await {
