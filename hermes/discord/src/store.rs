@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use hermes_core::agenda::{Agenda, AgendaStatus, AgendaTurn};
-use hermes_core::approval::{ActionEffect, PendingAction, Provenance};
+use hermes_core::approval::{ActionEffect, AgentileAction, PendingAction, Provenance};
 use hermes_core::memory::{MemoryError, MemorySnapshot, MemoryStore};
 use hermes_core::principal::Principal;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,8 @@ enum EffectDto {
     PostMessage { channel: u64, content: String },
     #[serde(rename = "digest")]
     Digest { source_channel: u64, target_channel: u64 },
+    #[serde(rename = "agentile")]
+    Agentile { action: String, title: String, body: String },
 }
 
 impl SnapshotDto {
@@ -210,6 +212,11 @@ impl PendingDto {
             ActionEffect::Digest { source_channel, target_channel } => {
                 EffectDto::Digest { source_channel: *source_channel, target_channel: *target_channel }
             }
+            ActionEffect::Agentile { action, title, body } => EffectDto::Agentile {
+                action: action.as_kind().to_string(),
+                title: title.clone(),
+                body: body.clone(),
+            },
         };
         Self {
             id: p.id,
@@ -227,6 +234,13 @@ impl PendingDto {
             EffectDto::Digest { source_channel, target_channel } => {
                 ActionEffect::Digest { source_channel, target_channel }
             }
+            // An unrecognized persisted action decodes fail-closed to WorkAnchor (the
+            // inert, record-only action) rather than a powerful one.
+            EffectDto::Agentile { action, title, body } => ActionEffect::Agentile {
+                action: AgentileAction::parse(&action).unwrap_or(AgentileAction::WorkAnchor),
+                title,
+                body,
+            },
         };
         PendingAction {
             id: self.id,
@@ -291,6 +305,37 @@ mod tests {
         assert_eq!(a.title, "Build the shard");
         assert_eq!(a.context_window(10), vec!["Build the shard\nbody", "more"]);
         assert_eq!(queue2.pending_count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn all_effect_variants_round_trip_through_disk() {
+        let path = temp_path("effects");
+        let store = JsonMemoryStore::new(&path);
+        let queue = ApprovalQueue::new();
+        queue.propose(ActionEffect::PostMessage { channel: 1, content: "hi".into() }, Provenance::default(), 0);
+        queue.propose(ActionEffect::Digest { source_channel: 2, target_channel: 3 }, Provenance::default(), 0);
+        queue.propose(
+            ActionEffect::Agentile {
+                action: AgentileAction::JournalWrite,
+                title: "t".into(),
+                body: "b".into(),
+            },
+            Provenance::default(),
+            0,
+        );
+        store.save(&MemorySnapshot::capture(&AgendaStore::new(), &queue)).unwrap();
+
+        let snap = store.load().unwrap().unwrap();
+        let queue2 = ApprovalQueue::new();
+        restore_into(snap, &mut AgendaStore::new(), &queue2);
+        let (pending, _) = queue2.snapshot();
+        assert_eq!(pending.len(), 3);
+        assert!(pending.iter().any(|p| matches!(p.effect, ActionEffect::Digest { .. })));
+        assert!(pending.iter().any(|p| matches!(
+            &p.effect,
+            ActionEffect::Agentile { action: AgentileAction::JournalWrite, .. }
+        )));
         let _ = std::fs::remove_file(&path);
     }
 

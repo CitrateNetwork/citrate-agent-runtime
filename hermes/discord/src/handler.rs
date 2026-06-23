@@ -66,6 +66,33 @@ async fn fetch_recent(ctx: &Context, channel: u64, limit: u32) -> anyhow::Result
         .collect())
 }
 
+/// Append a structured block to the agentile worklog (S2.2b). Append-only — never rewrites
+/// the file — so the worklog is itself an audit record. Creates the file (and parent dir)
+/// on first write.
+fn append_worklog(
+    path: &std::path::Path,
+    kind: &str,
+    title: &str,
+    body: &str,
+    at_ms: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut block = format!("\n## [{kind}] {title}\n- at: t+{at_ms}ms\n");
+    if !body.trim().is_empty() {
+        block.push('\n');
+        block.push_str(body.trim());
+        block.push('\n');
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(block.as_bytes())?;
+    Ok(())
+}
+
 /// The Hermes gateway handler.
 pub struct Handler {
     auth: OwnerAuth,
@@ -87,6 +114,9 @@ pub struct Handler {
     memory: Arc<dyn MemoryStore>,
     /// Allowlisted channels a digest may be posted to (T13). Empty ⇒ digests are refused.
     digest_targets: Vec<u64>,
+    /// Append-only agentile worklog file (S2.2b). `None` ⇒ agentile actions are recorded via
+    /// the decision/trail only (no file written).
+    agentile_log: Option<std::path::PathBuf>,
 }
 
 impl Handler {
@@ -108,6 +138,7 @@ impl Handler {
         agendas: Arc<Mutex<AgendaStore>>,
         memory: Arc<dyn MemoryStore>,
         digest_targets: Vec<u64>,
+        agentile_log: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             auth,
@@ -123,6 +154,7 @@ impl Handler {
             agendas,
             memory,
             digest_targets,
+            agentile_log,
         }
     }
 
@@ -321,6 +353,9 @@ impl Handler {
                 let source = source_channel.unwrap_or(ev.channel);
                 self.stage_digest_proposal(ctx, msg, ev, source, target_channel).await;
             }
+            Ok(LlmOutcome::ProposeAgentile { action, title, body }) => {
+                self.stage_agentile_proposal(ctx, msg, ev, action, title, body).await;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "llm error");
                 let _ = ChannelId::new(reply_channel)
@@ -386,25 +421,13 @@ impl Handler {
                 .await;
             return;
         }
-        let effect = ActionEffect::Digest { source_channel: source, target_channel: target };
-        let provenance = Provenance {
-            triggered_by_message: Some(ev.message_id),
-            triggered_in_channel: Some(ev.channel),
-        };
-        let action = self.queue.propose(effect, provenance, self.now_ms());
-        self.persist().await;
-        let dest = self.approval_channel.unwrap_or(ev.channel);
-        match self.post_proposal(ctx, dest, &action).await {
-            Ok(()) => {
-                let _ = msg
-                    .reply(ctx, format!("Proposed (#{}) — awaiting your approval.", action.id))
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to post digest proposal");
-                let _ = msg.reply(ctx, "I drafted that digest but couldn't queue it.").await;
-            }
-        }
+        self.stage_effect(
+            ctx,
+            msg,
+            ev,
+            ActionEffect::Digest { source_channel: source, target_channel: target },
+        )
+        .await;
     }
 
     /// Create a pending action for a proposed post and surface it with Approve/Deny.
@@ -417,7 +440,20 @@ impl Handler {
         content: String,
     ) {
         let target = channel_id.unwrap_or(ev.channel);
-        let effect = ActionEffect::PostMessage { channel: target, content };
+        self.stage_effect(ctx, msg, ev, ActionEffect::PostMessage { channel: target, content })
+            .await;
+    }
+
+    /// Queue an effect for approval and tell the owner. Shared by every proposer
+    /// (post / digest / agentile): propose → persist → post the Approve/Deny card →
+    /// acknowledge. The queue entry carries the owner-message provenance (T11).
+    async fn stage_effect(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        ev: &MessageEvent,
+        effect: ActionEffect,
+    ) {
         let provenance = Provenance {
             triggered_by_message: Some(ev.message_id),
             triggered_in_channel: Some(ev.channel),
@@ -438,9 +474,32 @@ impl Handler {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to post proposal");
-                let _ = msg.reply(ctx, "I drafted that but couldn't post it to the approval queue.").await;
+                let _ = msg
+                    .reply(ctx, "I drafted that but couldn't post it to the approval queue.")
+                    .await;
             }
         }
+    }
+
+    /// Stage an agentile-pack action on Hermes's own work (S2.2b). An unrecognized action is
+    /// refused, never guessed.
+    async fn stage_agentile_proposal(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        ev: &MessageEvent,
+        action: String,
+        title: String,
+        body: String,
+    ) {
+        let Some(parsed) = hermes_core::AgentileAction::parse(&action) else {
+            let _ = msg
+                .reply(ctx, format!("I don't recognize the agentile action `{action}`."))
+                .await;
+            return;
+        };
+        self.stage_effect(ctx, msg, ev, ActionEffect::Agentile { action: parsed, title, body })
+            .await;
     }
 
     /// Post a proposal message with the concrete effect (H-A12) and Approve/Deny buttons.
@@ -503,6 +562,22 @@ impl Handler {
                     .map_err(|e| anyhow::anyhow!("summarize failed: {e}"))?;
                 let body = format!("📰 **Digest of <#{source_channel}>**\n{}", truncate(&summary, 1800));
                 ChannelId::new(*target_channel).say(&ctx.http, body).await?;
+                Ok(())
+            }
+            ActionEffect::Agentile { action, title, body } => {
+                // The approval already emitted a decision record (anchored on-chain when the
+                // anchor sink is on), so a work-anchor is anchored even with no worklog file.
+                if let Some(path) = &self.agentile_log {
+                    append_worklog(path, action.as_kind(), title, body, self.now_ms())
+                        .map_err(|e| anyhow::anyhow!("worklog append failed: {e}"))?;
+                    tracing::info!(action = action.as_kind(), %title, "agentile action → worklog");
+                } else {
+                    tracing::info!(
+                        action = action.as_kind(),
+                        %title,
+                        "agentile action recorded (no worklog file configured)"
+                    );
+                }
                 Ok(())
             }
         }

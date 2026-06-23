@@ -38,8 +38,8 @@ pub mod trail;
 pub use action::{decide, Action};
 pub use agenda::{Agenda, AgendaId, AgendaStatus, AgendaStore, AgendaTurn};
 pub use approval::{
-    custom_id, parse_custom_id, ActionEffect, ActionId, ApprovalQueue, Decision, PendingAction,
-    Provenance,
+    custom_id, parse_custom_id, ActionEffect, ActionId, AgentileAction, ApprovalQueue, Decision,
+    PendingAction, Provenance,
 };
 pub use cooldown::RefusalCooldown;
 pub use decision::{ApprovalDecision, DecisionSink, InMemoryDecisionSink, NullDecisionSink};

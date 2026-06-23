@@ -131,6 +131,17 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
         tracing::info!(count = digest_targets.len(), "digest targets → allowlisted");
     }
 
+    // WP-S2.2b — agentile worklog. When set, approved agentile actions append to this file.
+    let agentile_log = std::env::var("HERMES_AGENTILE_LOG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    match &agentile_log {
+        Some(p) => tracing::info!(path = %p.display(), "agentile worklog → file"),
+        None => tracing::info!("agentile worklog → decision/trail only (set HERMES_AGENTILE_LOG for a file)"),
+    }
+
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler::new(
             auth,
@@ -144,6 +155,7 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
             agendas,
             memory,
             digest_targets,
+            agentile_log,
         ))
         .await?;
 

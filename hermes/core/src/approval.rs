@@ -22,6 +22,57 @@ use crate::event::{ChannelId, MessageId};
 /// A queue-assigned id for a pending action (monotonic within a run).
 pub type ActionId = u64;
 
+/// The agentile-pack capsule actions Hermes can take on its own work (S2.2b): opening and
+/// closing a sprint, writing a journal entry, and anchoring a work note. They are recorded
+/// to the agentile worklog on approval, and — because every approval emits an
+/// [`crate::decision::ApprovalDecision`] — a work-anchor is anchored on-chain for free when
+/// the anchor sink is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentileAction {
+    /// Open a sprint.
+    SprintOpen,
+    /// Close a sprint.
+    SprintClose,
+    /// Write a journal entry.
+    JournalWrite,
+    /// Anchor a work note.
+    WorkAnchor,
+}
+
+impl AgentileAction {
+    /// The stable machine label (used as the effect kind in logs/trail/decisions).
+    pub fn as_kind(self) -> &'static str {
+        match self {
+            AgentileAction::SprintOpen => "sprint-open",
+            AgentileAction::SprintClose => "sprint-close",
+            AgentileAction::JournalWrite => "journal-write",
+            AgentileAction::WorkAnchor => "work-anchor",
+        }
+    }
+
+    /// Parse from the tool-supplied action string. `None` for anything unrecognized, so an
+    /// unknown action is refused rather than guessed.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "sprint-open" => Some(AgentileAction::SprintOpen),
+            "sprint-close" => Some(AgentileAction::SprintClose),
+            "journal-write" => Some(AgentileAction::JournalWrite),
+            "work-anchor" => Some(AgentileAction::WorkAnchor),
+            _ => None,
+        }
+    }
+
+    /// A human verb for the description.
+    fn verb(self) -> &'static str {
+        match self {
+            AgentileAction::SprintOpen => "Open sprint",
+            AgentileAction::SprintClose => "Close sprint",
+            AgentileAction::JournalWrite => "Write journal entry",
+            AgentileAction::WorkAnchor => "Anchor work note",
+        }
+    }
+}
+
 /// The concrete effect a pending action will have if approved. Each variant is something
 /// outward-facing or hard-to-reverse, which is *why* it needs approval (guardrails 02).
 /// S2.2 ships the one Guided-Builder effect; S3/S4 add moderation and server-structure
@@ -45,6 +96,17 @@ pub enum ActionEffect {
         /// The allowlisted channel the digest will be posted to.
         target_channel: ChannelId,
     },
+    /// An agentile-pack action on Hermes's own work (S2.2b): sprint open/close, journal
+    /// write, or work anchor. Executed by appending a structured block to the agentile
+    /// worklog; approval emits a decision record (so a work-anchor anchors on-chain).
+    Agentile {
+        /// Which agentile action.
+        action: AgentileAction,
+        /// A short title / sprint name / journal title.
+        title: String,
+        /// Optional body (journal text, work note); may be empty for sprint open/close.
+        body: String,
+    },
 }
 
 impl ActionEffect {
@@ -53,6 +115,7 @@ impl ActionEffect {
         match self {
             ActionEffect::PostMessage { .. } => "post-message",
             ActionEffect::Digest { .. } => "digest",
+            ActionEffect::Agentile { action, .. } => action.as_kind(),
         }
     }
 
@@ -72,6 +135,15 @@ impl ActionEffect {
                 format!(
                     "**Summarize** <#{source_channel}> and **post the digest** to <#{target_channel}>"
                 )
+            }
+            ActionEffect::Agentile { action, title, body } => {
+                let mut out = format!("**{}** `{title}`", action.verb());
+                if !body.is_empty() {
+                    let quoted =
+                        body.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+                    out.push_str(&format!(":\n{quoted}"));
+                }
+                out
             }
         }
     }
@@ -254,6 +326,36 @@ mod tests {
         assert!(d.contains("<#12345>"));
         assert!(d.contains("> Welcome!"));
         assert!(d.contains("> Rules in #info"));
+    }
+
+    #[test]
+    fn agentile_action_parse_roundtrips_and_rejects_unknown() {
+        for k in ["sprint-open", "sprint-close", "journal-write", "work-anchor"] {
+            assert_eq!(AgentileAction::parse(k).unwrap().as_kind(), k);
+        }
+        assert_eq!(AgentileAction::parse("delete-everything"), None);
+    }
+
+    #[test]
+    fn agentile_effect_describes_action_title_and_body() {
+        let e = ActionEffect::Agentile {
+            action: AgentileAction::JournalWrite,
+            title: "S2 close-out".into(),
+            body: "Shipped the research room.\nLesson: seam + adapter.".into(),
+        };
+        assert_eq!(e.kind(), "journal-write");
+        let d = e.describe();
+        assert!(d.contains("Write journal entry"));
+        assert!(d.contains("`S2 close-out`"));
+        assert!(d.contains("> Shipped the research room."));
+        // Empty body → no quoted block.
+        let open = ActionEffect::Agentile {
+            action: AgentileAction::SprintOpen,
+            title: "HERMES-L-S3".into(),
+            body: String::new(),
+        };
+        assert_eq!(open.kind(), "sprint-open");
+        assert!(!open.describe().contains('>'));
     }
 
     #[test]

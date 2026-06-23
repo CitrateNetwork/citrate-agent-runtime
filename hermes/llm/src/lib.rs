@@ -69,6 +69,9 @@ pub enum LlmOutcome {
     /// turns this into an approval-queue entry; the target must be on the digest allowlist
     /// (T13). `source_channel` `None` ⇒ the current channel.
     ProposeDigest { source_channel: Option<u64>, target_channel: u64 },
+    /// The model wants to take an **agentile-pack** action on Hermes's own work (S2.2b):
+    /// open/close a sprint, write a journal entry, or anchor a work note. Approval-gated.
+    ProposeAgentile { action: String, title: String, body: String },
 }
 
 impl LlmClient {
@@ -136,7 +139,7 @@ impl LlmClient {
             "messages": self.messages(owner_turns),
             "temperature": self.temperature,
             "stream": false,
-            "tools": [propose_post_tool(), read_channel_tool(), digest_channel_tool()],
+            "tools": [propose_post_tool(), read_channel_tool(), digest_channel_tool(), agentile_action_tool()],
             "tool_choice": "auto",
         })
     }
@@ -275,6 +278,35 @@ fn digest_channel_tool() -> serde_json::Value {
     })
 }
 
+fn agentile_action_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "agentile_action",
+            "description": "Record an agentile-pack action on your own work: open or close a sprint, write a journal entry, or anchor a work note. Approval-gated — it goes to Saul's queue. Use when Saul asks you to open/close a sprint, journal something, or anchor a piece of work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["sprint-open", "sprint-close", "journal-write", "work-anchor"],
+                        "description": "Which agentile action."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Sprint name / journal title / work-note title."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional detail (journal text, work note). May be empty for sprint open/close."
+                    }
+                },
+                "required": ["action", "title"]
+            }
+        }
+    })
+}
+
 fn propose_post_tool() -> serde_json::Value {
     serde_json::json!({
         "type": "function",
@@ -304,11 +336,17 @@ fn propose_post_tool() -> serde_json::Value {
 fn outcome_from_message(msg: RespMessage) -> LlmOutcome {
     if let Some(call) = msg.tool_calls.as_ref().and_then(|t| {
         t.iter().find(|c| {
-            matches!(c.function.name.as_str(), "propose_post" | "read_channel" | "digest_channel")
+            matches!(
+                c.function.name.as_str(),
+                "propose_post" | "read_channel" | "digest_channel" | "agentile_action"
+            )
         })
     }) {
         let args = normalize_args(&call.function.arguments);
         let chan = |key: &str| args.get(key).and_then(|v| v.as_str()).and_then(parse_channel);
+        let str_arg = |key: &str| {
+            args.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+        };
         match call.function.name.as_str() {
             "propose_post" => {
                 let content = args
@@ -334,6 +372,18 @@ fn outcome_from_message(msg: RespMessage) -> LlmOutcome {
                     return LlmOutcome::ProposeDigest {
                         source_channel: chan("source_channel_id"),
                         target_channel: target,
+                    };
+                }
+            }
+            "agentile_action" => {
+                let title = str_arg("title");
+                // An agentile action needs at least an action + title; otherwise fall
+                // through to a reply (Hermes asks rather than queuing an empty action).
+                if !title.is_empty() {
+                    return LlmOutcome::ProposeAgentile {
+                        action: str_arg("action"),
+                        title,
+                        body: str_arg("body"),
                     };
                 }
             }
@@ -490,6 +540,29 @@ mod tests {
         assert_eq!(
             outcome_from_message(m2),
             LlmOutcome::ReadChannel { channel_id: None, limit: 7 }
+        );
+    }
+
+    #[test]
+    fn agentile_tool_parses_action_title_body() {
+        let m = msg_from(
+            r#"{"tool_calls":[{"function":{"name":"agentile_action","arguments":{"action":"journal-write","title":"S2 close","body":"shipped it"}}}]}"#,
+        );
+        assert_eq!(
+            outcome_from_message(m),
+            LlmOutcome::ProposeAgentile {
+                action: "journal-write".into(),
+                title: "S2 close".into(),
+                body: "shipped it".into()
+            }
+        );
+        // Missing title ⇒ falls back to a reply (Hermes asks).
+        let no_title = msg_from(
+            r#"{"content":"what should I title it?","tool_calls":[{"function":{"name":"agentile_action","arguments":{"action":"sprint-open"}}}]}"#,
+        );
+        assert_eq!(
+            outcome_from_message(no_title),
+            LlmOutcome::Reply("what should I title it?".into())
         );
     }
 
