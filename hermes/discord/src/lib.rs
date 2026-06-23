@@ -7,12 +7,16 @@
 pub mod classify;
 pub mod handler;
 pub mod preflight;
+pub mod sink;
+
+use std::sync::Arc;
 
 use hermes_core::guard::OwnerAuth;
 use serenity::all::{Client, GatewayIntents, Http};
 
 pub use handler::Handler;
 pub use preflight::{preflight, PreflightError};
+pub use sink::TracingTrail;
 
 /// Run the Hermes daemon: preflight the config (fail-closed), resolve the bot's own id,
 /// then connect to the gateway with least-privilege intents and dispatch events through
@@ -36,8 +40,9 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
         | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::DIRECT_MESSAGES;
 
+    let trail = Arc::new(TracingTrail);
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler::new(auth, bot_id))
+        .event_handler(Handler::new(auth, bot_id, trail))
         .await?;
 
     tracing::info!("hermes daemon starting");

@@ -28,9 +28,11 @@ pub mod cooldown;
 pub mod event;
 pub mod guard;
 pub mod principal;
+pub mod trail;
 
 pub use action::{decide, Action};
 pub use cooldown::RefusalCooldown;
+pub use trail::{InMemoryTrail, NullTrail, Outcome, Trail, TrailEntry};
 pub use event::{
     Addressed, AuthorKind, ChannelId, ChannelKind, InteractionEvent, InteractionKind, MessageEvent,
     MessageId, UserId,

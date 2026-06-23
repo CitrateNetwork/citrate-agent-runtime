@@ -1,10 +1,12 @@
 //! The serenity event handler: normalize → ask the guard → carry out the [`Action`].
 //! This is the only place serenity types meet hermes-core; it decides nothing itself.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use hermes_core::event::{InteractionEvent, InteractionKind, MessageEvent};
 use hermes_core::guard::{route_interaction, InteractionDecision, OwnerAuth, REFUSAL};
+use hermes_core::trail::{Outcome, Trail, TrailEntry};
 use hermes_core::{decide, Action, RefusalCooldown};
 use serenity::all::{Context, EventHandler, Interaction, Message, Ready};
 use serenity::async_trait;
@@ -23,16 +25,19 @@ pub struct Handler {
     cooldown: Mutex<RefusalCooldown>,
     bot_id: u64,
     start: Instant,
+    trail: Arc<dyn Trail>,
 }
 
 impl Handler {
-    /// Build the handler for a known owner authority and the bot's own user id.
-    pub fn new(auth: OwnerAuth, bot_id: u64) -> Self {
+    /// Build the handler for a known owner authority, the bot's own user id, and an
+    /// append-only audit trail (every decision is recorded, WP-S1.4).
+    pub fn new(auth: OwnerAuth, bot_id: u64, trail: Arc<dyn Trail>) -> Self {
         Self {
             auth,
             cooldown: Mutex::new(RefusalCooldown::new(REFUSAL_WINDOW_MS)),
             bot_id,
             start: Instant::now(),
+            trail,
         }
     }
 
@@ -75,10 +80,16 @@ impl EventHandler for Handler {
 
     async fn message(&self, ctx: Context, msg: Message) {
         let ev = self.normalize(&msg);
+        let now = self.now_ms();
         let action = {
             let mut cd = self.cooldown.lock().await;
-            decide(&self.auth, &mut cd, &ev, self.now_ms())
+            decide(&self.auth, &mut cd, &ev, now)
         };
+        // WP-S1.4 — record every decision (append-only). Non-owner command attempts are
+        // flagged as security signals by the trail.
+        let principal = self.auth.authorize_author(ev.author);
+        self.trail
+            .record(TrailEntry::for_message(now, principal, ev.author, ev.channel, &action));
         match action {
             Action::Refuse => {
                 // Fixed string, no LLM round-trip — cannot be prompt-injected (T1).
@@ -114,7 +125,19 @@ impl EventHandler for Handler {
             },
             _ => return,
         };
-        match route_interaction(&self.auth, &ev) {
+        let decision = route_interaction(&self.auth, &ev);
+        let (principal, outcome) = match decision {
+            InteractionDecision::Allow => (self.auth.authorize_user(ev.user), Outcome::InteractionAllowed),
+            InteractionDecision::Deny => (self.auth.authorize_user(ev.user), Outcome::InteractionDenied),
+        };
+        self.trail.record(TrailEntry {
+            at_ms: self.now_ms(),
+            principal,
+            actor: Some(ev.user),
+            channel: ev.channel,
+            outcome,
+        });
+        match decision {
             InteractionDecision::Allow => {
                 tracing::info!(user = ev.user, "owner interaction allowed (S1: no handlers yet)");
             }
