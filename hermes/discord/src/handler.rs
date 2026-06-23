@@ -5,10 +5,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use hermes_core::agenda::{AgendaStore, AgendaTurn};
 use hermes_core::approval::{custom_id, parse_custom_id};
 use hermes_core::decision::{ApprovalDecision, DecisionSink};
-use hermes_core::event::{InteractionEvent, InteractionKind, MessageEvent};
+use hermes_core::event::{Addressed, InteractionEvent, InteractionKind, MessageEvent};
 use hermes_core::guard::{route_interaction, InteractionDecision, OwnerAuth, REFUSAL};
+use hermes_core::principal::Principal;
+use hermes_core::room::{is_new_agenda_post, is_private_surface, RoomScope};
 use hermes_core::trail::{Outcome, Trail, TrailEntry};
 use hermes_core::{
     decide, Action, ActionEffect, ApprovalQueue, Decision, PendingAction, Provenance,
@@ -17,8 +20,8 @@ use hermes_core::{
 use hermes_llm::{LlmClient, LlmOutcome};
 use serenity::all::{
     ButtonStyle, ChannelId, ComponentInteraction, Context, CreateActionRow, CreateButton,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, EventHandler,
-    Interaction, Message, Ready,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
+    EventHandler, Interaction, Message, Ready,
 };
 use serenity::async_trait;
 use tokio::sync::Mutex;
@@ -27,6 +30,10 @@ use crate::classify::{classify_addressed, classify_author, classify_channel};
 
 /// Default per-user refusal cooldown: 10 minutes.
 const REFUSAL_WINDOW_MS: u64 = 10 * 60 * 1000;
+/// Most recent owner turns fed to the planner per agenda reply (bounds the prompt, T18).
+const MAX_CONTEXT_TURNS: usize = 12;
+/// Max characters in a derived agenda/thread title.
+const TITLE_MAX: usize = 80;
 
 /// Truncate to at most `max` characters (Discord's message limit is 2000), appending an
 /// ellipsis when cut. Operates on chars so a multibyte boundary is never split.
@@ -52,13 +59,19 @@ pub struct Handler {
     queue: Arc<ApprovalQueue>,
     /// Channel proposals are posted to. `None` ⇒ post in the channel the command came from.
     approval_channel: Option<u64>,
+    /// The research-room boundary (H-A16): which surfaces are private enough for rich,
+    /// multi-turn command handling.
+    room: RoomScope,
+    /// Open agendas (one thread each) with their running owner-authored context (S2.5).
+    agendas: Arc<Mutex<AgendaStore>>,
 }
 
 impl Handler {
     /// Build the handler. `llm` `None` ⇒ the owner gets a plain acknowledgement;
     /// `approval_channel` `None` ⇒ proposals post in-place. `decisions` is the
     /// decision-anchoring sink (always at least the tracing sink; an on-chain anchor is
-    /// layered on when configured, WP-S2.2b).
+    /// layered on when configured, WP-S2.2b). `room` + `agendas` drive the research-room
+    /// command plane (S2.5).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: OwnerAuth,
@@ -68,6 +81,8 @@ impl Handler {
         llm: Option<Arc<LlmClient>>,
         queue: Arc<ApprovalQueue>,
         approval_channel: Option<u64>,
+        room: RoomScope,
+        agendas: Arc<Mutex<AgendaStore>>,
     ) -> Self {
         Self {
             auth,
@@ -79,6 +94,8 @@ impl Handler {
             llm,
             queue,
             approval_channel,
+            room,
+            agendas,
         }
     }
 
@@ -132,22 +149,122 @@ impl Handler {
         });
     }
 
-    /// Handle an owner command: ask the model, then either reply or stage a proposal.
+    /// Whether `channel` is a known agenda thread (one Hermes opened). Takes the agenda
+    /// lock briefly.
+    async fn is_agenda_thread(&self, channel: u64) -> bool {
+        self.agendas.lock().await.is_agenda_thread(channel)
+    }
+
+    /// Route an owner command through the research-room model (S2.5):
+    ///   - **public surface** → downgrade to ambient (no rich reply): no public owner-id
+    ///     oracle (H-A16);
+    ///   - **new agenda post** (top-level in the research channel) → open a thread and work
+    ///     it there;
+    ///   - **inside an agenda thread** → append the turn and reply with multi-turn context;
+    ///   - **DM / research channel chatter** → a plain rich reply (stateless).
     async fn handle_command(&self, ctx: &Context, msg: &Message, ev: &MessageEvent) {
-        let Some(llm) = &self.llm else {
+        let is_agenda_thread = self.is_agenda_thread(ev.channel).await;
+
+        if !is_private_surface(ev, &self.room, is_agenda_thread) {
+            // H-A16: the owner addressed Hermes on a public surface. Reasoning richly here
+            // would tell any observer who the owner is. Stay silent — it was already
+            // recorded on the trail as an (ignored) command.
+            tracing::info!(
+                channel = ev.channel,
+                "owner command on a public surface — downgraded to ambient (H-A16, no rich reply)"
+            );
+            return;
+        }
+
+        if self.llm.is_none() {
             let _ = msg.reply(ctx, "Command received (no local model configured).").await;
             return;
+        }
+
+        if is_new_agenda_post(ev, &self.room, is_agenda_thread) {
+            self.open_agenda(ctx, msg, ev).await;
+        } else if is_agenda_thread {
+            self.continue_agenda(ctx, msg, ev).await;
+        } else {
+            // DM or research-channel chatter not bound to an agenda: a stateless rich reply.
+            let prompt = self.strip_self_mention(&ev.content);
+            self.respond_with_turns(ctx, msg, ev, &[prompt], ev.channel).await;
+        }
+    }
+
+    /// Open a new agenda: create a thread off the owner's post, register it, and kick off
+    /// the work there with the opening post as the first context turn.
+    async fn open_agenda(&self, ctx: &Context, msg: &Message, ev: &MessageEvent) {
+        let content = self.strip_self_mention(&ev.content);
+        let title = hermes_core::agenda::derive_title(&content, TITLE_MAX);
+        let thread = match msg
+            .channel_id
+            .create_thread_from_message(&ctx.http, msg.id, CreateThread::new(title.clone()))
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open agenda thread");
+                let _ = msg.reply(ctx, "I couldn't open a thread for that agenda.").await;
+                return;
+            }
         };
-        let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
-        let prompt = self.strip_self_mention(&ev.content);
-        match llm.respond_or_propose(&[prompt]).await {
+        let thread_id = thread.id.get();
+        {
+            let mut store = self.agendas.lock().await;
+            store.open(ev.message_id, thread_id, &content, TITLE_MAX, self.now_ms());
+        }
+        let _ = thread
+            .id
+            .say(&ctx.http, format!("📌 **Agenda:** {title}\nWorking this here. Add intent any time; I'll keep the thread as the running record."))
+            .await;
+        // First pass over the opening intent, in-thread.
+        self.respond_with_turns(ctx, msg, ev, &[content], thread_id).await;
+    }
+
+    /// Continue an agenda: append the owner's turn, then reply in-thread with the most
+    /// recent owner-authored context (ADR-H9: only owner turns are planner input).
+    async fn continue_agenda(&self, ctx: &Context, msg: &Message, ev: &MessageEvent) {
+        let content = self.strip_self_mention(&ev.content);
+        let turns = {
+            let mut store = self.agendas.lock().await;
+            store.append_turn(
+                ev.channel,
+                AgendaTurn {
+                    message_id: ev.message_id,
+                    principal: Principal::Owner,
+                    content: content.clone(),
+                    at_ms: self.now_ms(),
+                },
+            );
+            store
+                .get_by_thread(ev.channel)
+                .map(|a| a.context_window(MAX_CONTEXT_TURNS))
+                .unwrap_or_else(|| vec![content.clone()])
+        };
+        self.respond_with_turns(ctx, msg, ev, &turns, ev.channel).await;
+    }
+
+    /// Ask the model over `turns` and deliver the result to `reply_channel`: either a rich
+    /// reply or a staged approval-queue proposal. Shared by every command surface.
+    async fn respond_with_turns(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        ev: &MessageEvent,
+        turns: &[String],
+        reply_channel: u64,
+    ) {
+        let Some(llm) = &self.llm else { return };
+        let _ = ChannelId::new(reply_channel).broadcast_typing(&ctx.http).await;
+        match llm.respond_or_propose(turns).await {
             Ok(LlmOutcome::Reply(text)) => {
                 let out = if text.is_empty() {
                     "(the model returned nothing)".to_string()
                 } else {
                     truncate(&text, 1900)
                 };
-                if let Err(e) = msg.reply(ctx, out).await {
+                if let Err(e) = ChannelId::new(reply_channel).say(&ctx.http, out).await {
                     tracing::warn!(error = %e, "failed to send command reply");
                 }
             }
@@ -156,7 +273,9 @@ impl Handler {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "llm error");
-                let _ = msg.reply(ctx, "I hit an error reaching my local model.").await;
+                let _ = ChannelId::new(reply_channel)
+                    .say(&ctx.http, "I hit an error reaching my local model.")
+                    .await;
             }
         }
     }
@@ -312,7 +431,17 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        let ev = self.normalize(&msg);
+        let mut ev = self.normalize(&msg);
+        // Research-room UX (S2.5): inside a private research surface (the research channel
+        // or an agenda thread Hermes opened), an owner message is a command without needing
+        // an @mention. This never widens authority — the guard still authorizes by owner id
+        // — it only relaxes the *addressed* requirement on surfaces that are private by
+        // construction (so it cannot create a public oracle, H-A16).
+        let in_private_room = self.room.research_channel == Some(ev.channel)
+            || self.is_agenda_thread(ev.channel).await;
+        if in_private_room && !ev.addressed.is_addressed() {
+            ev.addressed = Addressed::Direct;
+        }
         let now = self.now_ms();
         let action = {
             let mut cd = self.cooldown.lock().await;

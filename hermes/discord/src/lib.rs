@@ -12,9 +12,10 @@ pub mod sink;
 use std::sync::Arc;
 
 use hermes_core::guard::OwnerAuth;
-use hermes_core::ApprovalQueue;
+use hermes_core::{AgendaStore, ApprovalQueue, RoomScope};
 use hermes_llm::LlmClient;
 use serenity::all::{Client, GatewayIntents, Http};
+use tokio::sync::Mutex;
 
 pub use handler::Handler;
 pub use preflight::{preflight, PreflightError};
@@ -72,6 +73,20 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
     // every decision is still durably recorded locally.
     let decisions = build_decision_sink();
 
+    // WP-S2.5 — the research room. Rich, multi-turn command handling is confined to private
+    // surfaces (the research channel + agenda threads + DMs), so a public channel can never
+    // become an owner-id oracle (H-A16). Without a research channel configured, only DMs are
+    // a rich surface.
+    let research_channel = std::env::var("HERMES_RESEARCH_CHANNEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    match research_channel {
+        Some(ch) => tracing::info!(channel = ch, "research room → #hermes-research"),
+        None => tracing::info!("research room → DMs only (set HERMES_RESEARCH_CHANNEL to add a channel)"),
+    }
+    let room = RoomScope::new(research_channel);
+    let agendas = Arc::new(Mutex::new(AgendaStore::new()));
+
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler::new(
             auth,
@@ -81,6 +96,8 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
             Some(llm),
             queue,
             approval_channel,
+            room,
+            agendas,
         ))
         .await?;
 

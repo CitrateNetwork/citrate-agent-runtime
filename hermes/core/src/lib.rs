@@ -24,21 +24,25 @@
 //!   ([`guard::owner_authored_context`]).
 
 pub mod action;
+pub mod agenda;
 pub mod approval;
 pub mod cooldown;
 pub mod decision;
 pub mod event;
 pub mod guard;
 pub mod principal;
+pub mod room;
 pub mod trail;
 
 pub use action::{decide, Action};
+pub use agenda::{Agenda, AgendaId, AgendaStatus, AgendaStore, AgendaTurn};
 pub use approval::{
     custom_id, parse_custom_id, ActionEffect, ActionId, ApprovalQueue, Decision, PendingAction,
     Provenance,
 };
 pub use cooldown::RefusalCooldown;
 pub use decision::{ApprovalDecision, DecisionSink, InMemoryDecisionSink, NullDecisionSink};
+pub use room::{is_new_agenda_post, is_private_surface, RoomScope};
 pub use trail::{InMemoryTrail, NullTrail, Outcome, Trail, TrailEntry};
 pub use event::{
     Addressed, AuthorKind, ChannelId, ChannelKind, InteractionEvent, InteractionKind, MessageEvent,
