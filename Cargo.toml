@@ -10,6 +10,7 @@ members = [
     "agent-cron",
     "agent-code",
     "agent-legacy",
+    "hermes/core",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
