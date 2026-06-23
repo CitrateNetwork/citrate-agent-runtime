@@ -12,6 +12,7 @@ pub mod sink;
 use std::sync::Arc;
 
 use hermes_core::guard::OwnerAuth;
+use hermes_core::ApprovalQueue;
 use hermes_llm::LlmClient;
 use serenity::all::{Client, GatewayIntents, Http};
 
@@ -51,9 +52,21 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
         | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::DIRECT_MESSAGES;
 
+    // WP-S2.2 — the approval queue + its (optional) dedicated channel. Without a
+    // configured channel, proposals post in-place where the owner is talking.
+    let queue = Arc::new(ApprovalQueue::new());
+    let approval_channel = std::env::var("HERMES_APPROVAL_CHANNEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if let Some(ch) = approval_channel {
+        tracing::info!(channel = ch, "approval queue → dedicated channel");
+    } else {
+        tracing::info!("approval queue → in-place (set HERMES_APPROVAL_CHANNEL to dedicate one)");
+    }
+
     let trail = Arc::new(TracingTrail);
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler::new(auth, bot_id, trail, Some(llm)))
+        .event_handler(Handler::new(auth, bot_id, trail, Some(llm), queue, approval_channel))
         .await?;
 
     tracing::info!("hermes daemon starting");

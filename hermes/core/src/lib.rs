@@ -24,6 +24,7 @@
 //!   ([`guard::owner_authored_context`]).
 
 pub mod action;
+pub mod approval;
 pub mod cooldown;
 pub mod event;
 pub mod guard;
@@ -31,6 +32,10 @@ pub mod principal;
 pub mod trail;
 
 pub use action::{decide, Action};
+pub use approval::{
+    custom_id, parse_custom_id, ActionEffect, ActionId, ApprovalQueue, Decision, PendingAction,
+    Provenance,
+};
 pub use cooldown::RefusalCooldown;
 pub use trail::{InMemoryTrail, NullTrail, Outcome, Trail, TrailEntry};
 pub use event::{
