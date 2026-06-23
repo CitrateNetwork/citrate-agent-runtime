@@ -1,0 +1,31 @@
+# hermes-discord — the serenity gateway adapter for Hermes (HERMES-L-S1, WP-S1.1/S1.2).
+# Transport only: it normalizes Discord gateway events into hermes-core event types,
+# asks the guard what to do, and carries out the resulting Action. It makes NO
+# authorization or routing decisions of its own — those all live in hermes-core (ADR-H3).
+[package]
+name = "hermes-discord"
+version = "0.4.0"
+edition = "2021"
+authors = ["Citrate Network"]
+license = "MIT"
+repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
+description = "Hermes Discord gateway adapter + daemon: maps gateway events onto the hermes-core boundary (HERMES-L-S1)."
+
+[[bin]]
+name = "hermesd"
+path = "src/bin/hermesd.rs"
+
+[dependencies]
+hermes-core = { path = "../core" }
+serenity = { version = "0.12", default-features = false, features = [
+    "builder",
+    "client",
+    "gateway",
+    "http",
+    "model",
+    "rustls_backend",
+] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

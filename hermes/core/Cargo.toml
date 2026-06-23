@@ -1,0 +1,18 @@
+# hermes-core — the transport-agnostic decision core for Hermes (HERMES-L-S1).
+# Pure logic: the ingress guard, two-plane routing, owner authorization,
+# per-message principal binding, and the refusal cooldown. No Discord, no async,
+# no I/O — so the security heart is exhaustively unit-testable. The serenity
+# gateway adapter (hermes-discord) maps transport events onto these types and
+# makes no decisions of its own (ADR-H3, ADR-H9).
+[package]
+name = "hermes-core"
+version = "0.4.0"
+edition = "2021"
+authors = ["Citrate Network"]
+license = "MIT"
+repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
+description = "Hermes decision core: owner-only command boundary, two-plane routing, anti-injection primitives (HERMES-L-S1)."
+
+[dependencies]
+# Intentionally empty: pure std. Keeps the security core dependency-free and
+# trivially auditable (no supply-chain surface on the boundary itself, ADR-H11).
