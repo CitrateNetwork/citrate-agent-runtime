@@ -18,7 +18,7 @@ use serenity::all::{Client, GatewayIntents, Http};
 
 pub use handler::Handler;
 pub use preflight::{preflight, PreflightError};
-pub use sink::TracingTrail;
+pub use sink::{FanoutDecisionSink, TracingDecisionSink, TracingTrail};
 
 /// Run the Hermes daemon: preflight the config (fail-closed), resolve the bot's own id,
 /// then connect to the gateway with least-privilege intents and dispatch events through
@@ -65,11 +65,61 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
     }
 
     let trail = Arc::new(TracingTrail);
+
+    // WP-S2.2b — decision anchoring. The tracing sink is always on (a local append-only
+    // record of every approve/deny). An on-chain anchor (hermes-anchor → RecorderClient)
+    // is layered on only when the owner supplies a registry address + signer; until then
+    // every decision is still durably recorded locally.
+    let decisions = build_decision_sink();
+
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler::new(auth, bot_id, trail, Some(llm), queue, approval_channel))
+        .event_handler(Handler::new(
+            auth,
+            bot_id,
+            trail,
+            decisions,
+            Some(llm),
+            queue,
+            approval_channel,
+        ))
         .await?;
 
     tracing::info!("hermes daemon starting");
     client.start().await?;
     Ok(())
+}
+
+/// Build the decision-anchoring sink. The tracing sink is always present (a local,
+/// append-only record of every owner decision). When the `anchor` feature is built **and**
+/// the owner has supplied `HERMES_DECISION_REGISTRY` + a signer (`DEPLOYER_PRIVATE_KEY` /
+/// `.env.testnet`), an on-chain anchor is layered on top via [`hermes_anchor`]. Without
+/// either, decisions are still durably recorded locally — anchoring is additive, never the
+/// only record (WP-S2.2b).
+fn build_decision_sink() -> Arc<dyn hermes_core::decision::DecisionSink> {
+    let tracing_sink: Arc<dyn hermes_core::decision::DecisionSink> = Arc::new(TracingDecisionSink);
+
+    #[cfg(feature = "anchor")]
+    {
+        match hermes_anchor::ChainDecisionSink::from_env() {
+            Some(chain) => {
+                tracing::info!(
+                    registry = chain.registry_addr(),
+                    signer = chain.signer_address(),
+                    "decision anchoring → on-chain (AgentDecisionRegistryV2) + journald"
+                );
+                return Arc::new(FanoutDecisionSink::new(vec![tracing_sink, Arc::new(chain)]));
+            }
+            None => {
+                tracing::info!(
+                    "decision anchoring → journald only (set HERMES_DECISION_REGISTRY + a signer to anchor on-chain)"
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "anchor"))]
+    {
+        tracing::info!("decision anchoring → journald only (built without the `anchor` feature)");
+    }
+
+    tracing_sink
 }

@@ -12,6 +12,7 @@ members = [
     "agent-legacy",
     "hermes/core",
     "hermes/llm",
+    "hermes/anchor",
     "hermes/discord",
 ]
 default-members = ["agent/cli"]

@@ -26,6 +26,7 @@
 pub mod action;
 pub mod approval;
 pub mod cooldown;
+pub mod decision;
 pub mod event;
 pub mod guard;
 pub mod principal;
@@ -37,6 +38,7 @@ pub use approval::{
     Provenance,
 };
 pub use cooldown::RefusalCooldown;
+pub use decision::{ApprovalDecision, DecisionSink, InMemoryDecisionSink, NullDecisionSink};
 pub use trail::{InMemoryTrail, NullTrail, Outcome, Trail, TrailEntry};
 pub use event::{
     Addressed, AuthorKind, ChannelId, ChannelKind, InteractionEvent, InteractionKind, MessageEvent,

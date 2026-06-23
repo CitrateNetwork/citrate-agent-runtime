@@ -1,0 +1,21 @@
+# hermes-anchor — the OPTIONAL on-chain decision sink for Hermes (HERMES-L-S2.2b).
+#
+# Isolated so the heavy chain stack (citrate-agent-core → wasmtime, wallet-core) is a
+# supply-chain surface ONLY when on-chain anchoring is built in. hermes-core stays pure
+# (ADR-H11); the daemon pulls this crate via the off-by-default `anchor` feature, and even
+# then only anchors when the owner supplies a registry address + signer.
+[package]
+name = "hermes-anchor"
+version = "0.4.0"
+edition = "2021"
+authors = ["Citrate Network"]
+license = "MIT"
+repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
+description = "Hermes on-chain decision anchor: ApprovalDecision → AgentDecisionRegistryV2.record via the runtime RecorderClient (optional)."
+
+[dependencies]
+hermes-core = { path = "../core" }
+citrate-agent-core = { path = "../../agent/core" }
+sha3 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

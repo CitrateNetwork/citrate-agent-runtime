@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hermes_core::approval::{custom_id, parse_custom_id};
+use hermes_core::decision::{ApprovalDecision, DecisionSink};
 use hermes_core::event::{InteractionEvent, InteractionKind, MessageEvent};
 use hermes_core::guard::{route_interaction, InteractionDecision, OwnerAuth, REFUSAL};
 use hermes_core::trail::{Outcome, Trail, TrailEntry};
@@ -46,6 +47,7 @@ pub struct Handler {
     bot_id: u64,
     start: Instant,
     trail: Arc<dyn Trail>,
+    decisions: Arc<dyn DecisionSink>,
     llm: Option<Arc<LlmClient>>,
     queue: Arc<ApprovalQueue>,
     /// Channel proposals are posted to. `None` ⇒ post in the channel the command came from.
@@ -54,11 +56,15 @@ pub struct Handler {
 
 impl Handler {
     /// Build the handler. `llm` `None` ⇒ the owner gets a plain acknowledgement;
-    /// `approval_channel` `None` ⇒ proposals post in-place.
+    /// `approval_channel` `None` ⇒ proposals post in-place. `decisions` is the
+    /// decision-anchoring sink (always at least the tracing sink; an on-chain anchor is
+    /// layered on when configured, WP-S2.2b).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: OwnerAuth,
         bot_id: u64,
         trail: Arc<dyn Trail>,
+        decisions: Arc<dyn DecisionSink>,
         llm: Option<Arc<LlmClient>>,
         queue: Arc<ApprovalQueue>,
         approval_channel: Option<u64>,
@@ -69,6 +75,7 @@ impl Handler {
             bot_id,
             start: Instant::now(),
             trail,
+            decisions,
             llm,
             queue,
             approval_channel,
@@ -270,6 +277,12 @@ impl Handler {
                 .await;
             return;
         };
+
+        // Anchor the decision (the concrete effect the owner approved, H-A12). Recorded
+        // before execution so the audit record exists even if the effect later fails — a
+        // denied action is recorded too. resolve() already guaranteed this fires once.
+        self.decisions
+            .record(ApprovalDecision::from_resolved(&action, dec, self.now_ms()));
 
         let result_line = match dec {
             Decision::Approve => match self.execute(ctx, &action.effect).await {

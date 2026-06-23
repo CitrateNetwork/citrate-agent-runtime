@@ -15,9 +15,17 @@ description = "Hermes Discord gateway adapter + daemon: maps gateway events onto
 name = "hermesd"
 path = "src/bin/hermesd.rs"
 
+[features]
+# Off by default: pulls in the chain stack (citrate-agent-core → wasmtime, wallet-core)
+# ONLY when on-chain decision anchoring is built in. Build the production daemon with
+# `--features anchor` and set HERMES_DECISION_REGISTRY + a signer to anchor (WP-S2.2b).
+default = []
+anchor = ["dep:hermes-anchor"]
+
 [dependencies]
 hermes-core = { path = "../core" }
 hermes-llm = { path = "../llm" }
+hermes-anchor = { path = "../anchor", optional = true }
 serenity = { version = "0.12", default-features = false, features = [
     "builder",
     "client",
