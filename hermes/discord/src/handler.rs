@@ -22,7 +22,7 @@ use hermes_llm::{LlmClient, LlmOutcome};
 use serenity::all::{
     ButtonStyle, ChannelId, ComponentInteraction, Context, CreateActionRow, CreateButton,
     CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateThread,
-    EventHandler, Interaction, Message, Ready,
+    EventHandler, GetMessages, Interaction, Message, Ready,
 };
 use serenity::async_trait;
 use tokio::sync::Mutex;
@@ -48,6 +48,24 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Fetch up to `limit` recent messages from a channel as `"author: content"` lines (newest
+/// first, the order serenity returns). Bot/own messages are kept — the caller frames the
+/// result as data. Each line is single-lined + bounded so one giant message can't dominate.
+async fn fetch_recent(ctx: &Context, channel: u64, limit: u32) -> anyhow::Result<Vec<String>> {
+    let n = limit.clamp(1, 50) as u8;
+    let msgs = ChannelId::new(channel)
+        .messages(&ctx.http, GetMessages::new().limit(n))
+        .await?;
+    Ok(msgs
+        .into_iter()
+        .map(|m| {
+            let content = m.content.replace('\n', " ");
+            let content = truncate(&content, 240);
+            format!("{}: {}", m.author.name, content)
+        })
+        .collect())
+}
+
 /// The Hermes gateway handler.
 pub struct Handler {
     auth: OwnerAuth,
@@ -67,6 +85,8 @@ pub struct Handler {
     agendas: Arc<Mutex<AgendaStore>>,
     /// Durable memory backend (S2.3); persisted after every agenda/queue mutation.
     memory: Arc<dyn MemoryStore>,
+    /// Allowlisted channels a digest may be posted to (T13). Empty ⇒ digests are refused.
+    digest_targets: Vec<u64>,
 }
 
 impl Handler {
@@ -87,6 +107,7 @@ impl Handler {
         room: RoomScope,
         agendas: Arc<Mutex<AgendaStore>>,
         memory: Arc<dyn MemoryStore>,
+        digest_targets: Vec<u64>,
     ) -> Self {
         Self {
             auth,
@@ -101,6 +122,7 @@ impl Handler {
             room,
             agendas,
             memory,
+            digest_targets,
         }
     }
 
@@ -291,11 +313,96 @@ impl Handler {
             Ok(LlmOutcome::ProposePost { channel_id, content }) => {
                 self.stage_post_proposal(ctx, msg, ev, channel_id, content).await;
             }
+            Ok(LlmOutcome::ReadChannel { channel_id, limit }) => {
+                let target = channel_id.unwrap_or(ev.channel);
+                self.read_channel_for_owner(ctx, target, limit, reply_channel).await;
+            }
+            Ok(LlmOutcome::ProposeDigest { source_channel, target_channel }) => {
+                let source = source_channel.unwrap_or(ev.channel);
+                self.stage_digest_proposal(ctx, msg, ev, source, target_channel).await;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "llm error");
                 let _ = ChannelId::new(reply_channel)
                     .say(&ctx.http, "I hit an error reaching my local model.")
                     .await;
+            }
+        }
+    }
+
+    /// Read recent messages from `channel` and show them to the owner (S2.4 discord-read).
+    /// Read-only: nothing is posted to the source. The content is shown to the owner as
+    /// **data** — it is never fed back to the model as instructions (T22).
+    async fn read_channel_for_owner(
+        &self,
+        ctx: &Context,
+        channel: u64,
+        limit: u32,
+        reply_channel: u64,
+    ) {
+        match fetch_recent(ctx, channel, limit).await {
+            Ok(lines) if lines.is_empty() => {
+                let _ = ChannelId::new(reply_channel)
+                    .say(&ctx.http, format!("No readable recent messages in <#{channel}>."))
+                    .await;
+            }
+            Ok(lines) => {
+                // Oldest-first, framed as a quoted read so it's visibly data, not Hermes.
+                let body = format!(
+                    "🔎 **Recent messages in <#{channel}>** (latest {}):\n{}",
+                    lines.len(),
+                    lines.iter().rev().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+                );
+                let _ = ChannelId::new(reply_channel).say(&ctx.http, truncate(&body, 1900)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, channel, "read_channel failed");
+                let _ = ChannelId::new(reply_channel)
+                    .say(&ctx.http, format!("I couldn't read <#{channel}> (no access?)."))
+                    .await;
+            }
+        }
+    }
+
+    /// Stage a digest proposal (S2.4 discord-digest). The target must be on the allowlist
+    /// (T13) — checked here at propose time and again at execute time (defense in depth). If
+    /// it isn't, Hermes refuses and names the allowed targets rather than staging anything.
+    async fn stage_digest_proposal(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        ev: &MessageEvent,
+        source: u64,
+        target: u64,
+    ) {
+        if !self.digest_targets.contains(&target) {
+            let allowed = if self.digest_targets.is_empty() {
+                "no digest targets are configured".to_string()
+            } else {
+                self.digest_targets.iter().map(|c| format!("<#{c}>")).collect::<Vec<_>>().join(", ")
+            };
+            let _ = msg
+                .reply(ctx, format!("I can't post a digest to <#{target}> — it's not an allowed target. Allowed: {allowed}."))
+                .await;
+            return;
+        }
+        let effect = ActionEffect::Digest { source_channel: source, target_channel: target };
+        let provenance = Provenance {
+            triggered_by_message: Some(ev.message_id),
+            triggered_in_channel: Some(ev.channel),
+        };
+        let action = self.queue.propose(effect, provenance, self.now_ms());
+        self.persist().await;
+        let dest = self.approval_channel.unwrap_or(ev.channel);
+        match self.post_proposal(ctx, dest, &action).await {
+            Ok(()) => {
+                let _ = msg
+                    .reply(ctx, format!("Proposed (#{}) — awaiting your approval.", action.id))
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to post digest proposal");
+                let _ = msg.reply(ctx, "I drafted that digest but couldn't queue it.").await;
             }
         }
     }
@@ -368,6 +475,34 @@ impl Handler {
         match effect {
             ActionEffect::PostMessage { channel, content } => {
                 ChannelId::new(*channel).say(&ctx.http, content).await?;
+                Ok(())
+            }
+            ActionEffect::Digest { source_channel, target_channel } => {
+                // T13 re-check at execute time: the allowlist could have changed, or a
+                // restored proposal could name a now-disallowed target. Never post off-list.
+                if !self.digest_targets.contains(target_channel) {
+                    anyhow::bail!("digest target <#{target_channel}> is not allowlisted");
+                }
+                let llm = self
+                    .llm
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no model configured to summarize"))?;
+                let lines = fetch_recent(ctx, *source_channel, 50)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read source failed: {e}"))?;
+                if lines.is_empty() {
+                    ChannelId::new(*target_channel)
+                        .say(&ctx.http, format!("Digest of <#{source_channel}>: nothing recent to summarize."))
+                        .await?;
+                    return Ok(());
+                }
+                // Summarized as untrusted data (T22).
+                let summary = llm
+                    .summarize_messages(&format!("<#{source_channel}>"), &lines)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("summarize failed: {e}"))?;
+                let body = format!("📰 **Digest of <#{source_channel}>**\n{}", truncate(&summary, 1800));
+                ChannelId::new(*target_channel).say(&ctx.http, body).await?;
                 Ok(())
             }
         }

@@ -125,6 +125,8 @@ struct PendingDto {
 enum EffectDto {
     #[serde(rename = "post-message")]
     PostMessage { channel: u64, content: String },
+    #[serde(rename = "digest")]
+    Digest { source_channel: u64, target_channel: u64 },
 }
 
 impl SnapshotDto {
@@ -205,6 +207,9 @@ impl PendingDto {
             ActionEffect::PostMessage { channel, content } => {
                 EffectDto::PostMessage { channel: *channel, content: content.clone() }
             }
+            ActionEffect::Digest { source_channel, target_channel } => {
+                EffectDto::Digest { source_channel: *source_channel, target_channel: *target_channel }
+            }
         };
         Self {
             id: p.id,
@@ -218,6 +223,9 @@ impl PendingDto {
         let effect = match self.effect {
             EffectDto::PostMessage { channel, content } => {
                 ActionEffect::PostMessage { channel, content }
+            }
+            EffectDto::Digest { source_channel, target_channel } => {
+                ActionEffect::Digest { source_channel, target_channel }
             }
         };
         PendingAction {

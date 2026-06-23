@@ -118,6 +118,19 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
     }
     let agendas = Arc::new(Mutex::new(agenda_store));
 
+    // WP-S2.4 — digest target allowlist (T13). A digest may only be posted to a channel on
+    // this list; empty ⇒ digests are refused. Comma-separated channel ids.
+    let digest_targets: Vec<u64> = std::env::var("HERMES_DIGEST_TARGETS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .collect();
+    if digest_targets.is_empty() {
+        tracing::info!("digest targets → none (set HERMES_DIGEST_TARGETS to allow digests)");
+    } else {
+        tracing::info!(count = digest_targets.len(), "digest targets → allowlisted");
+    }
+
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler::new(
             auth,
@@ -130,6 +143,7 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
             room,
             agendas,
             memory,
+            digest_targets,
         ))
         .await?;
 

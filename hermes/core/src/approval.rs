@@ -35,6 +35,16 @@ pub enum ActionEffect {
         /// The exact content that will be posted.
         content: String,
     },
+    /// Summarize a channel's recent activity and post the digest to a target (S2.4). The
+    /// target is allowlisted by the adapter (T13); the source content is summarized as
+    /// untrusted data (T22). The summary is produced at execute time, so the approval is for
+    /// the *act* (summarize source → post to target), with the exact source + target shown.
+    Digest {
+        /// The channel whose recent activity will be summarized.
+        source_channel: ChannelId,
+        /// The allowlisted channel the digest will be posted to.
+        target_channel: ChannelId,
+    },
 }
 
 impl ActionEffect {
@@ -42,11 +52,12 @@ impl ActionEffect {
     pub fn kind(&self) -> &'static str {
         match self {
             ActionEffect::PostMessage { .. } => "post-message",
+            ActionEffect::Digest { .. } => "digest",
         }
     }
 
     /// The **full, concrete** human description the owner approves against (H-A12): the
-    /// exact target and the exact content, never a vague summary.
+    /// exact target and the exact content/effect, never a vague summary.
     pub fn describe(&self) -> String {
         match self {
             ActionEffect::PostMessage { channel, content } => {
@@ -56,6 +67,11 @@ impl ActionEffect {
                     content.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
                 };
                 format!("**Post a message** to <#{channel}>:\n{quoted}")
+            }
+            ActionEffect::Digest { source_channel, target_channel } => {
+                format!(
+                    "**Summarize** <#{source_channel}> and **post the digest** to <#{target_channel}>"
+                )
             }
         }
     }
@@ -238,6 +254,31 @@ mod tests {
         assert!(d.contains("<#12345>"));
         assert!(d.contains("> Welcome!"));
         assert!(d.contains("> Rules in #info"));
+    }
+
+    #[test]
+    fn digest_effect_describes_source_and_target() {
+        let e = ActionEffect::Digest { source_channel: 111, target_channel: 222 };
+        assert_eq!(e.kind(), "digest");
+        let d = e.describe();
+        assert!(d.contains("<#111>"));
+        assert!(d.contains("<#222>"));
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_pending_and_advances_next_id() {
+        let q = ApprovalQueue::new();
+        q.propose(post(9, "a"), Provenance::default(), 0);
+        q.propose(post(9, "b"), Provenance::default(), 1);
+        let (pending, next_id) = q.snapshot();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(next_id, 2);
+
+        let q2 = ApprovalQueue::new();
+        q2.restore(pending, next_id);
+        assert_eq!(q2.pending_count(), 2);
+        // A new proposal gets id 3 — no collision with the restored 1/2.
+        assert_eq!(q2.propose(post(9, "c"), Provenance::default(), 2).id, 3);
     }
 
     #[test]
