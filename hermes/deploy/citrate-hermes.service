@@ -33,17 +33,18 @@ ProtectHome=read-only
 # The one writable path Hermes needs (workspace for agent-code/capsules). Narrow this.
 ReadWritePaths=%h/Projects/Citrate-Labs/citrate-agent-runtime
 PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
-# No capabilities, no privilege escalation, no root.
-CapabilityBoundingSet=
-AmbientCapabilities=
+# NOTE: ProtectKernelTunables/Modules/ControlGroups are omitted — they require capability
+# manipulation a --user manager can't perform (exit 218/CAPABILITIES). To enable them, run
+# Hermes as a SYSTEM service under a dedicated unprivileged user instead.
+# NOTE: capability-dropping (CapabilityBoundingSet=/AmbientCapabilities=) is intentionally
+# omitted — a --user service already runs unprivileged with no capabilities, and the user
+# manager is not permitted to set the bounding set (it fails with EPERM). NoNewPrivileges
+# above already blocks any escalation.
 
 [Install]
 WantedBy=default.target
