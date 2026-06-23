@@ -23,11 +23,13 @@
 //!   the planner context window is filtered to owner-authored messages
 //!   ([`guard::owner_authored_context`]).
 
+pub mod action;
 pub mod cooldown;
 pub mod event;
 pub mod guard;
 pub mod principal;
 
+pub use action::{decide, Action};
 pub use cooldown::RefusalCooldown;
 pub use event::{
     Addressed, AuthorKind, ChannelId, ChannelKind, InteractionEvent, InteractionKind, MessageEvent,

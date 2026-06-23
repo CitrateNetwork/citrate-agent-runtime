@@ -1,0 +1,49 @@
+# Hermes daemon — hardened, unprivileged systemd unit (ADR-H6).
+#
+# Install as a --user service on the DGX:
+#   mkdir -p ~/.config/systemd/user
+#   cp hermes/deploy/citrate-hermes.service ~/.config/systemd/user/
+#   # edit WorkingDirectory + EnvironmentFile paths below, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now citrate-hermes
+#   journalctl --user -u citrate-hermes -f
+#
+# Runs as the invoking (non-root) user. Because Hermes has shell access via capsules,
+# the hardening below contains the blast radius of a compromise to an unprivileged
+# sandbox, not the machine (T5/T10).
+
+[Unit]
+Description=Citrate Hermes operator agent (HERMES-L)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Absolute paths — edit to your checkout.
+WorkingDirectory=%h/Projects/Citrate-Labs/citrate-agent-runtime
+EnvironmentFile=%h/Projects/Citrate-Labs/citrate-agent-runtime/.env.hermes
+ExecStart=%h/Projects/Citrate-Labs/citrate-agent-runtime/target/release/hermesd
+Restart=on-failure
+RestartSec=5
+
+# --- hardening (ADR-H6) ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The one writable path Hermes needs (workspace for agent-code/capsules). Narrow this.
+ReadWritePaths=%h/Projects/Citrate-Labs/citrate-agent-runtime
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+# No capabilities, no privilege escalation, no root.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=default.target

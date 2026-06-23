@@ -11,6 +11,7 @@ members = [
     "agent-code",
     "agent-legacy",
     "hermes/core",
+    "hermes/discord",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
