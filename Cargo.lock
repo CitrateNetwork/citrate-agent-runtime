@@ -2368,10 +2368,23 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "hermes-core",
+ "hermes-llm",
  "serenity",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "hermes-llm"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

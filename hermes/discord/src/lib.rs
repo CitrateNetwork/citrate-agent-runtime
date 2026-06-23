@@ -12,6 +12,7 @@ pub mod sink;
 use std::sync::Arc;
 
 use hermes_core::guard::OwnerAuth;
+use hermes_llm::LlmClient;
 use serenity::all::{Client, GatewayIntents, Http};
 
 pub use handler::Handler;
@@ -32,6 +33,16 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
     let bot_id = me.id.get();
     tracing::info!(bot = %me.name, bot_id, "preflight ok — owner configured, token valid");
 
+    // WP-S2.1 — local LLM for the command plane. A down model is a warning, not a fatal
+    // error: the owner boundary must run regardless; commands just report the model is
+    // unreachable until it's back.
+    let llm = Arc::new(LlmClient::from_env());
+    if llm.health().await {
+        tracing::info!(endpoint = llm.endpoint(), model = llm.model(), "local LLM reachable");
+    } else {
+        tracing::warn!(endpoint = llm.endpoint(), "local LLM NOT reachable — owner commands will report an error until it's up");
+    }
+
     // Least-privilege intents for S1: read + members (for later onboarding). No
     // moderation/manage intents until the sprints that need them (ADR-H8).
     let intents = GatewayIntents::GUILDS
@@ -42,7 +53,7 @@ pub async fn run(token: String, owner_id_cfg: Option<String>) -> anyhow::Result<
 
     let trail = Arc::new(TracingTrail);
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler::new(auth, bot_id, trail))
+        .event_handler(Handler::new(auth, bot_id, trail, Some(llm)))
         .await?;
 
     tracing::info!("hermes daemon starting");

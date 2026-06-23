@@ -17,6 +17,7 @@ path = "src/bin/hermesd.rs"
 
 [dependencies]
 hermes-core = { path = "../core" }
+hermes-llm = { path = "../llm" }
 serenity = { version = "0.12", default-features = false, features = [
     "builder",
     "client",

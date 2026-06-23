@@ -1,0 +1,19 @@
+# hermes-llm — client for the local LLM that backs Hermes's reasoning (HERMES-L-S2).
+# Talks to any OpenAI-compatible chat endpoint on the box: Ollama (127.0.0.1:11434) or
+# the citrate-llama llama-server. Local by default — no prompt leaves the machine (ADR-H2).
+[package]
+name = "hermes-llm"
+version = "0.4.0"
+edition = "2021"
+authors = ["Citrate Network"]
+license = "MIT"
+repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
+description = "Hermes local LLM client (OpenAI-compatible chat) for the research-room command plane."
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
