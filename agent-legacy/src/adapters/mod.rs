@@ -3,5 +3,6 @@
 //! through the MCP server and capability grant system.
 
 pub mod hermes;
+pub mod memory;
 pub mod openclaw;
 pub mod sandbox;
