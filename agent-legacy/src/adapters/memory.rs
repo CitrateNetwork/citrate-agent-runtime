@@ -56,7 +56,7 @@ pub trait MemoryTransport: Send + Sync {
 }
 
 /// Configuration for a BYOM memory connection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryAdapterConfig {
     /// Gateway origin, e.g. `https://mem-gateway.example.com` (no baked host).
     pub origin: String,
@@ -64,6 +64,79 @@ pub struct MemoryAdapterConfig {
     pub sub: String,
     /// HS256 connect token (byte-matches the gateway's MEM_CONNECT_SECRET issuance).
     pub connect_token: String,
+}
+
+impl MemoryAdapterConfig {
+    /// Resolve credentials WITHOUT forcing the user to touch environment
+    /// variables. Sources, first hit wins:
+    ///
+    /// 1. **Session/config file** — a JSON `{origin, sub, connect_token}` at
+    ///    `CITRATE_MEMORY_CONFIG`, else `$XDG_CONFIG_HOME/citrate/memory.json`,
+    ///    else `$HOME/.config/citrate/memory.json`. The host app (citrate-core /
+    ///    Studio) writes this once, after the user logs in — so an in-app agent
+    ///    is credentialed by the login the user already did, not by a dotfile edit.
+    /// 2. **Environment** — `MEM_GATEWAY_ORIGIN` / `MEM_GATEWAY_SUB` /
+    ///    `MEM_CONNECT_TOKEN`. Last resort, for CI and self-hosters.
+    ///
+    /// `None` means unconfigured — memory is optional, so callers no-op quietly.
+    /// (An explicit, code-supplied config bypasses this entirely: just build the
+    /// adapter with [`MemoryAdapter::new`].)
+    pub fn resolve() -> Option<Self> {
+        Self::from_config_file().or_else(Self::from_env_vars)
+    }
+
+    /// Read credentials from the session/config JSON file, if present and complete.
+    pub fn from_config_file() -> Option<Self> {
+        Self::from_json_path(&Self::config_path()?)
+    }
+
+    /// Read credentials from `MEM_GATEWAY_ORIGIN` / `MEM_GATEWAY_SUB` /
+    /// `MEM_CONNECT_TOKEN`. All three required; blanks are treated as unset.
+    pub fn from_env_vars() -> Option<Self> {
+        let var = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        match (
+            var("MEM_GATEWAY_ORIGIN"),
+            var("MEM_GATEWAY_SUB"),
+            var("MEM_CONNECT_TOKEN"),
+        ) {
+            (Some(origin), Some(sub), Some(connect_token)) => Some(Self {
+                origin,
+                sub,
+                connect_token,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Parse a session/config JSON file at `path`. Returns `None` on a missing
+    /// file, bad JSON, or any blank field (fail-closed — never a half-built config).
+    pub fn from_json_path(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        let cfg: Self = serde_json::from_slice(&bytes).ok()?;
+        let complete = ![&cfg.origin, &cfg.sub, &cfg.connect_token]
+            .iter()
+            .any(|s| s.trim().is_empty());
+        complete.then_some(cfg)
+    }
+
+    /// The session/config file location: `CITRATE_MEMORY_CONFIG`, else an
+    /// XDG/`$HOME`-based default. No machine-specific path is baked in.
+    fn config_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("CITRATE_MEMORY_CONFIG") {
+            if !p.trim().is_empty() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.config")))?;
+        Some(
+            std::path::PathBuf::from(base)
+                .join("citrate")
+                .join("memory.json"),
+        )
+    }
 }
 
 /// A memory client for one principal over one gateway. Generic over the
@@ -213,28 +286,28 @@ impl MemoryTransport for ReqwestMemoryTransport {
 
 #[cfg(feature = "reqwest-transport")]
 impl MemoryAdapter<ReqwestMemoryTransport> {
-    /// Build a reqwest-backed adapter from the environment. Memory is optional
-    /// for an agent, so an unconfigured environment is `Ok(None)` (not an error);
-    /// a partially-configured one is also `Ok(None)` — fail-closed, never a
-    /// half-built client. Reads `MEM_GATEWAY_ORIGIN`, `MEM_GATEWAY_SUB`,
-    /// `MEM_CONNECT_TOKEN`.
+    /// Build a reqwest-backed adapter from resolved credentials (session/config
+    /// file, then env — see [`MemoryAdapterConfig::resolve`]). This is the path
+    /// that lets an in-app agent be credentialed by the user's login, with no
+    /// environment variables. Unconfigured → `Ok(None)` (memory is optional).
+    pub fn resolved() -> Result<Option<Self>, MemoryError> {
+        Self::build(MemoryAdapterConfig::resolve())
+    }
+
+    /// Build a reqwest-backed adapter from environment variables only. Prefer
+    /// [`resolved`](Self::resolved) for user-facing surfaces; use this for CI or
+    /// self-hosting where env is the intended configuration channel.
     pub fn from_env() -> Result<Option<Self>, MemoryError> {
-        let var = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
-        match (
-            var("MEM_GATEWAY_ORIGIN"),
-            var("MEM_GATEWAY_SUB"),
-            var("MEM_CONNECT_TOKEN"),
-        ) {
-            (Some(origin), Some(sub), Some(connect_token)) => {
-                let transport = ReqwestMemoryTransport::new()?;
-                let cfg = MemoryAdapterConfig {
-                    origin,
-                    sub,
-                    connect_token,
-                };
-                Ok(Some(Self::new(cfg, transport)?))
-            }
-            _ => Ok(None),
+        Self::build(MemoryAdapterConfig::from_env_vars())
+    }
+
+    /// Shared: build from an optional config, minting the reqwest client once.
+    /// `None` config → `Ok(None)`; a present config still fails closed if the
+    /// client can't be built.
+    fn build(cfg: Option<MemoryAdapterConfig>) -> Result<Option<Self>, MemoryError> {
+        match cfg {
+            Some(cfg) => Ok(Some(Self::new(cfg, ReqwestMemoryTransport::new()?)?)),
+            None => Ok(None),
         }
     }
 }
@@ -359,5 +432,34 @@ mod tests {
         let transport = ReqwestMemoryTransport::new().expect("build reqwest transport");
         let adapter = MemoryAdapter::new(cfg(), transport).expect("build adapter");
         assert_eq!(adapter.url, "https://mem-gateway.example.com/mcp/u/user-123");
+    }
+
+    #[test]
+    fn config_file_resolves_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.json");
+        std::fs::write(
+            &path,
+            r#"{"origin":"https://mg.example.com","sub":"u-9","connect_token":"tok-9"}"#,
+        )
+        .unwrap();
+        let cfg = MemoryAdapterConfig::from_json_path(&path).expect("complete config resolves");
+        assert_eq!(cfg.origin, "https://mg.example.com");
+        assert_eq!(cfg.sub, "u-9");
+        assert_eq!(cfg.connect_token, "tok-9");
+        // and it builds a usable adapter
+        let adapter = MemoryAdapter::new(cfg, MockTransport::new(200, "{}")).unwrap();
+        assert_eq!(adapter.url, "https://mg.example.com/mcp/u/u-9");
+    }
+
+    #[test]
+    fn config_file_fails_closed_on_blank_or_missing() {
+        // a blank field is treated as unconfigured (no half-built config)
+        let dir = tempfile::tempdir().unwrap();
+        let blank = dir.path().join("blank.json");
+        std::fs::write(&blank, r#"{"origin":"https://x","sub":"","connect_token":"t"}"#).unwrap();
+        assert!(MemoryAdapterConfig::from_json_path(&blank).is_none());
+        // a missing file is None, not an error
+        assert!(MemoryAdapterConfig::from_json_path(dir.path().join("nope.json").as_path()).is_none());
     }
 }

@@ -158,13 +158,32 @@ pub async fn register_memory_tools<T: MemoryTransport + 'static>(
         .await;
 }
 
-/// Build a reqwest-backed adapter from the environment and register the memory
-/// tools, if the `MEM_GATEWAY_*` seam is configured. Returns whether they were
-/// registered — an unconfigured environment is a quiet no-op (memory is
-/// optional), and a client-build failure is logged, never fatal.
+/// Register the memory tools from **resolved** credentials — a session/config
+/// file written by the host app after login, then env as a fallback (see
+/// [`MemoryAdapterConfig::resolve`](super::memory::MemoryAdapterConfig::resolve)).
+/// This is the path user-facing agents should use: an in-app agent is
+/// credentialed by the login the user already did, with no environment variables.
+/// Returns whether the tools were registered — unconfigured is a quiet no-op
+/// (memory is optional), a client-build failure is logged, never fatal.
+#[cfg(feature = "reqwest-transport")]
+pub async fn register_memory_tools_auto(registry: &crate::tool::ToolRegistry) -> bool {
+    register_from(registry, MemoryAdapter::resolved()).await
+}
+
+/// Register the memory tools from environment variables only. Prefer
+/// [`register_memory_tools_auto`] for user-facing surfaces; use this for CI or
+/// self-hosting where env is the intended configuration channel.
 #[cfg(feature = "reqwest-transport")]
 pub async fn register_memory_tools_from_env(registry: &crate::tool::ToolRegistry) -> bool {
-    match MemoryAdapter::from_env() {
+    register_from(registry, MemoryAdapter::from_env()).await
+}
+
+#[cfg(feature = "reqwest-transport")]
+async fn register_from(
+    registry: &crate::tool::ToolRegistry,
+    built: Result<Option<MemoryAdapter<super::memory::ReqwestMemoryTransport>>, MemoryError>,
+) -> bool {
+    match built {
         Ok(Some(adapter)) => {
             register_memory_tools(registry, Arc::new(adapter)).await;
             true
