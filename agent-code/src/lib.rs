@@ -26,6 +26,13 @@ pub async fn register_tools(registry: &ToolRegistry) {
     registry.register(Arc::new(tools::ShellExec)).await;
     registry.register(Arc::new(tools::GitOps)).await;
     registry.register(Arc::new(tools::SearchCode)).await;
+
+    // Memory tools (memory_recall / memory_assert) over the citrate-memories
+    // gateway. Registered only when the MEM_GATEWAY_* env seam is configured; a
+    // quiet no-op otherwise, so memory stays optional for the coding agent.
+    if citrate_agent_core::adapters::memory_tools::register_memory_tools_from_env(registry).await {
+        tracing::info!("registered memory tools: memory_recall, memory_assert");
+    }
 }
 
 #[cfg(test)]

@@ -4,5 +4,6 @@
 
 pub mod hermes;
 pub mod memory;
+pub mod memory_tools;
 pub mod openclaw;
 pub mod sandbox;
