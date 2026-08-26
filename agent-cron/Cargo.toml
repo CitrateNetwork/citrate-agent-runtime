@@ -7,7 +7,7 @@ description = "Cron scheduling and Standard Operating Procedures (SOPs) for the 
 [dependencies]
 # Legacy agent core (aliased) — needed by the existing
 # SOPDefinition / ApprovalFlow infrastructure in sop.rs.
-citrate-agent-core = { path = "../agent-legacy", package = "citrate-agent-legacy" }
+citrate-agent-core = { path = "../agent-legacy", package = "citrate-agent-legacy", features = ["reqwest-transport"] }
 
 # BFR-INT-poam-B — real agent-core for RecorderClient access in
 # the tripwire jobs. Imported under a distinct name so the

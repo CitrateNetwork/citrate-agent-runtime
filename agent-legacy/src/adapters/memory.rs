@@ -163,6 +163,82 @@ impl<T: MemoryTransport> MemoryAdapter<T> {
     }
 }
 
+// --------------------------------------------------------------------------
+// Batteries-included reqwest transport (opt-in: feature = "reqwest-transport").
+// --------------------------------------------------------------------------
+
+/// A [`MemoryTransport`] backed by `reqwest`. This is the production transport
+/// most agents want; provide a custom impl only for an exotic client or an
+/// offline test. Enable with `features = ["reqwest-transport"]` — the audited
+/// default build pulls in no HTTP client.
+#[cfg(feature = "reqwest-transport")]
+pub struct ReqwestMemoryTransport {
+    client: reqwest::Client,
+}
+
+#[cfg(feature = "reqwest-transport")]
+impl ReqwestMemoryTransport {
+    /// Build with a default client.
+    pub fn new() -> Result<Self, MemoryError> {
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| MemoryError::Transport(format!("build reqwest client: {e}")))?;
+        Ok(Self { client })
+    }
+
+    /// Build from a pre-configured client (proxies, timeouts, custom TLS).
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[cfg(feature = "reqwest-transport")]
+#[async_trait]
+impl MemoryTransport for ReqwestMemoryTransport {
+    async fn post(&self, url: &str, bearer: &str, body: &str) -> Result<(u16, String), String> {
+        let resp = self
+            .client
+            .post(url)
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        Ok((status, text))
+    }
+}
+
+#[cfg(feature = "reqwest-transport")]
+impl MemoryAdapter<ReqwestMemoryTransport> {
+    /// Build a reqwest-backed adapter from the environment. Memory is optional
+    /// for an agent, so an unconfigured environment is `Ok(None)` (not an error);
+    /// a partially-configured one is also `Ok(None)` — fail-closed, never a
+    /// half-built client. Reads `MEM_GATEWAY_ORIGIN`, `MEM_GATEWAY_SUB`,
+    /// `MEM_CONNECT_TOKEN`.
+    pub fn from_env() -> Result<Option<Self>, MemoryError> {
+        let var = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        match (
+            var("MEM_GATEWAY_ORIGIN"),
+            var("MEM_GATEWAY_SUB"),
+            var("MEM_CONNECT_TOKEN"),
+        ) {
+            (Some(origin), Some(sub), Some(connect_token)) => {
+                let transport = ReqwestMemoryTransport::new()?;
+                let cfg = MemoryAdapterConfig {
+                    origin,
+                    sub,
+                    connect_token,
+                };
+                Ok(Some(Self::new(cfg, transport)?))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 /// Percent-encode a path segment conservatively (agents' `sub` is usually an
 /// OIDC subject with `:`/`/`; keep the URL well-formed without a URL crate).
 fn encode_path_segment(s: &str) -> String {
@@ -275,5 +351,13 @@ mod tests {
         let c = MemoryAdapterConfig { sub: "oidc|abc/def".into(), ..cfg() };
         let adapter = MemoryAdapter::new(c, MockTransport::new(200, "{}")).unwrap();
         assert_eq!(adapter.url, "https://mem-gateway.example.com/mcp/u/oidc%7Cabc%2Fdef");
+    }
+
+    #[cfg(feature = "reqwest-transport")]
+    #[test]
+    fn reqwest_transport_builds_a_valid_adapter() {
+        let transport = ReqwestMemoryTransport::new().expect("build reqwest transport");
+        let adapter = MemoryAdapter::new(cfg(), transport).expect("build adapter");
+        assert_eq!(adapter.url, "https://mem-gateway.example.com/mcp/u/user-123");
     }
 }

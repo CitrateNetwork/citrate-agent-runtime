@@ -1038,6 +1038,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "subtle",
