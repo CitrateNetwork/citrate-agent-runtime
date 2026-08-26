@@ -6,6 +6,7 @@
 use clap::{Parser, Subcommand};
 
 mod config;
+mod connect_cmd;
 mod doctor_cmd;
 
 #[derive(Parser, Debug)]
@@ -19,6 +20,8 @@ struct Cli {
 enum Command {
     /// Run the doctor pre-flight / continuous-monitoring pass.
     Doctor(doctor_cmd::DoctorArgs),
+    /// Sign in and write the memory config so the agent needs no env vars.
+    Connect(connect_cmd::ConnectArgs),
 }
 
 fn main() {
@@ -41,6 +44,9 @@ fn main() {
             rt.block_on(async { tokio::task::spawn_blocking(move || doctor_cmd::run(args)).await })
                 .unwrap_or(2)
         }
+        // Synchronous — uses reqwest::blocking + a loopback listener, so it must
+        // NOT run inside a tokio runtime.
+        Command::Connect(args) => connect_cmd::run(args),
     };
     std::process::exit(exit);
 }
