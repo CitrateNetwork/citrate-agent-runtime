@@ -5,7 +5,7 @@ edition = "2021"
 description = "Coding agent tools: file_read, file_write, file_edit, shell_exec, git_ops, search_code — OpenCode-style bridge for IDE/Studio"
 
 [dependencies]
-citrate-agent-core = { path = "../agent-legacy", package = "citrate-agent-legacy" }
+citrate-agent-core = { path = "../agent-legacy", package = "citrate-agent-legacy", features = ["reqwest-transport"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
