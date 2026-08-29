@@ -375,3 +375,45 @@ async fn a_chain_effect_that_is_rejected_does_not_proceed() {
         "rejected → the effect is refused"
     );
 }
+
+/// A ToolCall shaped exactly as the QueuedApprovalGate submits a chain effect ({to, data_hex}).
+fn chain_effect_call(id: &str) -> ToolCall {
+    ToolCall {
+        call_id: id.to_string(),
+        name: "cap::eth-send".to_string(), // not trusted → pends
+        args: serde_json::json!({
+            "to": "0x4a86659BDab24dc444C72fbbaD4cd83491820E40",
+            "data_hex": "0xdeadbeef",
+            "data_len": 4
+        }),
+    }
+}
+
+#[tokio::test]
+async fn approvals_exposes_the_raw_calldata_for_the_ceremony_bridge() {
+    // S6.3: citrate-core's ceremony needs the raw (to, data) to build the SignatureIntent. /approvals
+    // must surface them from the pending chain effect, not just a human summary.
+    let queue = Arc::new(ApprovalQueue::new());
+    let q = queue.clone();
+    let submitter = tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("cd1")).await });
+    wait_depth(&queue, 1).await;
+
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue: queue.clone(),
+        skills: vec![],
+        dispatch: None,
+        bearer: BEARER.to_string(),
+    });
+    let resp = app(st).oneshot(authed("GET", "/approvals")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j[0]["to"], "0x4a86659BDab24dc444C72fbbaD4cd83491820E40",
+        "the chain target is exposed"
+    );
+    assert_eq!(j[0]["data"], "0xdeadbeef", "the calldata is exposed");
+
+    queue.approve();
+    let _ = submitter.await;
+}
