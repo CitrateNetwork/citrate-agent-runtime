@@ -22,6 +22,7 @@ fn state() -> Arc<AppState> {
                 description: "".into(),
             },
         ],
+        dispatch: None,
         bearer: BEARER.to_string(),
     })
 }
@@ -122,17 +123,115 @@ async fn approvals_is_empty_until_a_skill_runs() {
     assert_eq!(j.as_array().unwrap().len(), 0);
 }
 
+// runSkill now RUNS a skill (S6.3 slice-2) via CapsuleDispatch::call_json, spawning it so a chain
+// effect can park on the ApprovalGate. The unit tests below pin the guard rails (auth, bad body,
+// unknown skill, no-dispatch, estop); the real gate-path e2e (a skill's effect surfaces on the queue)
+// is `run_skill_surfaces_a_chain_effect_on_the_queue` further down, driven from the real capsule dir.
+
+// The built capsule fixtures live at the repo root, but tests run from the crate dir.
+fn capsules_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../capsules")
+}
+
+fn run_body(name: &str, args: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/run_skill")
+        .header("authorization", format!("Bearer {BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "name": name, "args": args }).to_string(),
+        ))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn run_skill_refuses_until_s6_3() {
+async fn run_skill_rejects_a_malformed_body_after_auth() {
+    // Authed but empty body → 400 (auth still runs first; Bytes never rejects).
     let resp = app(state())
         .oneshot(authed("POST", "/run_skill"))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "no effect runs without the ceremony bridge"
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn run_skill_503s_when_no_dispatch_loaded() {
+    // state() has dispatch: None — a valid request must NOT pretend to run (Rule 1).
+    let resp = app(state())
+        .oneshot(run_body("list-compliance-posture", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
+    // The gD-hermes safety property through the FULL runSkill path: a skill (the eth-sender-test
+    // capsule) is accepted, runs on a background task via call_json, and its eth-send parks on the
+    // ApprovalGate — surfacing on the same queue /approvals shows. Then approve resolves it. The
+    // send itself fails closed (the sidecar is keyless: no eth-send dispatcher) — proving the sidecar
+    // gates + surfaces but never signs.
+    let queue = Arc::new(ApprovalQueue::new());
+    let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
+    assert!(dispatch.is_some(), "the repo capsules/ dir must load");
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue: queue.clone(),
+        skills: vec![SkillView {
+            name: "eth-sender-test".into(),
+            description: String::new(),
+        }],
+        dispatch,
+        bearer: BEARER.to_string(),
+    });
+
+    // `to` must be the capsule's allow-listed address so the effect reaches the gate (not rejected at
+    // the allow-list). `data` is a 1-byte payload. call_json maps both hex strings → list<u8>.
+    let resp = app(st.clone())
+        .oneshot(run_body(
+            "eth-sender-test",
+            serde_json::json!({
+                "to": "0x4a86659BDab24dc444C72fbbaD4cd83491820E40",
+                "data": "0x01",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "skill accepted");
+    let j = body_json(resp).await;
+    assert_eq!(j["ok"], true);
+    assert_eq!(j["submitted"], true);
+
+    // The spawned skill's eth-send now blocks on the gate → the effect is a pending approval.
+    wait_depth(&queue, 1).await;
+    // Resolve it exactly as POST /approvals/approve does; the gate returns Ok, the (keyless) send then
+    // fails closed and the task ends — the queue drains.
+    queue.approve();
+    wait_depth(&queue, 0).await;
+}
+
+#[tokio::test]
+async fn run_skill_404s_for_an_unknown_skill() {
+    // A loaded dispatch, but the name isn't in the catalog.
+    let queue = Arc::new(ApprovalQueue::new());
+    let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
+    assert!(dispatch.is_some(), "the repo capsules/ dir must load");
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue,
+        skills: vec![SkillView {
+            name: "eth-sender-test".into(),
+            description: String::new(),
+        }],
+        dispatch,
+        bearer: BEARER.to_string(),
+    });
+    let resp = app(st)
+        .oneshot(run_body("no-such-skill", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

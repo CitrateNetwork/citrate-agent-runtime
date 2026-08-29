@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use agent_sidecar::{app, load_skills, AppState};
+use agent_sidecar::{app, load_dispatch, load_skills, AppState};
 use citrate_agent_core::hitl::ApprovalQueue;
 use citrate_agent_legacy::estop::EmergencyStop;
 
@@ -28,12 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let capsule_dir =
         std::env::var("CITRATE_HERMES_CAPSULES").unwrap_or_else(|_| "capsules".to_string());
-    let skills = load_skills(std::path::Path::new(&capsule_dir));
+    let capsule_path = std::path::Path::new(&capsule_dir);
+    let skills = load_skills(capsule_path);
+    let queue = Arc::new(ApprovalQueue::new());
+    // The dispatch carries the QueuedApprovalGate over `queue`, so a skill's chain effect surfaces on
+    // the same queue /approvals + /status read.
+    let dispatch = load_dispatch(capsule_path, queue.clone());
 
     let state = Arc::new(AppState {
         estop: EmergencyStop::new(),
-        queue: Arc::new(ApprovalQueue::new()),
+        queue,
         skills,
+        dispatch,
         bearer,
     });
 

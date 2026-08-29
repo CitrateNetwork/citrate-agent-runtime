@@ -11,9 +11,7 @@
 //! string. Adapter code stays in the consumer crate — this struct
 //! is the library boundary.
 
-use crate::capsule::dispatcher::{
-    ApprovalGate, EthCallDispatcher, EthSendDispatcher,
-};
+use crate::capsule::dispatcher::{ApprovalGate, EthCallDispatcher, EthSendDispatcher};
 use crate::capsule::manifest::Manifest;
 use crate::capsule::wasm::EngineFactory;
 use crate::capsule::{archive, bundled_key, Capsule};
@@ -128,12 +126,10 @@ impl CapsuleDispatch {
         let mut capsules = HashMap::new();
         let mut unverified = HashSet::new();
         let registry = bundled_key::registry();
-        let entries = std::fs::read_dir(dir).map_err(|e| {
-            AgentError::Capsule(format!("read capsule dir {dir:?}: {e}"))
-        })?;
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| AgentError::Capsule(format!("read capsule dir {dir:?}: {e}")))?;
         for entry in entries {
-            let entry = entry
-                .map_err(|e| AgentError::Capsule(format!("read_dir entry: {e}")))?;
+            let entry = entry.map_err(|e| AgentError::Capsule(format!("read_dir entry: {e}")))?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -219,9 +215,10 @@ impl CapsuleDispatch {
         func_name: &str,
         args: &[wasmtime::component::Val],
     ) -> Result<wasmtime::component::Val, AgentError> {
-        let capsule = self.capsules.get(capsule_name).ok_or_else(|| {
-            AgentError::Capsule(format!("capsule {capsule_name:?} not loaded"))
-        })?;
+        let capsule = self
+            .capsules
+            .get(capsule_name)
+            .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
 
         // CIT-AGENT-3e (closes RM-A WP-AGENT_RUNTIME-2026-05-31-001): fail-closed
         // integrity gate with NO escape hatch. A loose-dir capsule that is not bound to
@@ -324,11 +321,9 @@ impl CapsuleDispatch {
         // NOTE: this catches host-Rust panics. WASM-level traps come
         // back as Err from func.call (already handled below) and
         // don't unwind, so catch_unwind is a no-op for them.
-        let call_result = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| {
-                func.call(&mut store, args, &mut results)
-            }),
-        );
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            func.call(&mut store, args, &mut results)
+        }));
         match call_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(AgentError::Capsule(format!("capsule call: {e}"))),
@@ -356,6 +351,45 @@ impl CapsuleDispatch {
         ))
     }
 
+    /// Invoke a capsule from JSON — the Hermes-sidecar (agent-sidecar) entry point (ADR-001,
+    /// Option A). The caller passes only the capsule name + a JSON object of args; this discovers the
+    /// capsule's single exported interface + function and its param types **from the component itself**
+    /// (the WIT is the type source of truth — no hand-maintained schema to drift), maps the JSON args
+    /// to typed `Val`s in signature order, calls through the vetted [`Self::call_raw`] (so the
+    /// integrity gate, resource limits, epoch deadline, panic guard, and the **ApprovalGate** all
+    /// apply — every chain effect still surfaces for human approval), and maps the result back to
+    /// JSON. Fail-closed: a missing arg, a type this mapper does not cover, or a capsule that does not
+    /// export exactly one interface-function is a typed error, never a wrong call.
+    pub fn call_json(
+        &self,
+        capsule_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, AgentError> {
+        let capsule = self
+            .capsules
+            .get(capsule_name)
+            .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
+        // Discover the single (interface, function, params) from the component's own type.
+        let component =
+            wasmtime::component::Component::from_binary(&self.engine, &capsule.archive.wasm)
+                .map_err(|e| AgentError::Capsule(format!("component parse: {e}")))?;
+        let (iface, func, params) = discover_single_entry(&self.engine, &component, capsule_name)?;
+        // Map JSON (an object keyed by the WIT param names) to Vals in signature order.
+        let obj = args.as_object().ok_or_else(|| {
+            AgentError::Capsule(format!("args for {capsule_name} must be a JSON object"))
+        })?;
+        let mut vals = Vec::with_capacity(params.len());
+        for (name, ty) in &params {
+            let v = obj.get(name).ok_or_else(|| {
+                AgentError::Capsule(format!("missing arg {name:?} for {capsule_name}"))
+            })?;
+            vals.push(json_to_val(ty, v, name)?);
+        }
+        // Reuse the vetted call path (integrity gate + limits + epoch + panic guard + ApprovalGate).
+        let result = self.call_raw(capsule_name, &iface, &func, &vals)?;
+        Ok(val_to_json(&result))
+    }
+
     /// Inspection accessor for the host context history (audit +
     /// tests). Note: each call to `call_raw` creates a fresh store,
     /// so the history is per-invocation; the boeing-shell adapter
@@ -363,6 +397,147 @@ impl CapsuleDispatch {
     /// if it wants to retain it.
     pub fn engine(&self) -> &wasmtime::Engine {
         &self.engine
+    }
+}
+
+// ── call_json helpers (ADR-001, Option A) — WIT is the type source of truth ──────────────────────
+
+/// Discover a capsule's single exported interface + function + typed params from the component type.
+/// Skills export exactly one interface with one function (verified across the catalog); if a capsule
+/// exports none, that is a fail-closed error (never guess a call).
+#[allow(clippy::type_complexity)]
+fn discover_single_entry(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    capsule_name: &str,
+) -> Result<
+    (
+        String,
+        String,
+        Vec<(String, wasmtime::component::types::Type)>,
+    ),
+    AgentError,
+> {
+    use wasmtime::component::types::ComponentItem;
+    for (iface_name, item) in component.component_type().exports(engine) {
+        if let ComponentItem::ComponentInstance(inst) = item {
+            for (func_name, fitem) in inst.exports(engine) {
+                if let ComponentItem::ComponentFunc(cf) = fitem {
+                    let params = cf.params().map(|(n, t)| (n.to_string(), t)).collect();
+                    return Ok((iface_name.to_string(), func_name.to_string(), params));
+                }
+            }
+        }
+    }
+    Err(AgentError::Capsule(format!(
+        "capsule {capsule_name:?} exports no interface function — call_json needs one exported \
+         interface with a function"
+    )))
+}
+
+/// Map one JSON value to a typed `Val` by the WIT param type. Fail-closed: a shape mismatch or a
+/// type this mapper does not cover is an error, never a coerced/wrong value. Covers the types the
+/// skill catalog uses (string / bool / u8 / u16 / u32 / u64 / `list<u8>` as a hex string or byte array).
+fn json_to_val(
+    ty: &wasmtime::component::types::Type,
+    v: &serde_json::Value,
+    name: &str,
+) -> Result<wasmtime::component::Val, AgentError> {
+    use wasmtime::component::types::Type;
+    use wasmtime::component::Val;
+    let err = |want: &str| AgentError::Capsule(format!("arg {name:?}: expected {want}"));
+    match ty {
+        Type::String => v
+            .as_str()
+            .map(|s| Val::String(s.to_string()))
+            .ok_or_else(|| err("string")),
+        Type::Bool => v.as_bool().map(Val::Bool).ok_or_else(|| err("bool")),
+        Type::U8 => v
+            .as_u64()
+            .map(|n| Val::U8(n as u8))
+            .ok_or_else(|| err("u8")),
+        Type::U16 => v
+            .as_u64()
+            .map(|n| Val::U16(n as u16))
+            .ok_or_else(|| err("u16")),
+        Type::U32 => v
+            .as_u64()
+            .map(|n| Val::U32(n as u32))
+            .ok_or_else(|| err("u32")),
+        Type::U64 => v.as_u64().map(Val::U64).ok_or_else(|| err("u64")),
+        Type::List(list) if matches!(list.ty(), Type::U8) => {
+            let bytes: Vec<u8> = if let Some(s) = v.as_str() {
+                hex::decode(s.trim_start_matches("0x")).map_err(|_| err("hex byte string"))?
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .map(|n| n.as_u64().map(|x| x as u8).ok_or_else(|| err("byte array")))
+                    .collect::<Result<Vec<u8>, _>>()?
+            } else {
+                return Err(err("hex string or byte array"));
+            };
+            Ok(Val::List(bytes.into_iter().map(Val::U8).collect()))
+        }
+        other => Err(AgentError::Capsule(format!(
+            "arg {name:?}: WIT type {other:?} not supported by call_json (skills use \
+             string/bool/uN/list<u8>)"
+        ))),
+    }
+}
+
+/// Map a `Val` result back to JSON. `list<u8>` → a `0x` hex string; `result<_, e>` → `{ok}`/`{err}`;
+/// records → objects. Unmapped variants degrade to their debug string rather than failing (the
+/// result is informational to the caller; the effect already happened through the gate).
+fn val_to_json(v: &wasmtime::component::Val) -> serde_json::Value {
+    use serde_json::Value;
+    use wasmtime::component::Val;
+    match v {
+        Val::Bool(b) => Value::from(*b),
+        Val::S8(n) => Value::from(*n),
+        Val::U8(n) => Value::from(*n),
+        Val::S16(n) => Value::from(*n),
+        Val::U16(n) => Value::from(*n),
+        Val::S32(n) => Value::from(*n),
+        Val::U32(n) => Value::from(*n),
+        Val::S64(n) => Value::from(*n),
+        Val::U64(n) => Value::from(*n),
+        Val::Float32(f) => Value::from(*f),
+        Val::Float64(f) => Value::from(*f),
+        Val::Char(c) => Value::from(c.to_string()),
+        Val::String(s) => Value::from(s.clone()),
+        Val::List(items) => {
+            if !items.is_empty() && items.iter().all(|x| matches!(x, Val::U8(_))) {
+                let bytes: Vec<u8> = items
+                    .iter()
+                    .filter_map(|x| if let Val::U8(b) = x { Some(*b) } else { None })
+                    .collect();
+                Value::from(format!("0x{}", hex::encode(bytes)))
+            } else {
+                Value::Array(items.iter().map(val_to_json).collect())
+            }
+        }
+        Val::Record(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), val_to_json(v)))
+                .collect(),
+        ),
+        Val::Tuple(items) => Value::Array(items.iter().map(val_to_json).collect()),
+        Val::Result(r) => match r {
+            Ok(inner) => {
+                serde_json::json!({ "ok": inner.as_deref().map(val_to_json).unwrap_or(Value::Null) })
+            }
+            Err(inner) => {
+                serde_json::json!({ "err": inner.as_deref().map(val_to_json).unwrap_or(Value::Null) })
+            }
+        },
+        Val::Option(o) => o.as_deref().map(val_to_json).unwrap_or(Value::Null),
+        Val::Enum(name) => Value::from(name.clone()),
+        Val::Flags(flags) => Value::from(flags.clone()),
+        Val::Variant(name, payload) => serde_json::json!({
+            "variant": name,
+            "value": payload.as_deref().map(val_to_json).unwrap_or(Value::Null),
+        }),
+        other => Value::from(format!("{other:?}")),
     }
 }
 
@@ -391,9 +566,8 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let dispatch =
-            CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
-                .expect("dispatch loads");
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("dispatch loads");
         let engine = dispatch.engine().clone();
 
         let wasm = wat::parse_str(r#"(module (func (export "spin") (loop (br 0))))"#)
@@ -438,9 +612,8 @@ mod tests {
             .and_then(|p| p.parent())
             .expect("walk up to citrate_v0.01.1/")
             .join("capsules");
-        let dispatch =
-            CapsuleDispatch::load_from_dir(&capsules_root, None, None, None)
-                .expect("loads cleanly");
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root, None, None, None)
+            .expect("loads cleanly");
         let names = dispatch.capsule_names();
         // 7 BFR-INT-12 tool capsules + 3 supporting/test capsules
         // (hello, echo-chain, eth-sender-test). The fleet has at
@@ -466,7 +639,6 @@ mod tests {
 
     const PLACEHOLDER_HASH: &str =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
 
     #[test]
     fn loose_dir_with_matching_hash_is_still_unverified() {
@@ -537,7 +709,10 @@ tier = "bundled"
             "the signed .cps fleet must load fully verified; unverified: {:?}",
             dispatch.unverified
         );
-        assert!(dispatch.has("hello"), "fleet loaded via the verified .cps path");
+        assert!(
+            dispatch.has("hello"),
+            "fleet loaded via the verified .cps path"
+        );
     }
 
     #[test]
@@ -584,5 +759,62 @@ tier = "bundled"
             "refusal must cite the missing integrity proof, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── call_json mapping (ADR-001, Option A) ──────────────────────────────────────────────
+
+    #[test]
+    fn json_to_val_maps_scalars_and_fails_closed_on_mismatch() {
+        use wasmtime::component::types::Type;
+        use wasmtime::component::Val;
+        assert!(
+            matches!(json_to_val(&Type::String, &serde_json::json!("hi"), "a"), Ok(Val::String(s)) if s == "hi")
+        );
+        assert!(matches!(
+            json_to_val(&Type::Bool, &serde_json::json!(true), "a"),
+            Ok(Val::Bool(true))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U8, &serde_json::json!(7), "a"),
+            Ok(Val::U8(7))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U32, &serde_json::json!(9000), "a"),
+            Ok(Val::U32(9000))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U64, &serde_json::json!(1u64 << 40), "a"),
+            Ok(Val::U64(_))
+        ));
+        // fail-closed: wrong JSON shape for the declared type is an error, never a coerced value.
+        assert!(json_to_val(&Type::U8, &serde_json::json!("not-a-number"), "a").is_err());
+        assert!(json_to_val(&Type::String, &serde_json::json!(5), "a").is_err());
+    }
+
+    #[test]
+    fn val_to_json_maps_bytes_to_hex_and_result_records() {
+        use wasmtime::component::Val;
+        // list<u8> → 0x hex
+        let bytes = Val::List(vec![Val::U8(0xde), Val::U8(0xad)]);
+        assert_eq!(val_to_json(&bytes), serde_json::json!("0xdead"));
+        // result<record, string> Ok
+        let rec = Val::Record(vec![
+            ("posture".into(), Val::U8(3)),
+            ("expired".into(), Val::Bool(false)),
+        ]);
+        let ok = Val::Result(Ok(Some(Box::new(rec))));
+        assert_eq!(
+            val_to_json(&ok),
+            serde_json::json!({ "ok": { "posture": 3, "expired": false } })
+        );
+        // result Err(string)
+        let err = Val::Result(Err(Some(Box::new(Val::String("nope".into())))));
+        assert_eq!(val_to_json(&err), serde_json::json!({ "err": "nope" }));
+        // plain scalars
+        assert_eq!(val_to_json(&Val::U64(42)), serde_json::json!(42));
+        assert_eq!(
+            val_to_json(&Val::String("x".into())),
+            serde_json::json!("x")
+        );
     }
 }

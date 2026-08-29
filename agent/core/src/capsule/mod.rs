@@ -29,6 +29,16 @@ pub mod wasm;
 use crate::error::AgentError;
 use std::io::Read;
 
+/// A permissive, non-overflowing per-store epoch delta for the "no tight per-call bound" paths.
+///
+/// `Store::set_epoch_deadline(delta)` sets the deadline to `engine.current_epoch() + delta`
+/// (wasmtime computes the sum internally). Passing `u64::MAX` overflows that sum the moment
+/// `current_epoch > 0` — which happens as soon as `CapsuleDispatch`'s background `increment_epoch()`
+/// ticker has advanced even once — and in a debug build the overflow PANICS mid-instantiation
+/// (release wraps, then the value is usually overwritten, masking it). `u64::MAX / 2` is
+/// effectively infinite (≈ 1.4e10 years at the 50 ms tick) while never overflowing.
+const PERMISSIVE_EPOCH_DELTA: u64 = u64::MAX / 2;
+
 /// A loaded capsule: parsed manifest + unpacked archive entries. The
 /// content_hash declared in the manifest is verified against the
 /// computed hash of the archive contents during `from_archive`.
@@ -169,7 +179,7 @@ impl Capsule {
         // bound on compute-DoS becomes effective only once a background
         // `engine.increment_epoch()` ticker is wired (deferred follow-up to
         // REM-12a per `06_REMEDIATION_PLAN.md`).
-        store.set_epoch_deadline(u64::MAX);
+        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
@@ -210,7 +220,7 @@ impl Capsule {
             ),
         );
         // REM-12a — see instantiate_with_store for rationale.
-        store.set_epoch_deadline(u64::MAX);
+        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
@@ -241,7 +251,7 @@ impl Capsule {
             wasm::HostCtx::with_dispatcher(allow_list, dispatcher),
         );
         // REM-12a — see instantiate_with_store for rationale.
-        store.set_epoch_deadline(u64::MAX);
+        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
