@@ -176,3 +176,50 @@ fn load_skills_parses_manifests_and_is_empty_on_a_missing_dir() {
     assert_eq!(skills[0].description, "a demo");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ── S6.3 — the ceremony-resolution bridge (approve/reject the head) ──
+
+#[tokio::test]
+async fn approve_reject_require_the_bearer() {
+    for p in ["/approvals/approve", "/approvals/reject"] {
+        let resp = app(state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(p)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{p} must require the bearer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn approve_on_an_empty_queue_is_an_honest_noop() {
+    // Nothing pending yet (no capsule has run) → resolved:false, but the endpoint is live so the
+    // ceremony can resolve the head the moment a chain effect enqueues.
+    let resp = app(state())
+        .oneshot(authed("POST", "/approvals/approve"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["ok"], true);
+    assert_eq!(j["resolved"], false);
+}
+
+#[tokio::test]
+async fn reject_on_an_empty_queue_is_an_honest_noop() {
+    let resp = app(state())
+        .oneshot(authed("POST", "/approvals/reject"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["resolved"], false);
+}

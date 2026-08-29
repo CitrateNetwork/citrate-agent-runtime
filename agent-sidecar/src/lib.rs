@@ -110,6 +110,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/status", get(status))
         .route("/skills", get(skills))
         .route("/approvals", get(approvals))
+        .route("/approvals/approve", post(approve_head))
+        .route("/approvals/reject", post(reject_head))
         .route("/run_skill", post(run_skill))
         .route("/stop", post(stop))
         .with_state(state)
@@ -172,6 +174,36 @@ async fn approvals(
     Ok(Json(out))
 }
 
+/// S6.3 — the CEREMONY BRIDGE (approve half). citrate-core's SignatureCeremony, once the human
+/// approves the head pending approval, calls this to resolve it. The queue is a FIFO; approving the
+/// head unblocks the capsule host-fn that submitted it, which then performs the eth-send. Honest:
+/// approving an empty queue is a no-op (nothing was pending), reported as such.
+async fn approve_head(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let had = st.queue.depth() > 0;
+    st.queue.approve();
+    Ok(Json(serde_json::json!({ "ok": true, "resolved": had })))
+}
+
+/// S6.3 — the ceremony bridge (reject half). The human declined the head approval; the submitting
+/// host-fn gets `Err`, so the chain effect is NOT performed.
+async fn reject_head(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let had = st.queue.depth() > 0;
+    st.queue.reject();
+    Ok(Json(serde_json::json!({ "ok": true, "resolved": had })))
+}
+
 async fn run_skill(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -179,7 +211,10 @@ async fn run_skill(
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    // Rule 1: do NOT run an effect no human has gated. The capsule-run + ceremony bridge is S6.3.
+    // Rule 1: do NOT run an effect no human has gated. The ceremony-resolution bridge is now here
+    // (/approvals/approve|reject), but the capsule DISPATCH that submits effects to the queue (arg
+    // mapping over each capsule's WIT interface) is the remaining S6.3 slice — so runSkill still
+    // refuses rather than run an ungated capsule.
     Err(StatusCode::NOT_IMPLEMENTED)
 }
 
