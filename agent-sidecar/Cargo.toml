@@ -1,0 +1,23 @@
+[package]
+name = "agent-sidecar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The citrate-core agent sidecar — a bearer-authed loopback HTTP control plane over the citrate-agent-core harness (capsule skills + the ceremony-grade ApprovalQueue + emergency-stop). citrate-core spawns this as the keyless agent that surfaces every chain effect for human approval. NOTE: distinct from hermes/ (the Discord bot) — different program."
+
+[[bin]]
+name = "citrate-agent-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+citrate-agent-core = { path = "../agent/core" }
+citrate-agent-legacy = { path = "../agent-legacy" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tower = "0.5"
