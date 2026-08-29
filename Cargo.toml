@@ -12,6 +12,7 @@ members = [
     "agent-legacy",
     "hermes/core",
     "hermes/discord",
+    "agent-sidecar",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
@@ -26,6 +27,7 @@ repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
+axum = "0.7"
 async-trait = "0.1"
 
 # Serialization
