@@ -142,6 +142,13 @@ struct ApprovalBody {
     id: String,
     kind: String,
     summary: String,
+    /// The raw chain-call target + calldata for a chain effect, so citrate-core's ceremony can build
+    /// the `SignatureIntent` and sign+broadcast it (the keyless bridge). `None` for non-chain effects
+    /// (code/shell). Parsed from the pending call's args (`{to, data_hex}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
 }
 
 /// Build the control-plane router. `/health` is open (the supervisor probes it with no bearer);
@@ -207,10 +214,20 @@ async fn approvals(
     // S6.2: the queue is empty until runSkill (S6.3) submits an effect; surface the head honestly.
     let mut out = Vec::new();
     if let Some(p) = st.queue.peek() {
+        // A chain effect's args carry the raw target + calldata ({to, data_hex}); expose them so
+        // citrate-core's ceremony can build the SignatureIntent. Non-chain effects have neither.
+        let args: serde_json::Value = serde_json::from_str(&p.args_pretty).unwrap_or_default();
+        let to = args.get("to").and_then(|v| v.as_str()).map(str::to_string);
+        let data = args
+            .get("data_hex")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         out.push(ApprovalBody {
             id: p.name.clone(),
             kind: p.risk_level.clone(),
             summary: p.description,
+            to,
+            data,
         });
     }
     Ok(Json(out))
