@@ -223,3 +223,56 @@ async fn reject_on_an_empty_queue_is_an_honest_noop() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["resolved"], false);
 }
+
+// ── S6.3 — end-to-end ceremony bridge: an effect submitted (as a capsule's ApprovalGate does)
+// surfaces on the queue and is resolved by the same approve/reject the HTTP endpoints call. This is
+// the safety property of gD-hermes proven through the real ApprovalQueue submit→resolve path.
+
+use citrate_agent_core::hitl::{ApprovalOutcomePublic, ToolCall};
+
+fn effect_call(id: &str) -> ToolCall {
+    ToolCall {
+        call_id: id.to_string(),
+        name: "eth-send".to_string(), // not trusted → must pend for human approval
+        args: serde_json::json!({ "to": "0x1111111111111111111111111111111111111111", "data": "0x01" }),
+    }
+}
+
+async fn wait_depth(q: &ApprovalQueue, want: usize) {
+    for _ in 0..400 {
+        if q.depth() == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("queue never reached depth {want} (was {})", q.depth());
+}
+
+#[tokio::test]
+async fn a_chain_effect_surfaces_and_approve_lets_it_proceed() {
+    let queue = Arc::new(ApprovalQueue::new());
+    let q = queue.clone();
+    // A capsule's eth-send submits + blocks on the outcome (here, directly via the queue's async API).
+    let submitter = tokio::spawn(async move { q.submit_with_outcome(effect_call("c1")).await });
+    wait_depth(&queue, 1).await; // the effect is now a pending approval (what /approvals shows)
+    queue.approve(); // exactly what POST /approvals/approve calls
+    let outcome = submitter.await.unwrap();
+    assert!(
+        matches!(outcome, ApprovalOutcomePublic::Approved),
+        "approved → the effect proceeds"
+    );
+}
+
+#[tokio::test]
+async fn a_chain_effect_that_is_rejected_does_not_proceed() {
+    let queue = Arc::new(ApprovalQueue::new());
+    let q = queue.clone();
+    let submitter = tokio::spawn(async move { q.submit_with_outcome(effect_call("c2")).await });
+    wait_depth(&queue, 1).await;
+    queue.reject(); // POST /approvals/reject
+    let outcome = submitter.await.unwrap();
+    assert!(
+        matches!(outcome, ApprovalOutcomePublic::Rejected),
+        "rejected → the effect is refused"
+    );
+}
