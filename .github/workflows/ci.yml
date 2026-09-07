@@ -65,3 +65,13 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
         run: cargo test --workspace --locked
+
+      # AR-B-046 — advisory sweep for the "absent/empty/unconfigured ⇒ permit"
+      # idiom that was the shared root cause of AR-B-015/018/021/025/044. Every
+      # hit is reviewed per instance (not auto-failed), so this step is
+      # informational; flip SEMGREP_STRICT=1 in the runner to gate on it.
+      - name: AR-B-046 fail-open-defaults tripwire (advisory)
+        run: |
+          python3 -m pip install --quiet semgrep || pipx install semgrep || true
+          bash scripts/semgrep/run-ar-b-046.sh
+        continue-on-error: true
