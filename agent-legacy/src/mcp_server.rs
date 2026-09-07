@@ -61,11 +61,19 @@ pub enum ToolCategory {
     GovernanceRead,
     GovernanceWrite,
     Shell,
+    /// AR-B-018: a tool whose name is not on the known catalog. It carries no
+    /// known risk class, so it is denied under EVERY policy profile
+    /// (fail-closed) rather than silently treated as harmless `Docs`.
+    Unknown,
 }
 
 impl ToolCategory {
     /// Whether this category is allowed by a given policy profile.
     pub fn allowed_by(&self, policy: &PolicyProfile) -> bool {
+        // AR-B-018: an unclassified tool is never allowed, regardless of policy.
+        if matches!(self, ToolCategory::Unknown) {
+            return false;
+        }
         match policy {
             PolicyProfile::ReadOnly => matches!(
                 self,
@@ -95,13 +103,34 @@ pub fn categorize_tool(tool_name: &str) -> ToolCategory {
         "file_write" | "file_edit" => ToolCategory::Repo,
         "git_ops" => ToolCategory::Repo,
         "shell_exec" => ToolCategory::Shell,
-        _ => ToolCategory::Docs,
+        // AR-B-018: fail CLOSED — an unrecognized tool name (file_delete,
+        // export_key, any future/attacker tool) is Unknown, denied by every
+        // policy, not silently reachable as Docs under a ReadOnly grant.
+        _ => ToolCategory::Unknown,
     }
 }
 
 /// External runtimes need Operator-or-higher scope for these tools.
 fn requires_operator_scope(tool_name: &str) -> bool {
     matches!(tool_name, "send_tx" | "deploy_contract" | "shell_exec")
+}
+
+/// AR-B-018: lexical path-scope containment for grant `allowed_paths`.
+///
+/// Returns `true` iff `path` is inside one of `allowed` on a component
+/// boundary. Any `..` component in `path` is rejected outright (no escaping a
+/// scoped directory), and `Path::starts_with` compares whole components so
+/// `/home/u/project-secrets` does NOT match an allowlisted `/home/u/project`.
+/// This is a purely lexical check (no filesystem access), so it is TOCTOU-free
+/// but does not resolve symlinks — callers that open the path must still guard
+/// against a post-check symlink swap.
+fn path_within_any(path: &str, allowed: &[String]) -> bool {
+    use std::path::{Component, Path};
+    let p = Path::new(path);
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    allowed.iter().any(|a| p.starts_with(Path::new(a)))
 }
 
 /// MCP Server — the capability boundary for external runtimes.
@@ -308,16 +337,16 @@ impl McpServer {
             ));
         }
 
-        // Check path scope for file tools
+        // Check path scope for file tools.
+        // AR-B-018: the old `str::starts_with` was a raw string prefix with no
+        // `..` rejection and no component boundary, so `/home/u/project-secrets`
+        // matched an allowlisted `/home/u/project`, and
+        // `/home/u/project/../../etc/shadow` slipped through. Use a lexical,
+        // component-boundary containment check that rejects any parent-dir
+        // traversal.
         if let Some(path) = file_path {
-            if !grant.allowed_paths.is_empty() {
-                let path_allowed = grant
-                    .allowed_paths
-                    .iter()
-                    .any(|allowed| path.starts_with(allowed));
-                if !path_allowed {
-                    return Err(format!("Path '{}' not in grant's allowed paths", path));
-                }
+            if !grant.allowed_paths.is_empty() && !path_within_any(path, &grant.allowed_paths) {
+                return Err(format!("Path '{}' not in grant's allowed paths", path));
             }
         }
 
@@ -546,6 +575,86 @@ mod tests {
             .check_grant("grant-1", "check_balance", None, None)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn path_within_any_rejects_traversal_and_sibling_prefix() {
+        // AR-B-018: component-boundary containment + `..` rejection.
+        let allowed = vec!["/home/u/project".to_string()];
+        assert!(path_within_any("/home/u/project/src/main.rs", &allowed));
+        assert!(path_within_any("/home/u/project", &allowed));
+        // Sibling directory sharing a string prefix must NOT match.
+        assert!(!path_within_any("/home/u/project-secrets/keys", &allowed));
+        // Parent-dir traversal must be refused even though it starts in-scope.
+        assert!(!path_within_any("/home/u/project/../../etc/shadow", &allowed));
+        // Out-of-scope absolute path.
+        assert!(!path_within_any("/etc/shadow", &allowed));
+    }
+
+    #[test]
+    fn unknown_tool_fails_closed_under_every_policy() {
+        // AR-B-018: an unrecognized tool is Unknown and denied by all profiles,
+        // never silently reachable as Docs under ReadOnly.
+        assert_eq!(categorize_tool("file_delete"), ToolCategory::Unknown);
+        assert_eq!(categorize_tool("export_key"), ToolCategory::Unknown);
+        for policy in [
+            PolicyProfile::ReadOnly,
+            PolicyProfile::Guided,
+            PolicyProfile::Operator,
+            PolicyProfile::Maintainer,
+        ] {
+            assert!(
+                !ToolCategory::Unknown.allowed_by(&policy),
+                "Unknown must be denied under {policy:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_path_scope_blocks_traversal() {
+        // AR-B-018: a file tool scoped to a directory cannot escape it via `..`
+        // or a sibling-prefix path.
+        let registry = Arc::new(ToolRegistry::new());
+        let server = McpServer::new(registry);
+        let grant = CapabilityGrant {
+            id: "grant-path".to_string(),
+            issuer: "0xuser".to_string(),
+            recipient: "hermes".to_string(),
+            allowed_tools: vec!["file_read".to_string()],
+            max_value_per_tx: None,
+            allowed_paths: vec!["/home/u/project".to_string()],
+            expires_at: "2026-12-31T00:00:00Z".to_string(),
+            // Maintainer so the Repo-category file_read is permitted and the
+            // path-scope check is what this test isolates.
+            policy: PolicyProfile::Maintainer,
+            revoked: false,
+            connected_since: 0,
+            issuer_pubkey: Vec::new(),
+            signature: Vec::new(),
+        };
+        server.add_grant(grant).await;
+        assert!(server
+            .check_grant("grant-path", "file_read", Some("/home/u/project/a.rs"), None)
+            .await
+            .is_ok());
+        assert!(server
+            .check_grant(
+                "grant-path",
+                "file_read",
+                Some("/home/u/project/../../etc/shadow"),
+                None
+            )
+            .await
+            .is_err());
+        assert!(server
+            .check_grant(
+                "grant-path",
+                "file_read",
+                Some("/home/u/project-secrets/keys"),
+                None
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

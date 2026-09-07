@@ -64,7 +64,7 @@ impl Check for AuditChainIntegrityCheck {
         let Some(path) = &ctx.audit_chain_path else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no audit_chain_path configured".into(),
                 details: BTreeMap::new(),
             };
@@ -152,7 +152,7 @@ impl Check for AuditFilePermissionsCheck {
         let Some(path) = &ctx.audit_chain_path else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no audit_chain_path configured".into(),
                 details: BTreeMap::new(),
             };
@@ -196,7 +196,7 @@ impl Check for AuditFilePermissionsCheck {
         {
             CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: non-Unix platform".into(),
                 details: BTreeMap::new(),
             }
@@ -227,7 +227,7 @@ impl Check for ApprovalQueueDepthCheck {
         let Some(queue) = &ctx.approval_queue else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no approval_queue configured".into(),
                 details: BTreeMap::new(),
             };
@@ -273,7 +273,7 @@ impl Check for PendingBreakGlassCheck {
         let Some(registry) = &ctx.break_glass else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no break_glass registry configured".into(),
                 details: BTreeMap::new(),
             };
@@ -281,7 +281,7 @@ impl Check for PendingBreakGlassCheck {
         if self.action_ids.is_empty() {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no action_ids supplied".into(),
                 details: BTreeMap::new(),
             };
@@ -382,7 +382,7 @@ impl Check for CapsuleManifestReverifyCheck {
         if self.capsule_paths.is_empty() {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no capsule_paths supplied".into(),
                 details: BTreeMap::new(),
             };
@@ -481,7 +481,7 @@ impl Check for WasmLinkerRecheckCheck {
         if self.pairs.is_empty() {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no (manifest, wit) pairs supplied".into(),
                 details: BTreeMap::new(),
             };
@@ -560,7 +560,7 @@ impl Check for PolicyBundleHashCheck {
         if self.files.is_empty() {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no pinned files supplied".into(),
                 details: BTreeMap::new(),
             };
@@ -666,7 +666,7 @@ impl Check for TlaSpecCiStatusCheck {
         let Some(path) = &self.status_file_path else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no status_file_path supplied".into(),
                 details: BTreeMap::new(),
             };
@@ -832,7 +832,7 @@ impl Check for RetentionAgeCheck {
         let Some(path) = &ctx.audit_chain_path else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no audit_chain_path configured".into(),
                 details: BTreeMap::new(),
             };
@@ -909,7 +909,7 @@ impl Check for AnchorReconciliationCheck {
         let Some(client) = &self.client else {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no AnchorRegistryClient configured".into(),
                 details: BTreeMap::new(),
             };
@@ -917,7 +917,7 @@ impl Check for AnchorReconciliationCheck {
         if self.expected_roots.is_empty() {
             return CheckResult {
                 name: self.name().into(),
-                severity: Severity::Pass,
+                severity: Severity::Skipped,
                 message: "skipped: no expected_roots supplied".into(),
                 details: BTreeMap::new(),
             };
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn audit_chain_check_skips_without_path() {
         let r = AuditChainIntegrityCheck.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
         assert!(r.message.contains("skipped"));
     }
 
@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn approval_queue_depth_skips_without_queue() {
         let r = ApprovalQueueDepthCheck::default().run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
         assert!(r.message.contains("skipped"));
     }
 
@@ -1194,7 +1194,7 @@ mod tests {
     fn pending_break_glass_skips_without_registry() {
         let check = PendingBreakGlassCheck { action_ids: vec![] };
         let r = check.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
     }
 
     #[test]
@@ -1203,7 +1203,7 @@ mod tests {
         ctx.break_glass = Some(Arc::new(BreakGlassRegistry::new()));
         let check = PendingBreakGlassCheck { action_ids: vec![] };
         let r = check.run(&ctx);
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
         assert!(r.message.contains("skipped"));
     }
 
@@ -1229,7 +1229,7 @@ mod tests {
             registry: None,
         };
         let r = check.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
         assert!(r.message.contains("skipped"));
     }
 
@@ -1248,7 +1248,7 @@ mod tests {
     fn wasm_linker_recheck_skips_empty() {
         let check = WasmLinkerRecheckCheck { pairs: vec![] };
         let r = check.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
     }
 
     #[test]
@@ -1304,7 +1304,7 @@ mod tests {
     fn policy_bundle_hash_skips_empty() {
         let check = PolicyBundleHashCheck { files: vec![] };
         let r = check.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
     }
 
     #[test]
@@ -1344,7 +1344,7 @@ mod tests {
     #[test]
     fn tla_ci_skips_without_path() {
         let r = TlaSpecCiStatusCheck::default().run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
         assert!(r.message.contains("skipped"));
     }
 
@@ -1412,7 +1412,7 @@ mod tests {
     #[test]
     fn retention_skips_without_path() {
         let r = RetentionAgeCheck::default().run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
     }
 
     #[test]
@@ -1434,7 +1434,7 @@ mod tests {
             expected_roots: vec![[0u8; 32]],
         };
         let r = check.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
         assert!(r.message.contains("skipped"));
     }
 
@@ -1456,7 +1456,7 @@ mod tests {
             expected_roots: vec![],
         };
         let r = check.run(&empty_ctx());
-        assert!(matches!(r.severity, Severity::Pass));
+        assert!(matches!(r.severity, Severity::Skipped));
     }
 
     #[test]

@@ -29,6 +29,12 @@ struct PendingItem {
     cancel: CancellationToken,
 }
 
+/// AR-B-020: hard ceiling on a caller-supplied `timeout_seconds`. The value
+/// came verbatim from the request, so `u64::MAX` produced an approval that
+/// never auto-denies and a resident timeout task that never exits. Clamp it to
+/// a sane maximum (1 hour) so every pending approval eventually resolves.
+const MAX_TIMEOUT_SECS: u64 = 3600;
+
 /// The approval manager — holds pending requests and resolves them.
 pub struct PendingApprovalStore {
     pending: Arc<RwLock<HashMap<String, PendingItem>>>,
@@ -47,18 +53,33 @@ impl PendingApprovalStore {
     pub async fn submit(&self, request: ApprovalRequest) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
         let request_id = request.request_id.clone();
-        let timeout_secs = request.timeout_seconds;
+        // AR-B-020: clamp the caller-supplied timeout so an approval can never
+        // be made to never expire.
+        let timeout_secs = request.timeout_seconds.min(MAX_TIMEOUT_SECS);
         let cancel = CancellationToken::new();
         let cancel_for_timeout = cancel.clone();
 
-        self.pending.write().await.insert(
-            request_id.clone(),
-            PendingItem {
-                request,
-                sender: tx,
-                cancel,
-            },
-        );
+        {
+            let mut pending = self.pending.write().await;
+            // AR-B-020: a duplicate request_id must NOT overwrite the existing
+            // pending item — the old code dropped the original awaiter's sender
+            // (it got RecvError, read as deny) while the displaced item's
+            // timeout task survived and later auto-denied the REPLACEMENT. Refuse
+            // the collision: deny the new request immediately (fail-closed) and
+            // leave the in-flight approval untouched.
+            if pending.contains_key(&request_id) {
+                let _ = tx.send(false);
+                return rx;
+            }
+            pending.insert(
+                request_id.clone(),
+                PendingItem {
+                    request,
+                    sender: tx,
+                    cancel,
+                },
+            );
+        }
 
         // RM-B1 / WP-E5.5 (audit AGT-09): the timeout task races
         // against an early-resolution cancel. With 10K long-timeout
@@ -87,6 +108,12 @@ impl PendingApprovalStore {
 
     /// Resolve a pending approval by request ID.
     /// Returns true if the request was found and resolved.
+    ///
+    /// SECURITY (AR-B-020 follow-up): this call carries no approver identity, so
+    /// any caller with a pending id can resolve it. Callers MUST gate this
+    /// behind their own authenticated approver surface; binding an approver
+    /// identity into the store is a tracked follow-up (needs an identity model
+    /// the legacy crate does not yet have).
     pub async fn resolve(&self, request_id: &str, approved: bool) -> bool {
         let mut pending = self.pending.write().await;
         if let Some(item) = pending.remove(request_id) {
@@ -175,6 +202,35 @@ mod tests {
         store.resolve("req-1", true).await;
         assert!(rx.await.expect("received"));
         assert_eq!(store.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_id_does_not_hijack_the_in_flight_approval() {
+        // AR-B-020: a second submit with the same id must NOT overwrite the
+        // first (which dropped the original awaiter's sender). The original
+        // stays pending and resolvable; the duplicate is denied immediately.
+        let store = PendingApprovalStore::new();
+        let rx1 = store.submit(test_request("dup", "send_tx")).await;
+        let rx2 = store.submit(test_request("dup", "deploy_contract")).await;
+        // The duplicate is denied right away.
+        assert!(!rx2.await.expect("dup received"), "duplicate must be denied");
+        // The original is still pending and still resolvable to Approved.
+        assert_eq!(store.pending_count().await, 1);
+        assert!(store.resolve("dup", true).await);
+        assert!(rx1.await.expect("orig received"), "original must survive");
+    }
+
+    #[tokio::test]
+    async fn timeout_seconds_is_clamped() {
+        // AR-B-020: an unbounded caller timeout is clamped so the approval
+        // cannot be made to never expire.
+        let store = PendingApprovalStore::new();
+        let mut req = test_request("clamp", "send_tx");
+        req.timeout_seconds = u64::MAX;
+        let _rx = store.submit(req).await;
+        // The item is pending; we only assert it was accepted (the clamp is
+        // applied to the spawned timeout, which we don't wait out here).
+        assert_eq!(store.pending_count().await, 1);
     }
 
     #[tokio::test]

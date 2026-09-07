@@ -43,6 +43,12 @@ fn compute_overall(results: &[CheckResult]) -> Severity {
         Severity::Blocker
     } else if results.iter().any(|r| matches!(r.severity, Severity::Warn)) {
         Severity::Warn
+    } else if results.iter().any(|r| matches!(r.severity, Severity::Skipped)) {
+        // AR-B-015: a report in which a required check did not run is NOT a
+        // clean Pass. A skipped check drags the overall status to Warn so an
+        // assessor never receives a signed all-green artifact whose green rows
+        // include checks that ran nothing.
+        Severity::Warn
     } else {
         Severity::Pass
     }

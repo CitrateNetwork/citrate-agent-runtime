@@ -69,6 +69,10 @@ pub struct ToolResult {
 /// thread to populate the ToolApprovalCard.
 #[derive(Debug, Clone)]
 pub struct PendingView {
+    /// AR-B-023: the stable call-id of the pending action, so an approver
+    /// can assert "I am approving *this* call" rather than "whatever is at
+    /// the FIFO head right now".
+    pub id: String,
     pub name: String,
     pub description: String,
     pub risk_level: String,
@@ -276,6 +280,10 @@ impl ApprovalQueue {
             return ApprovalOutcomePublic::AutoApproved;
         }
         let (tx, rx) = oneshot::channel();
+        // AR-B-023: remember which entry this future owns so a timeout evicts
+        // *this* call by id, not blindly the FIFO head (which may by then be a
+        // different, still-pending action).
+        let call_id = call.call_id.clone();
         {
             let mut q = match self.pending.lock() {
                 Ok(q) => q,
@@ -290,20 +298,61 @@ impl ApprovalQueue {
             Ok(Ok(ApprovalOutcome::Rejected)) => ApprovalOutcomePublic::Rejected,
             Ok(Err(_)) => ApprovalOutcomePublic::Rejected, // sender dropped
             Err(_) => {
-                self.evict_timed_out();
+                self.evict_by_id(&call_id);
                 ApprovalOutcomePublic::TimedOut
             }
         }
     }
 
     /// Approve the head of the queue.
+    ///
+    /// AR-B-023: prefer [`approve_by_id`] on any surface where the approver
+    /// saw a specific call — a bare head-approve can land on an action the
+    /// approver never reviewed if the head changed (a timeout eviction, a
+    /// second queued effect) between the read and the approve.
     pub fn approve(&self) {
         self.pop_head_with(ApprovalOutcome::Approved);
     }
 
-    /// Reject the head of the queue.
+    /// Reject the head of the queue. See [`approve`] for the call-id caveat.
     pub fn reject(&self) {
         self.pop_head_with(ApprovalOutcome::Rejected);
+    }
+
+    /// AR-B-023 — approve a *specific* pending call by id. Resolves the entry
+    /// only if it is at the head AND its call-id matches; a mismatch (the head
+    /// is a different action than the one the approver reviewed) returns
+    /// `Err(UnknownCallId)` and resolves nothing. This is the surface the
+    /// ceremony bridge (`POST /approvals/approve {id}`) must use so a human
+    /// decision can never land on an unreviewed action.
+    pub fn approve_by_id(&self, call_id: &str) -> Result<(), SignatureError> {
+        self.resolve_head_by_id(call_id, ApprovalOutcome::Approved)
+    }
+
+    /// AR-B-023 — reject a specific pending call by id (see [`approve_by_id`]).
+    pub fn reject_by_id(&self, call_id: &str) -> Result<(), SignatureError> {
+        self.resolve_head_by_id(call_id, ApprovalOutcome::Rejected)
+    }
+
+    fn resolve_head_by_id(
+        &self,
+        call_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<(), SignatureError> {
+        let mut q = self
+            .pending
+            .lock()
+            .map_err(|_| SignatureError::UnknownCallId)?;
+        match q.front() {
+            Some(head) if head.call.call_id == call_id => {
+                let entry = q.pop_front().expect("front just matched");
+                let _ = entry.resolver.send(outcome);
+                Ok(())
+            }
+            // Head is a different action (or the queue is empty): refuse rather
+            // than resolve the wrong call.
+            _ => Err(SignatureError::UnknownCallId),
+        }
     }
 
     /// BFR-INT-12b WP-4 — add the named tool to the auto-grant set
@@ -337,6 +386,7 @@ impl ApprovalQueue {
         let args_pretty = serde_json::to_string_pretty(&entry.call.args)
             .unwrap_or_else(|_| entry.call.args.to_string());
         Some(PendingView {
+            id: entry.call.call_id.clone(),
             name: entry.call.name.clone(),
             description: describe(&entry.call.name),
             risk_level: risk_level(&entry.call.name).to_string(),
@@ -454,7 +504,7 @@ impl ApprovalQueue {
         // signature from a SELF-MINTED key proves nothing about authority.
         // The pubkey MUST be on the authorized-signer roster for the role
         // it claims; without a roster a release build fails closed.
-        let dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-hitl");
+        let dev_allowed = cfg!(test) || cfg!(feature = "insecure-dev-hitl");
         if !signer_is_authorized(
             self.signer_roster.as_deref(),
             &sig.pubkey,
@@ -475,15 +525,27 @@ impl ApprovalQueue {
         {
             return Err(SignatureError::DuplicateSigner);
         }
-        // SoD: role-pair conflict (e.g. ComplianceOfficer +
-        // SecurityOfficer in same action).
-        for existing in &entry.signatures {
-            if roles::is_conflict(existing.signer.role, sig.signer.role) {
-                return Err(SignatureError::RoleConflict {
-                    existing: existing.signer.role,
-                    attempted: sig.signer.role,
-                });
-            }
+        // F-4: SoD role-pair conflict (ComplianceOfficer ⊥ SecurityOfficer) is
+        // a SAME-PRINCIPAL constraint — one identity must not provide BOTH
+        // attestations. That is already enforced: each signature carries a
+        // single role, `signer_is_authorized` binds a pubkey to the one role it
+        // is enrolled for (a CO key cannot claim SO), and DuplicateSigner (above)
+        // blocks the same id signing twice. Two DISTINCT principals holding CO
+        // and SO co-signing the same action is precisely the dual-attestation
+        // the Critical quorum (SecurityOfficer + ComplianceOfficer + Reviewer)
+        // mandates — so we must NOT reject it here. The previous cross-signer
+        // rejection made every Critical action permanently unapprovable (and
+        // blocked any High-tier NofM whose set named both). We therefore only
+        // guard the same-identity case, which the checks above already preclude.
+        if let Some(existing) = entry
+            .signatures
+            .iter()
+            .find(|s| s.signer.id == sig.signer.id && roles::is_conflict(s.signer.role, sig.signer.role))
+        {
+            return Err(SignatureError::RoleConflict {
+                existing: existing.signer.role,
+                attempted: sig.signer.role,
+            });
         }
         entry.signatures.push(sig);
         // Check if quorum is now satisfied.
@@ -551,11 +613,17 @@ impl ApprovalQueue {
         }
     }
 
-    fn evict_timed_out(&self) {
-        // A timed-out call is always at the head — submits run in
-        // FIFO order, so the first to expire is also the oldest.
+    /// AR-B-023 — remove a specific timed-out entry by call-id. The previous
+    /// `pop_front()` assumed the timed-out call was always at the head; when a
+    /// later-queued call's timeout fired first (or the head had already been
+    /// resolved), it evicted the WRONG entry, so a subsequent head-approve
+    /// could resolve an action the operator never saw. Removing by id keeps
+    /// each future's timeout scoped to its own entry.
+    fn evict_by_id(&self, call_id: &str) {
         if let Ok(mut q) = self.pending.lock() {
-            q.pop_front();
+            if let Some(pos) = q.iter().position(|e| e.call.call_id == call_id) {
+                q.remove(pos);
+            }
         }
     }
 }
@@ -828,14 +896,20 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// F-4 (RC-8): two DISTINCT principals holding ComplianceOfficer and
+    /// SecurityOfficer co-signing the same action is the dual-attestation the
+    /// Critical quorum mandates — it must be ACCEPTED, not rejected as an SoD
+    /// conflict. This test previously asserted the second signer was rejected
+    /// with `RoleConflict`, which encoded the deadlock (Critical actions
+    /// permanently unapprovable) as correct behaviour. Inverted with the fix.
     #[tokio::test(start_paused = true)]
-    async fn role_pair_conflict_rejected() {
+    async fn distinct_principals_co_and_so_may_both_sign() {
         let q = Arc::new(ApprovalQueue::new());
         let qa = q.clone();
         let handle = tokio::spawn(async move {
             qa.submit_for_action(
-                mkcall("role_conflict_action"),
-                b"role conflict payload".to_vec(),
+                mkcall("dual_attest_action"),
+                b"dual attestation payload".to_vec(),
                 Quorum::for_tier(
                     crate::capsule::manifest::RiskTier::High,
                     &[Role::ComplianceOfficer, Role::SecurityOfficer],
@@ -847,24 +921,28 @@ mod tests {
         tokio::task::yield_now().await;
         let first = sign_queued(
             &q,
-            "call_role_conflict_action",
+            "call_dual_attest_action",
             "carol",
             Role::ComplianceOfficer,
         );
-        q.add_signature("call_role_conflict_action", first)
-            .expect("first");
-        let conflicting = sign_queued(
+        q.add_signature("call_dual_attest_action", first)
+            .expect("CO signs");
+        let second = sign_queued(
             &q,
-            "call_role_conflict_action",
+            "call_dual_attest_action",
             "diana",
             Role::SecurityOfficer,
         );
-        let err = q
-            .add_signature("call_role_conflict_action", conflicting)
-            .expect_err("CO + SO conflict");
-        assert!(matches!(err, SignatureError::RoleConflict { .. }));
-        q.reject_action("call_role_conflict_action").expect("cleanup");
-        let _ = handle.await;
+        // The SecurityOfficer signature from a DIFFERENT principal must be
+        // accepted; together CO + SO satisfy the High-tier NofM{2} quorum.
+        q.add_signature("call_dual_attest_action", second)
+            .expect("distinct-principal SO must be accepted, not a role conflict");
+        // Quorum satisfied ⇒ the submit future resolves Approved.
+        let outcome = handle.await.expect("join");
+        assert!(
+            matches!(outcome, ApprovalOutcomePublic::Approved),
+            "CO + SO from two principals must satisfy the quorum; got {outcome:?}"
+        );
     }
 
     // ── CIT-AGENT-4b: attested-signature tests ────────────────────
@@ -1009,8 +1087,48 @@ mod tests {
             });
         }
         let view = q.peek().expect("head present");
+        assert_eq!(view.id, "c1");
         assert_eq!(view.name, "anchor_session");
         assert_eq!(view.risk_level, "medium");
+    }
+
+    /// AR-B-023 — a call-id-bound approve must resolve ONLY the call the
+    /// approver reviewed. Approving by an id that is not the current head is
+    /// refused (the approver saw a different action than the one at the head),
+    /// resolving nothing; approving by the head's own id resolves it.
+    #[tokio::test]
+    async fn approve_by_id_refuses_a_head_mismatch() {
+        let q = Arc::new(ApprovalQueue::new());
+        let call = |id: &str| ToolCall {
+            call_id: id.to_string(),
+            name: "file_write".to_string(),
+            args: serde_json::json!({}),
+        };
+        // Queue A then B (both park — file_write is not auto-granted).
+        let qa = q.clone();
+        let a = tokio::spawn(async move { qa.submit_with_outcome(call("A")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let qb = q.clone();
+        let b = tokio::spawn(async move { qb.submit_with_outcome(call("B")).await });
+        while q.depth() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // B is behind A: approving by B's id must FAIL and resolve nothing.
+        assert!(
+            q.approve_by_id("B").is_err(),
+            "approving a non-head call-id must be refused"
+        );
+        assert_eq!(q.depth(), 2, "a mismatched approve must not pop anything");
+
+        // Approving A (the head) by its own id resolves A only.
+        q.approve_by_id("A").expect("head id resolves");
+        assert_eq!(a.await.unwrap(), ApprovalOutcomePublic::Approved);
+        // Now B is the head and can be approved by its id.
+        q.approve_by_id("B").expect("B is now head");
+        assert_eq!(b.await.unwrap(), ApprovalOutcomePublic::Approved);
     }
 
     #[test]

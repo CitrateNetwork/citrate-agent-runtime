@@ -39,6 +39,31 @@ use std::io::Read;
 /// effectively infinite (≈ 1.4e10 years at the 50 ms tick) while never overflowing.
 const PERMISSIVE_EPOCH_DELTA: u64 = u64::MAX / 2;
 
+/// AR-B-005 — bounded epoch delta armed *around* `linker.instantiate`.
+///
+/// Instantiation runs a component's core `start` function; under
+/// `PERMISSIVE_EPOCH_DELTA` a `(start $spin)` that loops forever hangs the
+/// calling thread indefinitely (the per-call 600-tick deadline is armed only
+/// *after* instantiation returns). We arm a bounded deadline before
+/// `linker.instantiate` and restore the permissive default afterwards, so that
+/// — whenever a background `engine.increment_epoch()` ticker is running (as it
+/// is under `CapsuleDispatch`) — a runaway `start` traps instead of parking the
+/// thread. Without a ticker the deadline is simply inert, exactly as the
+/// permissive default was, so this is never a regression. 120 ticks ≈ 6 s at
+/// the 50 ms tick.
+const INSTANTIATE_EPOCH_DELTA: u64 = 120;
+
+/// AR-B-004 — apply the per-store resource caps (default 64 MiB heap, 1 table,
+/// 1 instance from `HostCtx::empty`) *before* `linker.instantiate`, so a
+/// component declaring a large initial `(memory N)` cannot allocate it at
+/// instantiate time. Previously `store.limiter(...)` was installed only in
+/// `dispatch.rs::call_raw`, i.e. *after* instantiation returned, leaving the
+/// documented 64 MiB cap inapplicable to instantiate-time allocation.
+fn arm_instantiate_bounds(store: &mut wasmtime::Store<wasm::HostCtx>) {
+    store.limiter(|state| &mut state.store_limits);
+    store.set_epoch_deadline(INSTANTIATE_EPOCH_DELTA);
+}
+
 /// A loaded capsule: parsed manifest + unpacked archive entries. The
 /// content_hash declared in the manifest is verified against the
 /// computed hash of the archive contents during `from_archive`.
@@ -170,19 +195,20 @@ impl Capsule {
             engine,
             wasm::HostCtx::with_eth_call_allow_list(allow_list),
         );
-        // REM-12a (wasmtime 26 → 45 follow-up): `Config::epoch_interruption(true)`
-        // is set by EngineFactory; v45 default Store deadline is 0, which
-        // traps every wasm-side epoch check immediately. Set a permissive
-        // default here so callers that don't tighten the deadline (tests,
-        // low-budget call paths) don't trip the interrupt. `dispatch.rs`
-        // overrides this per-call with `set_epoch_deadline(600)`. The real
-        // bound on compute-DoS becomes effective only once a background
-        // `engine.increment_epoch()` ticker is wired (deferred follow-up to
-        // REM-12a per `06_REMEDIATION_PLAN.md`).
-        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
+        // AR-B-004 + AR-B-005: install the resource limiter and a bounded
+        // instantiation deadline BEFORE `linker.instantiate`, so instantiate-time
+        // memory allocation and a runaway core `start` are both bounded.
+        arm_instantiate_bounds(&mut store);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
+        // REM-12a (wasmtime 26 → 45 follow-up): `Config::epoch_interruption(true)`
+        // is set by EngineFactory; v45 default Store deadline is 0, which
+        // traps every wasm-side epoch check immediately. Restore a permissive
+        // default AFTER instantiation so callers that don't tighten the deadline
+        // (tests, low-budget call paths) don't trip the interrupt. `dispatch.rs`
+        // overrides this per-call with `set_epoch_deadline(600)`.
+        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
         Ok((store, instance))
     }
 
@@ -224,11 +250,13 @@ impl Capsule {
                 self.manifest.risk.required_roles.clone(),
             ),
         );
-        // REM-12a — see instantiate_with_store for rationale.
-        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
+        // AR-B-004 + AR-B-005 — bound instantiate-time memory + compute.
+        arm_instantiate_bounds(&mut store);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
+        // REM-12a — see instantiate_with_store for rationale.
+        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
         Ok((store, instance))
     }
 
@@ -255,11 +283,13 @@ impl Capsule {
             engine,
             wasm::HostCtx::with_dispatcher(allow_list, dispatcher),
         );
-        // REM-12a — see instantiate_with_store for rationale.
-        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
+        // AR-B-004 + AR-B-005 — bound instantiate-time memory + compute.
+        arm_instantiate_bounds(&mut store);
         let instance = linker
             .instantiate(&mut store, &component)
             .map_err(|e| AgentError::Capsule(format!("component instantiate: {e}")))?;
+        // REM-12a — see instantiate_with_store for rationale.
+        store.set_epoch_deadline(PERMISSIVE_EPOCH_DELTA);
         Ok((store, instance))
     }
 
@@ -647,6 +677,83 @@ tier = "bundled"
         assert!(err.to_string().contains("parse") || err.to_string().contains("instantiate"));
     }
 
+    /// AR-B-004 — the documented 64 MiB per-store heap cap must apply to
+    /// memory a component allocates AT INSTANTIATE TIME, not only after
+    /// instantiation returns. Pre-fix, `store.limiter(...)` was installed only
+    /// in `dispatch.rs::call_raw`, i.e. after `instantiate_with_write_path`
+    /// returned, so a component with a >64 MiB initial `(memory N)` allocated
+    /// it in full during instantiation and this test passed the load.
+    #[test]
+    fn instantiate_bounds_initial_memory_to_the_store_limit() {
+        use crate::capsule::manifest::Manifest;
+        use crate::capsule::wasm::EngineFactory;
+
+        // A component whose core module demands a 100 MiB (1600-page) initial
+        // linear memory — above the 64 MiB store cap installed by
+        // `HostCtx::empty` / `arm_instantiate_bounds`.
+        let oversized = wat::parse_str(
+            r#"(component
+                 (core module $m (memory (export "m") 1600))
+                 (core instance (instantiate $m)))"#,
+        )
+        .expect("WAT compiles to a component");
+
+        let manifest_str = r#"
+[capsule]
+name = "bigmem"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[capability]
+network = "none"
+filesystem = []
+chain_calls = []
+subagent_spawn = false
+
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+
+[overlay]
+certified = []
+not_certified = []
+
+[procedure]
+gates = []
+
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "test"
+tla_spec = ""
+
+[signing]
+tier = "bundled"
+"#;
+        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        let capsule = Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm: oversized,
+                ..Default::default()
+            },
+        };
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker constructs")
+            .into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect_err("a >64 MiB initial memory must be refused AT instantiate time");
+    }
+
     /// CIT-AGENT-9a — empirical fail-closed proof for the
     /// "build from manifest, NOT filter default" linker invariant.
     ///
@@ -879,10 +986,15 @@ tier = "bundled"
         }
     }
 
-    /// CIT-AGENT-9c-host — happy-path. The echo-chain capsule
-    /// declares allow-list `["eth_call:0x4a86...20E40"]` in its
-    /// manifest. Calling `query` with that exact address returns
-    /// `Ok(vec![])` (the host fn's stub success response).
+    /// CIT-AGENT-9c-host / AR-B-044 — the echo-chain capsule declares
+    /// allow-list `["eth_call:0x4a86...20E40"]`. Calling `query` with that
+    /// exact address passes the allow-list gate but, with NO
+    /// `EthCallDispatcher` configured and no canned fixture, the host fn now
+    /// FAILS CLOSED (`Err("ChainCallFailed: no eth_call dispatcher configured")`)
+    /// instead of returning a fabricated `Ok(empty)` chain read.
+    ///
+    /// RC-8: this test previously asserted `Ok(Vec::new())` — encoding the
+    /// fail-open bug as correct behaviour. Inverted alongside the fix.
     #[test]
     fn echo_chain_capsule_with_authorized_address_succeeds() {
         use crate::capsule::manifest::Manifest;
@@ -921,10 +1033,12 @@ tier = "bundled"
         // out of `chain_calls = ["eth_call:0x4a86659B..."]`.
         let authorized = hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
         let result = invoke_echo_chain_query(&mut store, instance, authorized, vec![]);
-        assert_eq!(
-            result,
-            Ok(Vec::new()),
-            "authorized eth_call returns Ok(empty) stub response"
+        // AR-B-044: authorized address passes the allow-list, but with no
+        // dispatcher the read fails closed rather than fabricating Ok(empty).
+        let err = result.expect_err("no dispatcher ⇒ eth_call must fail closed, not Ok(empty)");
+        assert!(
+            err.contains("no eth_call dispatcher configured"),
+            "must cite the missing dispatcher; got: {err}"
         );
     }
 
@@ -3085,8 +3199,8 @@ version = "0.1.0"
 content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 [capability]
-network = "broker-only"
-filesystem = ["read:/data"]
+network = "none"
+filesystem = []
 chain_calls = []
 subagent_spawn = false
 
@@ -3116,7 +3230,13 @@ tla_spec = ""
 [signing]
 tier = "bundled"
 "#;
-        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        // AR-B-011: `Manifest::parse` now REFUSES a declared filesystem/network
+        // capability (it is unenforced). This test still exercises
+        // `prepare_linker`'s capability→token mapping, so set the fields
+        // directly on the parsed manifest, bypassing the load-time refusal.
+        let mut manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        manifest.capability.network = crate::capsule::manifest::NetworkPolicy::BrokerOnly;
+        manifest.capability.filesystem = vec!["read:/data".to_string()];
         // Wrap in a fake Capsule (no archive) to exercise prepare_linker
         // independently of from_archive.
         let capsule = Capsule {

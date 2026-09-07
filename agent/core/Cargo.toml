@@ -10,6 +10,16 @@ repository = "https://github.com/citrate-network/citrate"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# AR-B-025: explicit, greppable opt-in that disables the authorized-signer
+# roster (HITL quorum, break-glass, audit-chain role-sig verify). Previously
+# this was implied by `cfg!(debug_assertions)`, which is true for ANY
+# dev-profile build — including a debug *deployment* — so a `cargo run` or a
+# `--profile dev` sidecar silently accepted self-minted keys. The runtime now
+# gates on `cfg!(test)` (the crate's own unit-test build only) OR this explicit
+# feature; a release/debug deployment fails closed unless this is set on purpose.
+insecure-dev-hitl = []
+
 [dependencies]
 # RecorderClient (audit/) needs chain-client + signing primitives.
 # Consumed from CitrateNetwork/citrate-chain via SSH deploy key during
@@ -17,6 +27,8 @@ crate-type = ["rlib", "cdylib"]
 # audited release.
 citrate-wallet-core = { git = "ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain", rev = "0f2d16b486a9ec1ed8a0394440dac480075d6942" }
 k256 = { version = "0.13", features = ["ecdsa"] }
+# AR-B-027: wipe key/seed material on drop.
+zeroize = "1.8"
 sha3 = "0.10"
 hex = "0.4"
 tracing = "0.1"

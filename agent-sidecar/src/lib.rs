@@ -151,6 +151,35 @@ struct ApprovalBody {
     data: Option<String>,
 }
 
+/// AR-B-024 — refuse a non-loopback control bind unless explicitly opted in.
+/// The sidecar's control plane is a bearer-authed LOOPBACK plane by contract; a
+/// stray `0.0.0.0` bind would put only the bearer between an attacker and
+/// `run_skill`/`approve`. Requires the host of `addr` to be a loopback IP
+/// literal; a routable IP or a hostname is rejected. `allow_nonloopback`
+/// (wired to `CITRATE_HERMES_ALLOW_NONLOOPBACK=1`) is the deliberate override.
+pub fn enforce_loopback_bind(addr: &str, allow_nonloopback: bool) -> Result<(), String> {
+    if allow_nonloopback {
+        return Ok(());
+    }
+    // Split host:port from the right so IPv6 literals ([::1]:port) work.
+    let host = match addr.rsplit_once(':') {
+        Some((h, _)) => h.trim_matches(|c| c == '[' || c == ']'),
+        None => addr,
+    };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => Ok(()),
+        Ok(ip) => Err(format!(
+            "refusing to bind non-loopback control address {ip} (CITRATE_HERMES_ADDR={addr}); \
+             the sidecar control plane is loopback-only. Set \
+             CITRATE_HERMES_ALLOW_NONLOOPBACK=1 to override deliberately."
+        )),
+        Err(_) => Err(format!(
+            "CITRATE_HERMES_ADDR host {host:?} is not an IP literal; bind an explicit loopback \
+             address (127.0.0.1 / [::1]) so the bind cannot silently resolve off-loopback."
+        )),
+    }
+}
+
 /// Build the control-plane router. `/health` is open (the supervisor probes it with no bearer);
 /// every other route is bearer-gated.
 pub fn app(state: Arc<AppState>) -> Router {
@@ -176,8 +205,12 @@ fn authorized(headers: &HeaderMap, bearer: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "stopped": st.estop.is_stopped() }))
+async fn health(State(_st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // AR-B-024: `/health` is unauthenticated (the supervisor probes it with no
+    // bearer). It reports liveness only — the emergency-stop state is
+    // operational information and is exposed on the bearer-gated `/status`
+    // route (`running`), never here.
+    Json(serde_json::json!({ "status": "ok" }))
 }
 
 async fn status(
@@ -223,7 +256,10 @@ async fn approvals(
             .and_then(|v| v.as_str())
             .map(str::to_string);
         out.push(ApprovalBody {
-            id: p.name.clone(),
+            // AR-B-023: expose the stable call-id (not the tool name) so the
+            // ceremony can assert "I am approving *this* call" when it posts
+            // back to /approvals/approve.
+            id: p.id.clone(),
             kind: p.risk_level.clone(),
             summary: p.description,
             to,
@@ -237,29 +273,69 @@ async fn approvals(
 /// approves the head pending approval, calls this to resolve it. The queue is a FIFO; approving the
 /// head unblocks the capsule host-fn that submitted it, which then performs the eth-send. Honest:
 /// approving an empty queue is a no-op (nothing was pending), reported as such.
+///
+/// AR-B-023: when the request body carries `{"id": "<call_id>"}`, the approval
+/// is BOUND to that call — if the queue head is a different action than the one
+/// the operator reviewed (a timeout eviction or a second queued effect changed
+/// the head), the request is refused with 409 CONFLICT and nothing is resolved.
+/// A body without an id keeps the legacy head-approve for backward compatibility
+/// with ceremony clients that have not yet adopted the id round-trip.
 async fn approve_head(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let had = st.queue.depth() > 0;
-    st.queue.approve();
-    Ok(Json(serde_json::json!({ "ok": true, "resolved": had })))
+    resolve_body(&st, &body, true)
 }
 
 /// S6.3 — the ceremony bridge (reject half). The human declined the head approval; the submitting
-/// host-fn gets `Err`, so the chain effect is NOT performed.
+/// host-fn gets `Err`, so the chain effect is NOT performed. See [`approve_head`] for the call-id
+/// binding (AR-B-023).
 async fn reject_head(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    resolve_body(&st, &body, false)
+}
+
+/// Shared approve/reject resolution. Binds to a call-id when the body supplies
+/// one (AR-B-023); otherwise falls back to the legacy head resolution.
+fn resolve_body(
+    st: &Arc<AppState>,
+    body: &[u8],
+    approve: bool,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let requested_id = (!body.is_empty())
+        .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .flatten()
+        .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(str::to_string));
+
+    if let Some(id) = requested_id {
+        let res = if approve {
+            st.queue.approve_by_id(&id)
+        } else {
+            st.queue.reject_by_id(&id)
+        };
+        return match res {
+            Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "resolved": true }))),
+            // The head is not the call the operator reviewed — refuse.
+            Err(_) => Err(StatusCode::CONFLICT),
+        };
+    }
+
     let had = st.queue.depth() > 0;
-    st.queue.reject();
+    if approve {
+        st.queue.approve();
+    } else {
+        st.queue.reject();
+    }
     Ok(Json(serde_json::json!({ "ok": true, "resolved": had })))
 }
 
@@ -296,7 +372,17 @@ async fn run_skill(
     // multi-thread runtime `#[tokio::main]` gives us.
     let name = req.name.clone();
     let args = req.args.clone();
+    // AR-B-030: re-check the e-stop inside the task, immediately before running
+    // the capsule. The check above races a /stop that lands between accept and
+    // execution start; without this re-check an in-flight skill would begin
+    // executing after the kill switch was engaged. (Interrupting a call already
+    // in progress needs host-fn-level hooks — tracked separately.)
+    let estop = st.estop.clone();
     tokio::spawn(async move {
+        if estop.is_stopped() {
+            eprintln!("[citrate-agent-sidecar] skill {name:?} aborted: e-stop engaged before start");
+            return;
+        }
         let outcome = tokio::task::block_in_place(|| dispatch.call_json(&name, &args));
         match outcome {
             Ok(v) => eprintln!("[citrate-agent-sidecar] skill {name:?} finished: {v}"),

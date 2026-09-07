@@ -1079,6 +1079,7 @@ dependencies = [
  "wasmtime-wasi-io",
  "wat",
  "wiremock",
+ "zeroize",
  "zstd",
 ]
 
@@ -1090,6 +1091,7 @@ dependencies = [
  "chrono",
  "citrate-agent-core",
  "citrate-agent-legacy",
+ "ed25519-dalek",
  "hex",
  "reqwest",
  "serde",

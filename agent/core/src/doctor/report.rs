@@ -17,9 +17,18 @@ use std::collections::BTreeMap;
 /// surfaces a finding the operator should review but doesn't gate
 /// continued operation; `Blocker` means the doctor explicitly
 /// recommends halting the harness until remediation.
+///
+/// AR-B-015: `Skipped` means the check did NOT run (no config supplied,
+/// unsupported platform, etc.). It was previously encoded as `Pass` with a
+/// "skipped: …" message, so a report where four RFC §10.2 checks ran nothing —
+/// including capsule signature re-verification, the *first* required check —
+/// still rolled up to a signed all-green `Pass`. A skipped check is not a pass:
+/// it is excluded from a clean `Pass` and drags the overall status to at least
+/// `Warn` (see `doctor::compute_overall`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
     Pass,
+    Skipped,
     Warn,
     Blocker,
 }
@@ -28,6 +37,7 @@ impl Severity {
     pub fn as_str(self) -> &'static str {
         match self {
             Severity::Pass => "pass",
+            Severity::Skipped => "skipped",
             Severity::Warn => "warn",
             Severity::Blocker => "blocker",
         }

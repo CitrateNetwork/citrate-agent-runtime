@@ -109,8 +109,14 @@ impl ApprovalFlow {
                             Some(g) => g == s,
                             None => true, // legacy global grant covers all
                         },
-                        // Caller is anonymous: any active grant works.
-                        None => true,
+                        // AR-B-019: an anonymous caller is covered ONLY by a
+                        // GLOBAL grant. Previously any active grant satisfied an
+                        // anonymous check, so a grant created by
+                        // `set_auto_approve_for_session("sess-A")` auto-approved
+                        // Low/Medium tools for EVERY session (check() passes
+                        // None). A session-scoped grant must not leak past its
+                        // session.
+                        None => grant.session_id.is_none(),
                     }
                 }
             }
@@ -390,8 +396,14 @@ mod tests {
         assert!(matches!(r, Err(AgentError::Denied)));
     }
 
+    /// AR-B-019 (RC-8): a SESSION-scoped grant must NOT auto-approve the
+    /// anonymous `check()` path. This test previously asserted it DID (the
+    /// bleed: a grant for "sess-1" auto-approved Medium tools for every caller
+    /// because check() passes session_id = None). Now the anonymous check falls
+    /// through to the handler (AlwaysDeny) → Denied, while the session grant is
+    /// still active for a caller that names its session.
     #[tokio::test]
-    async fn test_agt10_auto_approve_active_within_ttl() {
+    async fn session_grant_does_not_auto_approve_anonymous_check() {
         let flow = ApprovalFlow::new(Arc::new(AlwaysDeny));
         flow.set_auto_approve_for_session("sess-1", 60).await;
         let r = flow
@@ -402,9 +414,30 @@ mod tests {
                 RiskLevel::Medium,
             )
             .await;
-        // Auto-approve bypasses medium even though handler denies.
-        assert!(r.is_ok());
+        assert!(
+            matches!(r, Err(AgentError::Denied)),
+            "a session-scoped grant must not leak to the anonymous check path"
+        );
+        // The grant is still active for the session that owns it.
         assert!(flow.auto_approve_active_for("sess-1").await);
+        assert!(!flow.auto_approve_active_for("sess-2").await);
+    }
+
+    /// AR-B-019: a GLOBAL grant (set_auto_approve(true)) DOES auto-approve the
+    /// anonymous check() — global is intentionally session-agnostic.
+    #[tokio::test]
+    async fn global_grant_auto_approves_anonymous_check() {
+        let flow = ApprovalFlow::new(Arc::new(AlwaysDeny));
+        flow.set_auto_approve(true).await;
+        let r = flow
+            .check(
+                "write_file",
+                "Write",
+                &serde_json::json!({}),
+                RiskLevel::Medium,
+            )
+            .await;
+        assert!(r.is_ok(), "a global grant auto-approves Medium even if the handler denies");
     }
 
     /// AGT-10 enforcement test: a grant bound to "sess-A" does NOT

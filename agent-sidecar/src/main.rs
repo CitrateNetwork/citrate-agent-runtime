@@ -43,6 +43,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bearer,
     });
 
+    // AR-B-024: the control plane is a bearer-authed LOOPBACK plane by contract.
+    // Refuse to bind a non-loopback address (e.g. 0.0.0.0) unless the operator
+    // explicitly opts in via CITRATE_HERMES_ALLOW_NONLOOPBACK=1, so a
+    // misconfiguration cannot silently expose run_skill/approve to the network.
+    let allow_nonloopback =
+        std::env::var("CITRATE_HERMES_ALLOW_NONLOOPBACK").as_deref() == Ok("1");
+    agent_sidecar::enforce_loopback_bind(&addr, allow_nonloopback)?;
+
     eprintln!(
         "citrate-agent-sidecar: {} skills, control on {}",
         state.skills.len(),

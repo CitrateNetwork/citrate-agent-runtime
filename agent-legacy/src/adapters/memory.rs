@@ -56,7 +56,12 @@ pub trait MemoryTransport: Send + Sync {
 }
 
 /// Configuration for a BYOM memory connection.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// AR-B-027: `Debug` is hand-implemented to REDACT `connect_token` — the derived
+/// `Debug` printed the HS256 bearer verbatim, so any `{:?}` (a log line, a panic
+/// message, a `dbg!`) would leak it. `Serialize`/`Deserialize` are retained
+/// because the config is round-tripped to the user's local credential store.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryAdapterConfig {
     /// Gateway origin, e.g. `https://mem-gateway.example.com` (no baked host).
     pub origin: String,
@@ -64,6 +69,16 @@ pub struct MemoryAdapterConfig {
     pub sub: String,
     /// HS256 connect token (byte-matches the gateway's MEM_CONNECT_SECRET issuance).
     pub connect_token: String,
+}
+
+impl std::fmt::Debug for MemoryAdapterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryAdapterConfig")
+            .field("origin", &self.origin)
+            .field("sub", &self.sub)
+            .field("connect_token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl MemoryAdapterConfig {
@@ -331,6 +346,23 @@ fn encode_path_segment(s: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn debug_redacts_the_connect_token() {
+        // AR-B-027: the derived Debug printed the HS256 bearer verbatim; the
+        // hand-impl must redact it so a stray {:?} / log line cannot leak it.
+        let cfg = MemoryAdapterConfig {
+            origin: "https://mem.example.com".into(),
+            sub: "did:citrate:agent:0xabc".into(),
+            connect_token: "SUPER-SECRET-HS256-TOKEN".into(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-HS256-TOKEN"),
+            "Debug must not leak the connect token; got: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "got: {dbg}");
+    }
 
     /// Records the last request and returns a canned (status, body).
     struct MockTransport {

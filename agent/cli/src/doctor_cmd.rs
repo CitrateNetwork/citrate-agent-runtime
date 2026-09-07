@@ -68,7 +68,7 @@ pub fn run(args: DoctorArgs) -> i32 {
     };
 
     // Build the 11 checks per RFC §10.2. Each check pulls its
-    // config from the TOML or skips with Pass when absent.
+    // config from the TOML or skips with Severity::Skipped when absent (AR-B-015).
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
     checks.push(Box::new(AuditChainIntegrityCheck));
     checks.push(Box::new(AuditFilePermissionsCheck));
@@ -197,7 +197,10 @@ pub fn run(args: DoctorArgs) -> i32 {
 
     match report.overall_status {
         Severity::Blocker => 1,
-        Severity::Pass | Severity::Warn => 0,
+        // AR-B-015: a report with skipped required checks never rolls up to
+        // Skipped at the overall level (compute_overall promotes it to Warn),
+        // but the arm is listed for exhaustiveness.
+        Severity::Pass | Severity::Skipped | Severity::Warn => 0,
     }
 }
 
@@ -205,8 +208,14 @@ pub fn run(args: DoctorArgs) -> i32 {
 mod tests {
     use super::*;
 
+    /// AR-B-015 (RC-8) — an empty config skips required checks, so the report
+    /// must NOT be a clean all-green Pass. This test previously asserted every
+    /// skipped check surfaced as `Pass` and the overall rolled up to Pass/Warn
+    /// (the bug: a signed CA-7 artifact whose green rows include checks that ran
+    /// nothing). Now the skipped rows carry `severity = "skipped"` and the
+    /// overall is `Warn`, never `Pass`.
     #[test]
-    fn empty_config_produces_all_skip_passes() {
+    fn empty_config_report_is_not_a_clean_pass() {
         let cfg_path = std::env::temp_dir().join("cit-agent-7c-empty.toml");
         std::fs::write(&cfg_path, b"[doctor]\nagent_did = \"did:test\"\n").unwrap();
         let out_path = std::env::temp_dir().join("cit-agent-7c-empty-report.toml");
@@ -217,12 +226,26 @@ mod tests {
             check: vec![],
             seed: None,
         });
-        assert_eq!(exit, 0, "empty config produces Pass/Warn overall");
+        // Skips do not gate the harness (exit stays 0), but the report is honest.
+        assert_eq!(exit, 0);
         let body = std::fs::read_to_string(&out_path).unwrap();
         assert!(body.contains("agent_did = \"did:test\""));
-        // 11 checks should appear in the report.
         let appearances = body.matches("[[results]]").count();
         assert_eq!(appearances, 11);
+        // The overall status must NOT be a clean Pass when required checks skip.
+        assert!(
+            body.contains("overall_status = \"Warn\""),
+            "empty config must roll up to Warn, not Pass; report:\n{body}"
+        );
+        assert!(
+            !body.contains("overall_status = \"Pass\""),
+            "empty config must not report an all-green Pass"
+        );
+        // At least one check honestly reports it was skipped.
+        assert!(
+            body.contains("severity = \"Skipped\""),
+            "skipped checks must surface as Skipped, not Pass"
+        );
         let _ = std::fs::remove_file(&cfg_path);
         let _ = std::fs::remove_file(&out_path);
     }

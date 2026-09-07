@@ -16,19 +16,43 @@ const ALLOWED_OPS: &[&str] = &["status", "diff", "commit", "push"];
 /// Timeout for git operations: 60 seconds.
 const GIT_TIMEOUT_MS: u64 = 60_000;
 
+/// AR-B-022: per-exec counter for the isolated scratch HOME name.
+static GITOPS_HOME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Execute a git command in the given directory and return (stdout, stderr, exit_code).
 async fn run_git(
     workspace: &str,
     args: &[&str],
 ) -> Result<(String, String, i32), AgentError> {
+    // AR-B-022: run git with a cleansed environment. Previously the full ambient
+    // env (incl. the real $HOME) was inherited, so `git` read `~/.gitconfig` —
+    // `core.sshCommand` / `core.pager` there is a code-exec sink an attacker can
+    // plant. env_clear + a fixed PATH + an isolated empty HOME + pinned
+    // global/system config to /dev/null remove that surface.
+    let scratch_home = std::env::temp_dir().join(format!(
+        "citrate-gitops-home-{}-{}",
+        std::process::id(),
+        GITOPS_HOME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::create_dir_all(&scratch_home);
     let output = tokio::time::timeout(
         Duration::from_millis(GIT_TIMEOUT_MS),
         tokio::process::Command::new("git")
             .args(args)
             .current_dir(workspace)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", &scratch_home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output(),
     )
     .await
+    .map(|r| {
+        let _ = std::fs::remove_dir_all(&scratch_home);
+        r
+    })
     .map_err(|_| AgentError::Timeout(GIT_TIMEOUT_MS))?
     .map_err(|e| AgentError::ExecutionFailed(format!("failed to run git: {e}")))?;
 

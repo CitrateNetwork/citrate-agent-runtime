@@ -121,11 +121,18 @@ impl HostCtx {
             // dispatch.rs may reconfigure before each call; this is
             // the conservative default that applies even if the
             // dispatcher forgets to set it.
+            // AR-B-004: 64 MiB heap is the security-relevant DoS bound and is
+            // now enforced from instantiate time onward (see
+            // `mod.rs::arm_instantiate_bounds`). The structural caps below are
+            // generous headroom for legitimate component-model capsules — a
+            // component with one core module already consumes 2 instances (the
+            // core instance + the component instance) — not tight limits; the
+            // heap cap is what bounds a hostile capsule.
             store_limits: StoreLimitsBuilder::new()
-                .memory_size(64 * 1024 * 1024) // 64 MiB hard cap
-                .tables(1)
-                .table_elements(10_000)
-                .instances(1)
+                .memory_size(64 * 1024 * 1024) // 64 MiB hard cap (per memory)
+                .tables(100)
+                .table_elements(1_000_000)
+                .instances(1_000)
                 .build(),
         }
     }

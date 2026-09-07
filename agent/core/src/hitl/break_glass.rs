@@ -30,6 +30,24 @@ use std::time::{Duration, Instant};
 /// 72-hour post-hoc affirmation window per RFC §5.5.
 pub const AFFIRMATION_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
 
+/// AR-B-026 — distinct signing domains for the two break-glass operations, so a
+/// captured invoke attestation is not a valid affirm attestation (and vice
+/// versa). The version suffix lets the preimage evolve (e.g. add a nonce/expiry)
+/// without silently accepting old signatures.
+const BREAKGLASS_INVOKE_DOMAIN: &[u8] = b"CIT-BREAKGLASS-INVOKE-v1";
+const BREAKGLASS_AFFIRM_DOMAIN: &[u8] = b"CIT-BREAKGLASS-AFFIRM-v1";
+
+/// Domain-separated attestation preimage: `domain || 0x00 || action_id`. The
+/// `0x00` separator keeps the domain and the (arbitrary) action_id
+/// unambiguous even though the domain tags are fixed-length and distinct.
+fn breakglass_preimage(domain: &[u8], action_id: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(domain.len() + 1 + action_id.len());
+    p.extend_from_slice(domain);
+    p.push(0x00);
+    p.extend_from_slice(action_id.as_bytes());
+    p
+}
+
 /// The five-role lattice — the set of approvers notified on invoke.
 fn all_approvers() -> BTreeSet<Role> {
     let mut s = BTreeSet::new();
@@ -183,16 +201,24 @@ impl BreakGlassRegistry {
         self
     }
 
-    /// Verify a break-glass attestation over `action_id` and roster-authorize
-    /// the signer for `role`. Returns the verified `Signer` on success.
+    /// Verify a break-glass attestation over the domain-separated preimage
+    /// `domain || 0x00 || action_id` and roster-authorize the signer for `role`.
+    /// Returns the verified `Signer` on success.
+    ///
+    /// AR-B-026: the attestation preimage was the bare `action_id.as_bytes()` —
+    /// no domain tag — so a captured INVOKE signature replayed verbatim as an
+    /// AFFIRM (only the role check + InvokerCannotAffirm separated them). Binding
+    /// a distinct domain to each operation makes an invoke signature invalid for
+    /// affirm and vice-versa.
     fn authorize(
         &self,
+        domain: &[u8],
         action_id: &str,
         attested: &AttestedSignature,
     ) -> Result<Signer, BreakGlassError> {
-        verify_attestation(action_id.as_bytes(), attested)
+        verify_attestation(&breakglass_preimage(domain, action_id), attested)
             .map_err(|e| BreakGlassError::AttestationInvalid(e.to_string()))?;
-        let dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-hitl");
+        let dev_allowed = cfg!(test) || cfg!(feature = "insecure-dev-hitl");
         if !signer_is_authorized(
             self.signer_roster.as_deref(),
             &attested.pubkey,
@@ -216,7 +242,7 @@ impl BreakGlassRegistry {
     ) -> Result<(), BreakGlassError> {
         // RM-G.2: a caller-asserted role is not enough — require a verified
         // attestation over the action_id from a roster-authorized key.
-        let signer = self.authorize(action_id, &attested)?;
+        let signer = self.authorize(BREAKGLASS_INVOKE_DOMAIN, action_id, &attested)?;
         if signer.role != Role::SecurityOfficer {
             return Err(BreakGlassError::NotSecurityOfficer);
         }
@@ -253,7 +279,9 @@ impl BreakGlassRegistry {
         now: Instant,
     ) -> Result<(), BreakGlassError> {
         // RM-G.2: verified attestation + roster authorization required.
-        let signer = self.authorize(action_id, &attested)?;
+        // AR-B-026: affirm uses a DISTINCT domain from invoke, so an invoke
+        // signature cannot be replayed here.
+        let signer = self.authorize(BREAKGLASS_AFFIRM_DOMAIN, action_id, &attested)?;
         if !matches!(signer.role, Role::Reviewer | Role::ComplianceOfficer) {
             return Err(BreakGlassError::NotAffirmationRole);
         }
@@ -426,13 +454,24 @@ mod tests {
         }
     }
 
-    fn attest(name: &str, role: Role, action_id: &str) -> AttestedSignature {
+    fn attest_domain(name: &str, role: Role, action_id: &str, domain: &[u8]) -> AttestedSignature {
         let mut seed = [0u8; 32];
         let bytes = name.as_bytes();
         let n = bytes.len().min(32);
         seed[..n].copy_from_slice(&bytes[..n]);
         let s = Ed25519FileSurface::from_seed(seed, role);
-        s.sign(action_id.as_bytes()).expect("attest sign")
+        s.sign(&breakglass_preimage(domain, action_id))
+            .expect("attest sign")
+    }
+
+    /// An INVOKE-domain attestation (AR-B-026).
+    fn attest(name: &str, role: Role, action_id: &str) -> AttestedSignature {
+        attest_domain(name, role, action_id, BREAKGLASS_INVOKE_DOMAIN)
+    }
+
+    /// An AFFIRM-domain attestation (AR-B-026).
+    fn attest_affirm(name: &str, role: Role, action_id: &str) -> AttestedSignature {
+        attest_domain(name, role, action_id, BREAKGLASS_AFFIRM_DOMAIN)
     }
 
     #[test]
@@ -529,30 +568,37 @@ mod tests {
         let t0 = Instant::now();
         reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
-        reg.affirm("act1", attest("rv", Role::Reviewer, "act1"), t0)
+        reg.affirm("act1", attest_affirm("rv", Role::Reviewer, "act1"), t0)
             .expect("rv affirms");
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Invoked);
-        reg.affirm("act1", attest("co", Role::ComplianceOfficer, "act1"), t0)
+        reg.affirm("act1", attest_affirm("co", Role::ComplianceOfficer, "act1"), t0)
             .expect("co affirms");
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Affirmed);
     }
 
+    /// AR-B-026 (RC-8) — a captured INVOKE attestation must NOT be replayable as
+    /// an AFFIRM. Previously this test replayed the SO's invoke attestation into
+    /// affirm() and asserted only the role-side guard (`NotAffirmationRole`)
+    /// stopped it — i.e. the SAME signature was accepted by both operations, the
+    /// exact replay the finding flags. With domain separation the affirm
+    /// verifier (AFFIRM domain) rejects the INVOKE-domain signature outright,
+    /// before any role check.
     #[test]
-    fn invoker_cannot_self_affirm() {
+    fn invoke_attestation_is_not_replayable_as_affirm() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let so = attest("so", Role::SecurityOfficer, "act1");
         reg.invoke("act1", so.clone(), &m, Instant::now())
             .expect("invoke");
-        // SecurityOfficer isn't an affirmation role anyway, but
-        // even if we tried with the SO id under a Reviewer role,
-        // we'd be using a different surface so the id would
-        // differ. The structural invoker-id check uses the
-        // recorded invoker.id. Test the role-side guard:
+        // Replay the invoke attestation into affirm — must fail on the
+        // attestation itself (domain mismatch), not merely the role guard.
         let err = reg
             .affirm("act1", so.clone(), Instant::now())
-            .expect_err("SO is not an affirmation role");
-        assert_eq!(err, BreakGlassError::NotAffirmationRole);
+            .expect_err("invoke attestation must not verify as an affirm");
+        assert!(
+            matches!(err, BreakGlassError::AttestationInvalid(_)),
+            "replayed invoke sig must be rejected as an invalid affirm attestation; got: {err:?}"
+        );
     }
 
     #[test]
@@ -562,11 +608,11 @@ mod tests {
         let t0 = Instant::now();
         reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
-        reg.affirm("act1", attest("rv1", Role::Reviewer, "act1"), t0)
+        reg.affirm("act1", attest_affirm("rv1", Role::Reviewer, "act1"), t0)
             .expect("first rv");
         // Same role again — DuplicateAffirmer.
         let err = reg
-            .affirm("act1", attest("rv2", Role::Reviewer, "act1"), t0)
+            .affirm("act1", attest_affirm("rv2", Role::Reviewer, "act1"), t0)
             .expect_err("two reviewers blocked");
         assert_eq!(err, BreakGlassError::DuplicateAffirmer);
         // Phase still Invoked.
@@ -599,7 +645,7 @@ mod tests {
             .expect("invoke");
         let t_late = t0 + Duration::from_secs(73 * 3600);
         let err = reg
-            .affirm("act1", attest("rv", Role::Reviewer, "act1"), t_late)
+            .affirm("act1", attest_affirm("rv", Role::Reviewer, "act1"), t_late)
             .expect_err("late affirm rejected");
         assert_eq!(err, BreakGlassError::AffirmationWindowExpired);
     }

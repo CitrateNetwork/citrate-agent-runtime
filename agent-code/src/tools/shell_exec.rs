@@ -112,6 +112,10 @@ const MAX_TIMEOUT_MS: u64 = 300_000;
 /// Maximum output size we return: 64 KiB.
 const MAX_OUTPUT_BYTES: usize = 65_536;
 
+/// AR-B-022: per-exec counter for the isolated scratch HOME directory name, so
+/// concurrent invocations get distinct empty homes.
+static SCRATCH_HOME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Tokenize a command string into (binary, args). Rejects:
 ///   - shell metacharacters anywhere in the string
 ///   - empty commands
@@ -145,6 +149,19 @@ pub fn parse_and_validate_command(
         return Err(format!(
             "binary '{}' is not in the allowlist; see ALLOWED_BINARIES in shell_exec.rs",
             basename
+        ));
+    }
+
+    // AR-B-022: a RELATIVE path that carries a separator (`./cargo`,
+    // `target/debug/make`) passed the basename allowlist but was never checked
+    // against SAFE_PATH, so it executed a workspace-local — attacker-writable —
+    // binary. Only a bare name (resolved via the cleansed PATH) or an absolute
+    // path inside SAFE_PATH is permitted; reject any other form.
+    if !std::path::Path::new(&binary_raw).is_absolute() && binary_raw.contains('/') {
+        return Err(format!(
+            "relative binary path '{}' is not permitted; use a bare binary name (resolved via the \
+             cleansed PATH) or an absolute path inside the safe PATH directories ({})",
+            binary_raw, SAFE_PATH
         ));
     }
 
@@ -248,22 +265,38 @@ impl AgentTool for ShellExec {
 
         // Build a minimal-environment Command. PATH is hard-coded
         // to SAFE_PATH so an attacker can't pre-stage a binary
-        // earlier in PATH; HOME is preserved (cargo/git read it
-        // for credentials/config) but no other env is inherited.
+        // earlier in PATH; no other env is inherited.
+        //
+        // AR-B-022: HOME is NOT inherited from the real user. The old code
+        // re-added the real $HOME, so an allow-listed `git`/`cargo` read
+        // `~/.gitconfig` (core.sshCommand / core.pager) or `~/.cargo/config.toml`
+        // ([target.*].runner) — a code-exec sink that never touches the Critical
+        // shell_exec re-auth gate. Point HOME at a fresh, isolated, empty scratch
+        // dir so no attacker-plantable home config is on the search path. Also
+        // pin git's global/system config to /dev/null as belt-and-braces.
+        let scratch_home = std::env::temp_dir().join(format!(
+            "citrate-shell-home-{}-{}",
+            std::process::id(),
+            SCRATCH_HOME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&scratch_home);
         let mut cmd = tokio::process::Command::new(&binary);
         cmd.args(&args)
             .current_dir(&ctx.workspace_dir)
             .env_clear()
-            .env("PATH", SAFE_PATH);
-        if let Ok(home) = std::env::var("HOME") {
-            cmd.env("HOME", home);
-        }
+            .env("PATH", SAFE_PATH)
+            .env("HOME", &scratch_home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
 
         let result = tokio::time::timeout(
             Duration::from_millis(timeout_ms),
             cmd.output(),
         )
         .await;
+
+        // AR-B-022: best-effort cleanup of the isolated scratch HOME.
+        let _ = std::fs::remove_dir_all(&scratch_home);
 
         match result {
             Err(_) => Err(AgentError::Timeout(timeout_ms)),

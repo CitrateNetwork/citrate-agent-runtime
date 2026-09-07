@@ -102,14 +102,16 @@ impl RecorderClient {
     /// so this code can live in `citrate-agent-core` with no host coupling.
     pub fn from_hex_key(hex_key: &str, rpc_url: impl Into<String>) -> Option<Self> {
         let stripped = hex_key.trim().trim_start_matches("0x");
-        let bytes = hex::decode(stripped).ok()?;
+        // AR-B-027: the decoded private-key bytes are secret — wipe them (and
+        // the fixed-size copy) on drop instead of leaving them in freed memory.
+        let bytes = zeroize::Zeroizing::new(hex::decode(stripped).ok()?);
         if bytes.len() != 32 {
             tracing::warn!("recorder: key must be 32 bytes; got {}", bytes.len());
             return None;
         }
-        let mut arr = [0u8; 32];
+        let mut arr = zeroize::Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&bytes);
-        let signing_key = SigningKey::from_bytes(&arr.into()).ok()?;
+        let signing_key = SigningKey::from_bytes(&(*arr).into()).ok()?;
         let from_address_hex = derive_address(&signing_key);
         Some(Self {
             signing_key,

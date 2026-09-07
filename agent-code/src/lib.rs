@@ -440,6 +440,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_arb022_rejects_workspace_relative_binary() {
+        // AR-B-022: a relative path with a separator passed the basename
+        // allowlist but escaped the SAFE_PATH check, executing a
+        // workspace-local (attacker-writable) binary. It must be rejected.
+        assert_rejected("./cargo build");
+        assert_rejected("target/debug/make");
+        assert_rejected("./git status");
+        assert_rejected("subdir/cargo build");
+    }
+
+    #[tokio::test]
     async fn test_agt04_accepts_allowlisted_binaries() {
         use crate::tools::shell_exec::parse_and_validate_command;
         let cases = &[
