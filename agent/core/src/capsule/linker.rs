@@ -360,15 +360,24 @@ impl LinkerBuilder {
                 // Resolution order (CIT-AGENT-9c-1-rpc):
                 //   1. Test fixture (canned-queue front).
                 //   2. Production dispatcher (real RPC).
-                //   3. Legacy stub (Ok(empty)) — preserved for
-                //      capsules instantiated without a dispatcher.
+                //   3. No dispatcher ⇒ FAIL-CLOSED (AR-B-044/AR-B-046).
                 if let Some(canned) = store.data_mut().take_eth_call_canned_response() {
                     return Ok((Ok(canned),));
                 }
                 if let Some(dispatcher) = store.data().eth_call_dispatcher() {
                     return Ok((dispatcher.eth_call(&addr, &data),));
                 }
-                Ok((Ok(Vec::new()),))
+                // AR-B-044/AR-B-046: previously this returned `Ok(Vec::new())` —
+                // a *successful* empty chain read. A capsule that ABI-decodes the
+                // empty response then reports a fabricated result (a compliance
+                // posture, a provenance verdict) derived from a read that never
+                // happened, with no error for the operator to see. The sibling
+                // eth-send host fn (`:449-457`) already fails closed on a missing
+                // dispatcher; mirror it here. The canned-queue fixture above
+                // remains the only non-dispatcher source (tests only).
+                Ok((Err(
+                    "ChainCallFailed: no eth_call dispatcher configured".to_string(),
+                ),))
             },
         )
         .map_err(|e| linker_err("citrate:chain/eth-call call func_wrap", e))?;

@@ -300,11 +300,16 @@ impl CapsuleDispatch {
         // Numbers chosen conservatively for the current capsule set
         // (largest in-tree capsule ~16 MiB heap, single table, single
         // instance per call). Revisit when capsule diversity grows.
+        // AR-B-004: 64 MiB heap is the DoS-relevant cap; the structural caps
+        // are generous headroom for legitimate component-model capsules (a
+        // single core module already needs 2 instances). Kept in sync with
+        // `HostCtx::empty` so `instantiate_*` (which arms the limiter from
+        // `store_limits`) and `call_raw` agree.
         store.data_mut().store_limits = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(64 * 1024 * 1024) // 64 MiB hard cap
-            .tables(1)
-            .table_elements(10_000)
-            .instances(1)
+            .memory_size(64 * 1024 * 1024) // 64 MiB hard cap (per memory)
+            .tables(100)
+            .table_elements(1_000_000)
+            .instances(1_000)
             .build();
         store.limiter(|state| &mut state.store_limits);
 
@@ -369,6 +374,19 @@ impl CapsuleDispatch {
             .capsules
             .get(capsule_name)
             .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
+        // AR-B-008: refuse an unverified capsule BEFORE any of its bytes reach
+        // `Component::from_binary` (full Cranelift compilation — the largest
+        // untrusted-parsing surface in the crate). RFC §4.5 requires manifest
+        // signature verification to succeed before WASM parsing begins. The gate
+        // in `call_raw` runs too late: `discover_single_entry` below already
+        // compiled the component. Mirror the `call_raw` gate here at the top.
+        if self.unverified.contains(capsule_name) {
+            return Err(AgentError::Capsule(format!(
+                "refusing to instantiate unverified capsule {capsule_name:?}: it is not bound to a \
+                 valid manifest content_hash + publisher signature. Pack and sign it with \
+                 cit-capsule-pack (CIT-AGENT-3e)."
+            )));
+        }
         // Discover the single (interface, function, params) from the component's own type.
         let component =
             wasmtime::component::Component::from_binary(&self.engine, &capsule.archive.wasm)
@@ -757,6 +775,58 @@ tier = "bundled"
         assert!(
             err.to_string().to_lowercase().contains("unverified"),
             "refusal must cite the missing integrity proof, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn call_json_refuses_unverified_before_wasm_parse() {
+        // AR-B-008: `call_json` must reject an unverified loose-dir capsule at
+        // the TOP — before its bytes reach `Component::from_binary` (Cranelift
+        // compilation). Pre-fix, `call_json` compiled the component first, so an
+        // unverified capsule with parseable-looking bytes reached the largest
+        // untrusted-parsing surface in the crate; the error surfaced as
+        // "component parse", not "unverified".
+        let root = std::env::temp_dir().join(format!("cit-cap-cj-unverified-{}", std::process::id()));
+        let cap = root.join("placeholdercap");
+        std::fs::create_dir_all(&cap).expect("mkdir");
+        let manifest = format!(
+            r#"[capsule]
+name = "placeholdercap"
+version = "0.1.0"
+content_hash = "{PLACEHOLDER_HASH}"
+[capability]
+network = "none"
+subagent_spawn = false
+[data_class]
+[risk]
+tier = "low"
+break_glass_eligible = false
+[overlay]
+[provenance]
+publisher = "did:citrate:test"
+build_reproducible = true
+agentile_sprint = "cit-agent-3e"
+[signing]
+tier = "bundled"
+"#
+        );
+        std::fs::write(cap.join("manifest.toml"), manifest).expect("write manifest");
+        std::fs::write(cap.join("capsule.wasm"), b"\x00asm\x01\x00\x00\x00").expect("write wasm");
+
+        let dispatch = CapsuleDispatch::load_from_dir(&root, None, None, None).expect("loads");
+        assert!(dispatch.unverified.contains("placeholdercap"));
+        let err = dispatch
+            .call_json("placeholdercap", &serde_json::json!({}))
+            .expect_err("call_json on an unverified capsule must be refused");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unverified"),
+            "must fail the integrity gate, not the wasm parser; got: {err}"
+        );
+        assert!(
+            !msg.contains("component parse"),
+            "unverified bytes must NOT reach Component::from_binary; got: {err}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
