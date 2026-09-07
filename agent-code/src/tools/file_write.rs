@@ -18,6 +18,31 @@ const DENIED_PATTERNS: &[&str] = &[
 /// File extensions that are always denied for write operations.
 const DENIED_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks"];
 
+/// Lexically normalize a path — resolve `.` and `..` components without
+/// touching the filesystem. Returns `None` if the path escapes above its
+/// root via `..` (a traversal attempt). This is what closes AR-B-006: the
+/// previous ancestor-walk stripped `..` with `PathBuf::pop()` for the
+/// existence check but returned the *un-normalised* candidate, so the kernel
+/// resolved the surviving `..` chain at write time and the write landed
+/// outside the workspace.
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                // Refuse to pop past the root / an empty accumulator.
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
 /// Resolve a path relative to the workspace for write operations.
 /// Unlike reads, the file need not exist yet — we validate the parent directory.
 /// Also checks denied patterns and extensions per SandboxPolicy rules.
@@ -48,13 +73,25 @@ fn resolve_write_path(workspace: &str, path: &str) -> Result<PathBuf, AgentError
         workspace.join(path)
     };
 
-    // Normalize the path manually since the file may not exist yet.
-    // We check that the parent resolves inside the workspace.
+    // Lexically normalize FIRST so any `..` chain is collapsed before we
+    // reason about containment. The old code returned the raw `candidate`
+    // with `..` intact, which the kernel later resolved through the
+    // filesystem — escaping the workspace (AR-B-006).
+    let candidate = lexical_normalize(&candidate).ok_or_else(|| {
+        AgentError::ExecutionFailed("path traversal outside workspace is not allowed".into())
+    })?;
+    if !candidate.starts_with(&workspace) {
+        return Err(AgentError::ExecutionFailed(
+            "path traversal outside workspace is not allowed".into(),
+        ));
+    }
+
+    // Defence in depth against a symlinked *existing* ancestor: walk up until
+    // we find an ancestor that exists, canonicalize it (following symlinks),
+    // and confirm it too is inside the workspace.
     let parent = candidate
         .parent()
         .ok_or_else(|| AgentError::ExecutionFailed("invalid file path".into()))?;
-
-    // The parent may not exist yet either — walk up until we find an existing ancestor.
     let mut check = parent.to_path_buf();
     loop {
         if check.exists() {
@@ -75,6 +112,8 @@ fn resolve_write_path(workspace: &str, path: &str) -> Result<PathBuf, AgentError
         }
     }
 
+    // Return the NORMALISED path (no surviving `..`), so the eventual write
+    // cannot be redirected by the kernel resolving traversal components.
     Ok(candidate)
 }
 
@@ -130,6 +169,22 @@ impl AgentTool for FileWrite {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| AgentError::ExecutionFailed(format!("failed to create dirs: {e}")))?;
+
+            // Re-canonicalize the (now-materialised) parent and confirm it is
+            // still inside the workspace. This closes the symlink-in-the-final
+            // component variant: an allow-listed operation could have planted a
+            // symlink at `parent`, which only resolves once it exists on disk.
+            let workspace = Path::new(&ctx.workspace_dir).canonicalize().map_err(|e| {
+                AgentError::ExecutionFailed(format!("invalid workspace dir: {e}"))
+            })?;
+            let real_parent = parent.canonicalize().map_err(|e| {
+                AgentError::ExecutionFailed(format!("cannot resolve parent dir: {e}"))
+            })?;
+            if !real_parent.starts_with(&workspace) {
+                return Err(AgentError::ExecutionFailed(
+                    "path traversal outside workspace is not allowed".into(),
+                ));
+            }
         }
 
         let bytes_written = content.len();

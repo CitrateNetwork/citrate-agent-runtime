@@ -13,6 +13,7 @@
 use crate::canonical::{CapabilityGrant, PolicyProfile, TrailEvent};
 use crate::tool::{RiskLevel, ToolRegistry};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
@@ -109,11 +110,23 @@ pub struct McpServer {
     /// Active capability grants for external runtimes
     grants: tokio::sync::RwLock<Vec<CapabilityGrant>>,
     /// When true, `add_grant` and `check_grant` reject unsigned
-    /// grants. Defaults to `false` for backward compatibility with
-    /// pre-RM-E5 tests; production code should call
-    /// `set_require_signed_grants(true)` after install.
+    /// grants AND require the grant's `issuer_pubkey` to be an enrolled
+    /// trust anchor (see `trusted_issuers`). Flip it on via
+    /// `new_strict` or `set_require_signed_grants`.
     /// RM-B1 / WP-E5.4 (audit AGT-08).
     require_signed_grants: bool,
+    /// Trust anchor: ed25519 public keys authorized to issue grants,
+    /// mapped to the `issuer` identity each key may sign as.
+    ///
+    /// AR-B-009 fix: `CapabilityGrant::verify_signature` verifies a
+    /// grant under the grant's OWN embedded `issuer_pubkey`, which is
+    /// self-attesting — an attacker mints a fresh keypair, signs a
+    /// `Maintainer` grant, and it "verifies". Pinning the pubkey to an
+    /// out-of-band trust anchor (device keyring / OrganizationSBT
+    /// `signing_authority` / the wallet behind `issuer`) is what makes
+    /// the signature mean anything. In strict mode a grant is accepted
+    /// only when its `issuer_pubkey` is enrolled here for its `issuer`.
+    trusted_issuers: HashMap<[u8; 32], String>,
 }
 
 impl McpServer {
@@ -122,6 +135,7 @@ impl McpServer {
             registry,
             grants: tokio::sync::RwLock::new(Vec::new()),
             require_signed_grants: false,
+            trusted_issuers: HashMap::new(),
         }
     }
 
@@ -134,12 +148,51 @@ impl McpServer {
             registry,
             grants: tokio::sync::RwLock::new(Vec::new()),
             require_signed_grants: true,
+            trusted_issuers: HashMap::new(),
         }
+    }
+
+    /// Enroll an ed25519 issuer public key as a trust anchor for
+    /// `issuer`. Consuming builder — call before wrapping in `Arc`.
+    /// AR-B-009.
+    pub fn with_trusted_issuer(mut self, pubkey: [u8; 32], issuer: impl Into<String>) -> Self {
+        self.trusted_issuers.insert(pubkey, issuer.into());
+        self
+    }
+
+    /// Toggle strict-signature mode after construction (before the
+    /// server is shared). Referenced by the module docs; AR-B-009 adds
+    /// the actual method (previously only recommended in a comment).
+    pub fn set_require_signed_grants(&mut self, require: bool) {
+        self.require_signed_grants = require;
     }
 
     /// True iff the server is in strict-signature mode.
     pub fn require_signed_grants(&self) -> bool {
         self.require_signed_grants
+    }
+
+    /// AR-B-009: verify the grant's `issuer_pubkey` is an enrolled
+    /// trust anchor for its declared `issuer`. Called only on the
+    /// strict path, AFTER `verify_signature` has confirmed the grant
+    /// content was signed by that key.
+    fn issuer_key_is_trusted(&self, grant: &CapabilityGrant) -> Result<(), String> {
+        let pk: [u8; 32] = grant
+            .issuer_pubkey
+            .as_slice()
+            .try_into()
+            .map_err(|_| "issuer_pubkey is not 32 bytes".to_string())?;
+        match self.trusted_issuers.get(&pk) {
+            Some(enrolled_issuer) if *enrolled_issuer == grant.issuer => Ok(()),
+            Some(_) => Err(
+                "issuer_pubkey is enrolled for a different issuer than the grant claims"
+                    .to_string(),
+            ),
+            None => Err(
+                "issuer_pubkey is not an enrolled trust anchor (self-attesting grant rejected)"
+                    .to_string(),
+            ),
+        }
     }
 
     /// List tools available to a specific grant/policy.
@@ -227,6 +280,14 @@ impl McpServer {
             if let Err(reason) = grant.verify_signature() {
                 return Err(format!("Grant signature invalid: {}", reason));
             }
+            // AR-B-009: in strict mode the signing key must also be an
+            // enrolled trust anchor — a valid self-attesting signature
+            // is not enough to authorize a call.
+            if self.require_signed_grants {
+                if let Err(reason) = self.issuer_key_is_trusted(grant) {
+                    return Err(format!("Grant issuer not trusted: {}", reason));
+                }
+            }
         }
 
         // Check tool is in allowed list
@@ -310,10 +371,14 @@ impl McpServer {
             return Err(format!("expires_at malformed: {}", e));
         }
 
-        // Strict mode: signature presence + verification mandatory.
+        // Strict mode: signature presence + verification mandatory,
+        // AND the signing key must be an enrolled trust anchor —
+        // otherwise a self-minted keypair authorizes any grant (AR-B-009).
         if self.require_signed_grants {
             grant.verify_signature()
                 .map_err(|e| format!("signature required: {}", e))?;
+            self.issuer_key_is_trusted(&grant)
+                .map_err(|e| format!("issuer not trusted: {}", e))?;
         } else if !grant.signature.is_empty() || !grant.issuer_pubkey.is_empty() {
             // Non-strict but a signature was provided — verify it
             // anyway. We don't accept partial data.
@@ -902,10 +967,91 @@ mod tests {
 
     #[tokio::test]
     async fn test_agt08_strict_mode_accepts_signed() {
+        // AR-B-009 (RC-8): strict mode now requires the signing key to be
+        // an enrolled trust anchor. A signed grant from a key enrolled for
+        // its issuer is accepted; the same key un-enrolled is rejected
+        // (see test_ar_b_009_* below).
+        let registry = Arc::new(ToolRegistry::new());
+        let issuer_pk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let server = McpServer::new_strict(registry).with_trusted_issuer(issuer_pk, "0xuser");
+        let grant = _signed_grant_for_test(); // issuer "0xuser", key [7u8;32]
+        server.try_add_grant(grant).await.expect("enrolled signed grant accepted");
+    }
+
+    /// AR-B-009 tripwire: a fresh, attacker-minted keypair signs a
+    /// `Maintainer` grant. Under `new_strict` with NO trust anchor the
+    /// self-attesting grant must be rejected (was accepted pre-fix).
+    #[tokio::test]
+    async fn test_ar_b_009_self_minted_maintainer_grant_rejected() {
+        use ed25519_dalek::Signer;
         let registry = Arc::new(ToolRegistry::new());
         let server = McpServer::new_strict(registry);
-        let grant = _signed_grant_for_test();
-        server.try_add_grant(grant).await.expect("signed grant accepted");
+
+        // Attacker's own keypair — never enrolled anywhere.
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
+        let mut grant = CapabilityGrant {
+            id: "attacker-grant".to_string(),
+            issuer: "0xATTACKER".to_string(),
+            recipient: "hermes".to_string(),
+            allowed_tools: vec![], // empty = unrestricted
+            max_value_per_tx: None,
+            allowed_paths: vec![],
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            policy: PolicyProfile::Maintainer,
+            revoked: false,
+            connected_since: 0,
+            issuer_pubkey: attacker.verifying_key().to_bytes().to_vec(),
+            signature: Vec::new(),
+        };
+        let preimage = grant.signing_preimage();
+        grant.signature = attacker.sign(&preimage).to_bytes().to_vec();
+
+        // The signature is cryptographically VALID under its own key —
+        // the point is the key is not a trust anchor.
+        grant.verify_signature().expect("self-signature is internally valid");
+        let err = server
+            .try_add_grant(grant)
+            .await
+            .expect_err("self-minted issuer key must be rejected in strict mode");
+        assert!(
+            err.contains("not trusted") || err.contains("trust anchor"),
+            "expected trust-anchor rejection, got: {err}"
+        );
+    }
+
+    /// AR-B-009: once the same attacker key is (mistakenly) enrolled for
+    /// its issuer, the grant is accepted — proving the gate keys on the
+    /// anchor, not merely on signature validity.
+    #[tokio::test]
+    async fn test_ar_b_009_enrolled_issuer_key_accepted() {
+        use ed25519_dalek::Signer;
+        let registry = Arc::new(ToolRegistry::new());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let pk = key.verifying_key().to_bytes();
+        let server = McpServer::new_strict(registry).with_trusted_issuer(pk, "0xORG");
+
+        let mut grant = CapabilityGrant {
+            id: "org-grant".to_string(),
+            issuer: "0xORG".to_string(),
+            recipient: "hermes".to_string(),
+            allowed_tools: vec!["check_balance".to_string()],
+            max_value_per_tx: None,
+            allowed_paths: vec![],
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            policy: PolicyProfile::ReadOnly,
+            revoked: false,
+            connected_since: 0,
+            issuer_pubkey: pk.to_vec(),
+            signature: Vec::new(),
+        };
+        let preimage = grant.signing_preimage();
+        grant.signature = key.sign(&preimage).to_bytes().to_vec();
+        server
+            .try_add_grant(grant)
+            .await
+            .expect("enrolled issuer key accepted");
     }
 
     #[tokio::test]

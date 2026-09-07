@@ -60,6 +60,11 @@ pub fn run(args: DoctorArgs) -> i32 {
         audit_chain_path: cfg.doctor.audit_chain.as_ref().map(|a| a.path.clone()),
         approval_queue: None,
         break_glass: None,
+        // AR-B-001: the CLI does not yet resolve the AgentSBT
+        // `latest_audit_chain_head`; until it does, tail-truncation
+        // cannot be detected here, though a deleted/empty log is still a
+        // Blocker. Wiring the on-chain head is tracked as follow-up.
+        expected_audit_head: None,
     };
 
     // Build the 11 checks per RFC §10.2. Each check pulls its

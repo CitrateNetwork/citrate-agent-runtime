@@ -805,4 +805,68 @@ mod tests {
 
         assert!(result.is_err());
     }
+
+    // ── AR-B-007 tripwire: relative-branch traversal must be rejected ───────
+    // Before the fix the relative branch canonicalized `../../..` and ran grep
+    // over it WITHOUT a containment check. Red on the vulnerable code.
+    #[tokio::test]
+    async fn test_search_code_blocks_relative_traversal_ar_b_007() {
+        // Workspace two levels deep so `../..` escapes into an existing dir.
+        let root = tempfile::tempdir().expect("failed to create temp dir");
+        let ws = root.path().join("a").join("b");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        // Plant a canary two levels above the workspace.
+        std::fs::write(root.path().join("CANARY.txt"), "TOP-SECRET-agentb")
+            .expect("write canary");
+        let ctx = test_ctx_with_dir(ws.to_str().expect("valid path"));
+
+        let result = tools::SearchCode
+            .execute(
+                serde_json::json!({ "pattern": "TOP-SECRET-agentb", "path": "../.." }),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "relative traversal `../..` must be rejected, got: {result:?}"
+        );
+    }
+
+    // ── AR-B-006 tripwire: file_write must not escape via a non-existent ─────
+    // ancestor `..` chain. Red on the vulnerable code, which materialised the
+    // `a/` dir then let the kernel resolve `../../..` outside the workspace.
+    #[tokio::test]
+    async fn test_file_write_blocks_nonexistent_ancestor_traversal_ar_b_006() {
+        // Keep the workspace deep inside the tempdir so any escape lands INSIDE
+        // `root` (cleaned up on drop) rather than in shared /tmp.
+        let root = tempfile::tempdir().expect("failed to create temp dir");
+        let ws = root.path().join("d1").join("d2").join("d3").join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        let ctx = test_ctx_with_dir(ws.to_str().expect("valid path"));
+
+        // `a` does not exist; `a/../../../evil.txt` normalises to
+        // root/d1/d2/evil.txt — above the workspace, still inside `root`.
+        let escape_target = root.path().join("d1").join("d2").join("evil.txt");
+        assert!(!escape_target.exists(), "precondition: escape target absent");
+
+        let result = tools::FileWrite
+            .execute(
+                serde_json::json!({
+                    "path": "a/../../../evil.txt",
+                    "content": "OWNED-BY-AGENTB"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "traversal write via non-existent ancestor must be rejected, got: {result:?}"
+        );
+        assert!(
+            !escape_target.exists(),
+            "file escaped the workspace to {escape_target:?}"
+        );
+    }
 }

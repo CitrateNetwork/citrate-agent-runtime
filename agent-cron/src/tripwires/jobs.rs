@@ -106,7 +106,13 @@ pub async fn run_trip_au_001(
     {
         Some(Ok(v)) => v,
         Some(Err(e)) => return JobOutcome::Failed(format!("metric: {e}")),
-        None => return JobOutcome::NoBreach, // metric not yet emitted
+        // AR-B-010: absent metric => detection control is disabled,
+        // NOT a clean "no breach". Fail safe / loud.
+        None => {
+            return JobOutcome::MetricUnavailable(
+                "rocksdb_size/capacity metric absent — control disabled".into(),
+            )
+        }
     };
     if !gate.evaluate(m) {
         return JobOutcome::NoBreach;
@@ -136,7 +142,10 @@ pub async fn run_trip_au_002(
     let m = match metrics.read_scalar("audit_log_shipper_backlog_count").await {
         Some(Ok(v)) => v,
         Some(Err(e)) => return JobOutcome::Failed(format!("metric: {e}")),
-        None => return JobOutcome::NoBreach,
+        // AR-B-010: absent metric => detection control disabled (fail-safe).
+        None => {
+            return JobOutcome::MetricUnavailable("metric absent — control disabled".into())
+        }
     };
     if !gate.evaluate(m) {
         return JobOutcome::NoBreach;
@@ -171,7 +180,10 @@ pub async fn run_trip_sc_001(
     let days = match metrics.read_scalar("tls_cert_days_until_expiry").await {
         Some(Ok(v)) => v,
         Some(Err(e)) => return JobOutcome::Failed(format!("metric: {e}")),
-        None => return JobOutcome::NoBreach,
+        // AR-B-010: absent metric => detection control disabled (fail-safe).
+        None => {
+            return JobOutcome::MetricUnavailable("metric absent — control disabled".into())
+        }
     };
     // Gate threshold is days_remaining: < 30 = fire. We flip the
     // sign — gate fires when (30 - days) > 0, with hysteresis
@@ -454,7 +466,10 @@ pub async fn run_trip_au_003(
     {
         Some(Ok(v)) => v,
         Some(Err(e)) => return JobOutcome::Failed(format!("attempts: {e}")),
-        None => return JobOutcome::NoBreach,
+        // AR-B-010: absent metric => detection control disabled (fail-safe).
+        None => {
+            return JobOutcome::MetricUnavailable("metric absent — control disabled".into())
+        }
     };
     let failures = match metrics
         .read_scalar("ipfs_pin_failures_total")
@@ -462,7 +477,10 @@ pub async fn run_trip_au_003(
     {
         Some(Ok(v)) => v,
         Some(Err(e)) => return JobOutcome::Failed(format!("failures: {e}")),
-        None => return JobOutcome::NoBreach,
+        // AR-B-010: absent metric => detection control disabled (fail-safe).
+        None => {
+            return JobOutcome::MetricUnavailable("metric absent — control disabled".into())
+        }
     };
     if attempts < 1.0 {
         return JobOutcome::NoBreach; // not enough data
@@ -503,7 +521,10 @@ pub async fn run_trip_si_001(
     {
         Some(Ok(v)) => v,
         Some(Err(e)) => return JobOutcome::Failed(format!("metric: {e}")),
-        None => return JobOutcome::NoBreach,
+        // AR-B-010: absent metric => detection control disabled (fail-safe).
+        None => {
+            return JobOutcome::MetricUnavailable("metric absent — control disabled".into())
+        }
     };
     if !gate.evaluate(count) {
         return JobOutcome::NoBreach;
@@ -587,8 +608,13 @@ mod tests {
         }
     }
 
+    // AR-B-010 (RC-8): a MISSING metric must be a fail-safe
+    // `MetricUnavailable`, NOT `NoBreach`. Mapping absence to NoBreach
+    // silently disabled the detection control (delete/rename the metric
+    // and it went dark). This fixture previously asserted the vulnerable
+    // NoBreach behavior; it now asserts the fail-safe outcome.
     #[tokio::test]
-    async fn trip_au_001_metric_missing_is_no_breach() {
+    async fn trip_au_001_metric_missing_is_unavailable_not_no_breach() {
         let metrics = MockMetricSource::new(); // no metric
         let chain = MockChainQuery::new(100);
         let mut gate = HysteresisGate::new(0.80, 0.70, Duration::from_secs(0));
@@ -601,7 +627,11 @@ mod tests {
             &mut gate,
         )
         .await;
-        assert_eq!(outcome, JobOutcome::NoBreach);
+        assert!(
+            matches!(outcome, JobOutcome::MetricUnavailable(_)),
+            "absent metric must be MetricUnavailable (fail-safe), got {outcome:?}"
+        );
+        assert_ne!(outcome, JobOutcome::NoBreach);
     }
 
     #[tokio::test]

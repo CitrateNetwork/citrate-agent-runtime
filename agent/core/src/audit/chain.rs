@@ -8,10 +8,11 @@
 //! and `AuditChain::verify_integrity` (read side).
 
 use crate::audit::record::{
-    record_hash, AnchorRef, AuditRecord, EventType, RoleSignature,
+    record_hash, verify_role_signature, AnchorRef, AuditRecord, EventType, RoleSignature,
 };
 use crate::audit::sink::AuditSink;
 use crate::error::AgentError;
+use crate::hitl::signing::{signer_is_authorized, SignerRoster};
 use std::sync::Arc;
 
 /// Information needed to mint the genesis record on first init.
@@ -31,6 +32,14 @@ pub struct AuditChain {
     sink: Arc<dyn AuditSink>,
     next_sequence: u64,
     last_hash: [u8; 32],
+    /// Optional roster of public keys authorized to sign under given
+    /// roles. AR-B-002: when set, every `RoleSignature` on an appended
+    /// or verified record must (a) verify cryptographically and (b)
+    /// come from a key enrolled for the role it claims. When `None`,
+    /// signature *authorization* falls back to `signer_is_authorized`'s
+    /// dev/prod policy (fail-closed in release builds), but the
+    /// cryptographic check always runs.
+    roster: Option<Arc<dyn SignerRoster>>,
 }
 
 impl AuditChain {
@@ -91,7 +100,111 @@ impl AuditChain {
             sink,
             next_sequence,
             last_hash,
+            roster: None,
         })
+    }
+
+    /// Open an EXISTING chain WITHOUT minting a genesis. Returns
+    /// `Ok(None)` when the sink holds no records so the caller can
+    /// decide what an empty sink means.
+    ///
+    /// AR-B-001: the doctor integrity check previously used
+    /// `open_or_init`, which mints a fresh genesis on an empty sink —
+    /// so a *wholesale-deleted* audit log was silently re-initialised
+    /// and reported as an intact "verified 1 records" Pass. The doctor
+    /// must treat an empty sink as a Blocker instead; this opener gives
+    /// it the ability to distinguish "empty" from "one record".
+    pub fn open_existing(sink: Arc<dyn AuditSink>) -> Result<Option<Self>, AgentError> {
+        let mut next_sequence = 0u64;
+        let mut last_hash = [0u8; 32];
+        let mut has_records = false;
+        for r in sink.iter()? {
+            let record = r?;
+            if record.previous_hash != last_hash {
+                return Err(AgentError::Audit(format!(
+                    "chain contiguity broken at sequence {}: previous_hash mismatch",
+                    record.sequence
+                )));
+            }
+            if record.sequence != next_sequence {
+                return Err(AgentError::Audit(format!(
+                    "chain sequence broken: expected {next_sequence}, got {}",
+                    record.sequence
+                )));
+            }
+            last_hash = record_hash(&record)?;
+            next_sequence = record.sequence + 1;
+            has_records = true;
+        }
+        if !has_records {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            sink,
+            next_sequence,
+            last_hash,
+            roster: None,
+        }))
+    }
+
+    /// Attach a `SignerRoster` so appended / verified role-signatures
+    /// are checked against enrolled keys (AR-B-002).
+    pub fn with_roster(mut self, roster: Arc<dyn SignerRoster>) -> Self {
+        self.roster = Some(roster);
+        self
+    }
+
+    /// Verify the walked head matches an externally-anchored
+    /// expectation (AgentSBT `latest_audit_chain_head` / the last
+    /// `AnchorRegistry` Merkle root). This is the ONLY way to detect
+    /// tail-truncation and rollback: internal contiguity from genesis
+    /// stays intact after the tail is lopped off, so a truncated log
+    /// walks clean. AR-B-001.
+    pub fn verify_head(
+        &self,
+        expected_sequence: u64,
+        expected_hash: [u8; 32],
+    ) -> Result<(), AgentError> {
+        if self.next_sequence == 0 {
+            return Err(AgentError::Audit(
+                "audit chain is empty — cannot match expected head".into(),
+            ));
+        }
+        let head_sequence = self.next_sequence - 1;
+        if head_sequence != expected_sequence || self.last_hash != expected_hash {
+            return Err(AgentError::Audit(format!(
+                "audit chain head mismatch: walked head is sequence {head_sequence}, \
+                 expected {expected_sequence} — tail truncation or rollback detected"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Verify every `RoleSignature` on `record`: cryptographically bind
+    /// it to the record, and (when configured / in release builds)
+    /// require the key to be an authorized signer for the claimed role.
+    /// AR-B-002.
+    fn verify_signatures(&self, record: &AuditRecord) -> Result<(), AgentError> {
+        // In debug / test builds with no roster we allow un-enrolled
+        // keys through the AUTHORIZATION gate so local flows work, but
+        // the cryptographic check below always runs. Release builds
+        // fail closed: a signed record with no roster is rejected.
+        let dev_allowed = cfg!(debug_assertions);
+        for sig in &record.signatures {
+            verify_role_signature(record, sig)?;
+            if !signer_is_authorized(
+                self.roster.as_deref(),
+                &sig.signer_pubkey,
+                sig.role,
+                dev_allowed,
+            ) {
+                return Err(AgentError::Audit(format!(
+                    "audit signature: signer '{}' is not authorized for role {:?}",
+                    sig.signer, sig.role
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Append a new event to the chain. Computes `previous_hash` from
@@ -117,6 +230,12 @@ impl AuditChain {
             signatures,
             chain_anchor: anchor,
         };
+        // AR-B-002: refuse to persist a record carrying an unverifiable
+        // or unauthorized role-signature. Signatures are computed over
+        // `canonical_cbor(record_without_sigs)`, which is fully
+        // determined here (sequence + previous_hash are assigned above),
+        // so the binding is exact.
+        self.verify_signatures(&record)?;
         self.sink.append(&record)?;
         self.last_hash = record_hash(&record)?;
         self.next_sequence += 1;
@@ -145,6 +264,10 @@ impl AuditChain {
                     record.sequence
                 )));
             }
+            // AR-B-002: re-verify every role-signature on the read path,
+            // so a signature written directly into the JSONL (bypassing
+            // `append`) cannot pass off as an attestation.
+            self.verify_signatures(&record)?;
             expected_prev = record_hash(&record)?;
             expected_seq = record.sequence + 1;
             count += 1;
@@ -335,6 +458,127 @@ mod tests {
         }
         let err = chain.verify_integrity().expect_err("tamper detected");
         assert!(err.to_string().contains("previous_hash break"));
+    }
+
+    // ── AR-B-002 tripwires ────────────────────────────────────────────
+    use crate::audit::record::{canonical_cbor, SigningSurfaceTag};
+    use crate::capsule::manifest::Role;
+    use crate::hitl::signing::StaticSignerRoster;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    /// A fabricated `RoleSignature` (64 zero bytes, claiming
+    /// SecurityOfficer) must be REJECTED by `append` — it does not
+    /// verify cryptographically. Red on the pre-fix code, which stored
+    /// it verbatim and never checked it.
+    #[test]
+    fn append_rejects_forged_signature_ar_b_002() {
+        let sink: Arc<dyn AuditSink> = Arc::new(MemorySink::default());
+        let mut chain =
+            AuditChain::open_or_init(sink, genesis_info(), 1_715_000_000).expect("open");
+        let forged = RoleSignature {
+            signer: "did:citrate:role:0xSECURITY_OFFICER".to_string(),
+            role: Role::SecurityOfficer,
+            signed_at: 0,
+            signature: vec![0u8; 64],
+            surface: SigningSurfaceTag::Slint,
+            signer_pubkey: [0u8; 32],
+        };
+        let res = chain.append(
+            EventType::Approval,
+            b"privileged write".to_vec(),
+            "did:citrate:agent:0xab12".to_string(),
+            vec![forged],
+            None,
+            1_715_000_001,
+        );
+        assert!(res.is_err(), "forged signature must be rejected, got {res:?}");
+    }
+
+    /// A cryptographically-VALID signature from a key that is NOT on
+    /// the roster (a self-minted key) must be rejected when a roster is
+    /// configured, and the same key+sig must be ACCEPTED once enrolled.
+    #[test]
+    fn append_roster_gates_signature_ar_b_002() {
+        let ts = 1_715_000_001i64;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let payload = b"privileged action".to_vec();
+        let actor = "did:citrate:agent:0xab12".to_string();
+
+        // Helper: sign the exact canonical preimage `append` will hash.
+        let sign_for = |chain: &AuditChain| -> Vec<u8> {
+            let unsigned = AuditRecord {
+                sequence: chain.next_sequence(),
+                timestamp: ts,
+                previous_hash: chain.last_hash(),
+                event_type: EventType::Approval,
+                payload: payload.clone(),
+                actor: actor.clone(),
+                signatures: vec![],
+                chain_anchor: None,
+            };
+            let preimage = canonical_cbor(&unsigned).expect("cbor");
+            key.sign(&preimage).to_bytes().to_vec()
+        };
+
+        // (a) Roster present, key NOT enrolled → rejected even with a valid sig.
+        {
+            let sink: Arc<dyn AuditSink> = Arc::new(MemorySink::default());
+            let roster = Arc::new(StaticSignerRoster::new()); // empty roster
+            let mut chain = AuditChain::open_or_init(sink, genesis_info(), 1_715_000_000)
+                .expect("open")
+                .with_roster(roster);
+            let sig = sign_for(&chain);
+            let unauthorized = RoleSignature {
+                signer: "did:citrate:role:0xSO".to_string(),
+                role: Role::SecurityOfficer,
+                signed_at: 0,
+                signature: sig,
+                surface: SigningSurfaceTag::Slint,
+                signer_pubkey: pubkey,
+            };
+            let res = chain.append(
+                EventType::Approval,
+                payload.clone(),
+                actor.clone(),
+                vec![unauthorized],
+                None,
+                ts,
+            );
+            assert!(
+                res.is_err(),
+                "valid sig from un-enrolled key must be rejected by the roster, got {res:?}"
+            );
+        }
+
+        // (b) Roster present, key enrolled for the role → accepted.
+        {
+            let sink: Arc<dyn AuditSink> = Arc::new(MemorySink::default());
+            let roster =
+                Arc::new(StaticSignerRoster::new().authorize(pubkey, Role::SecurityOfficer));
+            let mut chain = AuditChain::open_or_init(sink, genesis_info(), 1_715_000_000)
+                .expect("open")
+                .with_roster(roster);
+            let sig = sign_for(&chain);
+            let authorized = RoleSignature {
+                signer: "did:citrate:role:0xSO".to_string(),
+                role: Role::SecurityOfficer,
+                signed_at: 0,
+                signature: sig,
+                surface: SigningSurfaceTag::Slint,
+                signer_pubkey: pubkey,
+            };
+            chain
+                .append(
+                    EventType::Approval,
+                    payload.clone(),
+                    actor.clone(),
+                    vec![authorized],
+                    None,
+                    ts,
+                )
+                .expect("enrolled key + valid sig must be accepted");
+        }
     }
 
     #[test]

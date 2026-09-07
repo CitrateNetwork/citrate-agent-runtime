@@ -432,6 +432,11 @@ impl LinkerBuilder {
                     method: "eth-send".to_string(),
                     to: addr,
                     data: data.clone(),
+                    // AR-B-003: carry the manifest risk tier + required
+                    // roles so the gate enforces the role-bound quorum
+                    // rather than an anonymous single-click FIFO approve.
+                    tier: store.data().risk_tier(),
+                    required_roles: store.data().required_roles().to_vec(),
                 };
                 if let Err(reason) = gate.request(req) {
                     return Ok((Err(format!("ChainSendApprovalRejected: {reason}")),));
