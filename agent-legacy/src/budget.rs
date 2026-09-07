@@ -48,8 +48,14 @@ impl BudgetTracker {
     }
 
     /// Record token usage. Returns error if budget exceeded.
+    ///
+    /// AR-B-029: `count` typically comes from a model provider's usage field.
+    /// The old `fetch_add(count) + count` panicked in debug and WRAPPED the
+    /// running total in release on overflow — resetting the counter and
+    /// re-opening an exhausted budget. Saturate the computed total and clamp the
+    /// stored counter so a huge `count` can never wrap it back to a small value.
     pub fn record_tokens(&self, count: u64) -> Result<(), AgentError> {
-        let new_total = self.tokens_used.fetch_add(count, Ordering::SeqCst) + count;
+        let new_total = Self::commit_saturating(&self.tokens_used, count);
         if new_total > self.config.max_tokens {
             Err(AgentError::BudgetExceeded(format!(
                 "Token limit: {}/{}",
@@ -62,7 +68,7 @@ impl BudgetTracker {
 
     /// Record a tool call. Returns error if budget exceeded.
     pub fn record_tool_call(&self) -> Result<(), AgentError> {
-        let new_total = self.tool_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_total = Self::commit_saturating(&self.tool_calls, 1);
         if new_total > self.config.max_tool_calls {
             Err(AgentError::BudgetExceeded(format!(
                 "Tool call limit: {}/{}",
@@ -75,7 +81,7 @@ impl BudgetTracker {
 
     /// Record cost. Returns error if budget exceeded.
     pub fn record_cost(&self, micros: u64) -> Result<(), AgentError> {
-        let new_total = self.cost_micros.fetch_add(micros, Ordering::SeqCst) + micros;
+        let new_total = Self::commit_saturating(&self.cost_micros, micros);
         if new_total > self.config.max_cost_micros {
             Err(AgentError::BudgetExceeded(format!(
                 "Cost limit: ${:.2}/${:.2}",
@@ -84,6 +90,22 @@ impl BudgetTracker {
             )))
         } else {
             Ok(())
+        }
+    }
+
+    /// AR-B-029: add `count` to a monotonic saturating counter and return the
+    /// (saturating) new total. If the underlying `fetch_add` wrapped, clamp the
+    /// stored value to `u64::MAX` so the budget stays exhausted rather than
+    /// re-opening at a small wrapped value.
+    fn commit_saturating(counter: &AtomicU64, count: u64) -> u64 {
+        let prev = counter.fetch_add(count, Ordering::SeqCst);
+        match prev.checked_add(count) {
+            Some(total) => total,
+            None => {
+                // The atomic just wrapped — pin it at the ceiling.
+                counter.store(u64::MAX, Ordering::SeqCst);
+                u64::MAX
+            }
         }
     }
 
@@ -140,6 +162,27 @@ mod tests {
         assert!(tracker.record_tokens(50).is_ok());
         assert!(tracker.record_tokens(50).is_ok());
         assert!(tracker.record_tokens(1).is_err());
+    }
+
+    #[test]
+    fn record_tokens_saturates_and_stays_exhausted_on_overflow() {
+        // AR-B-029: a provider-supplied u64::MAX must not wrap the counter back
+        // to a small value and re-open an exhausted budget.
+        let tracker = BudgetTracker::new(BudgetConfig {
+            max_tokens: 100,
+            ..Default::default()
+        });
+        assert!(tracker.record_tokens(80).is_ok());
+        // A hostile/huge usage report must be refused, not wrap.
+        assert!(
+            tracker.record_tokens(u64::MAX).is_err(),
+            "overflowing count must be refused"
+        );
+        // And the budget must remain exhausted afterwards (no wrap re-open).
+        assert!(
+            tracker.record_tokens(1).is_err(),
+            "budget must stay exhausted after a saturating overflow"
+        );
     }
 
     #[test]

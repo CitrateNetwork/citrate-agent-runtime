@@ -143,35 +143,54 @@ pub struct CapabilityGrant {
 }
 
 impl CapabilityGrant {
-    /// Build the canonical signing pre-image for this grant. The
-    /// pre-image excludes `signature` and `issuer_pubkey` (the
-    /// signer commits to the *content*; the pubkey is metadata
-    /// the verifier already has). Stable across implementations
-    /// because it's a fixed field order joined by `\x1f` (US, ASCII
-    /// 31) — a delimiter that can't appear in any of the embedded
-    /// strings.
+    /// Build the canonical signing pre-image for this grant.
+    ///
+    /// AR-B-017: the previous encoding joined `allowed_tools` and `allowed_paths`
+    /// with `","` and length-prefixed nothing, so a signature over a
+    /// ONE-element list `["file_read,shell_exec"]` was byte-identical to — and
+    /// valid for — the SPLIT two-element list `["file_read","shell_exec"]`,
+    /// silently widening tool/path scope. The `\x1f` separator was also assumed
+    /// unable to appear in the (arbitrary) field strings, which nothing checked.
+    ///
+    /// This version is unambiguous: a fixed domain tag + version, then each
+    /// scalar and each list element length-prefixed (u64-LE length || bytes),
+    /// and each list count-prefixed. Two grants differing in ANY field — the
+    /// split above included — produce different pre-images.
+    ///
+    /// `signature` and `issuer_pubkey` are excluded (the signer commits to the
+    /// content; the pubkey is metadata the verifier already holds).
     pub fn signing_preimage(&self) -> Vec<u8> {
-        const SEP: u8 = 0x1f;
-        let mut buf: Vec<u8> = Vec::with_capacity(256);
-        let mut push = |b: &[u8]| {
+        const DOMAIN: &[u8] = b"CIT-GRANT-PREIMAGE-v1";
+        fn field(buf: &mut Vec<u8>, b: &[u8]) {
+            buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
             buf.extend_from_slice(b);
-            buf.push(SEP);
-        };
-        push(self.id.as_bytes());
-        push(self.issuer.as_bytes());
-        push(self.recipient.as_bytes());
-        let tools = self.allowed_tools.join(",");
-        push(tools.as_bytes());
-        push(self.expires_at.as_bytes());
-        let pol = format!("{:?}", self.policy);
-        push(pol.as_bytes());
-        let max = self
-            .max_value_per_tx
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        push(max.as_bytes());
-        let paths = self.allowed_paths.join(",");
-        push(paths.as_bytes());
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        field(&mut buf, DOMAIN);
+        field(&mut buf, self.id.as_bytes());
+        field(&mut buf, self.issuer.as_bytes());
+        field(&mut buf, self.recipient.as_bytes());
+        // Lists: count then each element length-prefixed (never joined).
+        buf.extend_from_slice(&(self.allowed_tools.len() as u64).to_le_bytes());
+        for t in &self.allowed_tools {
+            field(&mut buf, t.as_bytes());
+        }
+        field(&mut buf, self.expires_at.as_bytes());
+        field(&mut buf, format!("{:?}", self.policy).as_bytes());
+        field(
+            &mut buf,
+            self.max_value_per_tx
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        buf.extend_from_slice(&(self.allowed_paths.len() as u64).to_le_bytes());
+        for p in &self.allowed_paths {
+            field(&mut buf, p.as_bytes());
+        }
+        // AR-B-017: bind the revocation flag so a signature cannot be presented
+        // over a different revoked-state than the one the issuer signed.
+        buf.push(self.revoked as u8);
         buf
     }
 
@@ -405,6 +424,36 @@ mod tests {
         let sig = signing.sign(&preimage);
         grant.signature = sig.to_bytes().to_vec();
         signing
+    }
+
+    #[test]
+    fn preimage_distinguishes_split_vs_joined_lists() {
+        // AR-B-017: a one-element list ["a,b"] must NOT hash to the same
+        // pre-image as the split two-element list ["a","b"], nor may a signature
+        // over one transfer to the other (scope-widening replay).
+        let mut joined = unsigned_grant_for_test();
+        joined.allowed_tools = vec!["a,b".to_string()];
+        let mut split = unsigned_grant_for_test();
+        split.allowed_tools = vec!["a".to_string(), "b".to_string()];
+        assert_ne!(
+            joined.signing_preimage(),
+            split.signing_preimage(),
+            "split and joined tool lists must produce different pre-images"
+        );
+        // Same for paths.
+        let mut jp = unsigned_grant_for_test();
+        jp.allowed_paths = vec!["/x,/y".to_string()];
+        let mut sp = unsigned_grant_for_test();
+        sp.allowed_paths = vec!["/x".to_string(), "/y".to_string()];
+        assert_ne!(jp.signing_preimage(), sp.signing_preimage());
+        // A signature over the one-element grant does not verify for the split.
+        let signing = sign_grant(&mut joined);
+        split.issuer_pubkey = signing.verifying_key().to_bytes().to_vec();
+        split.signature = joined.signature.clone();
+        assert!(
+            split.verify_signature().is_err(),
+            "a signature over ['a,b'] must not verify for ['a','b']"
+        );
     }
 
     #[test]

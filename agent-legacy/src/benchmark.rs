@@ -86,25 +86,57 @@ pub fn export_json(pack: &BenchmarkPack) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(pack)
 }
 
-/// Redact sensitive data from trail events before export.
-/// Removes wallet addresses, private keys, and other PII.
-pub fn redact_event(event: &TrailEvent) -> TrailEvent {
-    let mut redacted = event.clone();
-    // Redact wallet addresses in data
-    if let Some(obj) = redacted.data.as_object_mut() {
-        for key in [
-            "address",
-            "from",
-            "to",
-            "wallet_address",
-            "private_key",
-            "mnemonic",
-        ] {
-            if obj.contains_key(key) {
-                obj.insert(key.to_string(), serde_json::json!("[REDACTED]"));
+/// Sensitive JSON keys redacted from exported trail events, at ANY nesting depth.
+///
+/// AR-B-031: the producer nests everything under `data.params` / `data.result`
+/// (see `mcp_server` tool_call_to_trail_event), but the old redactor scanned
+/// only the TOP-LEVEL keys of `data`, so it never fired on the shape the crate
+/// actually emits — `data.params.private_key` was exported verbatim. The key
+/// set was also missing `key`, `seed`, `password`, `secret`, `signature`,
+/// `token`.
+const SENSITIVE_KEYS: &[&str] = &[
+    "address",
+    "from",
+    "to",
+    "wallet_address",
+    "private_key",
+    "privatekey",
+    "mnemonic",
+    "key",
+    "seed",
+    "password",
+    "secret",
+    "signature",
+    "token",
+];
+
+/// Recursively replace the value of any [`SENSITIVE_KEYS`] key with
+/// `"[REDACTED]"`, walking nested objects and arrays.
+fn redact_json_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if SENSITIVE_KEYS.contains(&k.to_ascii_lowercase().as_str()) {
+                    *v = serde_json::json!("[REDACTED]");
+                } else {
+                    redact_json_in_place(v);
+                }
             }
         }
+        serde_json::Value::Array(items) => {
+            for v in items.iter_mut() {
+                redact_json_in_place(v);
+            }
+        }
+        _ => {}
     }
+}
+
+/// Redact sensitive data from trail events before export.
+/// Removes wallet addresses, private keys, and other PII at any nesting depth.
+pub fn redact_event(event: &TrailEvent) -> TrailEvent {
+    let mut redacted = event.clone();
+    redact_json_in_place(&mut redacted.data);
     redacted
 }
 
@@ -168,6 +200,33 @@ mod tests {
         let redacted = redact_event(&event);
         assert_eq!(redacted.data["address"], "[REDACTED]");
         assert_eq!(redacted.data["amount"], "100"); // Not redacted
+    }
+
+    #[test]
+    fn redact_event_redacts_nested_secrets() {
+        // AR-B-031: the producer nests under data.params/data.result, so the
+        // redactor must reach a secret at any depth — not only top-level keys.
+        let event = TrailEvent {
+            id: "e2".to_string(),
+            session_id: "s1".to_string(),
+            timestamp: "2026-03-31".to_string(),
+            event_type: "tool_call".to_string(),
+            tool_name: Some("send_tx".to_string()),
+            data: serde_json::json!({
+                "params": { "private_key": "0xdeadbeef", "to": "0xabc", "amount": "5" },
+                "result": { "signature": "0xsig", "ok": true }
+            }),
+            risk_level: Some("high".to_string()),
+            approved: Some(true),
+            duration_ms: Some(500),
+        };
+        let r = redact_event(&event);
+        assert_eq!(r.data["params"]["private_key"], "[REDACTED]");
+        assert_eq!(r.data["params"]["to"], "[REDACTED]");
+        assert_eq!(r.data["result"]["signature"], "[REDACTED]");
+        // Non-sensitive fields survive.
+        assert_eq!(r.data["params"]["amount"], "5");
+        assert_eq!(r.data["result"]["ok"], true);
     }
 
     #[test]
