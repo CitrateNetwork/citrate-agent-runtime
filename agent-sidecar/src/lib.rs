@@ -372,7 +372,17 @@ async fn run_skill(
     // multi-thread runtime `#[tokio::main]` gives us.
     let name = req.name.clone();
     let args = req.args.clone();
+    // AR-B-030: re-check the e-stop inside the task, immediately before running
+    // the capsule. The check above races a /stop that lands between accept and
+    // execution start; without this re-check an in-flight skill would begin
+    // executing after the kill switch was engaged. (Interrupting a call already
+    // in progress needs host-fn-level hooks — tracked separately.)
+    let estop = st.estop.clone();
     tokio::spawn(async move {
+        if estop.is_stopped() {
+            eprintln!("[citrate-agent-sidecar] skill {name:?} aborted: e-stop engaged before start");
+            return;
+        }
         let outcome = tokio::task::block_in_place(|| dispatch.call_json(&name, &args));
         match outcome {
             Ok(v) => eprintln!("[citrate-agent-sidecar] skill {name:?} finished: {v}"),
