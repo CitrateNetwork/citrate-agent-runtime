@@ -192,7 +192,7 @@ impl BreakGlassRegistry {
     ) -> Result<Signer, BreakGlassError> {
         verify_attestation(action_id.as_bytes(), attested)
             .map_err(|e| BreakGlassError::AttestationInvalid(e.to_string()))?;
-        let dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-hitl");
+        let dev_allowed = cfg!(test) || cfg!(feature = "insecure-dev-hitl");
         if !signer_is_authorized(
             self.signer_roster.as_deref(),
             &attested.pubkey,

@@ -189,7 +189,7 @@ impl AuditChain {
         // keys through the AUTHORIZATION gate so local flows work, but
         // the cryptographic check below always runs. Release builds
         // fail closed: a signed record with no roster is rejected.
-        let dev_allowed = cfg!(debug_assertions);
+        let dev_allowed = cfg!(test) || cfg!(feature = "insecure-dev-hitl");
         for sig in &record.signatures {
             verify_role_signature(record, sig)?;
             if !signer_is_authorized(

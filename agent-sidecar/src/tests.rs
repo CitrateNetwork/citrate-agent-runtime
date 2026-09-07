@@ -44,7 +44,11 @@ fn authed(method: &str, path: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn health_is_open_and_reports_stop_state() {
+async fn health_is_open_and_reports_liveness_only() {
+    // AR-B-024 (RC-8): /health is unauthenticated, so it must NOT leak the
+    // emergency-stop state to an anonymous prober. This test previously
+    // asserted `stopped == false` on the open route (the leak encoded as
+    // correct); the stop state now lives only on bearer-gated /status.
     let st = state();
     let resp = app(st.clone())
         .oneshot(
@@ -58,7 +62,10 @@ async fn health_is_open_and_reports_stop_state() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert_eq!(j["status"], "ok");
-    assert_eq!(j["stopped"], false);
+    assert!(
+        j.get("stopped").is_none(),
+        "unauthenticated /health must not expose the e-stop state; got: {j}"
+    );
 }
 
 #[tokio::test]
@@ -261,17 +268,35 @@ async fn stop_triggers_the_emergency_stop() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(st.estop.is_stopped(), "stop flips the emergency stop");
-    // /health then reflects it.
-    let h = app(st.clone())
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    // AR-B-024: the stop state is reflected on the bearer-gated /status route
+    // (`running`), not on the unauthenticated /health route.
+    let s = app(st.clone())
+        .oneshot(authed("GET", "/status"))
         .await
         .unwrap();
-    assert_eq!(body_json(h).await["stopped"], true);
+    assert_eq!(body_json(s).await["running"], false);
+}
+
+#[test]
+fn enforce_loopback_bind_rejects_nonloopback_without_optin() {
+    // AR-B-024: loopback literals pass; a routable IP or hostname is refused
+    // unless the explicit override is set.
+    assert!(enforce_loopback_bind("127.0.0.1:19700", false).is_ok());
+    assert!(enforce_loopback_bind("[::1]:19700", false).is_ok());
+    assert!(
+        enforce_loopback_bind("0.0.0.0:19700", false).is_err(),
+        "0.0.0.0 must be refused without the opt-in"
+    );
+    assert!(
+        enforce_loopback_bind("192.168.1.10:19700", false).is_err(),
+        "a routable IP must be refused"
+    );
+    assert!(
+        enforce_loopback_bind("example.com:19700", false).is_err(),
+        "a hostname must be refused (could resolve off-loopback)"
+    );
+    // Deliberate override lets it through.
+    assert!(enforce_loopback_bind("0.0.0.0:19700", true).is_ok());
 }
 
 #[test]
@@ -328,6 +353,26 @@ async fn approve_on_an_empty_queue_is_an_honest_noop() {
     let j = body_json(resp).await;
     assert_eq!(j["ok"], true);
     assert_eq!(j["resolved"], false);
+}
+
+#[tokio::test]
+async fn approve_with_a_mismatched_call_id_is_a_conflict() {
+    // AR-B-023: a call-id-bound approve whose id is not the current head must
+    // be refused (409), resolving nothing — a human decision can never land on
+    // an action the human did not review. On an empty queue any id mismatches.
+    let resp = app(state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/approvals/approve")
+                .header("authorization", format!("Bearer {BEARER}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"not-the-head"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
