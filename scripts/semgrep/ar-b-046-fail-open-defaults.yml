@@ -1,0 +1,75 @@
+# AR-B-046 — "absent, empty, or unconfigured ⇒ permit/succeed" idiom tripwire.
+#
+# The 2026-09-02 federation graded audit filed AR-B-046 as a CLASS finding: a
+# single root cause — the maximally-permissive value is the one you get when a
+# security input is absent, empty, or default-constructed — recurs across the
+# workspace and is the shared origin of AR-B-015/018/021/025/044. Those five
+# concrete instances were remediated (the eth_call host fn now returns Err with
+# no dispatcher; `validate_fire` fail-closes on empty signature/allowed_tools).
+# This rule is the finding's named deliverable: a grep the next reviewer runs so
+# the NEXT instance is caught in review before it ships.
+#
+# These rules are ADVISORY (severity: INFO / WARNING). Each hit is reviewed per
+# instance, NOT auto-failed — several matches are intentional (a genuinely
+# optional collaborator, a read-only default). Run:
+#
+#   semgrep --config scripts/semgrep/ar-b-046-fail-open-defaults.yml \
+#           --error --severity WARNING agent agent-cron agent-legacy
+#
+# and justify or fix every new WARNING before merge.
+rules:
+  - id: ar-b-046-empty-collection-means-permit
+    languages: [generic]
+    severity: WARNING
+    message: >
+      AR-B-046: an `if !X.is_empty() && ...` / `... || ...` guard makes an EMPTY
+      allow-list permit everything (empty allowed_tools ⇒ all tools; empty
+      allowed_paths ⇒ all paths). Confirm the empty case is meant to be
+      maximally permissive; prefer an explicit `Scope::All` variant over "empty
+      means all".
+    paths:
+      include: ['*.rs']
+      exclude: ['*/tests/*', '*_test.rs', '*/target/*']
+    patterns:
+      - pattern-regex: 'if\s+!\w[\w\.]*\.is_empty\(\)\s*(&&|\|\|)'
+
+  - id: ar-b-046-catch-all-least-restrictive
+    languages: [generic]
+    severity: WARNING
+    message: >
+      AR-B-046: a wildcard / None arm resolves an UNKNOWN or ABSENT input to the
+      least-restrictive outcome (ToolCategory::Docs, JobOutcome::NoBreach,
+      Severity::Pass, risk "low"). An unrecognized tool or a missing metric then
+      reads as safe. Make the unknown/absent arm the refusal, not the pass.
+    paths:
+      include: ['*.rs']
+      exclude: ['*/tests/*', '*_test.rs', '*/target/*']
+    patterns:
+      - pattern-regex: '(_|None)\s*=>\s*(return\s+)?(ToolCategory::Docs|JobOutcome::NoBreach|Severity::Pass|"low")'
+
+  - id: ar-b-046-optional-security-collaborator
+    languages: [generic]
+    severity: INFO
+    message: >
+      AR-B-046: an `Option<Arc<dyn ...>>` collaborator. Verify its `None` arm
+      FAILS CLOSED (returns Err / denies), as `approval_gate` and
+      `eth_send_dispatcher` do — not Ok/permit, as the eth_call stub once did.
+    paths:
+      include: ['*.rs']
+      exclude: ['*/tests/*', '*_test.rs', '*/target/*']
+    patterns:
+      - pattern-regex: 'Option<\s*(std::sync::)?Arc<dyn\s'
+
+  - id: ar-b-046-default-permissive-value
+    languages: [generic]
+    severity: WARNING
+    message: >
+      AR-B-046: a serde/Default-constructed security field whose default is the
+      permissive value (`require_signed_grants: false`, `expires_at` empty ⇒
+      never expires, `max_value_per_tx: None` ⇒ unlimited). A value built with
+      `..Default::default()` must not be maximally trusted.
+    paths:
+      include: ['*.rs']
+      exclude: ['*/tests/*', '*_test.rs', '*/target/*']
+    patterns:
+      - pattern-regex: '(require_signed_grants:\s*false|expires_at\.is_empty\(\)|max_value_per_tx:\s*None)'
