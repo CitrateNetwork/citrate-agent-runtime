@@ -349,6 +349,15 @@ impl ApprovalQueue {
         self.pending.lock().map(|q| q.len()).unwrap_or(0)
     }
 
+    /// Number of role-aware (quorum-gated) actions currently pending.
+    /// Parallel to [`depth`] for the FIFO track. AR-B-003: privileged
+    /// capsule effects (tier medium/high/critical) park here and are
+    /// resolved only by the role-bound quorum — never by an anonymous
+    /// FIFO `approve()`.
+    pub fn role_pending_depth(&self) -> usize {
+        self.role_pending.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
     // ── CIT-AGENT-4a: role-aware approval API ──────────────────────
 
     /// Submit an action for role-aware approval. Resolves when the
