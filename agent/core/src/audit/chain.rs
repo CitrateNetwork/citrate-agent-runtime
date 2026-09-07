@@ -32,6 +32,11 @@ pub struct AuditChain {
     sink: Arc<dyn AuditSink>,
     next_sequence: u64,
     last_hash: [u8; 32],
+    /// AR-B-045: the head record's timestamp. `append` refuses a
+    /// `now_unix_nanos` earlier than this, so a caller cannot backdate a
+    /// record or emit timestamps that contradict the sequence. RFC §6.1
+    /// declares `timestamp` monotonic; nothing enforced it before.
+    last_timestamp: i64,
     /// Optional roster of public keys authorized to sign under given
     /// roles. AR-B-002: when set, every `RoleSignature` on an appended
     /// or verified record must (a) verify cryptographically and (b)
@@ -54,6 +59,7 @@ impl AuditChain {
     ) -> Result<Self, AgentError> {
         let mut next_sequence = 0u64;
         let mut last_hash = [0u8; 32];
+        let mut last_timestamp = i64::MIN;
         let mut has_records = false;
         // Walk the sink to find the tail.
         for r in sink.iter()? {
@@ -73,7 +79,15 @@ impl AuditChain {
                     record.sequence
                 )));
             }
+            // AR-B-045: timestamps must be non-decreasing along the chain.
+            if record.timestamp < last_timestamp {
+                return Err(AgentError::Audit(format!(
+                    "timestamp regression at sequence {}: {} < previous {}",
+                    record.sequence, record.timestamp, last_timestamp
+                )));
+            }
             last_hash = record_hash(&record)?;
+            last_timestamp = record.timestamp;
             next_sequence = record.sequence + 1;
             has_records = true;
         }
@@ -94,12 +108,14 @@ impl AuditChain {
             };
             sink.append(&genesis)?;
             last_hash = record_hash(&genesis)?;
+            last_timestamp = now_unix_nanos;
             next_sequence = 1;
         }
         Ok(Self {
             sink,
             next_sequence,
             last_hash,
+            last_timestamp,
             roster: None,
         })
     }
@@ -117,6 +133,7 @@ impl AuditChain {
     pub fn open_existing(sink: Arc<dyn AuditSink>) -> Result<Option<Self>, AgentError> {
         let mut next_sequence = 0u64;
         let mut last_hash = [0u8; 32];
+        let mut last_timestamp = i64::MIN;
         let mut has_records = false;
         for r in sink.iter()? {
             let record = r?;
@@ -132,7 +149,15 @@ impl AuditChain {
                     record.sequence
                 )));
             }
+            // AR-B-045: timestamps must be non-decreasing along the chain.
+            if record.timestamp < last_timestamp {
+                return Err(AgentError::Audit(format!(
+                    "timestamp regression at sequence {}: {} < previous {}",
+                    record.sequence, record.timestamp, last_timestamp
+                )));
+            }
             last_hash = record_hash(&record)?;
+            last_timestamp = record.timestamp;
             next_sequence = record.sequence + 1;
             has_records = true;
         }
@@ -143,6 +168,7 @@ impl AuditChain {
             sink,
             next_sequence,
             last_hash,
+            last_timestamp,
             roster: None,
         }))
     }
@@ -220,6 +246,17 @@ impl AuditChain {
         anchor: Option<AnchorRef>,
         now_unix_nanos: i64,
     ) -> Result<AuditRecord, AgentError> {
+        // AR-B-045: refuse a backdated record. `now_unix_nanos` is
+        // caller-supplied and was written verbatim with no ordering check, so
+        // any caller could place a record earlier than its predecessor (and
+        // `verify_integrity` never looked at `timestamp`, so it passed). Require
+        // monotonic non-decreasing timestamps.
+        if now_unix_nanos < self.last_timestamp {
+            return Err(AgentError::Audit(format!(
+                "refusing to append a backdated record: timestamp {} < chain head {}",
+                now_unix_nanos, self.last_timestamp
+            )));
+        }
         let record = AuditRecord {
             sequence: self.next_sequence,
             timestamp: now_unix_nanos,
@@ -238,6 +275,7 @@ impl AuditChain {
         self.verify_signatures(&record)?;
         self.sink.append(&record)?;
         self.last_hash = record_hash(&record)?;
+        self.last_timestamp = now_unix_nanos;
         self.next_sequence += 1;
         Ok(record)
     }
@@ -250,6 +288,7 @@ impl AuditChain {
         let mut count = 0u64;
         let mut expected_prev = [0u8; 32];
         let mut expected_seq = 0u64;
+        let mut prev_ts = i64::MIN;
         for r in self.sink.iter()? {
             let record = r?;
             if record.sequence != expected_seq {
@@ -264,11 +303,21 @@ impl AuditChain {
                     record.sequence
                 )));
             }
+            // AR-B-045: a record whose timestamp precedes its predecessor's is
+            // a backdated / reordered entry — reject it. `verify_integrity`
+            // previously read only sequence + previous_hash.
+            if record.timestamp < prev_ts {
+                return Err(AgentError::Audit(format!(
+                    "timestamp regression at sequence {}: {} < previous {}",
+                    record.sequence, record.timestamp, prev_ts
+                )));
+            }
             // AR-B-002: re-verify every role-signature on the read path,
             // so a signature written directly into the JSONL (bypassing
             // `append`) cannot pass off as an attestation.
             self.verify_signatures(&record)?;
             expected_prev = record_hash(&record)?;
+            prev_ts = record.timestamp;
             expected_seq = record.sequence + 1;
             count += 1;
         }
@@ -401,6 +450,94 @@ mod tests {
         assert_eq!(r1.previous_hash, record_hash(&genesis_records[0]).unwrap());
         // r2's previous_hash equals r1's hash.
         assert_eq!(r2.previous_hash, record_hash(&r1).unwrap());
+    }
+
+    #[test]
+    fn append_refuses_a_backdated_record() {
+        // AR-B-045: `now_unix_nanos` is caller-supplied and was written verbatim
+        // with no ordering check, so a caller could backdate a record (and
+        // verify_integrity never looked at timestamp). append must refuse a
+        // timestamp earlier than the chain head.
+        let sink: Arc<dyn AuditSink> = Arc::new(MemorySink::default());
+        let mut chain =
+            AuditChain::open_or_init(sink, genesis_info(), 1_715_000_010).expect("open");
+        chain
+            .append(
+                EventType::Proposal,
+                b"in-order".to_vec(),
+                "did:citrate:role:0xop".to_string(),
+                vec![],
+                None,
+                1_715_000_020,
+            )
+            .expect("in-order append");
+        let err = chain
+            .append(
+                EventType::Proposal,
+                b"backdated".to_vec(),
+                "did:citrate:role:0xop".to_string(),
+                vec![],
+                None,
+                1_715_000_005, // earlier than the head at 1_715_000_020
+            )
+            .expect_err("a backdated record must be refused");
+        assert!(
+            err.to_string().contains("backdated"),
+            "must cite the backdated timestamp; got: {err}"
+        );
+        // Equal timestamps are allowed (non-decreasing, not strictly increasing).
+        chain
+            .append(
+                EventType::Proposal,
+                b"same-ts".to_vec(),
+                "did:citrate:role:0xop".to_string(),
+                vec![],
+                None,
+                1_715_000_020,
+            )
+            .expect("equal timestamp is allowed");
+    }
+
+    #[test]
+    fn verify_integrity_rejects_a_timestamp_regression() {
+        // AR-B-045: a record written directly into the sink (bypassing append)
+        // with a timestamp earlier than its predecessor must fail the read-path
+        // walk, not pass off as intact.
+        let sink: Arc<dyn AuditSink> = Arc::new(MemorySink::default());
+        let mut chain =
+            AuditChain::open_or_init(sink.clone(), genesis_info(), 1_715_000_000).expect("open");
+        chain
+            .append(
+                EventType::Proposal,
+                b"a".to_vec(),
+                "did:citrate:role:0xop".to_string(),
+                vec![],
+                None,
+                1_715_000_050,
+            )
+            .expect("append");
+        // Forge a contiguous record whose timestamp regresses. Rebuild the
+        // previous_hash link so ONLY the timestamp check can fire.
+        let recs: Vec<AuditRecord> = sink.iter().unwrap().collect::<Result<_, _>>().unwrap();
+        let head = recs.last().unwrap();
+        let forged = AuditRecord {
+            sequence: head.sequence + 1,
+            timestamp: 1_715_000_010, // regresses below the head's 1_715_000_050
+            previous_hash: record_hash(head).unwrap(),
+            event_type: EventType::Proposal,
+            payload: b"backdated-forgery".to_vec(),
+            actor: "did:citrate:role:0xop".to_string(),
+            signatures: vec![],
+            chain_anchor: None,
+        };
+        sink.append(&forged).unwrap();
+        let err = chain
+            .verify_integrity()
+            .expect_err("timestamp regression must be detected");
+        assert!(
+            err.to_string().contains("timestamp regression"),
+            "got: {err}"
+        );
     }
 
     #[test]
