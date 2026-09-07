@@ -71,6 +71,31 @@ impl Manifest {
                     .to_string(),
             ));
         }
+        // AR-B-011: the `[capability].filesystem` allow-list and a
+        // `network != "none"` policy are PARSED but NEVER enforced — `HostCtx`
+        // builds an empty `WasiCtx` with no preopens and no `socket_addr_check`,
+        // so the declaration reads as a working control while nothing consults
+        // it. Rather than let a manifest advertise a capability the runtime
+        // cannot physically enforce (RFC §4.5: "enforcement is physical, not
+        // advisory"), refuse to load it until per-path/per-socket enforcement
+        // exists. No shipped capsule declares either today, so this is
+        // fail-closed with no behavioral loss.
+        if !self.capability.filesystem.is_empty() {
+            return Err(AgentError::Capsule(
+                "[capability].filesystem is declared but per-path enforcement is not implemented \
+                 (AR-B-011): the runtime builds an empty WASI preopen table, so the allow-list \
+                 would be inert. Remove the declaration until filesystem sandboxing is wired."
+                    .to_string(),
+            ));
+        }
+        if self.capability.network != NetworkPolicy::None {
+            return Err(AgentError::Capsule(
+                "[capability].network != \"none\" is declared but network enforcement is not \
+                 implemented (AR-B-011): the runtime installs no socket_addr_check, so the policy \
+                 would be inert. Keep network = \"none\" until egress enforcement is wired."
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -347,6 +372,25 @@ tier = "bundled"
         let msg = err.to_string();
         assert!(msg.contains("ITAR"), "actual: {msg}");
         assert!(msg.contains("break_glass"), "actual: {msg}");
+    }
+
+    #[test]
+    fn reject_declared_but_unenforced_filesystem_capability() {
+        // AR-B-011: a filesystem allow-list is inert (no preopens are wired), so
+        // a manifest declaring one must be refused rather than advertise a
+        // control the runtime cannot enforce.
+        let bad = WORKED_EXAMPLE.replace("filesystem = []", r#"filesystem = ["read:/data"]"#);
+        let err = Manifest::parse(&bad).expect_err("unenforced filesystem capability refused");
+        assert!(err.to_string().contains("filesystem"), "actual: {err}");
+    }
+
+    #[test]
+    fn reject_declared_but_unenforced_network_capability() {
+        // AR-B-011: network != "none" is inert (no socket_addr_check), so it
+        // must be refused at load.
+        let bad = WORKED_EXAMPLE.replace(r#"network = "none""#, r#"network = "egress-allowed""#);
+        let err = Manifest::parse(&bad).expect_err("unenforced network capability refused");
+        assert!(err.to_string().contains("network"), "actual: {err}");
     }
 
     #[test]

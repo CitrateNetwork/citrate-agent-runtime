@@ -3199,8 +3199,8 @@ version = "0.1.0"
 content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 [capability]
-network = "broker-only"
-filesystem = ["read:/data"]
+network = "none"
+filesystem = []
 chain_calls = []
 subagent_spawn = false
 
@@ -3230,7 +3230,13 @@ tla_spec = ""
 [signing]
 tier = "bundled"
 "#;
-        let manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        // AR-B-011: `Manifest::parse` now REFUSES a declared filesystem/network
+        // capability (it is unenforced). This test still exercises
+        // `prepare_linker`'s capability→token mapping, so set the fields
+        // directly on the parsed manifest, bypassing the load-time refusal.
+        let mut manifest = Manifest::parse(manifest_str).expect("manifest parses");
+        manifest.capability.network = crate::capsule::manifest::NetworkPolicy::BrokerOnly;
+        manifest.capability.filesystem = vec!["read:/data".to_string()];
         // Wrap in a fake Capsule (no archive) to exercise prepare_linker
         // independently of from_archive.
         let capsule = Capsule {

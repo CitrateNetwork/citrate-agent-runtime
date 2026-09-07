@@ -133,17 +133,23 @@ impl Ed25519FileSurface {
     /// seed material. Returns `AgentError::Other` on read or size
     /// failure.
     pub fn load(path: &Path, role: Role) -> Result<Self, AgentError> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| AgentError::Other(format!("read seed file {path:?}: {e}")))?;
+        // AR-B-027: the seed file bytes and the copied 32-byte seed are secret
+        // key material — wipe both on drop rather than leaving them in freed
+        // memory. `ed25519_dalek::SigningKey` is `ZeroizeOnDrop`, so the derived
+        // key is already handled; the seed on the way in was the gap.
+        let bytes = zeroize::Zeroizing::new(
+            std::fs::read(path)
+                .map_err(|e| AgentError::Other(format!("read seed file {path:?}: {e}")))?,
+        );
         if bytes.len() != 32 {
             return Err(AgentError::Other(format!(
                 "seed file {path:?}: expected 32 bytes, got {}",
                 bytes.len()
             )));
         }
-        let mut seed = [0u8; 32];
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
         seed.copy_from_slice(&bytes);
-        Ok(Self::from_seed(seed, role))
+        Ok(Self::from_seed(*seed, role))
     }
 
     /// The signer identity (role + pubkey-fingerprint) this surface
