@@ -30,6 +30,9 @@ sha3 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# AR-B-021: sign grant snapshots in the AGT-14 tests (validate_fire now
+# fail-closes on an unsigned snapshot).
+ed25519-dalek = { version = "2.1", features = ["std"] }
 
 # BFR-INT-wiremock-harness — JSON-RPC mock for the fire() helper's
 # revert + timeout paths. Drains the agent-cron tail of the

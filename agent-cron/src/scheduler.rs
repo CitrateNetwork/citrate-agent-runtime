@@ -176,21 +176,31 @@ impl CronScheduler {
             .as_ref()
             .ok_or_else(|| "no grant snapshot recorded at registration".to_string())?;
 
-        // Signature still valid? (Either it was always signed and
-        // still verifies, or it was never signed and we treat that
-        // as legacy-OK — operator's policy choice at registration.)
-        if !snapshot.signature.is_empty() || !snapshot.issuer_pubkey.is_empty() {
-            snapshot
-                .verify_signature()
-                .map_err(|e| format!("snapshot signature invalid: {}", e))?;
+        // AR-B-021: FAIL CLOSED on an unsigned snapshot. Previously an empty
+        // signature AND empty issuer_pubkey skipped verification entirely, so a
+        // snapshot with { signature: [], issuer_pubkey: [], allowed_tools: [] }
+        // authorized ANY tool — an autonomous cron firing with no consent proof.
+        if snapshot.signature.is_empty() || snapshot.issuer_pubkey.is_empty() {
+            return Err(
+                "snapshot is unsigned (missing signature or issuer_pubkey) — refusing to fire \
+                 an autonomous cron without a consent proof"
+                    .to_string(),
+            );
         }
+        snapshot
+            .verify_signature()
+            .map_err(|e| format!("snapshot signature invalid: {}", e))?;
 
-        // Tool still in scope?
-        if !snapshot.allowed_tools.is_empty()
-            && !snapshot
-                .allowed_tools
-                .iter()
-                .any(|t| t == &due.job.tool_name)
+        // AR-B-021: FAIL CLOSED on an empty allow-list. An empty `allowed_tools`
+        // previously authorized every tool; require a non-empty list that names
+        // this job's tool.
+        if snapshot.allowed_tools.is_empty() {
+            return Err("snapshot authorizes no tools (empty allowed_tools)".to_string());
+        }
+        if !snapshot
+            .allowed_tools
+            .iter()
+            .any(|t| t == &due.job.tool_name)
         {
             return Err(format!(
                 "snapshot does not authorize tool '{}'",
@@ -487,7 +497,33 @@ mod tests {
 
     use citrate_agent_core::canonical::{CapabilityGrant, PolicyProfile};
 
+    /// AR-B-021: `validate_fire` now fail-closes on an unsigned snapshot, so the
+    /// AGT-14 tests build a properly SIGNED snapshot (deterministic ed25519
+    /// key) that then exercises the tool-scope / expiry logic.
     fn make_snapshot(allowed_tool: &str, expires_at: &str) -> CapabilityGrant {
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut grant = CapabilityGrant {
+            id: "grant-cron".to_string(),
+            issuer: "0xuser".to_string(),
+            recipient: "cron".to_string(),
+            allowed_tools: vec![allowed_tool.to_string()],
+            max_value_per_tx: None,
+            allowed_paths: vec![],
+            expires_at: expires_at.to_string(),
+            policy: PolicyProfile::Operator,
+            revoked: false,
+            connected_since: 0,
+            issuer_pubkey: Vec::new(),
+            signature: Vec::new(),
+        };
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        grant.issuer_pubkey = signing.verifying_key().to_bytes().to_vec();
+        grant.signature = signing.sign(&grant.signing_preimage()).to_bytes().to_vec();
+        grant
+    }
+
+    /// An UNSIGNED snapshot — used to prove validate_fire fail-closes (AR-B-021).
+    fn make_unsigned_snapshot(allowed_tool: &str, expires_at: &str) -> CapabilityGrant {
         CapabilityGrant {
             id: "grant-cron".to_string(),
             issuer: "0xuser".to_string(),
@@ -514,6 +550,45 @@ mod tests {
             matched_at: Utc::now(),
         };
         CronScheduler::validate_fire(&due, Utc::now()).expect("should pass");
+    }
+
+    #[tokio::test]
+    async fn agt14_validate_fire_rejects_unsigned_snapshot() {
+        // AR-B-021: an unsigned snapshot (empty signature/pubkey) must be
+        // refused, not treated as legacy-OK.
+        let mut job = make_job("j1", "* * * * * *");
+        job.tool_name = "check_balance".to_string();
+        job.grant_snapshot = Some(make_unsigned_snapshot("check_balance", "2030-01-01T00:00:00Z"));
+        let due = DueJob {
+            job,
+            matched_at: Utc::now(),
+        };
+        let err = CronScheduler::validate_fire(&due, Utc::now())
+            .expect_err("unsigned snapshot must fail closed");
+        assert!(err.contains("unsigned"), "actual: {err}");
+    }
+
+    #[tokio::test]
+    async fn agt14_validate_fire_rejects_empty_allowed_tools() {
+        // AR-B-021: an empty allowed_tools list previously authorized any tool.
+        let mut job = make_job("j1", "* * * * * *");
+        job.tool_name = "check_balance".to_string();
+        let mut snap = make_snapshot("check_balance", "2030-01-01T00:00:00Z");
+        // Empty the allow-list AND re-sign so the ONLY failure is the empty list.
+        snap.allowed_tools = vec![];
+        {
+            use ed25519_dalek::{Signer, SigningKey};
+            let signing = SigningKey::from_bytes(&[9u8; 32]);
+            snap.signature = signing.sign(&snap.signing_preimage()).to_bytes().to_vec();
+        }
+        job.grant_snapshot = Some(snap);
+        let due = DueJob {
+            job,
+            matched_at: Utc::now(),
+        };
+        let err = CronScheduler::validate_fire(&due, Utc::now())
+            .expect_err("empty allowed_tools must fail closed");
+        assert!(err.contains("no tools"), "actual: {err}");
     }
 
     #[tokio::test]
