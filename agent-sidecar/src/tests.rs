@@ -167,11 +167,16 @@ async fn run_skill_503s_when_no_dispatch_loaded() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
-    // The gD-hermes safety property through the FULL runSkill path: a skill (the eth-sender-test
-    // capsule) is accepted, runs on a background task via call_json, and its eth-send parks on the
-    // ApprovalGate — surfacing on the same queue /approvals shows. Then approve resolves it. The
-    // send itself fails closed (the sidecar is keyless: no eth-send dispatcher) — proving the sidecar
-    // gates + surfaces but never signs.
+    // AR-B-003 (RC-8): the eth-sender-test capsule declares tier = "high",
+    // required_roles = [Reviewer, ComplianceOfficer]. This test previously
+    // proved the VULNERABILITY: the tier-high eth-send parked on the anonymous
+    // FIFO queue and a single anonymous `queue.approve()` released it. Post-fix
+    // the effect is routed to the role-bound quorum track and the anonymous
+    // FIFO approve CANNOT release it.
+    //
+    // (Follow-up: the sidecar's HTTP /approvals + /approvals/approve ceremony
+    // is still FIFO-only; to approve a privileged effect an operator surface
+    // must adopt the role-aware submit_for_action/add_signature track.)
     let queue = Arc::new(ApprovalQueue::new());
     let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
     assert!(dispatch.is_some(), "the repo capsules/ dir must load");
@@ -203,12 +208,24 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
     assert_eq!(j["ok"], true);
     assert_eq!(j["submitted"], true);
 
-    // The spawned skill's eth-send now blocks on the gate → the effect is a pending approval.
-    wait_depth(&queue, 1).await;
-    // Resolve it exactly as POST /approvals/approve does; the gate returns Ok, the (keyless) send then
-    // fails closed and the task ends — the queue drains.
+    // The spawned tier-high eth-send parks on the ROLE-BOUND quorum track…
+    wait_role_depth(&queue, 1).await;
+    // …and NOT on the anonymous FIFO queue.
+    assert_eq!(
+        queue.depth(),
+        0,
+        "tier-high effect must not surface on the anonymous FIFO queue"
+    );
+
+    // The anonymous single-click FIFO approve MUST NOT release it (the exploit).
     queue.approve();
-    wait_depth(&queue, 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        queue.role_pending_depth(),
+        1,
+        "anonymous FIFO approve must not release a tier-high privileged effect"
+    );
+    assert_eq!(queue.depth(), 0);
 }
 
 #[tokio::test]
@@ -345,6 +362,20 @@ async fn wait_depth(q: &ApprovalQueue, want: usize) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("queue never reached depth {want} (was {})", q.depth());
+}
+
+/// AR-B-003: wait for the role-bound (quorum) pending track to reach `want`.
+async fn wait_role_depth(q: &ApprovalQueue, want: usize) {
+    for _ in 0..400 {
+        if q.role_pending_depth() == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "role-pending never reached depth {want} (was {})",
+        q.role_pending_depth()
+    );
 }
 
 #[tokio::test]
