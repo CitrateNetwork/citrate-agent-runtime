@@ -60,19 +60,37 @@ pub struct RecorderClient {
 }
 
 impl RecorderClient {
-    /// Create a recorder from env / `.env.testnet`. Returns `None`
-    /// when the key is unavailable or malformed — the shell starts
-    /// without write capability in that case.
+    /// Create a recorder from env / an operator-configured key file.
+    /// Returns `None` when the key is unavailable or malformed — the
+    /// process starts without write capability in that case.
     ///
     /// Resolution order:
     ///   1. `DEPLOYER_PRIVATE_KEY` env var
-    ///   2. `DEPLOYER_PRIVATE_KEY=…` line in `.env.testnet` next to
-    ///      the working directory
+    ///   2. `DEPLOYER_PRIVATE_KEY=…` line in the file named by
+    ///      `CITRATE_RECORDER_KEY_ENV_FILE`
+    ///
+    /// AR-B-010: the previous code fell back to a `.env.testnet` file
+    /// resolved **relative to the process CWD** — so anyone who could
+    /// drop a `.env.testnet` in the daemon's working directory (e.g.
+    /// via the `file_write` traversal, AR-B-006) supplied their own
+    /// signing key. The fallback is now an operator-configured
+    /// **absolute** path with `0600` perms; a relative path (the CWD
+    /// attack) is refused.
     pub fn from_env(rpc_url: impl Into<String>) -> Option<Self> {
-        let hex_key = std::env::var("DEPLOYER_PRIVATE_KEY")
+        if let Ok(k) = std::env::var("DEPLOYER_PRIVATE_KEY") {
+            if !k.is_empty() {
+                return Self::from_hex_key(&k, rpc_url);
+            }
+        }
+        let file = std::env::var("CITRATE_RECORDER_KEY_ENV_FILE")
             .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| read_env_var(Path::new(".env.testnet"), "DEPLOYER_PRIVATE_KEY"))?;
+            .filter(|s| !s.is_empty())?;
+        let path = Path::new(&file);
+        if let Err(e) = validate_key_env_file(path) {
+            tracing::warn!("recorder: refusing key env-file: {e}");
+            return None;
+        }
+        let hex_key = read_env_var(path, "DEPLOYER_PRIVATE_KEY")?;
         Self::from_hex_key(&hex_key, rpc_url)
     }
 
@@ -652,6 +670,33 @@ pub(crate) fn derive_address(signing_key: &SigningKey) -> String {
     format!("0x{}", hex::encode(addr))
 }
 
+/// AR-B-010: validate an operator-configured recorder key env-file.
+/// The path MUST be absolute (a relative path is resolved against the
+/// process CWD, which an attacker with `file_write` can control), and
+/// on Unix an existing file MUST be owner-only (`0600`). Returns
+/// `Err(reason)` on any violation.
+fn validate_key_env_file(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "recorder key env-file must be an absolute path, got {path:?} \
+             (CWD-relative fallback refused)"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(format!(
+                    "recorder key env-file {path:?} must be owner-only (0600), got {mode:o}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read a single `KEY=VALUE` line from a dotenv-style file.
 /// Returns `None` when the file doesn't exist or the key isn't
 /// found. Strips surrounding whitespace + optional `0x` prefix
@@ -690,6 +735,20 @@ mod tests {
             rec.from_address().to_lowercase(),
             "0x4250675f9015e65fc866f3a373f82bb9dfc000c6"
         );
+    }
+
+    // AR-B-010 tripwire: the recorder key env-file must be an absolute
+    // path. The old code fell back to a CWD-relative `.env.testnet`,
+    // which an attacker with `file_write` could plant to inject a
+    // signing key.
+    #[test]
+    fn validate_key_env_file_rejects_relative_cwd_path() {
+        // The exact vulnerable fallback path — must be refused now.
+        assert!(validate_key_env_file(Path::new(".env.testnet")).is_err());
+        assert!(validate_key_env_file(Path::new("subdir/.env.testnet")).is_err());
+        // An operator-configured absolute path (non-existent → perms
+        // check skipped) is accepted.
+        assert!(validate_key_env_file(Path::new("/opt/citrate/recorder.env")).is_ok());
     }
 
     #[test]

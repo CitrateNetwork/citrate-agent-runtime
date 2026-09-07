@@ -88,6 +88,14 @@ pub struct RoleSignature {
     pub signed_at: i64,
     pub signature: Vec<u8>,
     pub surface: SigningSurfaceTag,
+    /// Ed25519 public key (32 bytes) whose private counterpart produced
+    /// `signature`. AR-B-002 fix: without the pubkey a `RoleSignature`
+    /// could never be verified at all — it was stored verbatim and
+    /// trusted. The pubkey lets `verify_role_signature` check the
+    /// signature offline, and lets a `SignerRoster` decide whether the
+    /// key is an *authorized* signer for `role`.
+    #[serde(default)]
+    pub signer_pubkey: [u8; 32],
 }
 
 /// The canonical audit record. Every event of interest produces one.
@@ -135,6 +143,54 @@ pub fn canonical_cbor(record: &AuditRecord) -> Result<Vec<u8>, AgentError> {
     ciborium::ser::into_writer(&stripped, &mut buf)
         .map_err(|e| AgentError::Audit(format!("canonical CBOR encode: {e}")))?;
     Ok(buf)
+}
+
+/// Verify a single `RoleSignature` cryptographically binds to `record`.
+///
+/// The signature MUST be a valid ed25519 signature over
+/// `canonical_cbor(record_without_sigs)` under `sig.signer_pubkey`.
+///
+/// AR-B-002 fix: previously `AuditRecord.signatures[]` were written
+/// verbatim and verified *nowhere* in the repo, so a fabricated
+/// `RoleSignature` (e.g. a 64-zero-byte "SecurityOfficer" attestation)
+/// survived `verify_integrity()` and the doctor check as an "intact,
+/// verified chain". This makes the signature a real cryptographic
+/// attestation again.
+///
+/// NOTE: cryptographic validity alone does NOT prove the key belongs to
+/// an *authorized* signer for the claimed role — that binding is
+/// enforced by the caller via a `SignerRoster` (see
+/// `AuditChain::append` / `verify_integrity`).
+pub fn verify_role_signature(
+    record: &AuditRecord,
+    sig: &RoleSignature,
+) -> Result<(), AgentError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let vk = VerifyingKey::from_bytes(&sig.signer_pubkey).map_err(|e| {
+        AgentError::Audit(format!(
+            "audit signature: bad pubkey for signer '{}': {e}",
+            sig.signer
+        ))
+    })?;
+    if sig.signature.len() != Signature::BYTE_SIZE {
+        return Err(AgentError::Audit(format!(
+            "audit signature: length {} != {} for signer '{}'",
+            sig.signature.len(),
+            Signature::BYTE_SIZE,
+            sig.signer
+        )));
+    }
+    let mut arr = [0u8; Signature::BYTE_SIZE];
+    arr.copy_from_slice(&sig.signature);
+    let signature = Signature::from_bytes(&arr);
+    let preimage = canonical_cbor(record)?;
+    vk.verify(&preimage, &signature).map_err(|e| {
+        AgentError::Audit(format!(
+            "audit signature does not verify for signer '{}': {e}",
+            sig.signer
+        ))
+    })?;
+    Ok(())
 }
 
 /// SHA-256 of the canonical CBOR of `record_without_sigs`. This is
@@ -199,6 +255,7 @@ mod tests {
             signed_at: 0,
             signature: vec![1, 2, 3],
             surface: SigningSurfaceTag::Cli,
+            signer_pubkey: [0u8; 32],
         });
         r.chain_anchor = Some(AnchorRef {
             anchor_kind: AnchorKind::PerApproval,

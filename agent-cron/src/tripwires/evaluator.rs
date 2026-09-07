@@ -26,6 +26,13 @@ pub enum JobOutcome {
     /// Job ran but couldn't complete (network down, RPC error,
     /// etc). The reason is logged + the next tick retries.
     Failed(String),
+    /// AR-B-010: the backing metric is ABSENT from the source. A
+    /// detection control whose metric is missing is *disabled*, not
+    /// "no breach" — mapping absence to `NoBreach` silently suppresses
+    /// firing (delete/rename the metric and the control goes dark).
+    /// This fail-safe outcome surfaces the gap so the operator sees a
+    /// blind spot instead of a false all-clear.
+    MetricUnavailable(String),
 }
 
 /// Threshold evaluator with hysteresis + per-tripwire backoff.

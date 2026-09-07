@@ -90,9 +90,19 @@ impl AgentTool for SearchCode {
         } else {
             let resolved = workspace.join(search_path);
             if resolved.exists() {
-                resolved
+                let resolved = resolved
                     .canonicalize()
-                    .map_err(|e| AgentError::ExecutionFailed(format!("invalid path: {e}")))?
+                    .map_err(|e| AgentError::ExecutionFailed(format!("invalid path: {e}")))?;
+                // AR-B-007: the relative branch canonicalizes but previously did
+                // NOT verify containment, so `{"path":"../../../"}` escaped the
+                // workspace at RiskLevel::Low (auto-approved). Apply the same
+                // check the absolute branch already performs.
+                if !resolved.starts_with(&workspace) {
+                    return Err(AgentError::ExecutionFailed(
+                        "search path outside workspace is not allowed".into(),
+                    ));
+                }
+                resolved
             } else {
                 return Err(AgentError::ExecutionFailed(format!(
                     "search path '{}' does not exist",

@@ -217,6 +217,11 @@ impl Capsule {
                 eth_send_dispatcher,
                 approval_gate,
                 self.manifest.capsule.name.clone(),
+                // AR-B-003: carry the manifest's risk tier + required
+                // roles into the host context so the approval gate can
+                // enforce the role-bound quorum for privileged writes.
+                self.manifest.risk.tier,
+                self.manifest.risk.required_roles.clone(),
             ),
         );
         // REM-12a — see instantiate_with_store for rationale.

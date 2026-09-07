@@ -14,7 +14,8 @@ use crate::capsule::dispatcher::{
     ApprovalGate, ApprovalRequest, EthSendDispatcher,
 };
 use crate::capsule::wasm::Address;
-use crate::hitl::{ApprovalOutcomePublic, ApprovalQueue, ToolCall};
+use crate::hitl::quorum::Quorum;
+use crate::hitl::{ApprovalOutcomePublic, ApprovalQueue, Signer, ToolCall};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -54,29 +55,82 @@ impl ApprovalGate for QueuedApprovalGate {
             hex::encode(&out[..16])
         };
         let call = ToolCall {
-            call_id,
+            call_id: call_id.clone(),
             name: format!("{}::{}", req.capsule_name, req.method),
             args: json!({
                 "to": format!("0x{}", hex::encode(req.to)),
                 "data_hex": format!("0x{}", hex::encode(&req.data)),
                 "data_len": req.data.len(),
+                // AR-B-003: surface the TRUE risk tier from the manifest,
+                // not a name-derived "low" default.
+                "risk_tier": format!("{:?}", req.tier),
+                "required_roles": req
+                    .required_roles
+                    .iter()
+                    .map(|r| format!("{r:?}"))
+                    .collect::<Vec<_>>(),
             }),
         };
-        // Bridge sync → async via block_in_place. Requires a
-        // multi-thread runtime — see module docstring.
+
+        // AR-B-003: derive the role-bound quorum from the manifest tier.
+        // Tier-low actions auto-approve (log only); every higher tier
+        // MUST accumulate roster-authorized signatures satisfying the
+        // quorum before resolving — the anonymous single-click FIFO
+        // `approve()` path CANNOT release them.
+        let quorum = Quorum::for_tier(req.tier, &req.required_roles);
         let queue = self.queue.clone();
+
+        if matches!(quorum, Quorum::AutoApprove) {
+            // Tier-low: the legacy FIFO fast path is acceptable.
+            let outcome = tokio::task::block_in_place(move || {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async move { queue.submit_with_outcome(call).await })
+            });
+            return outcome_to_result(outcome);
+        }
+
+        // Tier medium/high/critical: route through the role-aware
+        // quorum. The proposer is the capsule itself (an Operator),
+        // which — by separation-of-duties — cannot count toward its
+        // own approval.
+        let payload = signing_payload(&req);
+        let proposer = Signer {
+            id: format!("capsule:{}", req.capsule_name),
+            role: crate::capsule::manifest::Role::Operator,
+        };
         let outcome = tokio::task::block_in_place(move || {
             let handle = tokio::runtime::Handle::current();
-            handle.block_on(async move { queue.submit_with_outcome(call).await })
+            handle.block_on(async move {
+                queue
+                    .submit_for_action(call, payload, quorum, proposer)
+                    .await
+            })
         });
-        match outcome {
-            ApprovalOutcomePublic::Approved => Ok(()),
-            ApprovalOutcomePublic::AutoApproved => Ok(()),
-            ApprovalOutcomePublic::Rejected => Err("rejected by operator".to_string()),
-            ApprovalOutcomePublic::TimedOut => {
-                Err("approval timed out (5min)".to_string())
-            }
-        }
+        outcome_to_result(outcome)
+    }
+}
+
+/// Canonical bytes the action's signers attest to. Fetched by the
+/// operator ceremony via `ApprovalQueue::payload_for(call_id)` and
+/// signed; `add_signature` verifies each signature against exactly
+/// these bytes.
+fn signing_payload(req: &ApprovalRequest) -> Vec<u8> {
+    format!(
+        "{}|{}|0x{}|0x{}",
+        req.capsule_name,
+        req.method,
+        hex::encode(req.to),
+        hex::encode(&req.data)
+    )
+    .into_bytes()
+}
+
+fn outcome_to_result(outcome: ApprovalOutcomePublic) -> Result<(), String> {
+    match outcome {
+        ApprovalOutcomePublic::Approved => Ok(()),
+        ApprovalOutcomePublic::AutoApproved => Ok(()),
+        ApprovalOutcomePublic::Rejected => Err("rejected by operator".to_string()),
+        ApprovalOutcomePublic::TimedOut => Err("approval timed out (5min)".to_string()),
     }
 }
 
@@ -137,6 +191,94 @@ impl EthSendDispatcher for RecorderEthSendDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::capsule::manifest::{RiskTier, Role};
+    use crate::hitl::signing::{Ed25519FileSurface, SigningSurface, StaticSignerRoster};
+    use crate::hitl::Signature;
+    use std::time::Duration;
+
+    fn call_id_for(capsule: &str, method: &str, to: &[u8; 20], data: &[u8]) -> String {
+        use sha3::{Digest, Keccak256};
+        let mut h = Keccak256::new();
+        h.update(capsule.as_bytes());
+        h.update(b"|");
+        h.update(method.as_bytes());
+        h.update(b"|");
+        h.update(to);
+        h.update(b"|");
+        h.update(data);
+        hex::encode(&h.finalize()[..16])
+    }
+
+    /// AR-B-003 tripwire: a tier-`high` capsule effect routed through the
+    /// production `QueuedApprovalGate` must NOT resolve on an anonymous
+    /// FIFO `approve()`, and MUST require two roster-authorized signatures
+    /// from `{Reviewer, ComplianceOfficer}`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_gate_tier_high_requires_role_quorum_ar_b_003() {
+        let reviewer = Ed25519FileSurface::from_seed([0x11; 32], Role::Reviewer);
+        let compliance = Ed25519FileSurface::from_seed([0x22; 32], Role::ComplianceOfficer);
+        let roster = StaticSignerRoster::new()
+            .authorize(reviewer.pubkey(), Role::Reviewer)
+            .authorize(compliance.pubkey(), Role::ComplianceOfficer);
+        let queue = Arc::new(ApprovalQueue::new().with_signer_roster(Arc::new(roster)));
+        let gate = Arc::new(QueuedApprovalGate::new(queue.clone()));
+
+        let addr = [0xa6u8; 20];
+        let data = vec![0xde, 0xad, 0xbe, 0xef];
+        let call_id = call_id_for("provision-user", "eth-send", &addr, &data);
+
+        let req = ApprovalRequest {
+            capsule_name: "provision-user".to_string(),
+            method: "eth-send".to_string(),
+            to: addr,
+            data: data.clone(),
+            tier: RiskTier::High,
+            required_roles: vec![Role::Reviewer, Role::ComplianceOfficer],
+        };
+
+        // Run the (blocking) gate on a worker; it parks until quorum.
+        let g = gate.clone();
+        let handle = tokio::spawn(async move { g.request(req) });
+
+        // Wait for the role-aware entry to register.
+        let payload = {
+            let mut got = None;
+            for _ in 0..200 {
+                if let Some(p) = queue.payload_for(&call_id) {
+                    got = Some(p);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            got.expect("role-aware entry should register")
+        };
+
+        // (a) The anonymous single-click FIFO approve MUST NOT release it.
+        queue.approve();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_finished(),
+            "tier-high write was released by an anonymous FIFO approve"
+        );
+
+        // (b) One roster signature is not enough (NofM{n:2}).
+        let s1: Signature = reviewer.sign(&payload).expect("reviewer sign").into();
+        queue.add_signature(&call_id, s1).expect("reviewer sig accepted");
+        assert_eq!(queue.signatures_on(&call_id).len(), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!handle.is_finished(), "resolved on a single signature");
+
+        // Second roster signature satisfies the quorum → resolves Approved.
+        let s2: Signature = compliance.sign(&payload).expect("compliance sign").into();
+        queue.add_signature(&call_id, s2).expect("compliance sig accepted");
+
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("gate resolves after quorum")
+            .expect("join");
+        assert!(res.is_ok(), "gate should approve once quorum met: {res:?}");
+    }
 
     /// Construction smoke — the production types build without
     /// panicking. Doesn't exercise the async bridge (that requires

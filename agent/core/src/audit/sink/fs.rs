@@ -140,6 +140,7 @@ mod tests {
                 signed_at: 0,
                 signature: vec![0xde, 0xad, 0xbe, 0xef],
                 surface: SigningSurfaceTag::Cli,
+                signer_pubkey: [0u8; 32],
             }],
             chain_anchor: None,
         }

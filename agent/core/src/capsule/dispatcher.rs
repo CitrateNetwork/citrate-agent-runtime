@@ -86,12 +86,22 @@ impl EthCallDispatcher for RpcEthCallDispatcher {
 /// address + calldata bytes) so the approval decision is informed.
 ///
 /// CIT-AGENT-9c-write-host.
+///
+/// AR-B-003: `tier` + `required_roles` carry the CALLING capsule's
+/// manifest risk declaration so the gate can compute the role-bound
+/// quorum (`Quorum::for_tier`) and surface the true risk level —
+/// instead of routing every write through the anonymous single-click
+/// FIFO track and labelling a tier-`high` privileged write "low".
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub capsule_name: String,
     pub method: String,
     pub to: Address,
     pub data: Vec<u8>,
+    /// Risk tier from the calling capsule's signed manifest.
+    pub tier: crate::capsule::manifest::RiskTier,
+    /// Roles the manifest requires to approve this action.
+    pub required_roles: Vec<crate::capsule::manifest::Role>,
 }
 
 /// Synchronous facade over the asynchronous `ApprovalQueue` (RFC

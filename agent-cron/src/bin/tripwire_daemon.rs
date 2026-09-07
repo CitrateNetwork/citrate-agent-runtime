@@ -76,6 +76,11 @@ fn log_outcome(name: &str, outcome: JobOutcome) {
         JobOutcome::NoBreach => {}
         JobOutcome::Fired(tx) => info!("{name}: FIRED — {tx}"),
         JobOutcome::Failed(reason) => warn!("{name}: failed — {reason}"),
+        // AR-B-010: a missing metric is a monitoring BLIND SPOT — surface
+        // it loudly rather than treating it as a clean pass.
+        JobOutcome::MetricUnavailable(reason) => {
+            warn!("{name}: DETECTION DISABLED — metric unavailable: {reason}")
+        }
     }
 }
 

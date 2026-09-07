@@ -75,6 +75,14 @@ pub struct HostCtx {
     /// from the manifest's `[capsule].name`. Empty when not yet
     /// instantiated.
     capsule_name: String,
+    /// Risk tier from the calling capsule's manifest. AR-B-003: the
+    /// approval gate uses this to compute the role-bound quorum and
+    /// surface the true risk — instead of defaulting a privileged
+    /// write to "low". Defaults to `Low` for un-instantiated / test
+    /// contexts.
+    risk_tier: crate::capsule::manifest::RiskTier,
+    /// Roles the manifest requires to approve this capsule's writes.
+    required_roles: Vec<crate::capsule::manifest::Role>,
     /// REM-12b real binding — per-store resource caps. Lives ON
     /// `HostCtx` (not in the limiter closure) so the `Store::limiter`
     /// callback can return `&mut self.store_limits` without the
@@ -107,6 +115,8 @@ impl HostCtx {
             eth_send_dispatcher: None,
             approval_gate: None,
             capsule_name: String::new(),
+            risk_tier: crate::capsule::manifest::RiskTier::Low,
+            required_roles: Vec::new(),
             // REM-12b — per-capsule call resource caps.
             // dispatch.rs may reconfigure before each call; this is
             // the conservative default that applies even if the
@@ -152,6 +162,8 @@ impl HostCtx {
         eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
         approval_gate: Option<Arc<dyn ApprovalGate>>,
         capsule_name: String,
+        risk_tier: crate::capsule::manifest::RiskTier,
+        required_roles: Vec<crate::capsule::manifest::Role>,
     ) -> Self {
         let mut s = Self::empty();
         s.eth_call_allow_list = eth_call_allow_list;
@@ -160,6 +172,8 @@ impl HostCtx {
         s.eth_send_dispatcher = eth_send_dispatcher;
         s.approval_gate = approval_gate;
         s.capsule_name = capsule_name;
+        s.risk_tier = risk_tier;
+        s.required_roles = required_roles;
         s
     }
 
@@ -207,6 +221,17 @@ impl HostCtx {
 
     pub fn capsule_name(&self) -> &str {
         &self.capsule_name
+    }
+
+    /// Risk tier from the calling capsule's manifest (AR-B-003).
+    pub fn risk_tier(&self) -> crate::capsule::manifest::RiskTier {
+        self.risk_tier
+    }
+
+    /// Roles the manifest requires to approve this capsule's writes
+    /// (AR-B-003).
+    pub fn required_roles(&self) -> &[crate::capsule::manifest::Role] {
+        &self.required_roles
     }
 
     /// Whether `to` is in the manifest-declared eth-call allow-list.

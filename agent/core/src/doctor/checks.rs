@@ -15,7 +15,7 @@
 //! (with `details: skipped`), so partial contexts still produce
 //! meaningful reports.
 
-use crate::audit::chain::{AuditChain, GenesisInfo};
+use crate::audit::chain::AuditChain;
 use crate::audit::sink::FilesystemSink;
 use crate::doctor::report::{CheckResult, Severity};
 use crate::hitl::{ApprovalQueue, BreakGlassPhase, BreakGlassRegistry};
@@ -35,6 +35,14 @@ pub struct DoctorContext {
     pub approval_queue: Option<Arc<ApprovalQueue>>,
     /// Break-glass registry handle. When `None`, the BG check skips.
     pub break_glass: Option<Arc<BreakGlassRegistry>>,
+    /// Externally-anchored expected audit-chain head `(sequence, hash)`
+    /// — from the AgentSBT `latest_audit_chain_head` or the last
+    /// `AnchorRegistry` Merkle root. AR-B-001: when supplied, the
+    /// integrity check fails unless the walked head matches, which is
+    /// the only way to detect tail-truncation of the log. When `None`,
+    /// truncation cannot be detected (documented limitation) but a
+    /// wholesale-deleted / empty log is still reported as a Blocker.
+    pub expected_audit_head: Option<(u64, [u8; 32])>,
 }
 
 /// The check trait. Implementors are Send + Sync so a single
@@ -72,19 +80,22 @@ impl Check for AuditChainIntegrityCheck {
                 };
             }
         };
-        // Re-open without minting a genesis (the chain SHOULD already
-        // exist for any agent that's been running). We pass a stub
-        // GenesisInfo; if the sink is empty, open_or_init mints
-        // genesis and returns a chain with one record — that's the
-        // "fresh init" pass result.
-        let genesis = GenesisInfo {
-            agent_did: ctx.agent_did.clone(),
-            harness_version: "doctor-check".into(),
-            policy_bundle_hash: [0u8; 32],
-            doctor_report_hash: [0u8; 32],
-        };
-        let chain = match AuditChain::open_or_init(sink, genesis, ctx.now_unix) {
-            Ok(c) => c,
+        // AR-B-001: open the EXISTING chain WITHOUT minting a genesis.
+        // An empty / wholesale-deleted log must be a Blocker — never a
+        // silently re-initialised "verified 1 records" Pass.
+        let chain = match AuditChain::open_existing(sink) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return CheckResult {
+                    name: self.name().into(),
+                    severity: Severity::Blocker,
+                    message: format!(
+                        "audit log at {path:?} is empty or deleted — expected an \
+                         initialized chain (possible wholesale erasure)"
+                    ),
+                    details: BTreeMap::new(),
+                };
+            }
             Err(e) => {
                 return CheckResult {
                     name: self.name().into(),
@@ -95,22 +106,36 @@ impl Check for AuditChainIntegrityCheck {
             }
         };
         let mut details = BTreeMap::new();
-        match chain.verify_integrity() {
-            Ok(count) => {
-                details.insert("records_verified".into(), count.to_string());
-                CheckResult {
+        let count = match chain.verify_integrity() {
+            Ok(count) => count,
+            Err(e) => {
+                return CheckResult {
                     name: self.name().into(),
-                    severity: Severity::Pass,
-                    message: format!("verified {count} records"),
+                    severity: Severity::Blocker,
+                    message: format!("chain integrity broken: {e}"),
                     details,
-                }
+                };
             }
-            Err(e) => CheckResult {
-                name: self.name().into(),
-                severity: Severity::Blocker,
-                message: format!("chain integrity broken: {e}"),
-                details,
-            },
+        };
+        details.insert("records_verified".into(), count.to_string());
+        // AR-B-001: if an externally-anchored head is configured, the
+        // walked head MUST match it — otherwise the tail was truncated.
+        if let Some((expected_seq, expected_hash)) = ctx.expected_audit_head {
+            details.insert("expected_head_sequence".into(), expected_seq.to_string());
+            if let Err(e) = chain.verify_head(expected_seq, expected_hash) {
+                return CheckResult {
+                    name: self.name().into(),
+                    severity: Severity::Blocker,
+                    message: format!("chain integrity broken: {e}"),
+                    details,
+                };
+            }
+        }
+        CheckResult {
+            name: self.name().into(),
+            severity: Severity::Pass,
+            message: format!("verified {count} records"),
+            details,
         }
     }
 }
@@ -965,6 +990,7 @@ mod tests {
             audit_chain_path: None,
             approval_queue: None,
             break_glass: None,
+            expected_audit_head: None,
         }
     }
 
@@ -979,11 +1005,12 @@ mod tests {
     fn audit_chain_check_passes_on_clean_chain() {
         let tmp = std::env::temp_dir().join("cit-agent-7a-clean-chain.jsonl");
         let _ = std::fs::remove_file(&tmp);
-        // Bootstrap the chain via open_or_init (mints genesis).
         let mut ctx = empty_ctx();
         ctx.audit_chain_path = Some(tmp.clone());
-        let _r1 = AuditChainIntegrityCheck.run(&ctx); // bootstraps
-        // Now append one record and re-check.
+        // AR-B-001 (RC-8): bootstrap the chain EXPLICITLY via
+        // open_or_init — NOT by running the doctor check, which no
+        // longer mints a genesis on an empty sink. Genesis + 1 append
+        // == 2 records.
         {
             use crate::audit::chain::{AuditChain, GenesisInfo};
             let sink: Arc<dyn crate::audit::sink::AuditSink> =
@@ -1013,6 +1040,97 @@ mod tests {
         let r2 = AuditChainIntegrityCheck.run(&ctx);
         assert!(matches!(r2.severity, Severity::Pass));
         assert_eq!(r2.details.get("records_verified"), Some(&"2".to_string()));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── AR-B-001 tripwires ────────────────────────────────────────────
+
+    /// Wholesale deletion: an empty / deleted audit log must be a
+    /// Blocker, NOT a silently re-minted "verified 1 records" Pass.
+    #[test]
+    fn audit_chain_check_blocks_on_deleted_log_ar_b_001() {
+        let tmp = std::env::temp_dir().join("cit-agent-ar-b-001-deleted.jsonl");
+        let _ = std::fs::remove_file(&tmp);
+        let mut ctx = empty_ctx();
+        ctx.audit_chain_path = Some(tmp.clone());
+        // File does not exist → the sink creates an empty one → no records.
+        let r = AuditChainIntegrityCheck.run(&ctx);
+        assert!(
+            matches!(r.severity, Severity::Blocker),
+            "deleted/empty log must Block, got {:?}: {}",
+            r.severity,
+            r.message
+        );
+        assert!(r.message.contains("empty or deleted"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Tail-truncation: with an externally-anchored expected head,
+    /// lopping the last records off the log must be a Blocker even
+    /// though the surviving prefix is internally contiguous.
+    #[test]
+    fn audit_chain_check_blocks_on_tail_truncation_ar_b_001() {
+        use crate::audit::chain::{AuditChain, GenesisInfo};
+        let tmp = std::env::temp_dir().join("cit-agent-ar-b-001-trunc.jsonl");
+        let _ = std::fs::remove_file(&tmp);
+        let mut ctx = empty_ctx();
+        ctx.audit_chain_path = Some(tmp.clone());
+
+        // Build genesis + 3 appends == 4 records, and capture the REAL head.
+        let (head_seq, head_hash) = {
+            let sink: Arc<dyn crate::audit::sink::AuditSink> =
+                Arc::new(FilesystemSink::open(&tmp).unwrap());
+            let mut chain = AuditChain::open_or_init(
+                sink,
+                GenesisInfo {
+                    agent_did: ctx.agent_did.clone(),
+                    harness_version: "test".into(),
+                    policy_bundle_hash: [0u8; 32],
+                    doctor_report_hash: [0u8; 32],
+                },
+                ctx.now_unix,
+            )
+            .unwrap();
+            for i in 0..3 {
+                chain
+                    .append(
+                        EventType::Proposal,
+                        format!("a{i}").into_bytes(),
+                        "did:citrate:role:0xop".into(),
+                        vec![],
+                        None,
+                        ctx.now_unix + 1 + i,
+                    )
+                    .unwrap();
+            }
+            (chain.next_sequence() - 1, chain.last_hash())
+        };
+        ctx.expected_audit_head = Some((head_seq, head_hash));
+
+        // Sanity: with the full log, the check passes.
+        let r_full = AuditChainIntegrityCheck.run(&ctx);
+        assert!(
+            matches!(r_full.severity, Severity::Pass),
+            "intact log should Pass, got {:?}: {}",
+            r_full.severity,
+            r_full.message
+        );
+
+        // Truncate: drop the last 2 lines from the JSONL file.
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        let kept: Vec<&str> = content.lines().collect();
+        let keep_n = kept.len() - 2;
+        let truncated = kept[..keep_n].join("\n") + "\n";
+        std::fs::write(&tmp, truncated).unwrap();
+
+        let r = AuditChainIntegrityCheck.run(&ctx);
+        assert!(
+            matches!(r.severity, Severity::Blocker),
+            "tail-truncated log must Block, got {:?}: {}",
+            r.severity,
+            r.message
+        );
+        assert!(r.message.contains("head mismatch") || r.message.contains("truncation"));
         let _ = std::fs::remove_file(&tmp);
     }
 

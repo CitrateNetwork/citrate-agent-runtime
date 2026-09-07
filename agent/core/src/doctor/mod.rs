@@ -79,6 +79,7 @@ mod tests {
             audit_chain_path: None,
             approval_queue: None,
             break_glass: None,
+            expected_audit_head: None,
         }
     }
 
