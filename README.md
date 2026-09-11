@@ -1,5 +1,7 @@
 # citrate-agent-runtime
 
+*Part of the **[Citrate Network](https://citrate.ai)** — own the means of computation. · [Docs](https://docs.citrate.ai) · [Run a node](https://citrate.ai/download) · [Contribute → free membership](https://github.com/CitrateNetwork/.github/blob/main/CONTRIBUTING.md)*
+
 > The Citrate agent execution runtime — signed WASM "capsules" (skills), a cron/tripwire daemon, and a chain-anchored audit recorder. Hermes, the general-purpose operator agent, runs on it.
 
 ## What it is
