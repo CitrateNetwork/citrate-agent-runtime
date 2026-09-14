@@ -21,11 +21,20 @@ crate-type = ["rlib", "cdylib"]
 insecure-dev-hitl = []
 
 [dependencies]
-# RecorderClient (audit/) needs chain-client + signing primitives.
-# Consumed from CitrateNetwork/citrate-chain via SSH deploy key during
-# the federation transition. Swap to crates.io after chain's first
-# audited release.
-citrate-wallet-core = { git = "ssh://git@github-citrate-chain/CitrateNetwork/citrate-chain", rev = "0f2d16b486a9ec1ed8a0394440dac480075d6942" }
+# RecorderClient (audit/) needs the chain-client + signing primitives, which
+# live in wallet-core's `native` feature (the default: `chain` module +
+# `sign_secp256k1`). Consumed from CitrateNetwork/citrate-chain over HTTPS —
+# same repo + rev as citrate-core/src-tauri, so the app and this sidecar share
+# ONE wallet-core. Swap to crates.io after chain's first audited release.
+#
+# Pin bumped 2026-09-13 (0f2d16b4 -> 47a6f92): 0f2d16b4 was a 2026-05-18 commit
+# orphaned by the srp-s5 re-roll (unreachable on a clean fetch → blocked the
+# Windows build, core#48) AND predated the B1.4.0 canonical-RLP r/s trim, so its
+# sign_secp256k1 emitted non-canonical signatures ~1/256 of txs. 47a6f92 is the
+# current, reachable rev citrate-core already uses; signing now routes through
+# the shared lean `crate::tx` path. HTTPS (not the ssh alias) so an org member
+# builds with only their GitHub credential.
+citrate-wallet-core = { git = "https://github.com/CitrateNetwork/citrate-chain.git", rev = "47a6f92" }
 k256 = { version = "0.13", features = ["ecdsa"] }
 # AR-B-027: wipe key/seed material on drop.
 zeroize = "1.8"
