@@ -76,13 +76,13 @@ ed25519-dalek = { version = "2.1", features = ["std"] }
 # The component-model feature is required for the WASM Component Model
 # that capsules use. wasmtime-wasi provides the standard WASI host
 # implementations we wire selectively per manifest in CIT-AGENT-3d.
-wasmtime = { version = "45", features = ["component-model"] }
-wasmtime-wasi = "45"
+wasmtime = { version = "46", features = ["component-model"] }
+wasmtime-wasi = "46"
 # wasmtime-wasi-io is a peer crate of wasmtime-wasi that hosts the
 # `wasi:io/error` binding. Required to wire io::error per-subsystem
 # in linker.rs (the wasmtime-wasi internal HasIo marker is private,
 # so we depend on the io crate directly). REM-12 wasmtime-26 → 45.
-wasmtime-wasi-io = "45"
+wasmtime-wasi-io = "46"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

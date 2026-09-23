@@ -437,10 +437,13 @@ fn discover_single_entry(
     AgentError,
 > {
     use wasmtime::component::types::ComponentItem;
+    // wasmtime 46: `exports()` now yields `ComponentExtern` values whose
+    // component-type is on the `.ty` field (previously the iterator
+    // yielded `ComponentItem` directly).
     for (iface_name, item) in component.component_type().exports(engine) {
-        if let ComponentItem::ComponentInstance(inst) = item {
+        if let ComponentItem::ComponentInstance(inst) = item.ty {
             for (func_name, fitem) in inst.exports(engine) {
-                if let ComponentItem::ComponentFunc(cf) = fitem {
+                if let ComponentItem::ComponentFunc(cf) = fitem.ty {
                     let params = cf.params().map(|(n, t)| (n.to_string(), t)).collect();
                     return Ok((iface_name.to_string(), func_name.to_string(), params));
                 }

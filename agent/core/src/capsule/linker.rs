@@ -196,8 +196,11 @@ impl LinkerBuilder {
         let l = &mut self.linker;
 
         if self.permitted.contains(&CapabilityToken::WasiCli) {
-            let opts = b::cli::exit::LinkOptions::default();
-            b::cli::exit::add_to_linker::<HostCtx, WasiCli>(l, &opts, HostCtx::cli)
+            // wasmtime 46: cli::exit::add_to_linker no longer takes a
+            // LinkOptions (the `cli-exit-with-code` gate was folded into
+            // the standard binding). Same per-subsystem, token-gated
+            // shape as the other cli bindings below.
+            b::cli::exit::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::exit", e))?;
             b::cli::environment::add_to_linker::<HostCtx, WasiCli>(l, HostCtx::cli)
                 .map_err(|e| linker_err("cli::environment", e))?;
