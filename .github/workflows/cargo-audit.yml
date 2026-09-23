@@ -84,6 +84,18 @@ jobs:
         #   RUSTSEC-2025-0046, 2025-0118
         #   RUSTSEC-2026-0020, 0021, 0085, 0086, 0087, 0088, 0089,
         #                       0091, 0092, 0093, 0094, 0095, 0096
+        #
+        # REM-24 (2026-09-23 advisory-DB refresh — see audit.toml):
+        #   RUSTSEC-2026-0220 — ruint <1.20 shift-op flags. ruint is
+        #     alloy-primitives 0.7.7-pinned via revm 10 → citrate-execution
+        #     (chain rev 51e161f); the 1.20 bump drags in a second arkworks
+        #     major (ark-ff 0.6) + defmt. Blocked on the chain's alloy bump.
+        #   RUSTSEC-2026-0049, 0098, 0099, 0104 — rustls-webpki 0.102.8 via
+        #     serenity 0.12.5's OPTIONAL tokio-tungstenite → tokio-rustls
+        #     0.25 → rustls 0.22 gateway path. hermes-discord does NOT enable
+        #     that serenity feature, so the subtree is inert (unresolved under
+        #     every active target/feature). Closes when serenity moves its
+        #     websocket TLS to rustls 0.23 upstream.
         run: |
           cargo audit \
             --color always \
@@ -102,4 +114,9 @@ jobs:
             --ignore RUSTSEC-2026-0093 \
             --ignore RUSTSEC-2026-0094 \
             --ignore RUSTSEC-2026-0095 \
-            --ignore RUSTSEC-2026-0096
+            --ignore RUSTSEC-2026-0096 \
+            --ignore RUSTSEC-2026-0220 \
+            --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104

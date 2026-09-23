@@ -58,6 +58,48 @@ ignore = [
     "RUSTSEC-2026-0094",  # Winch table.grow masking
     "RUSTSEC-2026-0095",  # Winch sandbox-escape memory access
     "RUSTSEC-2026-0096",  # Cranelift aarch64 sandbox escape
+
+    # ─────────────────────────────────────────────────────────────────
+    # REM-24 — 2026-09-23 advisory-DB refresh (new upstream advisories)
+    # ─────────────────────────────────────────────────────────────────
+    # Advisories that landed in the RustSec DB after the last sweep and
+    # are NOT cheaply closable by a semver-compatible lock bump. The
+    # cheaply-closable ones from the same refresh were fixed in-lock
+    # instead of ignored (no entry here):
+    #   RUSTSEC-2026-0204 crossbeam-epoch 0.9.18 -> 0.9.21
+    #   RUSTSEC-2026-0258 h2            0.4.14 -> 0.4.16
+    #   RUSTSEC-2026-0185 quinn-proto   0.11.14 -> 0.11.15
+    #
+    # RUSTSEC-2026-0220 — ruint <1.20.0: incorrect overflow flags +
+    # truncated shift amounts on Uint shift ops (CWE-682). ruint is
+    # pulled at 1.18.0 by alloy-primitives 0.7.7 → revm-primitives 5 →
+    # revm 10 → citrate-execution → citrate-wallet-core (chain rev
+    # 51e161f). The 1.20.0 release raises ruint's own dep floor: the bump
+    # resolves but pulls a SECOND arkworks major (ark-ff 0.6 alongside the
+    # pinned 0.4) plus defmt into the tree — a change with cryptographic-
+    # constant + no_std implications that belongs with the chain's alloy
+    # bump, not a leaf lock edit here. Deferred until citrate-chain moves
+    # alloy/revm forward. Tracked as REM-24.
+    "RUSTSEC-2026-0220",
+
+    # RUSTSEC-2026-0049 / 0098 / 0099 / 0104 — rustls-webpki 0.102.8
+    # (CRL authority matching, name-constraint wildcard/URI acceptance,
+    # CRL-parse reachable panic). This 0.102.8 comes ONLY via serenity
+    # 0.12.5's OPTIONAL `tokio-tungstenite` gateway dependency
+    # (tokio-tungstenite 0.21 → tokio-rustls 0.25 → rustls 0.22.4 →
+    # rustls-webpki 0.102.8). hermes-discord depends on serenity WITHOUT
+    # enabling that gateway/websocket feature, so the whole rustls-0.22
+    # subtree is inert: `cargo tree -e all --target all -i rustls@0.22.4`
+    # matches nothing — it is present in Cargo.lock but unresolved under
+    # every active target + feature set, so no shipped code path reaches
+    # this webpki. (The live TLS path is rustls 0.23.45 / rustls-webpki
+    # 0.103.15, which is already patched and NOT flagged.) Closes when
+    # serenity moves its websocket TLS onto rustls 0.23 upstream, or when
+    # a lock GC drops the dead subtree. Tracked as REM-24.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
 ]
 
 # ─── Unmaintained-warning ignores (REM-21 hygiene) ─────────────────
