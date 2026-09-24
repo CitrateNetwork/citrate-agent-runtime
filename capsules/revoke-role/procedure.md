@@ -11,7 +11,7 @@ revoke: func(user: string, tenant: string, reason: string)
 ```
 
 `reason` is free-form text; the capsule keccak256-hashes it to
-the on-chain `bytes32 reason` field, matching the Boeing
+the on-chain `bytes32 reason` field, matching the defense_prime
 chat-tool semantics.
 
 ## Calldata derivation (inside the capsule)

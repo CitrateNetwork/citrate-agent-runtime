@@ -8,7 +8,7 @@ license.workspace = true
 # This crate stays as the Hermes-era agent infrastructure (approval/
 # audit/tool/budget primitives) consumed by agent-chain, agent-code,
 # agent-cron, citrate_desktop_app, citrate_gui_native. It migrates to
-# the new crate via CIT-AGENT-8 (Boeing shell dep switch) and the
+# the new crate via CIT-AGENT-8 (defense_prime shell dep switch) and the
 # dependent agent-* crates over CIT-AGENT-3..7.
 name = "citrate-agent-legacy"
 version = "0.4.0"

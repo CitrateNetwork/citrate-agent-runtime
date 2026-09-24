@@ -1,6 +1,6 @@
 # list-compliance-posture — Standard Operating Procedure
 
-> Reads a single compliance row from BoeingComplianceRegistry on
+> Reads a single compliance row from defense_primeComplianceRegistry on
 > chain 40204 (Stage-9 deployment).
 
 ## Purpose
@@ -63,6 +63,6 @@ manifest's allow-list fails CLOSED at the host fn boundary.
 
 This capsule's existence + signature is the evidence artifact
 for SI-7 ("Software, Firmware, and Information Integrity"): the
-agent CANNOT call BoeingComplianceRegistry except through this
+agent CANNOT call defense_primeComplianceRegistry except through this
 capsule, and this capsule's bytes are reproducible from source
 + signed by the bundled-tier publisher key.

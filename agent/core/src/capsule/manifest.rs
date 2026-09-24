@@ -305,7 +305,7 @@ mod tests {
     /// archive contents (that's 3b).
     const WORKED_EXAMPLE: &str = r#"
 [capsule]
-name = "boeing-query-decisions-by-signer"
+name = "defense-prime-query-decisions-by-signer"
 version = "0.1.0"
 content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -345,7 +345,7 @@ tier = "bundled"
     #[test]
     fn parse_worked_example() {
         let m = Manifest::parse(WORKED_EXAMPLE).expect("worked example parses");
-        assert_eq!(m.capsule.name, "boeing-query-decisions-by-signer");
+        assert_eq!(m.capsule.name, "defense-prime-query-decisions-by-signer");
         assert_eq!(m.risk.tier, RiskTier::Low);
         assert_eq!(m.signing.tier, SigningTier::Bundled);
         assert_eq!(m.capability.network, NetworkPolicy::None);
@@ -396,8 +396,8 @@ tier = "bundled"
     #[test]
     fn reject_bad_dns_label() {
         let bad = WORKED_EXAMPLE.replace(
-            r#"name = "boeing-query-decisions-by-signer""#,
-            r#"name = "Boeing_Bad_Name""#,
+            r#"name = "defense-prime-query-decisions-by-signer""#,
+            r#"name = "defense_prime_Bad_Name""#,
         );
         let err = Manifest::parse(&bad).expect_err("uppercase + underscore forbidden");
         assert!(err.to_string().contains("DNS-label"));

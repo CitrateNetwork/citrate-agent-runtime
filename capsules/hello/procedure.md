@@ -8,7 +8,7 @@ Demonstrates the cit-agent capsule build → archive → load →
 instantiate pipeline with a minimal worked example. Useful as:
 
 - Smoke test for the toolchain (cargo-component, wasm-tools)
-- Reference shape for the 7 Boeing tool conversions
+- Reference shape for the 7 defense_prime tool conversions
   (CIT-AGENT-9c) and beyond
 - Empirical witness that the cit-agent linker can load a real
   compiled WASM component (CIT-AGENT-9a covered the converse —

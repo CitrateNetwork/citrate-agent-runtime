@@ -15,7 +15,7 @@
 //! - `CITRATE_TRIPWIRE_REGISTRY` — TripwireRegistry contract addr.
 //!   Default `0x7efc1eb17beff413e1af7fb3bb541e895c307300`.
 //! - `CITRATE_TRIPWIRE_SCOPE` — bytes32-hex scope under which to
-//!   fire. Default = `keccak256("boeing-root")`.
+//!   fire. Default = `keccak256("defense_prime-root")`.
 //! - `CITRATE_TRIPWIRE_TENANT` — TenantHierarchy address.
 //! - `CITRATE_TRIPWIRE_ROLE_ESCALATION` — RoleEscalation address.
 //! - `CITRATE_TRIPWIRE_MULTISIG` — MultiSigEnvelope address.
@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| DEFAULT_REGISTRY.to_string());
     let scope = std::env::var("CITRATE_TRIPWIRE_SCOPE")
         .map(|s| parse_bytes32_hex(&s).expect("CITRATE_TRIPWIRE_SCOPE bytes32"))
-        .unwrap_or_else(|_| keccak("boeing-root"));
+        .unwrap_or_else(|_| keccak("defense_prime-root"));
 
     let recorder = Arc::new(
         RecorderClient::from_env(&rpc_url)

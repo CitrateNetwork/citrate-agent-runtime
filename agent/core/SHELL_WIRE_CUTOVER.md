@@ -10,10 +10,10 @@ status: cutover-landed-pending-visual-proof
 
 > **Status (2026-05-15T17:10Z):** The opt-in cutover landed in
 > `CIT-AGENT-9c-shell-wire-cutover`. Both paths coexist in the
-> boeing-shell binary. Default is the legacy in-tree dispatch;
+> defense_prime-shell binary. Default is the legacy in-tree dispatch;
 > set `CITRATE_USE_CAPSULES=1` (and optionally
 > `CITRATE_CAPSULES_DIR=<path>`) to activate the capsule path.
-> Visual proof + `cargo test -p citrate-boeing-shell` pass on
+> Visual proof + `cargo test -p citrate-defense_prime-shell` pass on
 > the legacy path. The capsule-path verification (run with
 > `CITRATE_USE_CAPSULES=1` against a live testnet RPC) is
 > Saul-driven.
@@ -22,12 +22,12 @@ status: cutover-landed-pending-visual-proof
 > Reference doc for the CIT-AGENT-9c-shell-wire-cutover sprint
 > (visual-proof required, deferred from
 > CIT-AGENT-9c-shell-wire-prep). Documents the exact code path
-> change to replace `citrate-boeing-shell::tools::execute(...)`
+> change to replace `citrate-defense_prime-shell::tools::execute(...)`
 > with capsule-based dispatch.
 
 ## Current state (Rust dispatch)
 
-`citrate_v0.01.1/gui/citrate_boeing_shell/src/tools.rs:223-237`:
+`citrate_v0.01.1/gui/citrate_defense_prime-shell/src/tools.rs:223-237`:
 
 ```rust
 match call.name.as_str() {
@@ -42,13 +42,13 @@ match call.name.as_str() {
 ```
 
 Each `exec_*` (lines 279, 305, 341, 400, 418, 468, 498) calls
-into `BoeingBindings` (read tools) or `RecorderClient`
+into `defense_primeBindings` (read tools) or `RecorderClient`
 (write tools) directly.
 
 ## Target state (capsule dispatch)
 
 ```rust
-// At boeing-shell startup:
+// At defense_prime-shell startup:
 let dispatch = CapsuleDispatch::load_from_dir(
     Path::new("capsules"),
     Arc::new(RpcEthCallDispatcher::from_url(active_rpc_url())),
@@ -84,9 +84,9 @@ dispatch.call(capsule_name, &call.args).map(format_for_chat)
 
 ## What changes in main.rs
 
-`citrate_v0.01.1/gui/citrate_boeing_shell/src/main.rs:2557-2580`:
+`citrate_v0.01.1/gui/citrate_defense_prime-shell/src/main.rs:2557-2580`:
 
-Replace the construction of `BoeingBindings` + `RecorderClient` +
+Replace the construction of `defense_primeBindings` + `RecorderClient` +
 the executor closure with:
 
 ```rust
@@ -111,18 +111,18 @@ let dispatch = match recorder {
 |---|---|
 | `tools::execute` callers (chat loop, test tools) break compile | Keep both paths until visual proof passes; remove old `exec_*` functions in a follow-on |
 | ApprovalQueue receives entries from BOTH paths (old + new) | The cutover MUST be atomic in main.rs — either old or new wires the queue, not both |
-| Capsule `.cps` archives not packaged with the boeing-shell binary | Add `include_dir!` macro or path-resolution at startup to point at `citrate_v0.01.1/capsules/` |
+| Capsule `.cps` archives not packaged with the defense_prime-shell binary | Add `include_dir!` macro or path-resolution at startup to point at `citrate_v0.01.1/capsules/` |
 | Slint UI shows different result format from `exec_*` vs capsule | The `format_for_chat` function in tools.rs needs to format the new capsule return types (records, lists) the same as the old string returns |
-| Capsule load latency hurts first-tool-call UX | Load all 7 at boeing-shell startup (eager); cache the `Capsule` structs |
+| Capsule load latency hurts first-tool-call UX | Load all 7 at defense_prime-shell startup (eager); cache the `Capsule` structs |
 
 ## Test plan (for the cutover sprint)
 
-1. Compile boeing-shell with both paths present.
-2. Run `cargo test -p citrate-boeing-shell` — all 26 existing
+1. Compile defense_prime-shell with both paths present.
+2. Run `cargo test -p citrate-defense_prime-shell` — all 26 existing
    tests pass.
 3. Run `scripts/run_gui_visual_proofs.sh` — all PNG goldens
    match.
-4. Manual smoke: launch boeing-shell, ask the chat to call each
+4. Manual smoke: launch defense_prime-shell, ask the chat to call each
    of the 7 tools, verify the approval card surfaces for write
    tools, verify the chat response is informative.
 5. Remove old `exec_*` functions in a follow-on commit once
@@ -133,5 +133,5 @@ let dispatch = match recorder {
 - `tools::execute` dispatches via `CapsuleDispatch::call`
 - The 7 `exec_*` Rust functions are deleted
 - Visual proof regenerates without diffs
-- `cargo test -p citrate-boeing-shell` 26 tests pass
+- `cargo test -p citrate-defense_prime-shell` 26 tests pass
 - Manual smoke confirms each tool through the operator UI

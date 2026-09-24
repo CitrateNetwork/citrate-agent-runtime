@@ -11,7 +11,7 @@
 //!   * `sink` — `AuditSink` trait + `FilesystemSink` impl
 //!   * `recorder` — BFR-INT-12b on-chain decision-log writer
 //!     (moved here from `audit/mod.rs` in 5a; will become a
-//!     Boeing-overlay adapter once cit-agent's `AnchorRegistry`
+//!     defense_prime-overlay adapter once cit-agent's `AnchorRegistry`
 //!     ships in CIT-AGENT-6)
 
 pub mod chain;

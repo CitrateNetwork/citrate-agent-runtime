@@ -28,7 +28,7 @@ pub mod policy;
 pub mod error;
 pub mod types;
 
-// Public re-exports — the BFR-INT-12b types that boeing-shell consumes
+// Public re-exports — the BFR-INT-12b types that defense_prime-shell consumes
 // directly. Per RFC §3.2 the v1.0 frozen surface lists these by name.
 pub use audit::RecorderClient;
 pub use hitl::{
@@ -36,7 +36,7 @@ pub use hitl::{
 };
 
 // CIT-AGENT-9c-shell-wire-cutover — re-export `wasmtime` so the
-// capsule-dispatch consumer (boeing-shell + future agent shells)
+// capsule-dispatch consumer (defense_prime-shell + future agent shells)
 // can pass typed `Val` args to `CapsuleDispatch::call_raw` without
 // taking a direct wasmtime dep. The capsule library OWNS the
 // wasmtime version pinning; consumers SHOULD NOT depend on

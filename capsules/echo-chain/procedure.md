@@ -6,7 +6,7 @@
 
 ## Purpose
 
-The seven Boeing tool capsules (CIT-AGENT-9c-1..7) all import
+The seven defense_prime tool capsules (CIT-AGENT-9c-1..7) all import
 `citrate:chain/eth-call` and declare a single-address allow-list
 in their manifest. This capsule is the minimal version of that
 shape — it forwards `(to, data)` directly to the host fn so the
@@ -30,7 +30,7 @@ None. The `eth-call` host fn is read-only.
 
 ## Allow-listed addresses
 
-- `0x4a86659BDab24dc444C72fbbaD4cd83491820E40` — Boeing
+- `0x4a86659BDab24dc444C72fbbaD4cd83491820E40` — defense_prime
   AgentDecisionRegistryV2 contract (BFR-INT-12b).
 
 Any other `to` argument produces

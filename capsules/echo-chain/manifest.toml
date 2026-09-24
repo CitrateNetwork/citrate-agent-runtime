@@ -12,7 +12,7 @@ content_hash = "sha256:000000000000000000000000000000000000000000000000000000000
 [capability]
 network = "none"
 filesystem = []
-# Single address allowed: the Boeing AgentDecisionRegistryV2
+# Single address allowed: the defense_prime AgentDecisionRegistryV2
 # contract used in BFR-INT-12b. The host fn enforces this list
 # at call time; unauthorized addresses produce
 # `Err("ChainCallNotAuthorized: 0x...")`.

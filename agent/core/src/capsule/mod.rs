@@ -1261,7 +1261,7 @@ tier = "bundled"
     }
 
     /// CIT-AGENT-9c-1 — verifies the capsule encodes the canonical
-    /// ABI calldata for `BoeingComplianceRegistry.framework(...)`.
+    /// ABI calldata for `defense_primeComplianceRegistry.framework(...)`.
     /// The expected layout is:
     ///   selector (4 bytes) || framework_hash (32 bytes) || scope (32 bytes)
     /// where selector = keccak256("framework(bytes32,bytes32)")[0..4]
@@ -1310,7 +1310,7 @@ tier = "bundled"
         assert_eq!(
             hex::encode(to),
             "8dbbbc46d840f40205b48d76aa9fc5063b7d55d8",
-            "calldata must be routed to BoeingComplianceRegistry"
+            "calldata must be routed to defense_primeComplianceRegistry"
         );
     }
 
@@ -1466,7 +1466,7 @@ tier = "bundled"
             err.starts_with("ChainCallNotAuthorized:"),
             "host fn must reject; got: {err}"
         );
-        // The forensic info: the BoeingComplianceRegistry address
+        // The forensic info: the defense_primeComplianceRegistry address
         // (the capsule's compiled-in target) appears in the error
         // even though the manifest allow-listed deadbeef. This is
         // the "compiled-in vs declared mismatch" surface.

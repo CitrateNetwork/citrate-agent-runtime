@@ -2,7 +2,7 @@
 name = "citrate-agent-core"
 version = "0.4.0"
 edition = "2021"
-description = "Citrate Agent Core — RFC-CIT-AGENT-0001 normative library implementing the 8 subsystems (agent loop, policy engine, HITL queue, audit chain, capsule loader, model resolver, chain client, doctor). Consumed by Boeing shell + future agentd/cli/slint-embed/wasm surfaces."
+description = "Citrate Agent Core — RFC-CIT-AGENT-0001 normative library implementing the 8 subsystems (agent loop, policy engine, HITL queue, audit chain, capsule loader, model resolver, chain client, doctor). Consumed by defense_prime shell + future agentd/cli/slint-embed/wasm surfaces."
 authors = ["Citrate Network"]
 license = "Apache-2.0"
 repository = "https://github.com/citrate-network/citrate"

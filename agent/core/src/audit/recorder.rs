@@ -6,18 +6,18 @@
 //! `.agentile/formal/specs/agent/AuditChainIntegrity.tla` (CIT-AGENT-2 —
 //! 35,435 distinct states PASS).
 //!
-//! Boeing-overlay caveat: when the cit-agent contracts deploy
+//! defense_prime-overlay caveat: when the cit-agent contracts deploy
 //! (CIT-AGENT-6) the canonical write path moves to `AnchorRegistry`
-//! and `RecorderClient` becomes a Boeing-overlay adapter — see
+//! and `RecorderClient` becomes a defense_prime-overlay adapter — see
 //! planset `06_ON_CHAIN_SURFACE.md` row 21. Until then this module
 //! is the load-bearing audit path.
 //!
 //! ── Original BFR-INT-12b header preserved below ──
 //!
 //! BFR-INT-12b — Recorder client. Pilot-grade signing path for the
-//! Boeing shell.
+//! defense_prime shell.
 //!
-//! The recorder is the *only* signing surface in the Boeing shell
+//! The recorder is the *only* signing surface in the defense_prime shell
 //! today. It exists so the tool harness (BFR-INT-12 / 12b) can:
 //!
 //!   1. Write a `Decision` to `AgentDecisionRegistryV2.record` on
@@ -36,7 +36,7 @@
 //!     on every send. No local nonce cache; tx ordering within a
 //!     burst is RPC-dependent.
 //!   * Gas price is hard-coded at 1 Gwei (TransactionBuilder
-//!     default). Boeing tenant testnet has no congestion to
+//!     default). defense_prime tenant testnet has no congestion to
 //!     justify dynamic fee logic.
 //!   * Failures surface as `Result<String, String>` with the
 //!     tx hash or a human-readable error.
@@ -98,7 +98,7 @@ impl RecorderClient {
     /// testability; `from_env` is the production entry-point.
     ///
     /// CIT-AGENT-1: previously read `crate::active_rpc_url()` from the
-    /// host crate (boeing-shell); now the URL is an explicit parameter
+    /// host crate (defense_prime-shell); now the URL is an explicit parameter
     /// so this code can live in `citrate-agent-core` with no host coupling.
     pub fn from_hex_key(hex_key: &str, rpc_url: impl Into<String>) -> Option<Self> {
         let stripped = hex_key.trim().trim_start_matches("0x");
@@ -504,7 +504,7 @@ pub fn encode_revoke(
 
 /// BFR-INT-poam-A — `fire(bytes32 firing_id, bytes32 tripwire_id,
 /// bytes32 scope, uint8 severity, bytes32 evidence_cid)`. Targets
-/// `TripwireRegistry` (`boeing_binder::addr::TRIPWIRE_REGISTRY`).
+/// `TripwireRegistry` (`defense_prime_binder::addr::TRIPWIRE_REGISTRY`).
 ///
 /// 5-slot static head. Total length: 4 + 5 × 32 = 164 bytes.
 pub fn encode_fire_tripwire(
@@ -588,7 +588,7 @@ pub fn compute_firing_id(
 
 /// `registerModel(bytes32 modelHash, bytes32 manifestHash)
 /// returns (bytes32 modelId)`. Targets
-/// `AIModelRegistryPortable` (see `boeing_binder::addr::AI_MODEL_REGISTRY`).
+/// `AIModelRegistryPortable` (see `defense_prime_binder::addr::AI_MODEL_REGISTRY`).
 ///
 /// All-static 2-slot calldata. Total length: 4 + 2 × 32 = 68 bytes.
 /// The contract returns a derived `modelId = keccak256(chainid ||

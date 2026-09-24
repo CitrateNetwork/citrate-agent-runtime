@@ -1,6 +1,6 @@
 Feature: list-compliance-posture capsule
   As an Operator
-  I want to read compliance posture rows from BoeingComplianceRegistry
+  I want to read compliance posture rows from defense_primeComplianceRegistry
   So that the harness exposes the same data the BFR-INT-12 tool returned
 
   Scenario: encodes correct ABI calldata

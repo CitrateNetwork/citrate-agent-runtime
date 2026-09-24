@@ -4,7 +4,7 @@
 //!
 //! | Tier | Signed by | Verification |
 //! |---|---|---|
-//! | `bundled` | Citrate Network Inc. canonical publisher key (FIPS HSM) | Registry returns the canonical key; signature MUST verify under it. Mismatch → `CapsuleSigningTierMismatch`. |
+//! | `bundled` | Citrate Inc. canonical publisher key (FIPS HSM) | Registry returns the canonical key; signature MUST verify under it. Mismatch → `CapsuleSigningTierMismatch`. |
 //! | `managed` | Org's procurement-chain CA (OrganizationSBT's `signing_authority`) | Registry returns the org-CA key for the active OrganizationSBT; signature MUST verify under it. |
 //! | `workspace` | Operator's local key (hardware-backed) | Registry returns `None`; the signature is verified separately by the workspace dual-approval flow. CIT-AGENT-3b stops short here. |
 //!

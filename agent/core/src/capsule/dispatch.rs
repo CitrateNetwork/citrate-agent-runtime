@@ -5,7 +5,7 @@
 //! per-capsule linkers eagerly, and expose a single `call_raw`
 //! method that invokes a named export on a named capsule.
 //!
-//! The boeing-shell consumes this through a per-tool adapter that
+//! The defense_prime-shell consumes this through a per-tool adapter that
 //! translates the chat tool's JSON args into the capsule's WIT
 //! types + formats the returned `Val` into a chat-displayable
 //! string. Adapter code stays in the consumer crate — this struct
@@ -191,7 +191,7 @@ impl CapsuleDispatch {
     }
 
     /// Names of every loaded capsule, alphabetized. Used by the
-    /// boeing-shell startup smoke ("the fleet has all 7 capsules
+    /// defense_prime-shell startup smoke ("the fleet has all 7 capsules
     /// I expect") + by the doctor pre-flight check.
     pub fn capsule_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.capsules.keys().cloned().collect();
@@ -206,7 +206,7 @@ impl CapsuleDispatch {
 
     /// Low-level invocation: instantiate the named capsule, look
     /// up `iface.func`, call with the given Vals, return the
-    /// single result Val. The boeing-shell adapter does the JSON
+    /// single result Val. The defense_prime-shell adapter does the JSON
     /// → Val + Val → chat-string translation per-tool.
     pub fn call_raw(
         &self,
@@ -410,7 +410,7 @@ impl CapsuleDispatch {
 
     /// Inspection accessor for the host context history (audit +
     /// tests). Note: each call to `call_raw` creates a fresh store,
-    /// so the history is per-invocation; the boeing-shell adapter
+    /// so the history is per-invocation; the defense_prime-shell adapter
     /// should drain the history via the linker's post-call inspection
     /// if it wants to retain it.
     pub fn engine(&self) -> &wasmtime::Engine {

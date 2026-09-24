@@ -1,6 +1,6 @@
 # CIT-AGENT-9c-1 — list-compliance-posture capsule.
 #
-# Reads BoeingComplianceRegistry on chain 40204 (Stage-9 deployment).
+# Reads defense_primeComplianceRegistry on chain 40204 (Stage-9 deployment).
 # The capsule encodes its own ABI calldata + decodes its own response
 # — the harness's eth-call host fn only enforces the allow-list and
 # routes the bytes.
@@ -13,7 +13,7 @@ content_hash = "sha256:000000000000000000000000000000000000000000000000000000000
 [capability]
 network = "none"
 filesystem = []
-# Single contract: BoeingComplianceRegistry on chain 40204
+# Single contract: defense_primeComplianceRegistry on chain 40204
 # (Stage-9 deployment, address from gui/citrate_rbac_bindings).
 chain_calls = ["eth_call:0x8dbbbc46d840f40205b48d76aa9fc5063b7d55d8"]
 subagent_spawn = false

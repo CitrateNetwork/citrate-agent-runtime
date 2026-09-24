@@ -1,9 +1,9 @@
 //! Human-in-the-loop approval queue — RFC-CIT-AGENT-0001 §3.1
 //! "HITL Queue" + §5 (approval state machine).
 //!
-//! BFR-INT-12b WP-4/WP-5 lived in `citrate_boeing_shell::tools` as a
+//! BFR-INT-12b WP-4/WP-5 lived in `citrate_defense_prime-shell::tools` as a
 //! single-in-flight + FIFO + 5-min-timeout approval queue. CIT-AGENT-1
-//! moves the queue and its supporting types here, where the Boeing
+//! moves the queue and its supporting types here, where the defense_prime
 //! shell consumes them through a re-export shim. RFC §3.2 names
 //! `ApprovalQueue` in the frozen v1.0 public surface.
 //!
@@ -632,7 +632,7 @@ impl ApprovalQueue {
 /// surface as `low`; chain writes as `medium`; role-grant escalation
 /// as `high` since it's the loudest privilege change.
 ///
-/// Defaults recognize the BFR-INT-12b Boeing catalog. Capsule-based
+/// Defaults recognize the BFR-INT-12b defense_prime catalog. Capsule-based
 /// callers (CIT-AGENT-3+) supply richer metadata via the manifest.
 fn risk_level(name: &str) -> &'static str {
     match name {
@@ -649,7 +649,7 @@ fn risk_level(name: &str) -> &'static str {
 fn describe(name: &str) -> String {
     match name {
         "list_compliance_posture" =>
-            "Read one compliance row from BoeingComplianceRegistry. Read-only.".to_string(),
+            "Read one compliance row from defense_primeComplianceRegistry. Read-only.".to_string(),
         "query_decisions_by_tenant" =>
             "Read recent agent decisions from AgentDecisionRegistryV2. Read-only.".to_string(),
         "query_supplier_status" =>
@@ -658,7 +658,7 @@ fn describe(name: &str) -> String {
     }
 }
 
-// ── Unit tests (moved from citrate_boeing_shell::tools) ────────────
+// ── Unit tests (moved from citrate_defense_prime-shell::tools) ────────────
 
 #[cfg(test)]
 mod tests {
@@ -1081,7 +1081,7 @@ mod tests {
                 call: ToolCall {
                     call_id: "c1".into(),
                     name: "anchor_session".into(),
-                    args: serde_json::json!({"scope": "Boeing/777X"}),
+                    args: serde_json::json!({"scope": "defense_prime/777X"}),
                 },
                 resolver: tx,
             });
