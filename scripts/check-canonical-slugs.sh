@@ -7,6 +7,8 @@
 # Usage: scripts/check-canonical-slugs.sh [repo-root]   (default: this repo)
 set -uo pipefail
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Fail closed: a bad path must not read as "no hits".
+git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || { echo "FAIL - not a git repository: $ROOT"; exit 2; }
 PATTERN='(github\.com[/:]|raw\.githubusercontent\.com/)(citrate-ai|citrate-network|SaulBuilds/citrate([^A-Za-z0-9_-]|$))'
 hits=$(git -C "$ROOT" grep -I -n -i -E "$PATTERN" -- . \
     ':!contracts/lib/**' ':!**/node_modules/**' ':!**/vendor/**' \
