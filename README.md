@@ -142,4 +142,4 @@ Chain id `40204` is compiled in. **Capsules = skills**: each is a directory unde
 
 ## License
 
-Source-available (BUSL-1.1) — free for personal/non-commercial use; commercial use requires a Citrate membership. This is **not** an open-source license.
+Licensed under the Apache License, Version 2.0 (see [`LICENSE`](LICENSE)). This is the open-source infrastructure tier of Citrate's open-core model. The commercial application layer is source-available under BUSL-1.1. Licensor: Citrate Inc.

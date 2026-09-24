@@ -9,7 +9,7 @@ name = "hermes-core"
 version = "0.4.0"
 edition = "2021"
 authors = ["Citrate Network"]
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
 description = "Hermes decision core: owner-only command boundary, two-plane routing, anti-injection primitives (HERMES-L-S1)."
 

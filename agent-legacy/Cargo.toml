@@ -1,4 +1,5 @@
 [package]
+license.workspace = true
 # Renamed from citrate-agent-core in CIT-AGENT-1 (path: agent-core/ →
 # agent-legacy/). The canonical citrate-agent-core now lives at
 # agent/core/ per RFC-CIT-AGENT-0001 + planset
