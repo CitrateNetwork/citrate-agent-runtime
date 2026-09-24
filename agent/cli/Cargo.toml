@@ -5,7 +5,7 @@ edition = "2021"
 description = "Citrate Agent CLI — `citrate-agent` binary. CIT-AGENT-7c lands the `doctor` subcommand; future slices add `daemon`, `step`, `install`, etc."
 authors = ["Citrate Network"]
 license = "Apache-2.0"
-repository = "https://github.com/citrate-network/citrate"
+repository = "https://github.com/CitrateNetwork/citrate-agent-runtime"
 
 [[bin]]
 name = "citrate-agent"
