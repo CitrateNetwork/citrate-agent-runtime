@@ -34,7 +34,7 @@ insecure-dev-hitl = []
 # current, reachable rev citrate-core already uses; signing now routes through
 # the shared lean `crate::tx` path. HTTPS (not the ssh alias) so an org member
 # builds with only their GitHub credential.
-citrate-wallet-core = { git = "https://github.com/CitrateNetwork/citrate-chain.git", rev = "2d1ca33a9796a615da7eb236ab95c7afb59a41f7" }
+citrate-wallet-core = { git = "https://github.com/CitrateNetwork/citrate-chain.git", rev = "f4a07811940a0962325d18e8ba44fea0ff50a3b4" }
 k256 = { version = "0.13", features = ["ecdsa"] }
 # AR-B-027: wipe key/seed material on drop.
 zeroize = "1.8"
