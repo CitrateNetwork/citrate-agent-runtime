@@ -467,31 +467,42 @@ fn json_to_val(
     use wasmtime::component::types::Type;
     use wasmtime::component::Val;
     let err = |want: &str| AgentError::Capsule(format!("arg {name:?}: expected {want}"));
+    // PBA-L6b-011: narrow with `try_from`, never `as`. An out-of-range value is a typed error;
+    // a silent wrap would make the effect queued for approval differ from the one requested.
+    let narrow = |want: &str| {
+        let want = want.to_string();
+        move |n: u64| {
+            AgentError::Capsule(format!("arg {name:?}: {n} is out of range for {want}"))
+        }
+    };
     match ty {
         Type::String => v
             .as_str()
             .map(|s| Val::String(s.to_string()))
             .ok_or_else(|| err("string")),
         Type::Bool => v.as_bool().map(Val::Bool).ok_or_else(|| err("bool")),
-        Type::U8 => v
-            .as_u64()
-            .map(|n| Val::U8(n as u8))
-            .ok_or_else(|| err("u8")),
-        Type::U16 => v
-            .as_u64()
-            .map(|n| Val::U16(n as u16))
-            .ok_or_else(|| err("u16")),
-        Type::U32 => v
-            .as_u64()
-            .map(|n| Val::U32(n as u32))
-            .ok_or_else(|| err("u32")),
+        Type::U8 => {
+            let n = v.as_u64().ok_or_else(|| err("u8"))?;
+            u8::try_from(n).map(Val::U8).map_err(|_| narrow("u8")(n))
+        }
+        Type::U16 => {
+            let n = v.as_u64().ok_or_else(|| err("u16"))?;
+            u16::try_from(n).map(Val::U16).map_err(|_| narrow("u16")(n))
+        }
+        Type::U32 => {
+            let n = v.as_u64().ok_or_else(|| err("u32"))?;
+            u32::try_from(n).map(Val::U32).map_err(|_| narrow("u32")(n))
+        }
         Type::U64 => v.as_u64().map(Val::U64).ok_or_else(|| err("u64")),
         Type::List(list) if matches!(list.ty(), Type::U8) => {
             let bytes: Vec<u8> = if let Some(s) = v.as_str() {
                 hex::decode(s.trim_start_matches("0x")).map_err(|_| err("hex byte string"))?
             } else if let Some(arr) = v.as_array() {
                 arr.iter()
-                    .map(|n| n.as_u64().map(|x| x as u8).ok_or_else(|| err("byte array")))
+                    .map(|x| {
+                        let n = x.as_u64().ok_or_else(|| err("byte array"))?;
+                        u8::try_from(n).map_err(|_| narrow("a byte (u8) array element")(n))
+                    })
                     .collect::<Result<Vec<u8>, _>>()?
             } else {
                 return Err(err("hex string or byte array"));
@@ -862,6 +873,94 @@ tier = "bundled"
         // fail-closed: wrong JSON shape for the declared type is an error, never a coerced value.
         assert!(json_to_val(&Type::U8, &serde_json::json!("not-a-number"), "a").is_err());
         assert!(json_to_val(&Type::String, &serde_json::json!(5), "a").is_err());
+    }
+
+    /// PBA-L6b-011 regression (PoC `poc_shell_truncate_panic.rs` variant 2):
+    /// out-of-range integers must be refused, never narrowed. Pre-fix
+    /// `n as u32` turned 4294967297 into U32(1) and a byte-array element 256
+    /// into U8(0).
+    #[test]
+    fn json_to_val_refuses_out_of_range_integers_pba_l6b_011() {
+        use wasmtime::component::types::Type;
+        let j = |v: serde_json::Value| v;
+        assert!(json_to_val(&Type::U8, &j(serde_json::json!(256)), "a").is_err());
+        assert!(json_to_val(&Type::U16, &j(serde_json::json!(65_536)), "a").is_err());
+        assert!(json_to_val(&Type::U32, &j(serde_json::json!(4_294_967_297u64)), "a").is_err());
+        // Boundaries still map exactly.
+        assert!(matches!(
+            json_to_val(&Type::U8, &serde_json::json!(255), "a"),
+            Ok(wasmtime::component::Val::U8(255))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U16, &serde_json::json!(65_535), "a"),
+            Ok(wasmtime::component::Val::U16(65_535))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U32, &serde_json::json!(4_294_967_295u64), "a"),
+            Ok(wasmtime::component::Val::U32(4_294_967_295))
+        ));
+        let err = json_to_val(&Type::U32, &serde_json::json!(4_294_967_297u64), "amount")
+            .expect_err("out of range");
+        assert!(
+            err.to_string().contains("amount") && err.to_string().contains("out of range"),
+            "typed error names the arg and the reason: {err}"
+        );
+    }
+
+    /// PBA-L6b-011 at the real entry point: `call_json` (what /run_skill
+    /// calls) with a byte-array element > 255 must fail BEFORE any chain
+    /// dispatch, so the effect a human is asked about is exactly the effect
+    /// that was requested. Pre-fix the `echo-chain` capsule forwarded
+    /// `[0x01, 0x01]` for a requested `[1, 257]`.
+    #[test]
+    fn call_json_refuses_a_wrapping_byte_array_pba_l6b_011() {
+        use crate::capsule::dispatcher::EthCallDispatcher;
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<Vec<u8>>>);
+        impl EthCallDispatcher for Recorder {
+            fn eth_call(&self, _to: &crate::capsule::wasm::Address, data: &[u8]) -> Result<Vec<u8>, String> {
+                self.0.lock().map_err(|e| e.to_string())?.push(data.to_vec());
+                Ok(vec![])
+            }
+        }
+        let rec = Arc::new(Recorder::default());
+        let dispatch =
+            CapsuleDispatch::load_from_dir(&capsules_root(), Some(rec.clone()), None, None)
+                .expect("fleet loads");
+        let to: Vec<u64> = hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40")
+            .expect("hex")
+            .into_iter()
+            .map(u64::from)
+            .collect();
+        let res = dispatch.call_json(
+            "echo-chain",
+            &serde_json::json!({ "to": to, "data": [1, 257] }),
+        );
+        assert!(res.is_err(), "a wrapping byte must be refused, got {res:?}");
+        assert!(
+            rec.0.lock().expect("lock").is_empty(),
+            "nothing may reach the chain dispatcher: {:?}",
+            rec.0.lock().expect("lock")
+        );
+        // The in-range request still goes through, byte-exact.
+        dispatch
+            .call_json("echo-chain", &serde_json::json!({ "to": to, "data": [1, 255] }))
+            .expect("in-range call runs");
+        assert_eq!(rec.0.lock().expect("lock").as_slice(), &[vec![1u8, 255]]);
+    }
+
+    /// PBA-L6b-011 tripwire (class: silent integer narrowing of caller JSON).
+    /// `json_to_val` must not use an `as` cast to a narrower integer type.
+    #[test]
+    fn tripwire_json_to_val_has_no_narrowing_casts_pba_l6b_011() {
+        let src = include_str!("dispatch.rs");
+        let start = src.find("fn json_to_val(").expect("json_to_val present");
+        let end = start + src[start..].find("\nfn val_to_json(").expect("val_to_json follows");
+        let body = &src[start..end];
+        for cast in [" as u8", " as u16", " as u32", " as usize", " as i8", " as i16", " as i32"] {
+            assert!(!body.contains(cast), "json_to_val narrows with `{cast}` (use try_from)");
+        }
     }
 
     #[test]
