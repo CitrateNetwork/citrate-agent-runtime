@@ -244,6 +244,10 @@ async fn approvals(
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // PBA-L6b-010: the approval surface is closed while the e-stop is engaged.
+    if st.estop.is_stopped() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     // S6.2: the queue is empty until runSkill (S6.3) submits an effect; surface the head honestly.
     let mut out = Vec::new();
     if let Some(p) = st.queue.peek() {
@@ -317,6 +321,10 @@ fn resolve_body(
     body: &[u8],
     approve: bool,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // PBA-L6b-010: no approval can be resolved after the operator pulled the kill switch.
+    if st.estop.is_stopped() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let id = requested_call_id(body).ok_or(StatusCode::BAD_REQUEST)?;
     let res = if approve {
         st.queue.approve_by_id(&id)
@@ -396,7 +404,10 @@ async fn stop(
         return Err(StatusCode::UNAUTHORIZED);
     }
     st.estop.trigger();
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // PBA-L6b-010: freeze + drain the approval queue so nothing parked before the stop can be
+    // released after it, and running skills cannot queue new effects.
+    let drained = st.queue.freeze_and_drain();
+    Ok(Json(serde_json::json!({ "ok": true, "drained": drained })))
 }
 
 // A tiny constant-time compare so the bearer isn't `==`'d.

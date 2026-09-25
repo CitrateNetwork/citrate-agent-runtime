@@ -562,3 +562,75 @@ fn tripwire_no_idless_head_resolution_pba_l6b_009() {
         assert!(!sidecar.contains(needle), "sidecar calls an id-less resolve path: {needle}");
     }
 }
+
+/// PBA-L6b-010 regression: POST /stop must freeze and drain the approval surface. Pre-fix /stop only
+/// flipped the e-stop: /approvals kept serving to/data, an id-bound approve still released the
+/// effect, and parked effects on both tracks stayed live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_freezes_and_drains_the_approval_queue_pba_l6b_010() {
+    use citrate_agent_core::hitl::{Quorum, Role, Signer};
+    let queue = Arc::new(ApprovalQueue::new());
+    // One FIFO effect and one role-track (quorum) effect, both parked.
+    let q = queue.clone();
+    let fifo = tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("s1")).await });
+    let q = queue.clone();
+    let role = tokio::spawn(async move {
+        q.submit_for_action(
+            chain_effect_call("s2"),
+            b"payload".to_vec(),
+            Quorum::for_tier(
+                citrate_agent_core::capsule::manifest::RiskTier::High,
+                &[Role::Reviewer, Role::ComplianceOfficer],
+            ),
+            Signer {
+                id: "operator-1".into(),
+                role: Role::Operator,
+            },
+        )
+        .await
+    });
+    wait_depth(&queue, 1).await;
+    wait_role_depth(&queue, 1).await;
+    let st = state_with(queue.clone());
+
+    let resp = app(st.clone()).oneshot(authed("POST", "/stop")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Both parked effects are refused, not left pending.
+    let fifo_out = tokio::time::timeout(std::time::Duration::from_secs(2), fifo)
+        .await
+        .expect("FIFO effect must be resolved by /stop")
+        .unwrap();
+    assert_eq!(fifo_out, ApprovalOutcomePublic::Rejected);
+    let role_out = tokio::time::timeout(std::time::Duration::from_secs(2), role)
+        .await
+        .expect("role-track effect must be resolved by /stop")
+        .unwrap();
+    assert_eq!(role_out, ApprovalOutcomePublic::Rejected);
+    assert_eq!(queue.depth(), 0);
+    assert_eq!(queue.role_pending_depth(), 0);
+
+    // While stopped the approval surface is closed.
+    let resp = app(st.clone()).oneshot(authed("GET", "/approvals")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    for path in ["/approvals/approve", "/approvals/reject"] {
+        let resp = app(st.clone())
+            .oneshot(resolve_req(path, r#"{"id":"s1"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path} while stopped");
+    }
+
+    // A skill still running when the stop landed cannot queue a new effect: the gate refuses it
+    // at once instead of parking it for a human who can no longer act.
+    let q = queue.clone();
+    let late = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("s3")).await }),
+    )
+    .await
+    .expect("a post-stop submission must not park")
+    .unwrap();
+    assert_eq!(late, ApprovalOutcomePublic::Rejected);
+    assert_eq!(queue.depth(), 0);
+}

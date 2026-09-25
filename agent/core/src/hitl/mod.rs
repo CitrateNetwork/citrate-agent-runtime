@@ -262,6 +262,9 @@ pub struct ApprovalQueue {
     signer_roster: Option<std::sync::Arc<dyn SignerRoster>>,
     // PBA-L6b-009 — monotonically increasing submission nonce.
     next_nonce: std::sync::atomic::AtomicU64,
+    // PBA-L6b-010 — set by the emergency stop. While frozen every new
+    // submission is refused at once (never parked) and the queue is empty.
+    frozen: std::sync::atomic::AtomicBool,
 }
 
 /// PBA-L6b-009 — removes a FIFO submission's entry when its waiter goes away
@@ -304,6 +307,11 @@ impl ApprovalQueue {
     /// Same as [`submit`] but returns the rich outcome so callers
     /// can write a faithful decision-log row.
     pub async fn submit_with_outcome(&self, call: ToolCall) -> ApprovalOutcomePublic {
+        // PBA-L6b-010: after an emergency stop nothing new is queued — not
+        // even an auto-granted call.
+        if self.is_frozen() {
+            return ApprovalOutcomePublic::Rejected;
+        }
         // BFR-INT-12b WP-4 — auto-grant fast path. Resolved before
         // the queue is touched.
         if self.is_trusted(&call.name) {
@@ -322,6 +330,11 @@ impl ApprovalQueue {
                 Ok(q) => q,
                 Err(_) => return ApprovalOutcomePublic::Rejected,
             };
+            // PBA-L6b-010: re-check under the lock so a submission racing
+            // `freeze_and_drain` cannot slip in after the drain.
+            if self.is_frozen() {
+                return ApprovalOutcomePublic::Rejected;
+            }
             q.push_back(PendingEntry {
                 call,
                 resolver: tx,
@@ -343,6 +356,40 @@ impl ApprovalQueue {
             Ok(Err(_)) => ApprovalOutcomePublic::Rejected, // sender dropped
             Err(_) => ApprovalOutcomePublic::TimedOut,
         }
+    }
+
+    /// PBA-L6b-010 — emergency stop for the approval surface. Freezes the
+    /// queue (every later submission is refused immediately) and rejects
+    /// every pending entry on BOTH tracks, so no parked effect can be released
+    /// after the operator pulled the kill switch. Returns how many entries
+    /// were rejected. Idempotent.
+    pub fn freeze_and_drain(&self) -> usize {
+        self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut drained = 0;
+        if let Ok(mut q) = self.pending.lock() {
+            for entry in q.drain(..) {
+                let _ = entry.resolver.send(ApprovalOutcome::Rejected);
+                drained += 1;
+            }
+        }
+        if let Ok(mut role_q) = self.role_pending.lock() {
+            for (_, entry) in role_q.drain() {
+                let _ = entry.resolver.send(ApprovalOutcome::Rejected);
+                drained += 1;
+            }
+        }
+        drained
+    }
+
+    /// PBA-L6b-010 — lift the freeze (the operator reset the e-stop). Entries
+    /// drained by the stop stay rejected.
+    pub fn thaw(&self) {
+        self.frozen.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// PBA-L6b-010 — true while the emergency stop holds the queue frozen.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     // PBA-L6b-009: the id-less `approve()` / `reject()` ("resolve whatever is
@@ -463,6 +510,10 @@ impl ApprovalQueue {
         quorum: Quorum,
         proposer: Signer,
     ) -> ApprovalOutcomePublic {
+        // PBA-L6b-010: nothing new is queued after an emergency stop.
+        if self.is_frozen() {
+            return ApprovalOutcomePublic::Rejected;
+        }
         // Tier-low fast path.
         if matches!(quorum, Quorum::AutoApprove) {
             return ApprovalOutcomePublic::AutoApproved;
@@ -474,6 +525,9 @@ impl ApprovalQueue {
                 Ok(q) => q,
                 Err(_) => return ApprovalOutcomePublic::Rejected,
             };
+            if self.is_frozen() {
+                return ApprovalOutcomePublic::Rejected;
+            }
             role_q.insert(
                 call_id.clone(),
                 RoleAwareEntry {
@@ -1204,6 +1258,60 @@ mod tests {
         h.abort();
         let _ = h.await;
         assert_eq!(q.depth(), 0, "a cancelled submission must leave the queue");
+    }
+
+    /// PBA-L6b-010: `freeze_and_drain` rejects every parked entry on both
+    /// tracks, reports the count, and refuses later submissions (including an
+    /// auto-granted one) without parking them; `thaw` reopens the queue.
+    #[tokio::test]
+    async fn freeze_and_drain_rejects_both_tracks_and_refuses_new_work_pba_l6b_010() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let fifo = tokio::spawn(async move { qa.submit_with_outcome(mkcall("f")).await });
+        let qb = q.clone();
+        let role = tokio::spawn(async move {
+            qb.submit_for_action(
+                mkcall("r"),
+                b"p".to_vec(),
+                Quorum::for_tier(crate::capsule::manifest::RiskTier::Medium, &[Role::Reviewer]),
+                signer_for("op", Role::Operator),
+            )
+            .await
+        });
+        while q.depth() < 1 || q.role_pending_depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!q.is_frozen());
+        assert_eq!(q.freeze_and_drain(), 2);
+        assert!(q.is_frozen());
+        assert_eq!(fifo.await.unwrap(), ApprovalOutcomePublic::Rejected);
+        assert_eq!(role.await.unwrap(), ApprovalOutcomePublic::Rejected);
+        assert_eq!((q.depth(), q.role_pending_depth()), (0, 0));
+
+        q.add_grant("granted");
+        assert_eq!(
+            q.submit_with_outcome(mkcall("granted")).await,
+            ApprovalOutcomePublic::Rejected,
+            "a frozen queue refuses even auto-granted calls"
+        );
+        assert_eq!(
+            q.submit_for_action(
+                mkcall("low"),
+                vec![],
+                Quorum::AutoApprove,
+                signer_for("op", Role::Operator)
+            )
+            .await,
+            ApprovalOutcomePublic::Rejected
+        );
+        assert_eq!(q.freeze_and_drain(), 0, "idempotent");
+
+        q.thaw();
+        assert!(!q.is_frozen());
+        assert_eq!(
+            q.submit_with_outcome(mkcall("granted")).await,
+            ApprovalOutcomePublic::AutoApproved
+        );
     }
 
     #[test]
