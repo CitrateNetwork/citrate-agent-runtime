@@ -135,9 +135,31 @@ async fn approvals_is_empty_until_a_skill_runs() {
 // unknown skill, no-dispatch, estop); the real gate-path e2e (a skill's effect surfaces on the queue)
 // is `run_skill_surfaces_a_chain_effect_on_the_queue` further down, driven from the real capsule dir.
 
-// The built capsule fixtures live at the repo root, but tests run from the crate dir.
-fn capsules_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../capsules")
+// PBA-L6b-015: the eth-sender-test capsule is a test fixture, not part of the shipped fleet. It is
+// loaded from test-fixtures/ with an allowlist that admits exactly its signed build.
+fn fixture_capsules_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-fixtures/capsules")
+}
+
+fn fixture_dispatch(queue: Arc<ApprovalQueue>) -> Option<Arc<CapsuleDispatch>> {
+    use citrate_agent_core::capsule::allowlist::AllowEntry;
+    let allow = FleetAllowlist::from_entries(vec![AllowEntry {
+        name: "eth-sender-test".into(),
+        min_version: "0.1.0".into(),
+        content_hashes: vec![
+            "sha256:f6364f40f252d5212a3bc3f203ccf4019dfb8850ce96bfb5c67ecedcbffd8086".into(),
+        ],
+    }]);
+    crate::load_dispatch_with_allowlist(&fixture_capsules_dir(), &allow, queue)
+}
+
+/// PBA-L6b-015: the production loader (bundled allowlist) does not run the test capsule even when
+/// its signed archive sits in the capsule dir.
+#[test]
+fn production_loader_refuses_the_test_capsule_pba_l6b_015() {
+    let d = crate::load_dispatch(&fixture_capsules_dir(), Arc::new(ApprovalQueue::new()))
+        .expect("dir loads");
+    assert!(!d.has("eth-sender-test"));
 }
 
 fn run_body(name: &str, args: serde_json::Value) -> Request<Body> {
@@ -185,8 +207,8 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
     // is still FIFO-only; to approve a privileged effect an operator surface
     // must adopt the role-aware submit_for_action/add_signature track.)
     let queue = Arc::new(ApprovalQueue::new());
-    let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
-    assert!(dispatch.is_some(), "the repo capsules/ dir must load");
+    let dispatch = fixture_dispatch(queue.clone());
+    assert!(dispatch.is_some(), "the test-fixtures capsule dir must load");
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue: queue.clone(),
@@ -232,8 +254,8 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
 async fn run_skill_404s_for_an_unknown_skill() {
     // A loaded dispatch, but the name isn't in the catalog.
     let queue = Arc::new(ApprovalQueue::new());
-    let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
-    assert!(dispatch.is_some(), "the repo capsules/ dir must load");
+    let dispatch = fixture_dispatch(queue.clone());
+    assert!(dispatch.is_some(), "the test-fixtures capsule dir must load");
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue,

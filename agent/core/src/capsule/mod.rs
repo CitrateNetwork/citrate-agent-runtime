@@ -13,6 +13,7 @@
 //! `.agentile/formal/specs/agent/CapsuleInstall.tla` (CIT-AGENT-2 —
 //! 2,600 distinct states PASS).
 
+pub mod allowlist;
 pub mod archive;
 pub mod bundled_key;
 pub mod dispatch;
@@ -2642,6 +2643,8 @@ tier = "bundled"
             .parent()
             .and_then(|p| p.parent())
             .expect("walk up to citrate_v0.01.1/")
+            // PBA-L6b-015: the test capsule lives outside the shipped fleet.
+            .join("test-fixtures")
             .join("capsules")
             .join("eth-sender-test");
         let wasm = std::fs::read(capsule_dir.join("capsule.wasm")).unwrap();

@@ -132,7 +132,7 @@ No `.env.example`; the committed template is `.env.hermes` (edit it, don't ship 
 | `CITRATE_HERMES_TOKEN_FILE` | — (required) | 0600 bearer-token file for the sidecar |
 | `CITRATE_HERMES_CAPSULES` | `./capsules` | capsule (skill) directory |
 
-Chain id `40204` is compiled in. **Capsules = skills**: each is a directory under `capsules/` with a `manifest.toml` (declaring capabilities, data class, risk tier, provenance/publisher DID, signing tier), a signed `.cps` archive, a WIT world, and gherkin features.
+Chain id `40204` is compiled in. **Capsules = skills**: each is a directory under `capsules/` with a `manifest.toml` (declaring capabilities, data class, risk tier, provenance/publisher DID, signing tier), a signed `.cps` archive, a WIT world, and gherkin features. A signed capsule runs only if its `(name, version, content_hash)` is on the fleet allowlist compiled into the runtime (`agent/core/src/capsule/allowlist.rs`, with a per-capsule version floor); re-packing a capsule means adding its new hash there. Test-only capsules live under `test-fixtures/capsules/`, not in the shipped fleet.
 
 ## Links
 

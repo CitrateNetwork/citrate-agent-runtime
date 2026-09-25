@@ -28,6 +28,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use citrate_agent_core::capsule::allowlist::FleetAllowlist;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_core::capsule::dispatcher::ApprovalGate;
 use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
@@ -79,8 +80,18 @@ pub fn load_dispatch(
     capsule_dir: &std::path::Path,
     queue: Arc<ApprovalQueue>,
 ) -> Option<Arc<CapsuleDispatch>> {
+    load_dispatch_with_allowlist(capsule_dir, &FleetAllowlist::bundled(), queue)
+}
+
+/// [`load_dispatch`] against an explicit fleet allowlist (PBA-L6b-015 test fixtures). Production
+/// uses the compiled-in [`FleetAllowlist::bundled`] via `load_dispatch`.
+pub(crate) fn load_dispatch_with_allowlist(
+    capsule_dir: &std::path::Path,
+    allowlist: &FleetAllowlist,
+    queue: Arc<ApprovalQueue>,
+) -> Option<Arc<CapsuleDispatch>> {
     let gate: Arc<dyn ApprovalGate> = Arc::new(QueuedApprovalGate::new(queue));
-    match CapsuleDispatch::load_from_dir(capsule_dir, None, None, Some(gate)) {
+    match CapsuleDispatch::load_from_dir_with_allowlist(capsule_dir, allowlist, None, None, Some(gate)) {
         Ok(d) => Some(Arc::new(d)),
         Err(e) => {
             eprintln!("[citrate-agent-sidecar] no capsule dispatch ({capsule_dir:?}): {e}");
