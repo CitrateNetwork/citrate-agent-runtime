@@ -34,6 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The dispatch carries the QueuedApprovalGate over `queue`, so a skill's chain effect surfaces on
     // the same queue /approvals + /status read.
     let dispatch = load_dispatch(capsule_path, queue.clone());
+    // PBA-L6b-015: list only skills the dispatch will actually run (a refused or unverified
+    // capsule is not a skill).
+    let skills: Vec<_> = match &dispatch {
+        Some(d) => skills.into_iter().filter(|s| d.has(&s.name)).collect(),
+        None => skills,
+    };
 
     let state = Arc::new(AppState {
         estop: EmergencyStop::new(),
@@ -41,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         skills,
         dispatch,
         bearer,
+        run_slots: Arc::new(tokio::sync::Semaphore::new(agent_sidecar::MAX_CONCURRENT_SKILLS)),
     });
 
     // AR-B-024: the control plane is a bearer-authed LOOPBACK plane by contract.

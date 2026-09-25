@@ -64,7 +64,14 @@ pub struct AppState {
     /// with 503 rather than pretend a skill ran.
     pub dispatch: Option<Arc<CapsuleDispatch>>,
     pub bearer: String,
+    /// PBA-L6b-032: bounds concurrently running skills. Each `run_skill` holds one permit for the
+    /// life of its background task; when none is free the request is refused with 429 instead of
+    /// piling up blocked workers.
+    pub run_slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// PBA-L6b-032: at most this many skills run at once.
+pub const MAX_CONCURRENT_SKILLS: usize = 4;
 
 /// Build the capsule dispatch for `capsule_dir`, wired with the [`QueuedApprovalGate`] over `queue`.
 ///
@@ -149,6 +156,12 @@ struct StatusBody {
     skills: usize,
     #[serde(rename = "pendingApprovals")]
     pending_approvals: usize,
+    /// PBA-L6b-032: role-track (quorum) actions pending, which `/approvals` does not list.
+    #[serde(rename = "rolePendingApprovals")]
+    role_pending_approvals: usize,
+    /// PBA-L6b-032: skills currently running.
+    #[serde(rename = "runningSkills")]
+    running_skills: usize,
 }
 
 #[derive(Serialize)]
@@ -238,6 +251,8 @@ async fn status(
         running: !st.estop.is_stopped(),
         skills: st.skills.len(),
         pending_approvals: st.queue.depth(),
+        role_pending_approvals: st.queue.role_pending_depth(),
+        running_skills: MAX_CONCURRENT_SKILLS.saturating_sub(st.run_slots.available_permits()),
     }))
 }
 
@@ -376,6 +391,13 @@ async fn run_skill(
     if !st.skills.iter().any(|s| s.name == req.name) {
         return Err(StatusCode::NOT_FOUND);
     }
+    // PBA-L6b-032: bounded concurrency. The permit moves into the task and is released when the
+    // skill finishes (or is refused), so a burst of run_skill cannot pin every worker.
+    let permit = st
+        .run_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
 
     // Run the capsule on a background task and return {ok} = ACCEPTED, not the result. This is
     // required, not a shortcut: any chain effect the skill attempts blocks inside the ApprovalGate
@@ -392,6 +414,7 @@ async fn run_skill(
     // in progress needs host-fn-level hooks — tracked separately.)
     let estop = st.estop.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         if estop.is_stopped() {
             eprintln!("[citrate-agent-sidecar] skill {name:?} aborted: e-stop engaged before start");
             return;
