@@ -34,18 +34,44 @@ pub const AFFIRMATION_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
 /// captured invoke attestation is not a valid affirm attestation (and vice
 /// versa). The version suffix lets the preimage evolve (e.g. add a nonce/expiry)
 /// without silently accepting old signatures.
-const BREAKGLASS_INVOKE_DOMAIN: &[u8] = b"CIT-BREAKGLASS-INVOKE-v1";
-const BREAKGLASS_AFFIRM_DOMAIN: &[u8] = b"CIT-BREAKGLASS-AFFIRM-v1";
+///
+/// PBA-L6b-013: v2 preimages also bind the action PAYLOAD (see
+/// [`breakglass_preimage`]); v1 signatures (action_id only) no longer verify.
+const BREAKGLASS_INVOKE_DOMAIN: &[u8] = b"CIT-BREAKGLASS-INVOKE-v2";
+const BREAKGLASS_AFFIRM_DOMAIN: &[u8] = b"CIT-BREAKGLASS-AFFIRM-v2";
 
-/// Domain-separated attestation preimage: `domain || 0x00 || action_id`. The
-/// `0x00` separator keeps the domain and the (arbitrary) action_id
-/// unambiguous even though the domain tags are fixed-length and distinct.
-fn breakglass_preimage(domain: &[u8], action_id: &str) -> Vec<u8> {
-    let mut p = Vec::with_capacity(domain.len() + 1 + action_id.len());
+/// SHA-256 of the action payload a break-glass attestation covers.
+pub fn breakglass_payload_hash(payload: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(payload).into()
+}
+
+/// Domain-separated attestation preimage:
+/// `domain || 0x00 || sha256(payload) || action_id`.
+///
+/// PBA-L6b-013: the v1 preimage covered only `domain || action_id`, so an
+/// affirmation said nothing about WHAT was done under that id. The payload
+/// hash is fixed-length and precedes the variable-length action_id, so the
+/// encoding stays unambiguous.
+pub fn breakglass_preimage(domain: &[u8], action_id: &str, payload_hash: &[u8; 32]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(domain.len() + 1 + 32 + action_id.len());
     p.extend_from_slice(domain);
     p.push(0x00);
+    p.extend_from_slice(payload_hash);
     p.extend_from_slice(action_id.as_bytes());
     p
+}
+
+/// The exact bytes a SecurityOfficer signs to invoke break-glass on
+/// `action_id` for `payload`.
+pub fn invoke_preimage(action_id: &str, payload: &[u8]) -> Vec<u8> {
+    breakglass_preimage(BREAKGLASS_INVOKE_DOMAIN, action_id, &breakglass_payload_hash(payload))
+}
+
+/// The exact bytes an affirmer signs; `payload` must be the payload the
+/// invocation recorded.
+pub fn affirm_preimage(action_id: &str, payload: &[u8]) -> Vec<u8> {
+    breakglass_preimage(BREAKGLASS_AFFIRM_DOMAIN, action_id, &breakglass_payload_hash(payload))
 }
 
 /// The five-role lattice — the set of approvers notified on invoke.
@@ -91,6 +117,9 @@ pub struct BreakGlassEntry {
     pub notified: BTreeSet<Role>,
     pub affirmations: HashMap<Role, Signer>,
     pub surface_count: u32,
+    /// PBA-L6b-013: SHA-256 of the action payload the invocation covers.
+    /// Every affirmation must sign over the same hash.
+    pub payload_hash: Option<[u8; 32]>,
 }
 
 impl BreakGlassEntry {
@@ -103,6 +132,7 @@ impl BreakGlassEntry {
             notified: BTreeSet::new(),
             affirmations: HashMap::new(),
             surface_count: 0,
+            payload_hash: None,
         }
     }
 }
@@ -214,9 +244,10 @@ impl BreakGlassRegistry {
         &self,
         domain: &[u8],
         action_id: &str,
+        payload_hash: &[u8; 32],
         attested: &AttestedSignature,
     ) -> Result<Signer, BreakGlassError> {
-        verify_attestation(&breakglass_preimage(domain, action_id), attested)
+        verify_attestation(&breakglass_preimage(domain, action_id, payload_hash), attested)
             .map_err(|e| BreakGlassError::AttestationInvalid(e.to_string()))?;
         let dev_allowed = cfg!(test) || cfg!(feature = "insecure-dev-hitl");
         if !signer_is_authorized(
@@ -233,16 +264,23 @@ impl BreakGlassRegistry {
     /// SecurityOfficer invokes break-glass on an action. Validates
     /// the ITAR / eligibility / role preconditions, then transitions
     /// Pending → Invoked and fills `notified` with all 5 approvers.
+    ///
+    /// PBA-L6b-013: `payload` is the action being authorised; the invoker
+    /// signs [`invoke_preimage`]`(action_id, payload)` and every affirmer must
+    /// sign over the same payload hash.
     pub fn invoke(
         &self,
         action_id: &str,
+        payload: &[u8],
         attested: AttestedSignature,
         manifest: &Manifest,
         now: Instant,
     ) -> Result<(), BreakGlassError> {
         // RM-G.2: a caller-asserted role is not enough — require a verified
         // attestation over the action_id from a roster-authorized key.
-        let signer = self.authorize(BREAKGLASS_INVOKE_DOMAIN, action_id, &attested)?;
+        let payload_hash = breakglass_payload_hash(payload);
+        let signer =
+            self.authorize(BREAKGLASS_INVOKE_DOMAIN, action_id, &payload_hash, &attested)?;
         if signer.role != Role::SecurityOfficer {
             return Err(BreakGlassError::NotSecurityOfficer);
         }
@@ -266,6 +304,7 @@ impl BreakGlassRegistry {
         entry.invoked_at = Some(now);
         entry.invoker = Some(signer);
         entry.notified = all_approvers();
+        entry.payload_hash = Some(payload_hash);
         Ok(())
     }
 
@@ -278,13 +317,6 @@ impl BreakGlassRegistry {
         attested: AttestedSignature,
         now: Instant,
     ) -> Result<(), BreakGlassError> {
-        // RM-G.2: verified attestation + roster authorization required.
-        // AR-B-026: affirm uses a DISTINCT domain from invoke, so an invoke
-        // signature cannot be replayed here.
-        let signer = self.authorize(BREAKGLASS_AFFIRM_DOMAIN, action_id, &attested)?;
-        if !matches!(signer.role, Role::Reviewer | Role::ComplianceOfficer) {
-            return Err(BreakGlassError::NotAffirmationRole);
-        }
         let mut entries = self
             .entries
             .lock()
@@ -294,6 +326,17 @@ impl BreakGlassRegistry {
             .ok_or(BreakGlassError::UnknownActionId)?;
         if entry.phase != BreakGlassPhase::Invoked {
             return Err(BreakGlassError::NotInvoked);
+        }
+        let payload_hash = entry.payload_hash.ok_or(BreakGlassError::NotInvoked)?;
+        // RM-G.2: verified attestation + roster authorization required.
+        // AR-B-026: affirm uses a DISTINCT domain from invoke, so an invoke
+        // signature cannot be replayed here.
+        // PBA-L6b-013: the affirmation must cover the payload the invocation
+        // recorded, not just the action id.
+        let signer =
+            self.authorize(BREAKGLASS_AFFIRM_DOMAIN, action_id, &payload_hash, &attested)?;
+        if !matches!(signer.role, Role::Reviewer | Role::ComplianceOfficer) {
+            return Err(BreakGlassError::NotAffirmationRole);
         }
         if let Some(invoker) = &entry.invoker {
             if invoker.id == signer.id {
@@ -305,7 +348,12 @@ impl BreakGlassRegistry {
                 return Err(BreakGlassError::AffirmationWindowExpired);
             }
         }
-        if entry.affirmations.contains_key(&signer.role) {
+        // PBA-L6b-013: two-person affirmation means two SIGNERS. The roster
+        // lets one key hold several roles, so dedup by signer id as well as by
+        // role (a second signer of an already-affirmed role adds nothing).
+        if entry.affirmations.contains_key(&signer.role)
+            || entry.affirmations.values().any(|s| s.id == signer.id)
+        {
             return Err(BreakGlassError::DuplicateAffirmer);
         }
         entry.affirmations.insert(signer.role, signer);
@@ -400,12 +448,12 @@ mod tests {
         // Self-minted SO key, NOT on the roster → rejected even with a valid sig.
         let evil = attest("evil-so", Role::SecurityOfficer, "act1");
         let err = reg
-            .invoke("act1", evil, &m, Instant::now())
+            .invoke("act1", P, evil, &m, Instant::now())
             .expect_err("unauthorized SO must be rejected");
         assert!(matches!(err, BreakGlassError::SignerNotAuthorized));
 
         // Enrolled SO key → invoke succeeds.
-        reg.invoke("act1", good, &m, Instant::now())
+        reg.invoke("act1", P, good, &m, Instant::now())
             .expect("rostered SO invokes");
     }
 
@@ -454,13 +502,26 @@ mod tests {
         }
     }
 
+    /// The action payload every test invocation authorises.
+    const P: &[u8] = b"test action payload";
+
     fn attest_domain(name: &str, role: Role, action_id: &str, domain: &[u8]) -> AttestedSignature {
+        attest_payload(name, role, action_id, domain, P)
+    }
+
+    fn attest_payload(
+        name: &str,
+        role: Role,
+        action_id: &str,
+        domain: &[u8],
+        payload: &[u8],
+    ) -> AttestedSignature {
         let mut seed = [0u8; 32];
         let bytes = name.as_bytes();
         let n = bytes.len().min(32);
         seed[..n].copy_from_slice(&bytes[..n]);
         let s = Ed25519FileSurface::from_seed(seed, role);
-        s.sign(&breakglass_preimage(domain, action_id))
+        s.sign(&breakglass_preimage(domain, action_id, &breakglass_payload_hash(payload)))
             .expect("attest sign")
     }
 
@@ -479,8 +540,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let err = reg
-            .invoke(
-                "act1",
+            .invoke("act1", P,
                 attest("alice", Role::Reviewer, "act1"),
                 &m,
                 Instant::now(),
@@ -494,7 +554,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![DataClass::Itar], vec![], vec![]);
         let err = reg
-            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+            .invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("ITAR reads block");
         assert_eq!(err, BreakGlassError::ItarBlocked);
     }
@@ -504,7 +564,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![DataClass::Itar], vec![]);
         let err = reg
-            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+            .invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("ITAR writes block");
         assert_eq!(err, BreakGlassError::ItarBlocked);
     }
@@ -514,7 +574,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![DataClass::Itar]);
         let err = reg
-            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+            .invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("ITAR emits block");
         assert_eq!(err, BreakGlassError::ItarBlocked);
     }
@@ -524,7 +584,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(false, vec![], vec![], vec![]);
         let err = reg
-            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+            .invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("not eligible");
         assert_eq!(err, BreakGlassError::NotEligible);
     }
@@ -533,7 +593,7 @@ mod tests {
     fn invoke_happy_path_notifies_all_approvers() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![DataClass::Cui], vec![], vec![]);
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect("invoke succeeds");
         let entry = reg.get("act1").expect("entry exists");
         assert_eq!(entry.phase, BreakGlassPhase::Invoked);
@@ -553,10 +613,10 @@ mod tests {
     fn double_invoke_rejected() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect("first");
         let err = reg
-            .invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
+            .invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, Instant::now())
             .expect_err("second");
         assert_eq!(err, BreakGlassError::AlreadyInvoked);
     }
@@ -566,7 +626,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         reg.affirm("act1", attest_affirm("rv", Role::Reviewer, "act1"), t0)
             .expect("rv affirms");
@@ -588,7 +648,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let so = attest("so", Role::SecurityOfficer, "act1");
-        reg.invoke("act1", so.clone(), &m, Instant::now())
+        reg.invoke("act1", P, so.clone(), &m, Instant::now())
             .expect("invoke");
         // Replay the invoke attestation into affirm — must fail on the
         // attestation itself (domain mismatch), not merely the role guard.
@@ -606,7 +666,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         reg.affirm("act1", attest_affirm("rv1", Role::Reviewer, "act1"), t0)
             .expect("first rv");
@@ -619,12 +679,73 @@ mod tests {
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Invoked);
     }
 
+    /// PBA-L6b-013 regression: one key enrolled for BOTH affirmation roles
+    /// must not satisfy the two-person affirmation alone. Pre-fix the
+    /// affirmation set was deduplicated by role, so the same signer affirmed
+    /// once as Reviewer and once as ComplianceOfficer and the entry went to
+    /// Affirmed.
+    #[test]
+    fn one_multi_role_key_cannot_affirm_twice_pba_l6b_013() {
+        let rv = attest_affirm("dual", Role::Reviewer, "act1");
+        let co = attest_affirm("dual", Role::ComplianceOfficer, "act1");
+        assert_eq!(rv.signer.id, co.signer.id, "same key, two role claims");
+        let so = attest("so", Role::SecurityOfficer, "act1");
+        let reg = BreakGlassRegistry::new().with_signer_roster(std::sync::Arc::new(
+            StaticSignerRoster::new()
+                .authorize(so.pubkey, Role::SecurityOfficer)
+                .authorize(rv.pubkey, Role::Reviewer)
+                .authorize(rv.pubkey, Role::ComplianceOfficer),
+        ));
+        let m = manifest(true, vec![], vec![], vec![]);
+        let t0 = Instant::now();
+        reg.invoke("act1", P, so, &m, t0).expect("invoke");
+        reg.affirm("act1", rv, t0).expect("first affirmation");
+        let err = reg
+            .affirm("act1", co, t0)
+            .expect_err("the same signer must not affirm a second time under another role");
+        assert_eq!(err, BreakGlassError::DuplicateAffirmer);
+        assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Invoked);
+    }
+
+    /// PBA-L6b-013: an affirmation must cover the payload the invocation
+    /// recorded. A valid, rostered affirmation over a DIFFERENT payload for the
+    /// same action id is rejected.
+    #[test]
+    fn affirmation_is_bound_to_the_invoked_payload_pba_l6b_013() {
+        let reg = BreakGlassRegistry::new();
+        let m = manifest(true, vec![], vec![], vec![]);
+        let t0 = Instant::now();
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, t0)
+            .expect("invoke");
+        let other = attest_payload("rv", Role::Reviewer, "act1", BREAKGLASS_AFFIRM_DOMAIN, b"other");
+        let err = reg.affirm("act1", other, t0).expect_err("wrong payload");
+        assert!(matches!(err, BreakGlassError::AttestationInvalid(_)), "{err:?}");
+        // An invoke over one payload cannot be attested with another either.
+        let reg2 = BreakGlassRegistry::new();
+        let so_other =
+            attest_payload("so", Role::SecurityOfficer, "act1", BREAKGLASS_INVOKE_DOMAIN, b"other");
+        assert!(matches!(
+            reg2.invoke("act1", P, so_other, &m, t0),
+            Err(BreakGlassError::AttestationInvalid(_))
+        ));
+        // The public preimage helpers match what the registry verifies.
+        assert_eq!(
+            invoke_preimage("act1", P),
+            breakglass_preimage(BREAKGLASS_INVOKE_DOMAIN, "act1", &breakglass_payload_hash(P))
+        );
+        assert_eq!(
+            affirm_preimage("act1", P),
+            breakglass_preimage(BREAKGLASS_AFFIRM_DOMAIN, "act1", &breakglass_payload_hash(P))
+        );
+        assert_eq!(reg.get("act1").unwrap().payload_hash, Some(breakglass_payload_hash(P)));
+    }
+
     #[test]
     fn tick_unaffirms_after_window() {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         // Tick at t0 + 71h — still Invoked.
         let t_pre = t0 + Duration::from_secs(71 * 3600);
@@ -641,7 +762,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         let t_late = t0 + Duration::from_secs(73 * 3600);
         let err = reg
@@ -655,7 +776,7 @@ mod tests {
         let reg = BreakGlassRegistry::new();
         let m = manifest(true, vec![], vec![], vec![]);
         let t0 = Instant::now();
-        reg.invoke("act1", attest("so", Role::SecurityOfficer, "act1"), &m, t0)
+        reg.invoke("act1", P, attest("so", Role::SecurityOfficer, "act1"), &m, t0)
             .expect("invoke");
         reg.tick(t0 + Duration::from_secs(73 * 3600));
         assert_eq!(reg.get("act1").unwrap().phase, BreakGlassPhase::Unaffirmed);
