@@ -243,7 +243,8 @@ tier = "bundled"
             .check(&manifest("cap", "1.2.0", h3))
             .expect_err("unpinned")
             .contains("not an allowlisted build"));
-        l.check(&manifest("cap", "1.3.0", H2)).expect("second pinned hash");
+        l.check(&manifest("cap", "1.3.0", H2))
+            .expect("second pinned hash");
     }
 
     #[test]

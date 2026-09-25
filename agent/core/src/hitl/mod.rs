@@ -245,8 +245,8 @@ struct RoleAwareEntry {
 ///
 /// CIT-AGENT-4a adds a parallel role-aware track: `submit_for_action`
 /// + `add_signature` accumulate per-role signatures until the
-/// declared `Quorum` is satisfied. The simple `submit` / `approve` /
-/// `reject` API stays for BFR-INT-12b compatibility.
+/// declared `Quorum` is satisfied. The FIFO track is resolved only by
+/// call-id (`approve_by_id` / `reject_by_id`, PBA-L6b-009).
 ///
 /// Locking discipline: the std Mutex is only held across queue
 /// surgery (push / pop / peek). Awaits happen outside the lock

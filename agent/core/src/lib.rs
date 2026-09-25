@@ -60,7 +60,7 @@ mod insecure_feature_tripwire {
     /// only mention is its definition in agent/core/Cargo.toml.
     #[test]
     fn insecure_dev_hitl_is_off_everywhere() {
-        assert!(
+        const _: () = assert!(
             !cfg!(feature = "insecure-dev-hitl"),
             "insecure-dev-hitl is enabled in this build"
         );

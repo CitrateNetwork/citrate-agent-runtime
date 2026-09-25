@@ -489,8 +489,10 @@ mod pba_l6b_014_tests {
         assert_eq!(l.instances(), CAPSULE_MAX_INSTANCES);
         assert_eq!(l.memories(), CAPSULE_MAX_MEMORIES);
         assert_eq!(l.tables(), CAPSULE_MAX_TABLES);
-        assert!(CAPSULE_MAX_INSTANCES <= 64 && CAPSULE_MAX_MEMORIES <= 64 && CAPSULE_MAX_TABLES <= 64);
-        assert!(CAPSULE_MEMORY_BYTES_TOTAL <= 256 * 1024 * 1024);
+        const _: () = assert!(
+            CAPSULE_MAX_INSTANCES <= 64 && CAPSULE_MAX_MEMORIES <= 64 && CAPSULE_MAX_TABLES <= 64
+        );
+        const _: () = assert!(CAPSULE_MEMORY_BYTES_TOTAL <= 256 * 1024 * 1024);
 
         let mib = 1024 * 1024;
         // Per-memory cap still applies.
