@@ -1,6 +1,6 @@
 # CIT-AGENT-9c-write-host — eth-sender-test capsule. NOT a
 # production tool — exists only to drive cit-agent-core's
-# three-layer write-path tests (allow-list + HITL gate +
+# three-layer write-path tests (allow-list + HIC gate +
 # dispatcher).
 
 [capsule]

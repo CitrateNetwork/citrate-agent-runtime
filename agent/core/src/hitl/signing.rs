@@ -181,14 +181,14 @@ impl SigningSurface for Ed25519FileSurface {
     }
 }
 
-// ── Authorized-signer roster (RM-G.1 / AGENT_RUNTIME HITL quorum) ──
+// ── Authorized-signer roster (RM-G.1 / AGENT_RUNTIME HIC quorum) ──
 //
 // `verify_attestation` proves a signature verifies under the SUPPLIED
 // pubkey and that signer.id == fingerprint(pubkey). It does NOT prove the
 // pubkey belongs to an AUTHORIZED signer. Without that check, an attacker
 // mints a fresh keypair, labels its `Signer.role` with whatever role a
 // quorum requires, signs the payload, and is accepted — a full
-// human-in-the-loop consent bypass (the TLA+ SoD/quorum model assumes
+// HIC (Human In Control) consent bypass (the TLA+ SoD/quorum model assumes
 // "only authorized keys exist", which nothing enforced). This roster is
 // that enforcement: a quorum signature counts only if its pubkey is on the
 // roster FOR the role it claims.
@@ -250,7 +250,7 @@ pub fn signer_is_authorized(
 mod roster_tests {
     use super::*;
 
-    /// RM-G.1 / HITL quorum CRITICAL tripwire: a cryptographically-valid
+    /// RM-G.1 / HIC quorum CRITICAL tripwire: a cryptographically-valid
     /// signature from a key that is NOT on the roster (a self-minted key —
     /// the bypass) must be rejected, and a production build with no roster
     /// must fail closed.

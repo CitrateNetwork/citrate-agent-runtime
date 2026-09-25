@@ -9,7 +9,7 @@ use std::fmt;
 pub enum AgentError {
     /// Underlying RPC / chain client failure (recorder, anchor writes).
     Chain(String),
-    /// HITL queue lifecycle (timeout, rejection, lock poisoning).
+    /// HIC queue lifecycle (timeout, rejection, lock poisoning).
     Hitl(String),
     /// Audit-chain integrity failure (broken hash chain, signature
     /// verification failed, retention policy violation).

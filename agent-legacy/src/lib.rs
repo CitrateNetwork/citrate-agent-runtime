@@ -2,7 +2,7 @@
 //!
 //! This crate provides:
 //! - `AgentTool` trait and `ToolRegistry` for registering tools
-//! - `ApprovalFlow` for risk-tiered human-in-the-loop approval
+//! - `ApprovalFlow` for risk-tiered HIC (Human In Control) approval
 //! - `Budget` for token/cost tracking and limits
 //! - `AuditTrail` for immutable execution logging
 //! - `EmergencyStop` for kill-switch functionality

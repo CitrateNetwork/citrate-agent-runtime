@@ -214,7 +214,7 @@ impl Capsule {
 
     /// Instantiate with the full write-path wiring: read + write
     /// allow-lists (parsed from the manifest), both dispatchers,
-    /// and the HITL approval gate. Any of the optional arcs may be
+    /// and the HIC approval gate. Any of the optional arcs may be
     /// `None` — the host fn rejects accordingly (no gate ⇒ all
     /// eth_send calls fail closed). CIT-AGENT-9c-write-host.
     pub fn instantiate_with_write_path(
@@ -2440,7 +2440,7 @@ tier = "bundled"
     // ────────────────────── (end CIT-AGENT-9c-1-rpc) ──────────────
 
     // ────────────────────── CIT-AGENT-9c-write-host ───────────────
-    // Three-layer write-path tests: allow-list, HITL approval gate,
+    // Three-layer write-path tests: allow-list, HIC approval gate,
     // dispatcher. Each layer has its own test that proves the
     // capsule never reaches the layers below when a layer rejects.
 
@@ -2655,7 +2655,7 @@ tier = "bundled"
     }
 
     /// CIT-AGENT-9c-write-host LAYER 2 — allow-list passes, but the
-    /// HITL approval gate denies. Dispatcher is never invoked. The
+    /// HIC approval gate denies. Dispatcher is never invoked. The
     /// rejection reason is propagated through the WIT result.
     #[test]
     fn eth_send_capsule_blocks_when_approval_denied() {
