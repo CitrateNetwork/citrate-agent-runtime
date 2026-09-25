@@ -176,6 +176,13 @@ impl<T: MemoryTransport> MemoryAdapter<T> {
             return Err(MemoryError::Config("BYOM connect token required".into()));
         }
         let origin = config.origin.trim_end_matches('/');
+        // PBA-L6b-035: the connect token is a bearer credential; never send it
+        // over plain http except to a loopback gateway.
+        if !origin_is_secure(origin) {
+            return Err(MemoryError::Config(format!(
+                "memory gateway origin {origin:?} must be https (plain http only to loopback)"
+            )));
+        }
         let url = format!("{origin}/mcp/u/{}", encode_path_segment(&config.sub));
         Ok(Self {
             transport,
@@ -327,9 +334,35 @@ impl MemoryAdapter<ReqwestMemoryTransport> {
     }
 }
 
+/// PBA-L6b-035: `https://…`, or `http://` to a loopback host only.
+fn origin_is_secure(origin: &str) -> bool {
+    if origin.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// Percent-encode a path segment conservatively (agents' `sub` is usually an
 /// OIDC subject with `:`/`/`; keep the URL well-formed without a URL crate).
 fn encode_path_segment(s: &str) -> String {
+    // PBA-L6b-035: a segment of only dots ("." / "..") is a relative path
+    // step to a URL resolver or gateway router; encode every dot in it.
+    if !s.is_empty() && s.bytes().all(|b| b == b'.') {
+        return "%2E".repeat(s.len());
+    }
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         let ok = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
@@ -392,6 +425,33 @@ mod tests {
             origin: "https://mem-gateway.example.com".into(),
             sub: "user-123".into(),
             connect_token: "connect.tok".into(),
+        }
+    }
+
+    /// PBA-L6b-035 regression: the connect token must not travel over plain
+    /// http (loopback excepted), and a `.`/`..` principal must not become a
+    /// path-traversal segment of the gateway URL.
+    #[test]
+    fn requires_https_and_encodes_dot_segments_pba_l6b_035() {
+        let t = || MockTransport::new(200, "{}");
+        for bad in ["http://mem-gateway.example.com", "ftp://mem.example.com", "mem.example.com"] {
+            assert!(
+                MemoryAdapter::new(MemoryAdapterConfig { origin: bad.into(), ..cfg() }, t()).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        for ok in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:9"] {
+            MemoryAdapter::new(MemoryAdapterConfig { origin: ok.into(), ..cfg() }, t())
+                .unwrap_or_else(|e| panic!("{ok}: {e:?}"));
+        }
+        for sub in ["..", "."] {
+            let a = MemoryAdapter::new(MemoryAdapterConfig { sub: sub.into(), ..cfg() }, t())
+                .expect("builds");
+            assert!(
+                !a.url.ends_with("/..") && !a.url.ends_with("/."),
+                "dot segment must be encoded: {}",
+                a.url
+            );
         }
     }
 

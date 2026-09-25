@@ -212,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_skill_pack() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let config = HermesSidecarConfig::default();
         let adapter = HermesAdapter::new(config, mcp);
         let pack = adapter.export_skill_pack().await;
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn test_ingest_hermes_event() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp);
 
         let hermes_event = serde_json::json!({
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn test_agt12_unsigned_event_rejected_when_key_set() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp)
             .with_signing_key(signing.verifying_key().to_bytes());
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_agt12_signed_event_accepted() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp)
             .with_signing_key(signing.verifying_key().to_bytes());
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_agt12_tampered_event_rejected() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp)
             .with_signing_key(signing.verifying_key().to_bytes());
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_agt12_wrong_key_rejected() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let other = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp)
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn test_agt12_legacy_mode_accepts_unsigned() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         // No `with_signing_key` call.
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp);
         let event = serde_json::json!({
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn test_package_benchmark() {
         let registry = Arc::new(ToolRegistry::new());
-        let mcp = Arc::new(McpServer::new(registry));
+        let mcp = Arc::new(McpServer::new_insecure_unsigned_grants(registry));
         let adapter = HermesAdapter::new(HermesSidecarConfig::default(), mcp);
 
         let events = vec![TrailEvent {
