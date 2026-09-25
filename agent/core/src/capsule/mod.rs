@@ -828,6 +828,30 @@ tier = "bundled"
             .expect("80 MiB across two instances is within the aggregate cap");
     }
 
+    /// PBA-L6b-014 (R2 verifier): table storage counts against the store's
+    /// budget too. Many large funcref tables (each within the per-table
+    /// element cap) previously instantiated with nothing charged.
+    #[test]
+    fn instantiate_bounds_aggregate_table_storage_pba_l6b_014() {
+        use crate::capsule::wasm::EngineFactory;
+        let mut wat = String::from("(component (core module $m");
+        for _ in 0..16 {
+            wat.push_str(" (table 1000000 funcref)");
+        }
+        wat.push_str(") (core instance (instantiate $m)))");
+        let capsule = bounds_test_capsule(wat::parse_str(&wat).expect("WAT compiles"));
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect_err("16 x 1M-element tables must exceed the store budget");
+        // A modest table still instantiates.
+        let ok = "(component (core module $m (table 1000 funcref)) (core instance (instantiate $m)))";
+        let capsule = bounds_test_capsule(wat::parse_str(ok).expect("WAT compiles"));
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule.instantiate(&engine, &linker).expect("a 1k-element table is fine");
+    }
+
     /// PBA-L6b-014 regression: the count caps are small, not wasmtime's
     /// defaults (10,000 memories / instances). Many tiny instances must be
     /// refused.
