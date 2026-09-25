@@ -38,7 +38,7 @@ are audited alongside successful submissions.
 |---|---|
 | Any bytes32 arg malformed | `Err("expected 32-byte hex (64 chars), got N")` |
 | Allow-list miss | `Err("ChainSendNotAuthorized: 0x...")` |
-| HITL denial | `Err("ChainSendApprovalRejected: <reason>")` |
+| HIC denial | `Err("ChainSendApprovalRejected: <reason>")` |
 | Dispatcher error | `Err("ChainSendDispatchFailed: <e>")` |
 
 ## TLA+ spec carry-forward

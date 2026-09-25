@@ -2,7 +2,7 @@
 
 > **NOT a production tool.** Exists only as a fixture for the
 > cit-agent-core integration tests that exercise the three-layer
-> write-path enforcement: allow-list, HITL approval gate, and
+> write-path enforcement: allow-list, HIC approval gate, and
 > dispatcher.
 
 ## Why this capsule exists
@@ -13,7 +13,7 @@ with tool-specific calldata. Before any of those land, the
 harness needs an empirical witness that the host fn enforces:
 
 1. allow-list (writes to undeclared addresses are blocked)
-2. HITL approval gate (every write traverses the gate)
+2. HIC approval gate (every write traverses the gate)
 3. dispatcher (signed calldata reaches the chain only after
    approval)
 
