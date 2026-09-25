@@ -305,12 +305,10 @@ impl CapsuleDispatch {
         // single core module already needs 2 instances). Kept in sync with
         // `HostCtx::empty` so `instantiate_*` (which arms the limiter from
         // `store_limits`) and `call_raw` agree.
-        store.data_mut().store_limits = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(64 * 1024 * 1024) // 64 MiB hard cap (per memory)
-            .tables(100)
-            .table_elements(1_000_000)
-            .instances(1_000)
-            .build();
+        // PBA-L6b-014: keep the budget the store has ALREADY spent at
+        // instantiate time (`arm_instantiate_bounds` armed the same limiter), so
+        // the aggregate cap covers instantiate + call together. Replacing it
+        // with a fresh limiter here would reset the running total.
         store.limiter(|state| &mut state.store_limits);
 
         let mut results = [wasmtime::component::Val::Bool(false)];
