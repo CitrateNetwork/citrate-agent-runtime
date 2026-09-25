@@ -31,8 +31,9 @@ pub enum Quorum {
     /// Tier-medium: at least one signature from the manifest's
     /// required-role set.
     OneOf(BTreeSet<Role>),
-    /// Tier-high: N signatures from the manifest's required-role
-    /// set. Default N = 2 (planset §"Risk tiers").
+    /// Tier-high: signatures from N DISTINCT roles of the manifest's
+    /// required-role set. Default N = 2 (planset §"Risk tiers").
+    /// PBA-L6b-012: two signers holding the same role count once.
     NofM { n: u8, m: BTreeSet<Role> },
     /// Tier-critical: every named role in the set must sign.
     /// Per planset, this is SecurityOfficer + ComplianceOfficer +
@@ -78,8 +79,11 @@ impl Quorum {
             Quorum::AutoApprove => true,
             Quorum::OneOf(set) => usable.iter().any(|r| set.contains(r)),
             Quorum::NofM { n, m } => {
-                let hits = usable.iter().filter(|r| m.contains(r)).count();
-                hits >= *n as usize
+                // PBA-L6b-012: separation of duties is across roles — count
+                // each required role at most once.
+                let distinct: BTreeSet<Role> =
+                    usable.into_iter().filter(|r| m.contains(r)).collect();
+                distinct.len() >= usize::from(*n)
             }
             Quorum::Multiset(required) => {
                 let signed: BTreeSet<Role> = usable.into_iter().collect();
@@ -133,6 +137,77 @@ mod tests {
             Role::ComplianceOfficer,
             Role::Reviewer
         ]));
+    }
+
+    /// PBA-L6b-012 regression: N-of-M counts DISTINCT roles. Pre-fix two
+    /// Reviewer signatures satisfied `[Reviewer, ComplianceOfficer]`, so the
+    /// ComplianceOfficer attestation the manifest demands was never required.
+    #[test]
+    fn nofm_requires_distinct_roles_pba_l6b_012() {
+        let q = Quorum::for_tier(RiskTier::High, &[Role::Reviewer, Role::ComplianceOfficer]);
+        assert!(!q.satisfied_by(&[Role::Reviewer, Role::Reviewer]));
+        assert!(!q.satisfied_by(&[Role::ComplianceOfficer, Role::ComplianceOfficer]));
+        assert!(!q.satisfied_by(&[Role::Reviewer, Role::Reviewer, Role::Reviewer]));
+        assert!(q.satisfied_by(&[Role::Reviewer, Role::ComplianceOfficer]));
+        assert!(q.satisfied_by(&[Role::Reviewer, Role::Reviewer, Role::ComplianceOfficer]));
+    }
+
+    /// PBA-L6b-012 tripwire (class: quorum counted by signature instead of
+    /// by role). Exhaustive over every signer-role sequence of length <= 4:
+    /// each quorum is satisfied exactly when the set of DISTINCT approving
+    /// roles meets it, so repeating a role never helps.
+    #[test]
+    fn tripwire_quorum_depends_only_on_distinct_roles_pba_l6b_012() {
+        let all = [
+            Role::Operator,
+            Role::Reviewer,
+            Role::ComplianceOfficer,
+            Role::SecurityOfficer,
+            Role::Auditor,
+        ];
+        let quorums = [
+            Quorum::for_tier(RiskTier::Medium, &[Role::Reviewer, Role::ComplianceOfficer]),
+            Quorum::for_tier(RiskTier::High, &[Role::Reviewer, Role::ComplianceOfficer]),
+            Quorum::for_tier(
+                RiskTier::High,
+                &[Role::Reviewer, Role::ComplianceOfficer, Role::SecurityOfficer],
+            ),
+            Quorum::for_tier(RiskTier::Critical, &[]),
+        ];
+        let oracle = |q: &Quorum, signed: &BTreeSet<Role>| -> bool {
+            let usable: BTreeSet<Role> =
+                signed.iter().copied().filter(|r| roles::can_approve(*r)).collect();
+            match q {
+                Quorum::AutoApprove => true,
+                Quorum::OneOf(set) => !usable.is_disjoint(set),
+                Quorum::NofM { n, m } => usable.intersection(m).count() >= usize::from(*n),
+                Quorum::Multiset(req) => req.is_subset(&usable),
+            }
+        };
+        let mut seqs: Vec<Vec<Role>> = vec![vec![]];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for s in &seqs {
+                for r in all {
+                    let mut t = s.clone();
+                    t.push(r);
+                    next.push(t);
+                }
+            }
+            seqs.extend(next.clone());
+            seqs.dedup();
+            seqs = seqs.into_iter().filter(|s| s.len() <= 4).collect();
+        }
+        for seq in &seqs {
+            let set: BTreeSet<Role> = seq.iter().copied().collect();
+            for q in &quorums {
+                assert_eq!(
+                    q.satisfied_by(seq),
+                    oracle(q, &set),
+                    "quorum {q:?} on signer roles {seq:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -70,7 +70,10 @@ pub struct AppState {
 /// The sidecar is KEYLESS (Rule 3): it passes NO eth-call / eth-send dispatcher, so a skill's chain
 /// reads/writes fail closed at the host boundary — the actual signing + broadcast is citrate-core's
 /// SignatureCeremony, never the sidecar. What the sidecar DOES provide is the approval gate, so a
-/// skill's chain effect surfaces on `queue` (via `/approvals`) exactly as the ceremony bridge expects.
+/// skill's tier-low chain effect surfaces on `queue` (via `/approvals`) exactly as the ceremony bridge
+/// expects. PBA-L6b-012 / PBA-L6b-032: the gate binds no invoking human and the sidecar exposes no
+/// quorum-signature route, so a tier>=medium effect is refused at once rather than parked where
+/// nobody can approve it.
 /// A missing or unreadable capsule dir is an honest `None`, not a panic.
 pub fn load_dispatch(
     capsule_dir: &std::path::Path,

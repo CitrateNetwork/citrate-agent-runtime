@@ -234,6 +234,9 @@ struct RoleAwareEntry {
     payload: Vec<u8>,
     signatures: Vec<Signature>,
     resolver: oneshot::Sender<ApprovalOutcome>,
+    /// PBA-L6b-012: per-submission nonce so the waiter's cleanup removes only
+    /// the entry it inserted.
+    nonce: u64,
 }
 
 /// FIFO tool approval queue with auto-approve grants + per-call
@@ -279,6 +282,26 @@ struct FifoEvictGuard<'a> {
 impl Drop for FifoEvictGuard<'_> {
     fn drop(&mut self) {
         self.queue.evict_exact(&self.call_id, self.nonce);
+    }
+}
+
+/// PBA-L6b-012 — the role-track counterpart of [`FifoEvictGuard`].
+struct RoleEvictGuard<'a> {
+    queue: &'a ApprovalQueue,
+    call_id: String,
+    nonce: u64,
+}
+
+impl Drop for RoleEvictGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut role_q) = self.queue.role_pending.lock() {
+            if role_q
+                .get(&self.call_id)
+                .is_some_and(|e| e.nonce == self.nonce)
+            {
+                role_q.remove(&self.call_id);
+            }
+        }
     }
 }
 
@@ -333,6 +356,12 @@ impl ApprovalQueue {
             // PBA-L6b-010: re-check under the lock so a submission racing
             // `freeze_and_drain` cannot slip in after the drain.
             if self.is_frozen() {
+                return ApprovalOutcomePublic::Rejected;
+            }
+            // PBA-L6b-012: an identical effect (same call_id) is already
+            // waiting for a human. Refuse the duplicate instead of queueing a
+            // second entry an id-bound approve could not tell apart.
+            if q.iter().any(|e| e.call.call_id == call_id) {
                 return ApprovalOutcomePublic::Rejected;
             }
             q.push_back(PendingEntry {
@@ -520,12 +549,21 @@ impl ApprovalQueue {
         }
         let (tx, rx) = oneshot::channel();
         let call_id = call.call_id.clone();
+        let nonce = self
+            .next_nonce
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut role_q = match self.role_pending.lock() {
                 Ok(q) => q,
                 Err(_) => return ApprovalOutcomePublic::Rejected,
             };
             if self.is_frozen() {
+                return ApprovalOutcomePublic::Rejected;
+            }
+            // PBA-L6b-012: never overwrite a pending entry. The old insert
+            // replaced it (dropping its signatures and orphaning its waiter)
+            // and the first waiter's cleanup then deleted the replacement.
+            if role_q.contains_key(&call_id) {
                 return ApprovalOutcomePublic::Rejected;
             }
             role_q.insert(
@@ -536,11 +574,20 @@ impl ApprovalQueue {
                     payload,
                     signatures: Vec::new(),
                     resolver: tx,
+                    nonce,
                 },
             );
         }
-        // Also place on the FIFO pending queue so the existing UI
-        // surfaces still see the action.
+        // Clean up the entry if it's still there (timeout / reject /
+        // cancellation). PBA-L6b-012: only if it is still OUR entry (nonce
+        // match) — never a later submission that reused the call_id after ours
+        // resolved. A drop guard, so a dropped future cleans up too (otherwise
+        // the duplicate refusal above would block that call_id forever).
+        let _guard = RoleEvictGuard {
+            queue: self,
+            call_id: call_id.clone(),
+            nonce,
+        };
         let _ = call; // kept by RoleAwareEntry; not duplicated here
         // Race resolver against the standard timeout.
         let outcome = match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
@@ -549,10 +596,6 @@ impl ApprovalQueue {
             Ok(Err(_)) => ApprovalOutcomePublic::Rejected,
             Err(_) => ApprovalOutcomePublic::TimedOut,
         };
-        // Clean up the entry if it's still there (timeout/reject paths).
-        if let Ok(mut role_q) = self.role_pending.lock() {
-            role_q.remove(&call_id);
-        }
         outcome
     }
 
@@ -1312,6 +1355,121 @@ mod tests {
             q.submit_with_outcome(mkcall("granted")).await,
             ApprovalOutcomePublic::AutoApproved
         );
+    }
+
+    /// PBA-L6b-012 regression: a second submission with an already-pending
+    /// call_id must not overwrite the first entry (dropping its accumulated
+    /// signatures and orphaning its waiter), and the first waiter's cleanup
+    /// must not delete a later entry. Pre-fix the second insert replaced the
+    /// first and then parked for 5 minutes.
+    #[tokio::test]
+    async fn duplicate_role_call_id_does_not_clobber_the_pending_entry_pba_l6b_012() {
+        let q = Arc::new(ApprovalQueue::new());
+        let quorum = || {
+            Quorum::for_tier(
+                crate::capsule::manifest::RiskTier::High,
+                &[Role::Reviewer, Role::ComplianceOfficer],
+            )
+        };
+        let qa = q.clone();
+        let first = tokio::spawn(async move {
+            qa.submit_for_action(mkcall("dup"), b"p1".to_vec(), quorum(), signer_for("op", Role::Operator))
+                .await
+        });
+        while q.role_pending_depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let s1 = sign_queued(&q, "call_dup", "rv", Role::Reviewer);
+        q.add_signature("call_dup", s1).expect("reviewer signs the first entry");
+
+        // The duplicate is refused at once and leaves the first entry intact.
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            q.submit_for_action(mkcall("dup"), b"p2".to_vec(), quorum(), signer_for("op", Role::Operator)),
+        )
+        .await
+        .expect("a duplicate call_id must be refused, not parked");
+        assert_eq!(second, ApprovalOutcomePublic::Rejected);
+        assert_eq!(q.signatures_on("call_dup").len(), 1, "first entry's signature survives");
+        assert_eq!(q.payload_for("call_dup").as_deref(), Some(&b"p1"[..]));
+
+        let s2 = sign_queued(&q, "call_dup", "co", Role::ComplianceOfficer);
+        q.add_signature("call_dup", s2).expect("compliance completes the quorum");
+        assert_eq!(first.await.unwrap(), ApprovalOutcomePublic::Approved);
+    }
+
+    /// PBA-L6b-012: a role-track submitter whose future is dropped removes
+    /// its own entry, so the call_id is not blocked by the duplicate refusal.
+    #[tokio::test]
+    async fn a_cancelled_role_submitter_is_evicted_pba_l6b_012() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move {
+            qa.submit_for_action(
+                mkcall("rc"),
+                b"p".to_vec(),
+                Quorum::for_tier(crate::capsule::manifest::RiskTier::Medium, &[Role::Reviewer]),
+                signer_for("op", Role::Operator),
+            )
+            .await
+        });
+        while q.role_pending_depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        h.abort();
+        let _ = h.await;
+        assert_eq!(q.role_pending_depth(), 0);
+    }
+
+    /// PBA-L6b-012 variant on the FIFO track: a duplicate call_id is refused
+    /// instead of queued behind the first (an id-bound approve could not tell
+    /// the two apart).
+    #[tokio::test]
+    async fn duplicate_fifo_call_id_is_refused_pba_l6b_012() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let first = tokio::spawn(async move { qa.submit_with_outcome(mkcall("dupf")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let second = tokio::time::timeout(Duration::from_secs(2), q.submit_with_outcome(mkcall("dupf")))
+            .await
+            .expect("a duplicate FIFO call_id must be refused, not parked");
+        assert_eq!(second, ApprovalOutcomePublic::Rejected);
+        assert_eq!(q.depth(), 1);
+        q.approve_by_id("call_dupf").expect("the original is still the head");
+        assert_eq!(first.await.unwrap(), ApprovalOutcomePublic::Approved);
+    }
+
+    /// PBA-L6b-012 at the queue: two distinct Reviewer keys do not satisfy a
+    /// tier-high `[Reviewer, ComplianceOfficer]` quorum.
+    #[tokio::test]
+    async fn two_reviewers_do_not_release_a_high_tier_action_pba_l6b_012() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move {
+            qa.submit_for_action(
+                mkcall("two_rv"),
+                b"payload".to_vec(),
+                Quorum::for_tier(
+                    crate::capsule::manifest::RiskTier::High,
+                    &[Role::Reviewer, Role::ComplianceOfficer],
+                ),
+                signer_for("op", Role::Operator),
+            )
+            .await
+        });
+        while q.role_pending_depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        for name in ["rv1", "rv2"] {
+            let s = sign_queued(&q, "call_two_rv", name, Role::Reviewer);
+            q.add_signature("call_two_rv", s).expect("each reviewer signature is accepted");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!h.is_finished(), "two reviewers must not satisfy [Reviewer, ComplianceOfficer]");
+        q.reject_action("call_two_rv").expect("cleanup");
+        assert_eq!(h.await.unwrap(), ApprovalOutcomePublic::Rejected);
     }
 
     #[test]

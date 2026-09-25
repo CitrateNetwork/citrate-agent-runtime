@@ -215,24 +215,17 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
     assert_eq!(j["ok"], true);
     assert_eq!(j["submitted"], true);
 
-    // The spawned tier-high eth-send parks on the ROLE-BOUND quorum track…
-    wait_role_depth(&queue, 1).await;
-    // …and NOT on the anonymous FIFO queue.
+    // PBA-L6b-012 / PBA-L6b-032: the sidecar binds no invoking human to its gate and exposes no
+    // quorum-signature route, so a tier-high effect can never be approved here. It is refused at
+    // once instead of parking on the role track for 5 minutes (invisible to /approvals, holding a
+    // worker). It never reaches the anonymous FIFO queue either.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(queue.role_pending_depth(), 0, "no privileged effect parks");
     assert_eq!(
         queue.depth(),
         0,
         "tier-high effect must not surface on the anonymous FIFO queue"
     );
-
-    // An id-bound FIFO approve cannot release it either: the effect is not on the FIFO track.
-    let _ = queue.approve_by_id(&queue.peek().map(|p| p.id).unwrap_or_default());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(
-        queue.role_pending_depth(),
-        1,
-        "anonymous FIFO approve must not release a tier-high privileged effect"
-    );
-    assert_eq!(queue.depth(), 0);
 }
 
 #[tokio::test]
