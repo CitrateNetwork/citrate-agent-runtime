@@ -1,4 +1,4 @@
-//! Approval flow — risk-tiered human-in-the-loop approval.
+//! Approval flow, risk-tiered HIC (Human In Control) approval.
 //!
 //! Every tool execution passes through the approval flow before running.
 //! The flow checks risk level and either auto-approves or blocks until

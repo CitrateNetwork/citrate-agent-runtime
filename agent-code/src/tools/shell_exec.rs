@@ -12,7 +12,7 @@
 //! invocations (`sudo`, `nc`, `dd`, ...) and the metachar reject only
 //! rules out shell chaining — neither is the enforced control.
 //!
-//! The ENFORCED control is human-in-the-loop re-authorization:
+//! The ENFORCED control is HIC (Human In Control) re-authorization:
 //! `ShellExec::risk_level()` is `RiskLevel::Critical`, and every tool
 //! call is gated by `ApprovalFlow::check` in
 //! `agent-legacy/src/approval.rs` (invoked from

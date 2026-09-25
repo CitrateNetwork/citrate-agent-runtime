@@ -63,7 +63,7 @@ pub struct HostCtx {
     /// When set AND the canned-queue is empty, the host fn calls
     /// the dispatcher's `eth_send` AFTER the approval gate clears.
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
-    /// Optional HITL approval gate. Every eth_send call traverses
+    /// Optional HIC approval gate. Every eth_send call traverses
     /// this gate BEFORE the dispatcher is invoked. When `None`,
     /// the host fn rejects all eth_send calls with
     /// `Err("ChainSendApprovalRejected: no approval gate configured")`

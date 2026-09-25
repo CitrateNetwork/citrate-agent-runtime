@@ -24,7 +24,7 @@ Three facts from the codebase make this a real decision, not a wiring task:
 
 1. **Skills must be capsules, not SOPs.** Only the `agent/core` capsule path traverses the
    ceremony-grade `ApprovalQueue` (via `ApprovalGate`); `SOPEngine` uses the *legacy* risk-tiered
-   `ApprovalFlow` (`agent-cron/src/sop.rs:10`), which is a HITL prompt, not a ceremony. So "every
+   `ApprovalFlow` (`agent-cron/src/sop.rs:10`), which is an HIC prompt, not a ceremony. So "every
    chain effect → ceremony" (the gate's key property) requires running **capsules**.
 2. **Capsules have bespoke WIT interfaces.** `list-compliance-posture` exports
    `query: func(framework: string, scope: string) -> result<posture-row, string>`

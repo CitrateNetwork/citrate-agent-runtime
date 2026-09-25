@@ -4,5 +4,5 @@
 //! [`.agentile/planset/2026-05-14-citrate-agent/08_SPRINT_SEQUENCE.md`].
 //!
 //! Will contain: token-by-token streaming loop with checkpoint hooks,
-//! state-managed interrupt (HITL pause/resume), and optional
+//! state-managed interrupt (HIC pause/resume), and optional
 //! trajectory export (feature-gated, RFC §12 Q3).

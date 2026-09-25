@@ -1,6 +1,6 @@
 Feature: eth-sender-test capsule — three-layer write-path enforcement
   As the cit-agent harness
-  I want every write call to traverse allow-list + HITL + dispatcher
+  I want every write call to traverse allow-list + HIC + dispatcher
   So that no state change reaches the chain without operator consent
 
   Scenario: unauthorized address blocked at layer 1
@@ -10,7 +10,7 @@ Feature: eth-sender-test capsule — three-layer write-path enforcement
     And the ApprovalGate is NEVER consulted
     And the EthSendDispatcher is NEVER invoked
 
-  Scenario: HITL denial blocked at layer 2
+  Scenario: HIC denial blocked at layer 2
     Given the address is allow-listed
     And the ApprovalGate returns Err("denied")
     When send(...) is called

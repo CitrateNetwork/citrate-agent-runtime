@@ -12,7 +12,7 @@ register with a shared `ToolRegistry`, and execute through a risk-tiered approva
 ## Modules
 
 - `tool` -- `AgentTool` trait, `ToolRegistry`, `ToolResult`, `ToolContext`, and `RiskLevel` enum (Low/Medium/High/Critical)
-- `approval` -- `ApprovalFlow` with risk-tiered human-in-the-loop gating and `ApprovalHandler` callback trait
+- `approval` -- `ApprovalFlow` with risk-tiered HIC gating and `ApprovalHandler` callback trait
 - `budget` -- `BudgetTracker` enforcing per-session limits on tokens, cost (microdollars), tool calls, and wall-clock time
 - `audit` -- `AuditTrail` append-only log of every tool execution with session filtering and JSON export
 - `estop` -- `EmergencyStop` atomic kill switch shared across all agents via `Arc`

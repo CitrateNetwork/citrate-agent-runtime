@@ -57,7 +57,7 @@ pub enum CapabilityToken {
     /// `citrate:chain/eth-send@0.1.0` (state-changing chain calls).
     /// Permitted only when `[capability].chain_calls` contains at
     /// least one `eth_send:<address>` entry. The host fn enforces
-    /// allow-list + HITL approval gate at call time.
+    /// allow-list + HIC approval gate at call time.
     /// CIT-AGENT-9c-write-host.
     CitrateChainEthSend,
 }
@@ -130,7 +130,7 @@ impl LinkerBuilder {
             b.permitted.insert(CapabilityToken::CitrateChainEthCall);
         }
         // Citrate chain eth-send — token gates registration; host
-        // fn enforces (1) allow-list + (2) HITL approval gate +
+        // fn enforces (1) allow-list + (2) HIC approval gate +
         // (3) dispatcher availability. CIT-AGENT-9c-write-host.
         if manifest
             .capability
@@ -315,7 +315,7 @@ impl LinkerBuilder {
             self.wire_citrate_chain_eth_call()?;
         }
         // CIT-AGENT-9c-write-host: eth-send. Layered enforcement —
-        // allow-list, then HITL approval gate, then dispatcher.
+        // allow-list, then HIC approval gate, then dispatcher.
         if self.permitted.contains(&CapabilityToken::CitrateChainEthSend) {
             self.wire_citrate_chain_eth_send()?;
         }
@@ -390,7 +390,7 @@ impl LinkerBuilder {
     /// Wire `citrate:chain/eth-send@0.1.0`. Three-layer enforcement
     /// (CIT-AGENT-9c-write-host):
     ///   1. Allow-list — `to` MUST be in `eth_send_allow_list`.
-    ///   2. HITL approval gate — `ApprovalGate::request(...)` MUST
+    ///   2. HIC approval gate, `ApprovalGate::request(...)` MUST
     ///      return Ok(()). When no gate is configured, the call is
     ///      REJECTED (defense-in-depth: writes without a gate are
     ///      write-disabled).
@@ -425,7 +425,7 @@ impl LinkerBuilder {
                 // Audit-trail before any decision.
                 store.data_mut().record_eth_send(addr, data.clone());
 
-                // HITL approval gate. Defense-in-depth: if no gate,
+                // HIC approval gate. Defense-in-depth: if no gate,
                 // reject. A capsule that imports eth-send + a
                 // harness that hasn't wired a gate produces NO
                 // writes — never a write that bypassed the gate.

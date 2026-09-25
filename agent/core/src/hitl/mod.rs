@@ -1,5 +1,5 @@
-//! Human-in-the-loop approval queue — RFC-CIT-AGENT-0001 §3.1
-//! "HITL Queue" + §5 (approval state machine).
+//! HIC (Human In Control) approval queue, RFC-CIT-AGENT-0001 §3.1
+//! "HIC Queue" + §5 (approval state machine).
 //!
 //! BFR-INT-12b WP-4/WP-5 lived in `citrate_defense_prime-shell::tools` as a
 //! single-in-flight + FIFO + 5-min-timeout approval queue. CIT-AGENT-1

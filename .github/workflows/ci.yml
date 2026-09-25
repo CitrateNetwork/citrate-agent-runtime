@@ -76,3 +76,17 @@ jobs:
           python3 -m pip install --quiet semgrep || pipx install semgrep || true
           bash scripts/semgrep/run-ar-b-046.sh
         continue-on-error: true
+
+  hic-terminology:
+    name: HIC terminology guard (public-claims accuracy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: HIC terminology in docs, UI strings, comments and descriptions
+        run: |
+          python3 scripts/check_hic_terminology.py --self-test
+          python3 scripts/check_hic_terminology.py
