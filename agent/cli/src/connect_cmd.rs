@@ -130,13 +130,6 @@ fn discover(issuer: &str) -> Result<Discovery, String> {
 /// able to point either anywhere else (or smuggle shell metacharacters such as `&`).
 fn validate_endpoint(issuer: &str, endpoint: &str) -> Result<(), String> {
     let refuse = |why: &str| Err(format!("discovery endpoint {endpoint:?} refused: {why}"));
-    if endpoint.is_empty()
-        || !endpoint
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~:/%".contains(&b))
-    {
-        return refuse("contains characters outside the URL-safe path set");
-    }
     let iss = reqwest::Url::parse(issuer).map_err(|e| format!("issuer {issuer:?}: {e}"))?;
     let ep = match reqwest::Url::parse(endpoint) {
         Ok(u) => u,
@@ -154,6 +147,14 @@ fn validate_endpoint(issuer: &str, endpoint: &str) -> Result<(), String> {
     if ep.host_str() != iss.host_str() || ep.port_or_known_default() != iss.port_or_known_default()
     {
         return refuse("not on the issuer's origin");
+    }
+    // Checked last so each structural rule above is independently enforced (and tested); this
+    // also keeps shell metacharacters such as `&` out of the path the opener receives.
+    if !endpoint
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~:/%".contains(&b))
+    {
+        return refuse("contains characters outside the URL-safe path set");
     }
     Ok(())
 }
@@ -455,6 +456,10 @@ mod tests {
             "https://auth.citrate.ai/authorize&calc.exe",
             "https://auth.citrate.ai/authorize?x=1\"&calc",
             "https://user@auth.citrate.ai/authorize",
+            "https://user:pw@auth.citrate.ai/authorize",
+            "https://:pw@auth.citrate.ai/authorize",
+            "https://auth.citrate.ai/authorize?x=1",
+            "https://auth.citrate.ai/authorize#frag",
             "javascript:alert(1)",
             "",
         ] {

@@ -358,6 +358,21 @@ mod tests {
         assert!(body.bytes().all(|b| b == b'A'));
     }
 
+    /// PBA-L6b-034 (mutation-kill): output of exactly MAX_OUTPUT_BYTES is
+    /// returned whole, with no truncation marker.
+    #[tokio::test]
+    async fn shell_exec_does_not_mark_output_at_exactly_the_cap_pba_l6b_034() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(dir.path().join("out.txt"), vec![b'A'; 65_536]).expect("write fixture");
+        let ctx = test_ctx_with_dir(dir.path().to_str().expect("valid path"));
+        let result = tools::ShellExec
+            .execute(serde_json::json!({ "command": "cat out.txt" }), &ctx)
+            .await
+            .expect("shell_exec returns");
+        assert_eq!(result.output.len(), 65_536);
+        assert!(!result.output.contains("(truncated)"));
+    }
+
     #[tokio::test]
     async fn test_shell_exec_failing_command() {
         // Post RM-E4: shell builtins like `exit 42` no longer apply
