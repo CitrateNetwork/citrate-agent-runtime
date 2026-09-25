@@ -17,11 +17,11 @@
 //!   - Traits: `Model`, `AuditSink` (CIT-AGENT-3, 5)
 
 // PBA-R2 tripwire: `insecure-dev-hitl` disables the authorized-signer roster
-// (HITL quorum, break-glass, audit-chain role signatures). It must never reach
+// (HIC quorum, break-glass, audit-chain role signatures). It must never reach
 // an optimized build. See also `tests::insecure_dev_hitl_is_off_everywhere`.
 #[cfg(all(feature = "insecure-dev-hitl", not(debug_assertions)))]
 compile_error!(
-    "the `insecure-dev-hitl` feature disables HITL signer-roster checks and must never be \
+    "the `insecure-dev-hitl` feature disables HIC signer-roster checks and must never be \
      enabled in a release build"
 );
 
