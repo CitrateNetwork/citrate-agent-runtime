@@ -247,6 +247,29 @@ tier = "bundled"
             .expect("second pinned hash");
     }
 
+    /// PBA-L6b-015 (R2 verifier): the name match is exact and
+    /// case-sensitive. `Cap` / `CAP` are different capsules from `cap`.
+    #[test]
+    fn name_match_is_exact_and_case_sensitive_pba_l6b_015() {
+        let l = list();
+        for name in ["Cap", "CAP", "cap ", "ca"] {
+            assert!(
+                l.check(&manifest_unchecked(name, "1.2.0", H1)).is_err(),
+                "{name:?} must not match the entry for \"cap\""
+            );
+        }
+        l.check(&manifest("cap", "1.2.0", H1)).expect("exact name");
+    }
+
+    /// A manifest with a name `Manifest::parse` would reject (the name
+    /// validator enforces DNS labels), built directly so the allowlist's own
+    /// comparison is what is tested.
+    fn manifest_unchecked(name: &str, version: &str, hash: &str) -> Manifest {
+        let mut m = manifest("cap", version, hash);
+        m.capsule.name = name.to_string();
+        m
+    }
+
     #[test]
     fn version_parse_is_strict() {
         assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));

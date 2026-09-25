@@ -17,12 +17,15 @@
 //!   - Traits: `Model`, `AuditSink` (CIT-AGENT-3, 5)
 
 // PBA-R2 tripwire: `insecure-dev-hitl` disables the authorized-signer roster
-// (HIC quorum, break-glass, audit-chain role signatures). It must never reach
-// an optimized build. See also `tests::insecure_dev_hitl_is_off_everywhere`.
-#[cfg(all(feature = "insecure-dev-hitl", not(debug_assertions)))]
+// (HIC quorum, break-glass, audit-chain role signatures). Enabling the feature
+// in ANY build of this crate is a compile error, whatever the profile or
+// debug-assertions setting (a release profile can turn debug assertions on).
+// This crate's own unit tests get the dev bypass from `cfg!(test)` instead.
+// See also `insecure_feature_tripwire::insecure_dev_hitl_is_off_everywhere`.
+#[cfg(feature = "insecure-dev-hitl")]
 compile_error!(
     "the `insecure-dev-hitl` feature disables HIC signer-roster checks and must never be \
-     enabled in a release build"
+     enabled in any build"
 );
 
 pub mod agent;
