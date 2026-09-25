@@ -1,4 +1,4 @@
-# HIC terminology guard allowlist: `path:substring`, one per line (PBA-L8-018).
+# HIC terminology guard allowlist: `path:substring`, one per line (HIC terminology guard, public-claims accuracy).
 # Only code identifiers and immutable dated records belong here.
 # Enum variant identifier AgentError::Hitl (renaming it breaks the public API).
 agent/core/src/error.rs:Hitl(String)

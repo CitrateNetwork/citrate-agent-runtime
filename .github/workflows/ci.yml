@@ -78,7 +78,7 @@ jobs:
         continue-on-error: true
 
   hic-terminology:
-    name: HIC terminology guard (PBA-L8-018)
+    name: HIC terminology guard (public-claims accuracy)
     runs-on: ubuntu-latest
     permissions:
       contents: read

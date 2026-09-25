@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HIC terminology guard (PBA-L8-018).
+"""HIC terminology guard (public-claims accuracy).
 
 Owner standard: the human-oversight model is HIC (Human In Control, graded
 HIC-1 / HIC-2 / HIC-X). "HITL" and "human-in-the-loop" must not appear in
@@ -7,7 +7,8 @@ anything a person reads: docs, Gherkin, UI markup, user-facing strings, doc
 comments, and package descriptions.
 
 Scanned: .md .mdx .markdown .feature .slint .ts .tsx .js .jsx .mjs .cjs .rs
-.toml .yml .yaml and package.json (any extension case). The whole file is
+.toml .yml .yaml .tla .py .json .html .htm .txt (any extension case). Lockfiles
+(package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock) are not scanned. The whole file is
 scanned, so string literals and comments are both covered. Matching runs on
 the whole text, so a phrase split across lines, comment markers or markdown
 emphasis is still caught.
@@ -35,7 +36,9 @@ ROOT = os.path.abspath(ARGS[0] if ARGS else ".")
 SELF = "check_hic_terminology.py"
 SKIP_DIRS = {".git", "node_modules", "target", ".next", "dist", "build", ".turbo", "vendor"}
 EXTS = (".md", ".mdx", ".markdown", ".feature", ".slint", ".ts", ".tsx", ".js", ".jsx",
-        ".mjs", ".cjs", ".rs", ".toml", ".yml", ".yaml")
+        ".mjs", ".cjs", ".rs", ".toml", ".yml", ".yaml", ".tla", ".py", ".json", ".html",
+        ".htm", ".txt")
+LOCKFILES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "cargo.lock", "npm-shrinkwrap.json"}
 
 # Separator between the words of the phrase: whitespace (incl. line breaks),
 # ASCII and Unicode hyphens/dashes, comment markers, markdown emphasis.
@@ -47,8 +50,8 @@ BANNED = [
     # not CamelCase continuations (HITLQuorum, HitlUiError), not SCREAMING_SNAKE
     # constants (HITL_TIMEOUT), not lowercase identifiers (hitl, nist-agent-hitl)
     re.compile(r"(?<![A-Za-z0-9_])(?<!::)H[Ii][Tt][Ll](?:s|_[a-z][a-z0-9]*)?(?![A-Za-z0-9_])"),
-    # dotted / spaced spelling: H.I.T.L, H. I. T. L.
-    re.compile(r"(?<![A-Za-z0-9])H\.\s*I\.\s*T\.\s*L\b", re.I),
+    # dotted / hyphenated / spaced spelling: H.I.T.L, H-I-T-L, H. I. T. L.
+    re.compile(r"(?<![A-Za-z0-9])H[.\-‐-―]\s*I[.\-‐-―]\s*T[.\-‐-―]\s*L\b", re.I),
 ]
 
 
@@ -73,7 +76,9 @@ def load_allowlist(root):
 
 def wanted(name):
     low = name.lower()
-    return low.endswith(EXTS) or low == "package.json"
+    if low in LOCKFILES:
+        return False
+    return low.endswith(EXTS)
 
 
 def scan(root):
@@ -135,6 +140,15 @@ def self_test():
         "u.md": "the H.I.T.L gate\n",
         "v.md": "a human-*in*-the-loop gate\n",
         "w.yml": "name: HITL gate\n",
+        "x.tla": "\\* The HITL gate must approve before install.\nInit == TRUE\n",
+        "y.tla": "(* human in the loop approval *)\n",
+        "z.py": '"""HITL approval helper."""\ndef f(): pass\n',
+        "aa.py": 'print("awaiting HITL decision")\n',
+        "ab.json": '{"label": "HITL review"}\n',
+        "ac.html": "<p>Human-in-the-loop review</p>\n",
+        "ad.txt": "an HITL gate\n",
+        "ae.md": "the H-I-T-L gate\n",
+        "af.HTM": "<b>HITL</b>\n",
     }
     must_pass = {
         "a.md": "an HIC gate, crate `nist-agent-hitl`, spec HITLQuorum.tla, path `agent/core/src/hitl/`\n",
@@ -142,6 +156,10 @@ def self_test():
         "c.md": "Mr. Whitlock approved it; the human_in_the_loop field is legacy\n",
         "d/Cargo.toml": '[dependencies]\nnist-agent-hitl = { path = "../nist-agent-hitl" }\n',
         "e.tsx": "import { hitl } from './hitl/index';\n",
+        "f.tla": "VARIABLES hitlQueue\nHITLQuorum == TRUE\n",
+        "g.py": "from nist_agent import hitl\nHITL_TIMEOUT = 5\n",
+        "package-lock.json": '{"description": "HITL approval queue"}\n',
+        "Cargo.lock": 'name = "x"\ndescription = "HITL"\n',
     }
     ok = True
 
