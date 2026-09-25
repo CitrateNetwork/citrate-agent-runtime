@@ -18,9 +18,8 @@
 //!
 //! Trust root: the list ships inside the signed / notarized runtime binary,
 //! next to the bundled publisher key it constrains, so it is exactly as
-//! authentic as that key. Moving it to a separately signed file (so the fleet
-//! can update without a binary release) needs the HSM-held publisher key and
-//! is an OWNER step; see the PBA-L6b-015 notes in the PR.
+//! authentic as that key. A separately signed allowlist file (so the fleet can
+//! update without a binary release) is a possible future option.
 //!
 //! Updating: after re-packing a capsule with `cit-capsule-pack`, add the new
 //! `content_hash` from its `.cps` manifest to the entry (and raise
