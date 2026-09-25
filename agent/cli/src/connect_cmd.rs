@@ -113,10 +113,50 @@ fn discover(issuer: &str) -> Result<Discovery, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("discovery missing {k}"))
     };
+    let authorization_endpoint = field("authorization_endpoint")?;
+    let token_endpoint = field("token_endpoint")?;
+    validate_endpoint(issuer, &authorization_endpoint)?;
+    validate_endpoint(issuer, &token_endpoint)?;
     Ok(Discovery {
-        authorization_endpoint: field("authorization_endpoint")?,
-        token_endpoint: field("token_endpoint")?,
+        authorization_endpoint,
+        token_endpoint,
     })
+}
+
+/// PBA-L6b-016: a discovery-supplied endpoint must be an https URL on the issuer's own origin
+/// (scheme, host and port), with no userinfo, query or fragment, and only URL-safe path characters.
+/// The authorization endpoint is handed to the OS browser opener and the token endpoint receives
+/// the authorization code + PKCE verifier, so a hostile or tampered discovery document must not be
+/// able to point either anywhere else (or smuggle shell metacharacters such as `&`).
+fn validate_endpoint(issuer: &str, endpoint: &str) -> Result<(), String> {
+    let refuse = |why: &str| Err(format!("discovery endpoint {endpoint:?} refused: {why}"));
+    let iss = reqwest::Url::parse(issuer).map_err(|e| format!("issuer {issuer:?}: {e}"))?;
+    let ep = match reqwest::Url::parse(endpoint) {
+        Ok(u) => u,
+        Err(e) => return refuse(&e.to_string()),
+    };
+    if ep.scheme() != "https" {
+        return refuse("not https");
+    }
+    if !ep.username().is_empty() || ep.password().is_some() {
+        return refuse("carries userinfo");
+    }
+    if ep.query().is_some() || ep.fragment().is_some() {
+        return refuse("carries a query or fragment");
+    }
+    if ep.host_str() != iss.host_str() || ep.port_or_known_default() != iss.port_or_known_default()
+    {
+        return refuse("not on the issuer's origin");
+    }
+    // Checked last so each structural rule above is independently enforced (and tested); this
+    // also keeps shell metacharacters such as `&` out of the path the opener receives.
+    if !endpoint
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~:/%".contains(&b))
+    {
+        return refuse("contains characters outside the URL-safe path set");
+    }
+    Ok(())
 }
 
 // --- PKCE ---
@@ -253,17 +293,32 @@ fn config_path(explicit: Option<&str>) -> PathBuf {
     PathBuf::from(base).join("citrate").join("memory.json")
 }
 
+/// PBA-L6b-016: open the token file for writing with mode 0600 FROM CREATION (the old path wrote
+/// the token under the process umask, then chmodded), and tighten a pre-existing file to 0600
+/// before any byte of the new token is written.
+fn open_private_file(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(f)
+}
+
 fn write_config(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    // 0600 — the file holds a token.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    let mut f = open_private_file(path).map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.write_all(bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -275,13 +330,24 @@ fn http_get_json(url: &str) -> Result<serde_json::Value, String> {
     resp.json().map_err(|e| format!("parse {url}: {e}"))
 }
 
+/// PBA-L6b-016: hand the URL to the Windows URL protocol handler directly, as a single argument.
+/// `cmd /C start "" <url>` let cmd.exe parse the URL, and every `&` in the auth URL is a command
+/// separator there. `rundll32 url.dll,FileProtocolHandler` is the ShellExecute path without a shell.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_browser_command(url: &str) -> (&'static str, Vec<String>) {
+    (
+        "rundll32.exe",
+        vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+    )
+}
+
 fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
-    let (cmd, args) = ("open", vec![url]);
+    let (cmd, args) = ("open", vec![url.to_string()]);
     #[cfg(target_os = "linux")]
-    let (cmd, args) = ("xdg-open", vec![url]);
+    let (cmd, args) = ("xdg-open", vec![url.to_string()]);
     #[cfg(target_os = "windows")]
-    let (cmd, args) = ("cmd", vec!["/C", "start", "", url]);
+    let (cmd, args) = windows_browser_command(url);
     std::process::Command::new(cmd).args(args).spawn().map(|_| ())
 }
 
@@ -346,6 +412,81 @@ mod tests {
     fn url_round_trip() {
         let s = "oidc|abc/def+ghi";
         assert_eq!(urldecode(&urlencode(s)), s);
+    }
+
+    /// PBA-L6b-016 regression: on Windows the login URL must reach the
+    /// browser as ONE argument with no shell in between. Pre-fix it went
+    /// through `cmd /C start "" <url>`, where every `&` in the (always
+    /// multi-parameter) auth URL is a command separator — broken login, and
+    /// command injection from a hostile issuer's discovery document.
+    #[test]
+    fn windows_opener_never_goes_through_a_shell_pba_l6b_016() {
+        let url = "https://auth.citrate.ai/authorize?response_type=code&client_id=x&state=y";
+        let (prog, args) = windows_browser_command(url);
+        let prog = prog.to_ascii_lowercase();
+        assert!(
+            !prog.contains("cmd") && !prog.contains("powershell"),
+            "no shell interpreter: {prog}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some(url), "URL passed verbatim");
+        assert!(
+            !args.iter().any(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("start")),
+            "no cmd.exe start semantics: {args:?}"
+        );
+    }
+
+    /// PBA-L6b-016 regression: discovery endpoints must be https and
+    /// same-origin with the issuer. Pre-fix `authorization_endpoint` and
+    /// `token_endpoint` were taken verbatim from the discovery document.
+    #[test]
+    fn discovery_endpoints_must_be_https_same_origin_pba_l6b_016() {
+        let iss = "https://auth.citrate.ai";
+        for ok in [
+            "https://auth.citrate.ai/authorize",
+            "https://auth.citrate.ai/oauth/token",
+            "https://auth.citrate.ai:443/authorize",
+        ] {
+            validate_endpoint(iss, ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "http://auth.citrate.ai/authorize",
+            "https://evil.example/authorize",
+            "https://auth.citrate.ai.evil.example/authorize",
+            "https://auth.citrate.ai:8443/authorize",
+            "https://auth.citrate.ai/authorize&calc.exe",
+            "https://auth.citrate.ai/authorize?x=1\"&calc",
+            "https://user@auth.citrate.ai/authorize",
+            "https://user:pw@auth.citrate.ai/authorize",
+            "https://:pw@auth.citrate.ai/authorize",
+            "https://auth.citrate.ai/authorize?x=1",
+            "https://auth.citrate.ai/authorize#frag",
+            "javascript:alert(1)",
+            "",
+        ] {
+            assert!(validate_endpoint(iss, bad).is_err(), "must refuse {bad:?}");
+        }
+    }
+
+    /// PBA-L6b-016 regression: the token file is created 0600 up front, not
+    /// created with the process umask and chmodded after the token is written.
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_private_from_creation_pba_l6b_016() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cit-connect-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("memory.json");
+        let _ = std::fs::remove_file(&path);
+        let f = open_private_file(&path).expect("open");
+        let mode = f.metadata().expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "created with mode {mode:o} before any byte was written");
+        drop(f);
+        // A pre-existing, world-readable file is tightened before the write.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        write_config(&path, b"{}").expect("write");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

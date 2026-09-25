@@ -184,20 +184,23 @@ mod tests {
                 Quorum::Multiset(req) => req.is_subset(&usable),
             }
         };
+        // Every sequence of length 0..=4 over the five roles (781 sequences).
         let mut seqs: Vec<Vec<Role>> = vec![vec![]];
+        let mut layer: Vec<Vec<Role>> = vec![vec![]];
         for _ in 0..4 {
-            let mut next = Vec::new();
-            for s in &seqs {
-                for r in all {
-                    let mut t = s.clone();
-                    t.push(r);
-                    next.push(t);
-                }
-            }
-            seqs.extend(next.clone());
-            seqs.dedup();
-            seqs = seqs.into_iter().filter(|s| s.len() <= 4).collect();
+            layer = layer
+                .iter()
+                .flat_map(|s| {
+                    all.iter().map(move |r| {
+                        let mut t = s.clone();
+                        t.push(*r);
+                        t
+                    })
+                })
+                .collect();
+            seqs.extend(layer.iter().cloned());
         }
+        assert_eq!(seqs.len(), 1 + 5 + 25 + 125 + 625);
         for seq in &seqs {
             let set: BTreeSet<Role> = seq.iter().copied().collect();
             for q in &quorums {

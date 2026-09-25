@@ -335,6 +335,44 @@ mod tests {
         assert!(result.output.contains("hello"));
     }
 
+    /// PBA-L6b-034 regression (PoC `poc_shell_truncate_panic.rs`): output
+    /// whose byte 65_536 falls inside a multi-byte UTF-8 character made
+    /// `String::truncate(MAX_OUTPUT_BYTES)` panic and took the tool down.
+    /// It must truncate on a char boundary instead.
+    #[tokio::test]
+    async fn shell_exec_truncates_on_a_char_boundary_pba_l6b_034() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut raw = vec![b'A'; 65_535];
+        raw.extend_from_slice("\u{20AC}".as_bytes()); // 3-byte euro sign straddles 65_536
+        raw.extend_from_slice(b"tail");
+        std::fs::write(dir.path().join("out.txt"), &raw).expect("write fixture");
+        let ctx = test_ctx_with_dir(dir.path().to_str().expect("valid path"));
+        let result = tools::ShellExec
+            .execute(serde_json::json!({ "command": "cat out.txt" }), &ctx)
+            .await
+            .expect("shell_exec must return, not panic");
+        assert!(result.success);
+        assert!(result.output.ends_with("\n... (truncated)"), "truncation marker present");
+        let body = result.output.trim_end_matches("\n... (truncated)");
+        assert_eq!(body.len(), 65_535, "cut back to the last char boundary");
+        assert!(body.bytes().all(|b| b == b'A'));
+    }
+
+    /// PBA-L6b-034 (mutation-kill): output of exactly MAX_OUTPUT_BYTES is
+    /// returned whole, with no truncation marker.
+    #[tokio::test]
+    async fn shell_exec_does_not_mark_output_at_exactly_the_cap_pba_l6b_034() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(dir.path().join("out.txt"), vec![b'A'; 65_536]).expect("write fixture");
+        let ctx = test_ctx_with_dir(dir.path().to_str().expect("valid path"));
+        let result = tools::ShellExec
+            .execute(serde_json::json!({ "command": "cat out.txt" }), &ctx)
+            .await
+            .expect("shell_exec returns");
+        assert_eq!(result.output.len(), 65_536);
+        assert!(!result.output.contains("(truncated)"));
+    }
+
     #[tokio::test]
     async fn test_shell_exec_failing_command() {
         // Post RM-E4: shell builtins like `exit 42` no longer apply

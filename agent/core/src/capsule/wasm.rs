@@ -92,7 +92,121 @@ pub struct HostCtx {
     /// appetite per call"). Default values are the per-call caps
     /// (64 MiB heap, 1 table, 1 instance) — `dispatch.rs` may
     /// override per workload.
-    pub store_limits: StoreLimits,
+    pub store_limits: CapsuleLimiter,
+}
+
+/// PBA-L6b-014 — per-memory cap (the AR-B-004 DoS bound).
+pub const CAPSULE_MEMORY_BYTES_PER_MEMORY: usize = 64 * 1024 * 1024;
+/// PBA-L6b-014 — aggregate linear-memory cap for one capsule store, summed
+/// over every memory of every instance. The per-memory cap alone did not
+/// bound a store (wasmtime's default count limits are 10,000).
+pub const CAPSULE_MEMORY_BYTES_TOTAL: usize = 128 * 1024 * 1024;
+/// PBA-L6b-014 — structural count caps. A component with one core module
+/// already needs 2 instances; the shipped fleet uses a handful. These are
+/// headroom for legitimate component-model capsules, not tight fits.
+pub const CAPSULE_MAX_INSTANCES: usize = 32;
+pub const CAPSULE_MAX_MEMORIES: usize = 16;
+pub const CAPSULE_MAX_TABLES: usize = 32;
+pub const CAPSULE_MAX_TABLE_ELEMENTS: usize = 100_000;
+/// PBA-L6b-014 — bytes charged to the store budget per table element. A
+/// funcref slot is pointer-sized in wasmtime; 16 is a conservative upper bound
+/// so table storage cannot sit outside the aggregate budget.
+pub const CAPSULE_TABLE_ELEMENT_BYTES: usize = 16;
+
+/// PBA-L6b-014 — the capsule store's resource limiter: wasmtime's
+/// [`StoreLimits`] (per-memory size, table size, instance / memory / table
+/// counts) plus an aggregate linear-memory budget across the whole store.
+/// Single source of truth for `HostCtx::empty` and `CapsuleDispatch::call_raw`.
+pub struct CapsuleLimiter {
+    inner: StoreLimits,
+    memory_total: usize,
+    memory_total_max: usize,
+}
+
+impl CapsuleLimiter {
+    /// The production capsule limits.
+    pub fn capsule_default() -> Self {
+        Self {
+            inner: StoreLimitsBuilder::new()
+                .memory_size(CAPSULE_MEMORY_BYTES_PER_MEMORY)
+                .memories(CAPSULE_MAX_MEMORIES)
+                .tables(CAPSULE_MAX_TABLES)
+                .table_elements(CAPSULE_MAX_TABLE_ELEMENTS)
+                .instances(CAPSULE_MAX_INSTANCES)
+                .build(),
+            memory_total: 0,
+            memory_total_max: CAPSULE_MEMORY_BYTES_TOTAL,
+        }
+    }
+
+    /// Bytes granted so far in this store (linear memory plus table
+    /// storage at [`CAPSULE_TABLE_ELEMENT_BYTES`] per element).
+    pub fn memory_total(&self) -> usize {
+        self.memory_total
+    }
+
+    /// Charge `bytes` to the aggregate budget; `false` (nothing charged) when
+    /// it would exceed [`CAPSULE_MEMORY_BYTES_TOTAL`].
+    fn charge(&mut self, bytes: usize) -> wasmtime::Result<bool> {
+        match self.memory_total.checked_add(bytes) {
+            Some(total) if total <= self.memory_total_max => {
+                self.memory_total = total;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for CapsuleLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if !self.inner.memory_growing(current, desired, maximum)? {
+            return Ok(false);
+        }
+        self.charge(desired.saturating_sub(current))
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if !self.inner.table_growing(current, desired, maximum)? {
+            return Ok(false);
+        }
+        // PBA-L6b-014: table storage draws on the same aggregate budget as
+        // linear memory.
+        let bytes = desired
+            .saturating_sub(current)
+            .saturating_mul(CAPSULE_TABLE_ELEMENT_BYTES);
+        self.charge(bytes)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
 }
 
 impl HostCtx {
@@ -128,12 +242,9 @@ impl HostCtx {
             // component with one core module already consumes 2 instances (the
             // core instance + the component instance) — not tight limits; the
             // heap cap is what bounds a hostile capsule.
-            store_limits: StoreLimitsBuilder::new()
-                .memory_size(64 * 1024 * 1024) // 64 MiB hard cap (per memory)
-                .tables(100)
-                .table_elements(1_000_000)
-                .instances(1_000)
-                .build(),
+            // PBA-L6b-014: per-memory 64 MiB AND an aggregate 128 MiB
+            // budget, with small instance / memory / table counts.
+            store_limits: CapsuleLimiter::capsule_default(),
         }
     }
 
@@ -380,5 +491,82 @@ mod tests {
         // on empty bytes; we just check neither panics.
         let _ = e1;
         let _ = e2;
+    }
+}
+
+#[cfg(test)]
+mod pba_l6b_014_tests {
+    use super::*;
+    use wasmtime::ResourceLimiter;
+
+    /// PBA-L6b-014 tripwire: the count caps are small, and ONE aggregate
+    /// budget covers linear memory AND table storage across growth requests.
+    /// Scope: this is what `ResourceLimiter` can see. Globals and other
+    /// per-instance metadata are bounded only by the instance count cap and
+    /// the module size, not by this budget.
+    #[test]
+    fn tripwire_capsule_limiter_bounds_memory_and_tables_pba_l6b_014() {
+        let mut l = CapsuleLimiter::capsule_default();
+        assert_eq!(l.instances(), CAPSULE_MAX_INSTANCES);
+        assert_eq!(l.memories(), CAPSULE_MAX_MEMORIES);
+        assert_eq!(l.tables(), CAPSULE_MAX_TABLES);
+        const _: () = assert!(
+            CAPSULE_MAX_INSTANCES <= 64 && CAPSULE_MAX_MEMORIES <= 64 && CAPSULE_MAX_TABLES <= 64
+        );
+        const _: () = assert!(CAPSULE_MEMORY_BYTES_TOTAL <= 256 * 1024 * 1024);
+
+        let mib = 1024 * 1024;
+        // Per-memory cap still applies.
+        assert!(!l.memory_growing(0, 65 * mib, None).expect("no trap"));
+        assert_eq!(l.memory_total(), 0, "a refused growth is not charged");
+        // 64 + 64 fits exactly; one more byte does not.
+        assert!(l.memory_growing(0, 64 * mib, None).expect("no trap"));
+        assert!(l.memory_growing(0, 64 * mib, None).expect("no trap"));
+        assert_eq!(l.memory_total(), CAPSULE_MEMORY_BYTES_TOTAL);
+        assert!(!l.memory_growing(0, 1, None).expect("no trap"));
+        // Growth is charged as a delta over the current size.
+        let mut l = CapsuleLimiter::capsule_default();
+        assert!(l.memory_growing(0, 10 * mib, None).expect("no trap"));
+        assert!(l.memory_growing(10 * mib, 20 * mib, None).expect("no trap"));
+        assert_eq!(l.memory_total(), 20 * mib);
+        assert!(l.table_growing(0, 10, None).expect("no trap"));
+        assert_eq!(
+            l.memory_total(),
+            20 * mib + 10 * CAPSULE_TABLE_ELEMENT_BYTES,
+            "tables are charged"
+        );
+        assert!(!l
+            .table_growing(0, CAPSULE_MAX_TABLE_ELEMENTS + 1, None)
+            .expect("no trap"));
+        // Table storage alone cannot exceed the aggregate budget.
+        let mut l = CapsuleLimiter::capsule_default();
+        let per_table = CAPSULE_MAX_TABLE_ELEMENTS * CAPSULE_TABLE_ELEMENT_BYTES;
+        let fit = CAPSULE_MEMORY_BYTES_TOTAL / per_table;
+        for _ in 0..fit {
+            assert!(l
+                .table_growing(0, CAPSULE_MAX_TABLE_ELEMENTS, None)
+                .expect("no trap"));
+        }
+        assert!(!l
+            .table_growing(0, CAPSULE_MAX_TABLE_ELEMENTS, None)
+            .expect("no trap"));
+        assert!(l.memory_total() <= CAPSULE_MEMORY_BYTES_TOTAL);
+    }
+
+    /// PBA-L6b-014 tripwire: nobody builds an ad-hoc StoreLimits for a capsule
+    /// store outside this module (that is how dispatch.rs used to reset the
+    /// caps to wasmtime-default counts).
+    #[test]
+    fn tripwire_no_adhoc_store_limits_pba_l6b_014() {
+        for (name, src) in [
+            ("dispatch.rs", include_str!("dispatch.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("linker.rs", include_str!("linker.rs")),
+        ] {
+            assert!(
+                !src.contains("StoreLimitsBuilder"),
+                "{name} builds its own StoreLimits; use CapsuleLimiter::capsule_default()"
+            );
+        }
     }
 }

@@ -245,8 +245,8 @@ struct RoleAwareEntry {
 ///
 /// CIT-AGENT-4a adds a parallel role-aware track: `submit_for_action`
 /// + `add_signature` accumulate per-role signatures until the
-/// declared `Quorum` is satisfied. The simple `submit` / `approve` /
-/// `reject` API stays for BFR-INT-12b compatibility.
+/// declared `Quorum` is satisfied. The FIFO track is resolved only by
+/// call-id (`approve_by_id` / `reject_by_id`, PBA-L6b-009).
 ///
 /// Locking discipline: the std Mutex is only held across queue
 /// surgery (push / pop / peek). Awaits happen outside the lock
@@ -1285,6 +1285,41 @@ mod tests {
             assert_eq!(res, Err(SignatureError::ResolverGone));
             assert_eq!(q.depth(), 0, "the dead entry is still removed");
         }
+    }
+
+    /// PBA-L6b-009 (mutation-kill): the error names the reason.
+    #[test]
+    fn resolver_gone_displays_its_reason_pba_l6b_009() {
+        let msg = SignatureError::ResolverGone.to_string();
+        assert!(msg.contains("no longer waiting"), "{msg}");
+    }
+
+    /// PBA-L6b-009 (mutation-kill): a finished waiter's cleanup must remove
+    /// only its OWN entry. Here A is approved, then B is queued with the same
+    /// call-id before A's future observes the approval; when A's guard drops
+    /// it must leave B alone (a call-id-only match would evict B).
+    #[tokio::test]
+    async fn a_resolved_waiter_does_not_evict_a_later_same_id_entry_pba_l6b_009() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let q = Arc::new(ApprovalQueue::new());
+        let mut a = Box::pin(q.submit_with_outcome(mkcall("same")));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(a.as_mut().poll(&mut cx).is_pending(), "A parks");
+        q.approve_by_id("call_same").expect("A is the head");
+        let qb = q.clone();
+        let b = tokio::spawn(async move { qb.submit_with_outcome(mkcall("same")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        match a.as_mut().poll(&mut cx) {
+            Poll::Ready(o) => assert_eq!(o, ApprovalOutcomePublic::Approved),
+            Poll::Pending => panic!("A must see its approval"),
+        }
+        drop(a);
+        assert_eq!(q.depth(), 1, "B must survive A's cleanup");
+        q.reject_by_id("call_same").expect("B is the head");
+        assert_eq!(b.await.unwrap(), ApprovalOutcomePublic::Rejected);
     }
 
     /// PBA-L6b-009 variant: a submitter whose future is dropped (the capsule

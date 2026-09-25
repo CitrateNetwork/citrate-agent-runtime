@@ -14,6 +14,7 @@
 use crate::capsule::dispatcher::{ApprovalGate, EthCallDispatcher, EthSendDispatcher};
 use crate::capsule::manifest::Manifest;
 use crate::capsule::wasm::EngineFactory;
+use crate::capsule::allowlist::FleetAllowlist;
 use crate::capsule::{archive, bundled_key, Capsule};
 use crate::error::AgentError;
 use std::collections::{HashMap, HashSet};
@@ -97,6 +98,10 @@ pub struct CapsuleDispatch {
     /// (placeholder or mismatched content_hash, and no signed `.cps`). `call_raw`
     /// refuses to instantiate these — fail-closed, with no override (CIT-AGENT-3e).
     unverified: HashSet<String>,
+    /// PBA-L6b-015: signed capsules the fleet allowlist refused (unknown name,
+    /// version below the floor, or an unpinned build), with the reason. Never
+    /// instantiated.
+    refused: HashMap<String, String>,
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
     approval_gate: Option<Arc<dyn ApprovalGate>>,
@@ -113,8 +118,30 @@ impl CapsuleDispatch {
     /// directory to coexist with non-capsule scaffolding like the
     /// `wit/` and `gherkin/` companion dirs documented in
     /// planset 03).
+    ///
+    /// PBA-L6b-015: a signed capsule runs only if the compiled-in
+    /// [`FleetAllowlist::bundled`] admits its (name, version, content_hash).
     pub fn load_from_dir(
         dir: &Path,
+        eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
+        eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
+        approval_gate: Option<Arc<dyn ApprovalGate>>,
+    ) -> Result<Self, AgentError> {
+        Self::load_from_dir_with_allowlist(
+            dir,
+            &FleetAllowlist::bundled(),
+            eth_call_dispatcher,
+            eth_send_dispatcher,
+            approval_gate,
+        )
+    }
+
+    /// [`Self::load_from_dir`] against an explicit allowlist (test fixtures;
+    /// the signature check is unchanged — only bundled-key-signed archives
+    /// can load either way).
+    pub fn load_from_dir_with_allowlist(
+        dir: &Path,
+        allowlist: &FleetAllowlist,
         eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
         eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
         approval_gate: Option<Arc<dyn ApprovalGate>>,
@@ -125,6 +152,7 @@ impl CapsuleDispatch {
         let _epoch_ticker = EpochTicker::spawn(&engine);
         let mut capsules = HashMap::new();
         let mut unverified = HashSet::new();
+        let mut refused = HashMap::new();
         let registry = bundled_key::registry();
         let entries = std::fs::read_dir(dir)
             .map_err(|e| AgentError::Capsule(format!("read capsule dir {dir:?}: {e}")))?;
@@ -148,6 +176,14 @@ impl CapsuleDispatch {
                 let file = std::fs::File::open(&cps_path)
                     .map_err(|e| AgentError::Capsule(format!("open {cps_path:?}: {e}")))?;
                 let capsule = Capsule::from_archive_verified(file, &registry)?;
+                // PBA-L6b-015: a valid signature is necessary, not sufficient.
+                // The (name, version, content_hash) must be allowlisted, so an
+                // older signed release or a signed test capsule cannot run.
+                if let Err(reason) = allowlist.check(&capsule.manifest) {
+                    eprintln!("[capsule-dispatch] refusing {cps_path:?}: {reason}");
+                    refused.insert(capsule.manifest.capsule.name.clone(), reason);
+                    continue;
+                }
                 capsules.insert(capsule.manifest.capsule.name.clone(), capsule);
                 continue;
             }
@@ -183,6 +219,7 @@ impl CapsuleDispatch {
             engine,
             capsules,
             unverified,
+            refused,
             eth_call_dispatcher,
             eth_send_dispatcher,
             approval_gate,
@@ -197,6 +234,22 @@ impl CapsuleDispatch {
         let mut names: Vec<String> = self.capsules.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// PBA-L6b-015: signed capsules the allowlist refused, with the reason.
+    pub fn refused_capsules(&self) -> &HashMap<String, String> {
+        &self.refused
+    }
+
+    /// Error for a name that is not runnable: says why when the allowlist
+    /// refused it.
+    fn not_loaded(&self, capsule_name: &str) -> AgentError {
+        match self.refused.get(capsule_name) {
+            Some(reason) => AgentError::Capsule(format!(
+                "capsule {capsule_name:?} refused by the fleet allowlist: {reason}"
+            )),
+            None => AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")),
+        }
     }
 
     /// Whether `capsule_name` is in the fleet.
@@ -218,7 +271,7 @@ impl CapsuleDispatch {
         let capsule = self
             .capsules
             .get(capsule_name)
-            .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
+            .ok_or_else(|| self.not_loaded(capsule_name))?;
 
         // CIT-AGENT-3e (closes RM-A WP-AGENT_RUNTIME-2026-05-31-001): fail-closed
         // integrity gate with NO escape hatch. A loose-dir capsule that is not bound to
@@ -305,12 +358,10 @@ impl CapsuleDispatch {
         // single core module already needs 2 instances). Kept in sync with
         // `HostCtx::empty` so `instantiate_*` (which arms the limiter from
         // `store_limits`) and `call_raw` agree.
-        store.data_mut().store_limits = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(64 * 1024 * 1024) // 64 MiB hard cap (per memory)
-            .tables(100)
-            .table_elements(1_000_000)
-            .instances(1_000)
-            .build();
+        // PBA-L6b-014: keep the budget the store has ALREADY spent at
+        // instantiate time (`arm_instantiate_bounds` armed the same limiter), so
+        // the aggregate cap covers instantiate + call together. Replacing it
+        // with a fresh limiter here would reset the running total.
         store.limiter(|state| &mut state.store_limits);
 
         let mut results = [wasmtime::component::Val::Bool(false)];
@@ -373,7 +424,7 @@ impl CapsuleDispatch {
         let capsule = self
             .capsules
             .get(capsule_name)
-            .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
+            .ok_or_else(|| self.not_loaded(capsule_name))?;
         // AR-B-008: refuse an unverified capsule BEFORE any of its bytes reach
         // `Component::from_binary` (full Cranelift compilation — the largest
         // untrusted-parsing surface in the crate). RFC §4.5 requires manifest
@@ -647,10 +698,9 @@ mod tests {
         let dispatch = CapsuleDispatch::load_from_dir(&capsules_root, None, None, None)
             .expect("loads cleanly");
         let names = dispatch.capsule_names();
-        // 7 BFR-INT-12 tool capsules + 3 supporting/test capsules
-        // (hello, echo-chain, eth-sender-test). The fleet has at
-        // LEAST the 7 BFR tools; the supporting ones come along
-        // as siblings in the same dir.
+        // 7 BFR-INT-12 tool capsules + 2 supporting capsules
+        // (hello, echo-chain). PBA-L6b-015: the eth-sender-test capsule
+        // moved to test-fixtures/ and is not part of the shipped fleet.
         for expected in &[
             "list-compliance-posture",
             "query-decisions-by-tenant",
@@ -722,6 +772,98 @@ tier = "bundled"
             "an unverified loose-dir capsule must be refused fail-closed"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PBA-L6b-015 regression: a capsule signed with the bundled key is NOT
+    /// runnable just because the signature verifies. `eth-sender-test` (a
+    /// signed test capsule with an eth-send capability) sat in the shipped
+    /// fleet and loaded; it must not be part of the runnable fleet.
+    #[test]
+    fn shipped_fleet_does_not_run_the_test_capsule_pba_l6b_015() {
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("fleet loads");
+        assert!(
+            !dispatch.has("eth-sender-test"),
+            "eth-sender-test must not be in the runnable fleet: {:?}",
+            dispatch.capsule_names()
+        );
+        assert!(dispatch.call_json("eth-sender-test", &serde_json::json!({})).is_err());
+    }
+
+    /// PBA-L6b-015 tripwire: the compiled-in allowlist and the shipped
+    /// `capsules/` fleet agree exactly. Every shipped signed capsule is
+    /// admitted (nothing refused), every allowlisted name ships, and no
+    /// test-only capsule sits in the fleet dir. Re-packing a capsule without
+    /// updating the allowlist (or vice versa) fails here.
+    #[test]
+    fn bundled_allowlist_matches_the_shipped_fleet_pba_l6b_015() {
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("fleet loads");
+        assert!(
+            dispatch.refused_capsules().is_empty(),
+            "shipped capsules refused by the allowlist: {:?}",
+            dispatch.refused_capsules()
+        );
+        let mut allowed: Vec<String> = FleetAllowlist::bundled()
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        allowed.sort();
+        assert_eq!(dispatch.capsule_names(), allowed);
+        for entry in std::fs::read_dir(capsules_root()).expect("read capsules/") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("test"), "test capsule {name:?} in the shipped fleet dir");
+        }
+    }
+
+    /// PBA-L6b-015: a signed capsule that is not allowlisted is refused with
+    /// a reason, and an explicit allowlist can admit it (fixture path).
+    #[test]
+    fn refused_capsule_reports_the_allowlist_reason_pba_l6b_015() {
+        let fixtures = capsules_root()
+            .parent()
+            .expect("repo root")
+            .join("test-fixtures")
+            .join("capsules");
+        let dispatch =
+            CapsuleDispatch::load_from_dir(&fixtures, None, None, None).expect("fixtures load");
+        assert!(!dispatch.has("eth-sender-test"));
+        let err = dispatch
+            .call_json("eth-sender-test", &serde_json::json!({}))
+            .expect_err("refused");
+        assert!(err.to_string().contains("fleet allowlist"), "{err}");
+
+        let fixture_list =
+            FleetAllowlist::from_entries(vec![crate::capsule::allowlist::AllowEntry {
+                name: "eth-sender-test".into(),
+                min_version: "0.1.0".into(),
+                content_hashes: vec![
+                    "sha256:f6364f40f252d5212a3bc3f203ccf4019dfb8850ce96bfb5c67ecedcbffd8086".into(),
+                ],
+            }]);
+        let dispatch = CapsuleDispatch::load_from_dir_with_allowlist(
+            &fixtures,
+            &fixture_list,
+            None,
+            None,
+            None,
+        )
+        .expect("fixtures load");
+        assert!(dispatch.has("eth-sender-test"));
+        // Same build, but the floor raised above it: rollback refused.
+        let raised = FleetAllowlist::from_entries(vec![crate::capsule::allowlist::AllowEntry {
+            name: "eth-sender-test".into(),
+            min_version: "0.2.0".into(),
+            content_hashes: vec![
+                "sha256:f6364f40f252d5212a3bc3f203ccf4019dfb8850ce96bfb5c67ecedcbffd8086".into(),
+            ],
+        }]);
+        let dispatch =
+            CapsuleDispatch::load_from_dir_with_allowlist(&fixtures, &raised, None, None, None)
+                .expect("fixtures load");
+        assert!(!dispatch.has("eth-sender-test"));
+        assert!(dispatch.refused_capsules()["eth-sender-test"].contains("below the allowlist floor"));
     }
 
     #[test]

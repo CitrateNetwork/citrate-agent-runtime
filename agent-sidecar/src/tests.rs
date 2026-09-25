@@ -24,6 +24,7 @@ fn state() -> Arc<AppState> {
         ],
         dispatch: None,
         bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
     })
 }
 
@@ -135,9 +136,31 @@ async fn approvals_is_empty_until_a_skill_runs() {
 // unknown skill, no-dispatch, estop); the real gate-path e2e (a skill's effect surfaces on the queue)
 // is `run_skill_surfaces_a_chain_effect_on_the_queue` further down, driven from the real capsule dir.
 
-// The built capsule fixtures live at the repo root, but tests run from the crate dir.
-fn capsules_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../capsules")
+// PBA-L6b-015: the eth-sender-test capsule is a test fixture, not part of the shipped fleet. It is
+// loaded from test-fixtures/ with an allowlist that admits exactly its signed build.
+fn fixture_capsules_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-fixtures/capsules")
+}
+
+fn fixture_dispatch(queue: Arc<ApprovalQueue>) -> Option<Arc<CapsuleDispatch>> {
+    use citrate_agent_core::capsule::allowlist::AllowEntry;
+    let allow = FleetAllowlist::from_entries(vec![AllowEntry {
+        name: "eth-sender-test".into(),
+        min_version: "0.1.0".into(),
+        content_hashes: vec![
+            "sha256:f6364f40f252d5212a3bc3f203ccf4019dfb8850ce96bfb5c67ecedcbffd8086".into(),
+        ],
+    }]);
+    crate::load_dispatch_with_allowlist(&fixture_capsules_dir(), &allow, queue)
+}
+
+/// PBA-L6b-015: the production loader (bundled allowlist) does not run the test capsule even when
+/// its signed archive sits in the capsule dir.
+#[test]
+fn production_loader_refuses_the_test_capsule_pba_l6b_015() {
+    let d = crate::load_dispatch(&fixture_capsules_dir(), Arc::new(ApprovalQueue::new()))
+        .expect("dir loads");
+    assert!(!d.has("eth-sender-test"));
 }
 
 fn run_body(name: &str, args: serde_json::Value) -> Request<Body> {
@@ -185,8 +208,8 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
     // is still FIFO-only; to approve a privileged effect an operator surface
     // must adopt the role-aware submit_for_action/add_signature track.)
     let queue = Arc::new(ApprovalQueue::new());
-    let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
-    assert!(dispatch.is_some(), "the repo capsules/ dir must load");
+    let dispatch = fixture_dispatch(queue.clone());
+    assert!(dispatch.is_some(), "the test-fixtures capsule dir must load");
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue: queue.clone(),
@@ -196,6 +219,7 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
         }],
         dispatch,
         bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
     });
 
     // `to` must be the capsule's allow-listed address so the effect reaches the gate (not rejected at
@@ -232,8 +256,8 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
 async fn run_skill_404s_for_an_unknown_skill() {
     // A loaded dispatch, but the name isn't in the catalog.
     let queue = Arc::new(ApprovalQueue::new());
-    let dispatch = crate::load_dispatch(&capsules_dir(), queue.clone());
-    assert!(dispatch.is_some(), "the repo capsules/ dir must load");
+    let dispatch = fixture_dispatch(queue.clone());
+    assert!(dispatch.is_some(), "the test-fixtures capsule dir must load");
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue,
@@ -243,6 +267,7 @@ async fn run_skill_404s_for_an_unknown_skill() {
         }],
         dispatch,
         bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
     });
     let resp = app(st)
         .oneshot(run_body("no-such-skill", serde_json::json!({})))
@@ -471,6 +496,7 @@ async fn approvals_exposes_the_raw_calldata_for_the_ceremony_bridge() {
         skills: vec![],
         dispatch: None,
         bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
     });
     let resp = app(st).oneshot(authed("GET", "/approvals")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -503,6 +529,7 @@ fn state_with(queue: Arc<ApprovalQueue>) -> Arc<AppState> {
         skills: vec![],
         dispatch: None,
         bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
     })
 }
 
@@ -626,4 +653,75 @@ async fn stop_freezes_and_drains_the_approval_queue_pba_l6b_010() {
     .unwrap();
     assert_eq!(late, ApprovalOutcomePublic::Rejected);
     assert_eq!(queue.depth(), 0);
+}
+
+/// PBA-L6b-032 regression: /status must count role-track (quorum) pending actions too. Pre-fix
+/// `pendingApprovals` was the FIFO depth only, so a parked privileged effect was invisible.
+#[tokio::test]
+async fn status_counts_role_track_pending_pba_l6b_032() {
+    use citrate_agent_core::hitl::{Quorum, Role, Signer};
+    let queue = Arc::new(ApprovalQueue::new());
+    let q = queue.clone();
+    let h = tokio::spawn(async move {
+        q.submit_for_action(
+            chain_effect_call("rp1"),
+            b"p".to_vec(),
+            Quorum::for_tier(
+                citrate_agent_core::capsule::manifest::RiskTier::Medium,
+                &[Role::Reviewer],
+            ),
+            Signer {
+                id: "op".into(),
+                role: Role::Operator,
+            },
+        )
+        .await
+    });
+    wait_role_depth(&queue, 1).await;
+    let resp = app(state_with(queue.clone()))
+        .oneshot(authed("GET", "/status"))
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["rolePendingApprovals"], 1, "role-track pending must be visible: {j}");
+    queue.reject_action("rp1").unwrap();
+    let _ = h.await;
+}
+
+/// PBA-L6b-032: run_skill is refused with 429 when every run slot is taken, instead of spawning
+/// another task that may block a worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_skill_is_capped_pba_l6b_032() {
+    let queue = Arc::new(ApprovalQueue::new());
+    let dispatch = fixture_dispatch(queue.clone());
+    assert!(dispatch.is_some());
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS));
+    let held = slots.clone().acquire_many_owned(MAX_CONCURRENT_SKILLS as u32).await.unwrap();
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue,
+        skills: vec![SkillView {
+            name: "eth-sender-test".into(),
+            description: String::new(),
+        }],
+        dispatch,
+        bearer: BEARER.to_string(),
+        run_slots: slots.clone(),
+    });
+    let body = || run_body("eth-sender-test", serde_json::json!({"to": "0x00", "data": "0x00"}));
+    let resp = app(st.clone()).oneshot(body()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let s = body_json(app(st.clone()).oneshot(authed("GET", "/status")).await.unwrap()).await;
+    assert_eq!(s["runningSkills"], MAX_CONCURRENT_SKILLS);
+    drop(held);
+    let resp = app(st.clone()).oneshot(body()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a free slot admits the skill");
+    // The permit is released when the skill task ends.
+    for _ in 0..400 {
+        if slots.available_permits() == MAX_CONCURRENT_SKILLS {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("run slot never released");
 }

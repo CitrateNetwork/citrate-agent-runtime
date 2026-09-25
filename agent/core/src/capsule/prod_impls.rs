@@ -45,12 +45,17 @@ impl QueuedApprovalGate {
         }
     }
 
-    /// Bind the human operator who invokes capsules through this gate. Their
-    /// signer id (the pubkey fingerprint) becomes the proposer of every
-    /// role-track effect, so their own key can never count toward its
-    /// approval quorum.
-    pub fn with_proposer(mut self, proposer: Signer) -> Self {
-        self.proposer = Some(proposer);
+    /// Bind the human operator who invokes capsules through this gate, by
+    /// their Ed25519 PUBLIC KEY. The proposer id is derived from the key
+    /// (`signer_id_from_pubkey`, the same fingerprint `add_signature` checks),
+    /// so it cannot be set to an arbitrary string that no signing key matches
+    /// (PBA-L6b-012). That key can then never count toward the quorum of an
+    /// effect it proposed.
+    pub fn with_proposer(mut self, operator_pubkey: [u8; 32]) -> Self {
+        self.proposer = Some(Signer {
+            id: crate::hitl::signer_id_from_pubkey(&operator_pubkey),
+            role: crate::capsule::manifest::Role::Operator,
+        });
         self
     }
 }
@@ -254,7 +259,7 @@ mod tests {
         // PBA-L6b-012: the invoking human is the proposer.
         let operator = Ed25519FileSurface::from_seed([0x33; 32], Role::Operator);
         let gate =
-            Arc::new(QueuedApprovalGate::new(queue.clone()).with_proposer(operator.signer()));
+            Arc::new(QueuedApprovalGate::new(queue.clone()).with_proposer(operator.pubkey()));
 
         let addr = [0xa6u8; 20];
         let data = vec![0xde, 0xad, 0xbe, 0xef];
@@ -350,11 +355,8 @@ mod tests {
         let operator = Ed25519FileSurface::from_seed([0x44; 32], Role::Reviewer);
         let roster = StaticSignerRoster::new().authorize(operator.pubkey(), Role::Reviewer);
         let queue = Arc::new(ApprovalQueue::new().with_signer_roster(Arc::new(roster)));
-        let proposer = Signer {
-            id: operator.signer().id,
-            role: Role::Operator,
-        };
-        let gate = Arc::new(QueuedApprovalGate::new(queue.clone()).with_proposer(proposer));
+        let gate =
+            Arc::new(QueuedApprovalGate::new(queue.clone()).with_proposer(operator.pubkey()));
         let (addr, data) = ([0xa7u8; 20], vec![9u8]);
         let call_id = call_id_for("revoke-role", "eth-send", &addr, &data);
         let req = ApprovalRequest {

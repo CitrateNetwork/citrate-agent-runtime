@@ -13,6 +13,7 @@
 //! `.agentile/formal/specs/agent/CapsuleInstall.tla` (CIT-AGENT-2 —
 //! 2,600 distinct states PASS).
 
+pub mod allowlist;
 pub mod archive;
 pub mod bundled_key;
 pub mod dispatch;
@@ -752,6 +753,122 @@ tier = "bundled"
         capsule
             .instantiate(&engine, &linker)
             .expect_err("a >64 MiB initial memory must be refused AT instantiate time");
+    }
+
+    fn bounds_test_capsule(wasm: Vec<u8>) -> Capsule {
+        use crate::capsule::manifest::Manifest;
+        let manifest = Manifest::parse(
+            r#"
+[capsule]
+name = "aggmem"
+version = "0.1.0"
+content_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+[capability]
+network = "none"
+filesystem = []
+chain_calls = []
+subagent_spawn = false
+[data_class]
+reads = ["PUBLIC"]
+writes = []
+emits = ["PUBLIC"]
+[risk]
+tier = "low"
+required_roles = ["Operator"]
+break_glass_eligible = false
+[overlay]
+[provenance]
+publisher = "did:citrate:agent:0xab12"
+build_reproducible = true
+agentile_sprint = "test"
+tla_spec = ""
+[signing]
+tier = "bundled"
+"#,
+        )
+        .expect("manifest parses");
+        Capsule {
+            manifest,
+            archive: archive::ArchiveContents {
+                wasm,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// PBA-L6b-014 regression: the per-memory 64 MiB cap alone did not bound
+    /// a store. Four core instances with a 40 MiB memory each (every one under
+    /// the per-memory cap, 160 MiB together) instantiated fine pre-fix; the
+    /// aggregate cap must refuse it at instantiate time.
+    #[test]
+    fn instantiate_bounds_aggregate_memory_across_instances_pba_l6b_014() {
+        use crate::capsule::wasm::EngineFactory;
+        let wat = r#"(component
+             (core module $m (memory (export "m") 640))
+             (core instance (instantiate $m))
+             (core instance (instantiate $m))
+             (core instance (instantiate $m))
+             (core instance (instantiate $m)))"#;
+        let capsule = bounds_test_capsule(wat::parse_str(wat).expect("WAT compiles"));
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect_err("160 MiB of aggregate linear memory must be refused");
+
+        // Two of them (80 MiB) stay within the aggregate cap.
+        let ok = r#"(component
+             (core module $m (memory (export "m") 640))
+             (core instance (instantiate $m))
+             (core instance (instantiate $m)))"#;
+        let capsule = bounds_test_capsule(wat::parse_str(ok).expect("WAT compiles"));
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect("80 MiB across two instances is within the aggregate cap");
+    }
+
+    /// PBA-L6b-014 (R2 verifier): table storage counts against the store's
+    /// budget too. Many large funcref tables (each within the per-table
+    /// element cap) previously instantiated with nothing charged.
+    #[test]
+    fn instantiate_bounds_aggregate_table_storage_pba_l6b_014() {
+        use crate::capsule::wasm::EngineFactory;
+        let mut wat = String::from("(component (core module $m");
+        for _ in 0..16 {
+            wat.push_str(" (table 1000000 funcref)");
+        }
+        wat.push_str(") (core instance (instantiate $m)))");
+        let capsule = bounds_test_capsule(wat::parse_str(&wat).expect("WAT compiles"));
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect_err("16 x 1M-element tables must exceed the store budget");
+        // A modest table still instantiates.
+        let ok = "(component (core module $m (table 1000 funcref)) (core instance (instantiate $m)))";
+        let capsule = bounds_test_capsule(wat::parse_str(ok).expect("WAT compiles"));
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule.instantiate(&engine, &linker).expect("a 1k-element table is fine");
+    }
+
+    /// PBA-L6b-014 regression: the count caps are small, not wasmtime's
+    /// defaults (10,000 memories / instances). Many tiny instances must be
+    /// refused.
+    #[test]
+    fn instantiate_bounds_instance_count_pba_l6b_014() {
+        use crate::capsule::wasm::EngineFactory;
+        let mut wat = String::from("(component (core module $m (memory 1))");
+        for _ in 0..64 {
+            wat.push_str(" (core instance (instantiate $m))");
+        }
+        wat.push(')');
+        let capsule = bounds_test_capsule(wat::parse_str(&wat).expect("WAT compiles"));
+        let engine = EngineFactory::build().expect("engine builds");
+        let linker = capsule.prepare_linker(&engine).expect("linker").into_linker();
+        capsule
+            .instantiate(&engine, &linker)
+            .expect_err("64 core instances / memories must exceed the store caps");
     }
 
     /// CIT-AGENT-9a — empirical fail-closed proof for the
@@ -2550,6 +2667,8 @@ tier = "bundled"
             .parent()
             .and_then(|p| p.parent())
             .expect("walk up to citrate_v0.01.1/")
+            // PBA-L6b-015: the test capsule lives outside the shipped fleet.
+            .join("test-fixtures")
             .join("capsules")
             .join("eth-sender-test");
         let wasm = std::fs::read(capsule_dir.join("capsule.wasm")).unwrap();

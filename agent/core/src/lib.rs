@@ -16,6 +16,18 @@
 //!     (CIT-AGENT-3..5)
 //!   - Traits: `Model`, `AuditSink` (CIT-AGENT-3, 5)
 
+// PBA-R2 tripwire: `insecure-dev-hitl` disables the authorized-signer roster
+// (HIC quorum, break-glass, audit-chain role signatures). Enabling the feature
+// in ANY build of this crate is a compile error, whatever the profile or
+// debug-assertions setting (a release profile can turn debug assertions on).
+// This crate's own unit tests get the dev bypass from `cfg!(test)` instead.
+// See also `insecure_feature_tripwire::insecure_dev_hitl_is_off_everywhere`.
+#[cfg(feature = "insecure-dev-hitl")]
+compile_error!(
+    "the `insecure-dev-hitl` feature disables HIC signer-roster checks and must never be \
+     enabled in any build"
+);
+
 pub mod agent;
 pub mod audit;
 pub mod capsule;
@@ -42,3 +54,54 @@ pub use hitl::{
 // wasmtime version pinning; consumers SHOULD NOT depend on
 // wasmtime directly to avoid version skew.
 pub use wasmtime;
+
+#[cfg(test)]
+mod insecure_feature_tripwire {
+    /// PBA-R2 tripwire: `insecure-dev-hitl` stays OFF in every build. It is
+    /// not enabled for this test build (so not by `default` or by a workspace
+    /// dependent), no Cargo manifest in the workspace turns it on, and the
+    /// only mention is its definition in agent/core/Cargo.toml.
+    #[test]
+    fn insecure_dev_hitl_is_off_everywhere() {
+        const _: () = assert!(
+            !cfg!(feature = "insecure-dev-hitl"),
+            "insecure-dev-hitl is enabled in this build"
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let mut manifests = vec![root.join("Cargo.toml")];
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if p.is_dir() {
+                    if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                        stack.push(p);
+                    }
+                } else if name == "Cargo.toml" && p != root.join("Cargo.toml") {
+                    manifests.push(p);
+                }
+            }
+        }
+        let core_manifest = root.join("agent").join("core").join("Cargo.toml");
+        for m in &manifests {
+            let text = std::fs::read_to_string(m).expect("read manifest");
+            for line in text.lines() {
+                let code = line.split('#').next().unwrap_or("");
+                if !code.contains("insecure-dev-hitl") {
+                    continue;
+                }
+                assert!(
+                    m == &core_manifest && code.trim() == "insecure-dev-hitl = []",
+                    "{}: `{}` enables or re-exports insecure-dev-hitl",
+                    m.display(),
+                    line.trim()
+                );
+            }
+        }
+    }
+}

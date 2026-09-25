@@ -49,6 +49,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # RM-E5 / WP-E5.7 (audit AGT-12): hex decode for Hermes signed events.
 hex = "0.4"
 
+# PBA-L6b-035: parse the memory-gateway origin with the same WHATWG URL parser
+# reqwest uses, so validation and the actual connection agree.
+url = "2"
+
 # Optional: a batteries-included reqwest transport for the memory adapter
 # (adapters::memory). OFF by default so the audited default build carries no HTTP
 # client; consumers opt in with features = ["reqwest-transport"].
