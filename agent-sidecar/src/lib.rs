@@ -28,6 +28,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use citrate_agent_core::capsule::allowlist::FleetAllowlist;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_core::capsule::dispatcher::ApprovalGate;
 use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
@@ -63,21 +64,41 @@ pub struct AppState {
     /// with 503 rather than pretend a skill ran.
     pub dispatch: Option<Arc<CapsuleDispatch>>,
     pub bearer: String,
+    /// PBA-L6b-032: bounds concurrently running skills. Each `run_skill` holds one permit for the
+    /// life of its background task; when none is free the request is refused with 429 instead of
+    /// piling up blocked workers.
+    pub run_slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// PBA-L6b-032: at most this many skills run at once.
+pub const MAX_CONCURRENT_SKILLS: usize = 4;
 
 /// Build the capsule dispatch for `capsule_dir`, wired with the [`QueuedApprovalGate`] over `queue`.
 ///
 /// The sidecar is KEYLESS (Rule 3): it passes NO eth-call / eth-send dispatcher, so a skill's chain
 /// reads/writes fail closed at the host boundary — the actual signing + broadcast is citrate-core's
 /// SignatureCeremony, never the sidecar. What the sidecar DOES provide is the approval gate, so a
-/// skill's chain effect surfaces on `queue` (via `/approvals`) exactly as the ceremony bridge expects.
+/// skill's tier-low chain effect surfaces on `queue` (via `/approvals`) exactly as the ceremony bridge
+/// expects. PBA-L6b-012 / PBA-L6b-032: the gate binds no invoking human and the sidecar exposes no
+/// quorum-signature route, so a tier>=medium effect is refused at once rather than parked where
+/// nobody can approve it.
 /// A missing or unreadable capsule dir is an honest `None`, not a panic.
 pub fn load_dispatch(
     capsule_dir: &std::path::Path,
     queue: Arc<ApprovalQueue>,
 ) -> Option<Arc<CapsuleDispatch>> {
+    load_dispatch_with_allowlist(capsule_dir, &FleetAllowlist::bundled(), queue)
+}
+
+/// [`load_dispatch`] against an explicit fleet allowlist (PBA-L6b-015 test fixtures). Production
+/// uses the compiled-in [`FleetAllowlist::bundled`] via `load_dispatch`.
+pub(crate) fn load_dispatch_with_allowlist(
+    capsule_dir: &std::path::Path,
+    allowlist: &FleetAllowlist,
+    queue: Arc<ApprovalQueue>,
+) -> Option<Arc<CapsuleDispatch>> {
     let gate: Arc<dyn ApprovalGate> = Arc::new(QueuedApprovalGate::new(queue));
-    match CapsuleDispatch::load_from_dir(capsule_dir, None, None, Some(gate)) {
+    match CapsuleDispatch::load_from_dir_with_allowlist(capsule_dir, allowlist, None, None, Some(gate)) {
         Ok(d) => Some(Arc::new(d)),
         Err(e) => {
             eprintln!("[citrate-agent-sidecar] no capsule dispatch ({capsule_dir:?}): {e}");
@@ -135,6 +156,12 @@ struct StatusBody {
     skills: usize,
     #[serde(rename = "pendingApprovals")]
     pending_approvals: usize,
+    /// PBA-L6b-032: role-track (quorum) actions pending, which `/approvals` does not list.
+    #[serde(rename = "rolePendingApprovals")]
+    role_pending_approvals: usize,
+    /// PBA-L6b-032: skills currently running.
+    #[serde(rename = "runningSkills")]
+    running_skills: usize,
 }
 
 #[derive(Serialize)]
@@ -224,6 +251,8 @@ async fn status(
         running: !st.estop.is_stopped(),
         skills: st.skills.len(),
         pending_approvals: st.queue.depth(),
+        role_pending_approvals: st.queue.role_pending_depth(),
+        running_skills: MAX_CONCURRENT_SKILLS.saturating_sub(st.run_slots.available_permits()),
     }))
 }
 
@@ -243,6 +272,10 @@ async fn approvals(
 ) -> Result<Json<Vec<ApprovalBody>>, StatusCode> {
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    // PBA-L6b-010: the approval surface is closed while the e-stop is engaged.
+    if st.estop.is_stopped() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     // S6.2: the queue is empty until runSkill (S6.3) submits an effect; surface the head honestly.
     let mut out = Vec::new();
@@ -270,16 +303,14 @@ async fn approvals(
 }
 
 /// S6.3 — the CEREMONY BRIDGE (approve half). citrate-core's SignatureCeremony, once the human
-/// approves the head pending approval, calls this to resolve it. The queue is a FIFO; approving the
-/// head unblocks the capsule host-fn that submitted it, which then performs the eth-send. Honest:
-/// approving an empty queue is a no-op (nothing was pending), reported as such.
+/// approves a pending approval, calls this with `{"id": "<call_id>"}` to resolve it. Approving
+/// unblocks the capsule host-fn that submitted it.
 ///
-/// AR-B-023: when the request body carries `{"id": "<call_id>"}`, the approval
-/// is BOUND to that call — if the queue head is a different action than the one
-/// the operator reviewed (a timeout eviction or a second queued effect changed
-/// the head), the request is refused with 409 CONFLICT and nothing is resolved.
-/// A body without an id keeps the legacy head-approve for backward compatibility
-/// with ceremony clients that have not yet adopted the id round-trip.
+/// AR-B-023 / PBA-L6b-009: the approval is BOUND to the call-id the human reviewed.
+/// * No `id` (empty body, `{}`, non-string id, malformed JSON) → 400; nothing is resolved. The
+///   legacy "approve whatever is at the FIFO head" path is gone.
+/// * The id is not the current head (a timeout eviction or a second queued effect changed the
+///   head), or its submitter already stopped waiting → 409 CONFLICT; nothing runs.
 async fn approve_head(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -305,38 +336,35 @@ async fn reject_head(
     resolve_body(&st, &body, false)
 }
 
-/// Shared approve/reject resolution. Binds to a call-id when the body supplies
-/// one (AR-B-023); otherwise falls back to the legacy head resolution.
+/// Extract the call-id the human reviewed from an approve/reject body. `None` for anything that is
+/// not a JSON object carrying a non-empty string `id` (PBA-L6b-009).
+fn requested_call_id(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let id = v.get("id")?.as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Shared approve/reject resolution, always bound to a call-id (AR-B-023 / PBA-L6b-009).
 fn resolve_body(
     st: &Arc<AppState>,
     body: &[u8],
     approve: bool,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let requested_id = (!body.is_empty())
-        .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
-        .flatten()
-        .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(str::to_string));
-
-    if let Some(id) = requested_id {
-        let res = if approve {
-            st.queue.approve_by_id(&id)
-        } else {
-            st.queue.reject_by_id(&id)
-        };
-        return match res {
-            Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "resolved": true }))),
-            // The head is not the call the operator reviewed — refuse.
-            Err(_) => Err(StatusCode::CONFLICT),
-        };
+    // PBA-L6b-010: no approval can be resolved after the operator pulled the kill switch.
+    if st.estop.is_stopped() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-
-    let had = st.queue.depth() > 0;
-    if approve {
-        st.queue.approve();
+    let id = requested_call_id(body).ok_or(StatusCode::BAD_REQUEST)?;
+    let res = if approve {
+        st.queue.approve_by_id(&id)
     } else {
-        st.queue.reject();
+        st.queue.reject_by_id(&id)
+    };
+    match res {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "resolved": true }))),
+        // The head is not the call the operator reviewed, or its submitter is gone — refuse.
+        Err(_) => Err(StatusCode::CONFLICT),
     }
-    Ok(Json(serde_json::json!({ "ok": true, "resolved": had })))
 }
 
 async fn run_skill(
@@ -363,6 +391,13 @@ async fn run_skill(
     if !st.skills.iter().any(|s| s.name == req.name) {
         return Err(StatusCode::NOT_FOUND);
     }
+    // PBA-L6b-032: bounded concurrency. The permit moves into the task and is released when the
+    // skill finishes (or is refused), so a burst of run_skill cannot pin every worker.
+    let permit = st
+        .run_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
 
     // Run the capsule on a background task and return {ok} = ACCEPTED, not the result. This is
     // required, not a shortcut: any chain effect the skill attempts blocks inside the ApprovalGate
@@ -379,6 +414,7 @@ async fn run_skill(
     // in progress needs host-fn-level hooks — tracked separately.)
     let estop = st.estop.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         if estop.is_stopped() {
             eprintln!("[citrate-agent-sidecar] skill {name:?} aborted: e-stop engaged before start");
             return;
@@ -405,7 +441,10 @@ async fn stop(
         return Err(StatusCode::UNAUTHORIZED);
     }
     st.estop.trigger();
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // PBA-L6b-010: freeze + drain the approval queue so nothing parked before the stop can be
+    // released after it, and running skills cannot queue new effects.
+    let drained = st.queue.freeze_and_drain();
+    Ok(Json(serde_json::json!({ "ok": true, "drained": drained })))
 }
 
 // A tiny constant-time compare so the bearer isn't `==`'d.

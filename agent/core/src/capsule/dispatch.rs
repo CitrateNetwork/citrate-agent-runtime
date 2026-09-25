@@ -14,6 +14,7 @@
 use crate::capsule::dispatcher::{ApprovalGate, EthCallDispatcher, EthSendDispatcher};
 use crate::capsule::manifest::Manifest;
 use crate::capsule::wasm::EngineFactory;
+use crate::capsule::allowlist::FleetAllowlist;
 use crate::capsule::{archive, bundled_key, Capsule};
 use crate::error::AgentError;
 use std::collections::{HashMap, HashSet};
@@ -97,6 +98,10 @@ pub struct CapsuleDispatch {
     /// (placeholder or mismatched content_hash, and no signed `.cps`). `call_raw`
     /// refuses to instantiate these — fail-closed, with no override (CIT-AGENT-3e).
     unverified: HashSet<String>,
+    /// PBA-L6b-015: signed capsules the fleet allowlist refused (unknown name,
+    /// version below the floor, or an unpinned build), with the reason. Never
+    /// instantiated.
+    refused: HashMap<String, String>,
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
     approval_gate: Option<Arc<dyn ApprovalGate>>,
@@ -113,8 +118,30 @@ impl CapsuleDispatch {
     /// directory to coexist with non-capsule scaffolding like the
     /// `wit/` and `gherkin/` companion dirs documented in
     /// planset 03).
+    ///
+    /// PBA-L6b-015: a signed capsule runs only if the compiled-in
+    /// [`FleetAllowlist::bundled`] admits its (name, version, content_hash).
     pub fn load_from_dir(
         dir: &Path,
+        eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
+        eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
+        approval_gate: Option<Arc<dyn ApprovalGate>>,
+    ) -> Result<Self, AgentError> {
+        Self::load_from_dir_with_allowlist(
+            dir,
+            &FleetAllowlist::bundled(),
+            eth_call_dispatcher,
+            eth_send_dispatcher,
+            approval_gate,
+        )
+    }
+
+    /// [`Self::load_from_dir`] against an explicit allowlist (test fixtures;
+    /// the signature check is unchanged — only bundled-key-signed archives
+    /// can load either way).
+    pub fn load_from_dir_with_allowlist(
+        dir: &Path,
+        allowlist: &FleetAllowlist,
         eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
         eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
         approval_gate: Option<Arc<dyn ApprovalGate>>,
@@ -125,6 +152,7 @@ impl CapsuleDispatch {
         let _epoch_ticker = EpochTicker::spawn(&engine);
         let mut capsules = HashMap::new();
         let mut unverified = HashSet::new();
+        let mut refused = HashMap::new();
         let registry = bundled_key::registry();
         let entries = std::fs::read_dir(dir)
             .map_err(|e| AgentError::Capsule(format!("read capsule dir {dir:?}: {e}")))?;
@@ -148,6 +176,14 @@ impl CapsuleDispatch {
                 let file = std::fs::File::open(&cps_path)
                     .map_err(|e| AgentError::Capsule(format!("open {cps_path:?}: {e}")))?;
                 let capsule = Capsule::from_archive_verified(file, &registry)?;
+                // PBA-L6b-015: a valid signature is necessary, not sufficient.
+                // The (name, version, content_hash) must be allowlisted, so an
+                // older signed release or a signed test capsule cannot run.
+                if let Err(reason) = allowlist.check(&capsule.manifest) {
+                    eprintln!("[capsule-dispatch] refusing {cps_path:?}: {reason}");
+                    refused.insert(capsule.manifest.capsule.name.clone(), reason);
+                    continue;
+                }
                 capsules.insert(capsule.manifest.capsule.name.clone(), capsule);
                 continue;
             }
@@ -183,6 +219,7 @@ impl CapsuleDispatch {
             engine,
             capsules,
             unverified,
+            refused,
             eth_call_dispatcher,
             eth_send_dispatcher,
             approval_gate,
@@ -197,6 +234,22 @@ impl CapsuleDispatch {
         let mut names: Vec<String> = self.capsules.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// PBA-L6b-015: signed capsules the allowlist refused, with the reason.
+    pub fn refused_capsules(&self) -> &HashMap<String, String> {
+        &self.refused
+    }
+
+    /// Error for a name that is not runnable: says why when the allowlist
+    /// refused it.
+    fn not_loaded(&self, capsule_name: &str) -> AgentError {
+        match self.refused.get(capsule_name) {
+            Some(reason) => AgentError::Capsule(format!(
+                "capsule {capsule_name:?} refused by the fleet allowlist: {reason}"
+            )),
+            None => AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")),
+        }
     }
 
     /// Whether `capsule_name` is in the fleet.
@@ -218,7 +271,7 @@ impl CapsuleDispatch {
         let capsule = self
             .capsules
             .get(capsule_name)
-            .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
+            .ok_or_else(|| self.not_loaded(capsule_name))?;
 
         // CIT-AGENT-3e (closes RM-A WP-AGENT_RUNTIME-2026-05-31-001): fail-closed
         // integrity gate with NO escape hatch. A loose-dir capsule that is not bound to
@@ -305,12 +358,10 @@ impl CapsuleDispatch {
         // single core module already needs 2 instances). Kept in sync with
         // `HostCtx::empty` so `instantiate_*` (which arms the limiter from
         // `store_limits`) and `call_raw` agree.
-        store.data_mut().store_limits = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(64 * 1024 * 1024) // 64 MiB hard cap (per memory)
-            .tables(100)
-            .table_elements(1_000_000)
-            .instances(1_000)
-            .build();
+        // PBA-L6b-014: keep the budget the store has ALREADY spent at
+        // instantiate time (`arm_instantiate_bounds` armed the same limiter), so
+        // the aggregate cap covers instantiate + call together. Replacing it
+        // with a fresh limiter here would reset the running total.
         store.limiter(|state| &mut state.store_limits);
 
         let mut results = [wasmtime::component::Val::Bool(false)];
@@ -373,7 +424,7 @@ impl CapsuleDispatch {
         let capsule = self
             .capsules
             .get(capsule_name)
-            .ok_or_else(|| AgentError::Capsule(format!("capsule {capsule_name:?} not loaded")))?;
+            .ok_or_else(|| self.not_loaded(capsule_name))?;
         // AR-B-008: refuse an unverified capsule BEFORE any of its bytes reach
         // `Component::from_binary` (full Cranelift compilation — the largest
         // untrusted-parsing surface in the crate). RFC §4.5 requires manifest
@@ -467,31 +518,42 @@ fn json_to_val(
     use wasmtime::component::types::Type;
     use wasmtime::component::Val;
     let err = |want: &str| AgentError::Capsule(format!("arg {name:?}: expected {want}"));
+    // PBA-L6b-011: narrow with `try_from`, never `as`. An out-of-range value is a typed error;
+    // a silent wrap would make the effect queued for approval differ from the one requested.
+    let narrow = |want: &str| {
+        let want = want.to_string();
+        move |n: u64| {
+            AgentError::Capsule(format!("arg {name:?}: {n} is out of range for {want}"))
+        }
+    };
     match ty {
         Type::String => v
             .as_str()
             .map(|s| Val::String(s.to_string()))
             .ok_or_else(|| err("string")),
         Type::Bool => v.as_bool().map(Val::Bool).ok_or_else(|| err("bool")),
-        Type::U8 => v
-            .as_u64()
-            .map(|n| Val::U8(n as u8))
-            .ok_or_else(|| err("u8")),
-        Type::U16 => v
-            .as_u64()
-            .map(|n| Val::U16(n as u16))
-            .ok_or_else(|| err("u16")),
-        Type::U32 => v
-            .as_u64()
-            .map(|n| Val::U32(n as u32))
-            .ok_or_else(|| err("u32")),
+        Type::U8 => {
+            let n = v.as_u64().ok_or_else(|| err("u8"))?;
+            u8::try_from(n).map(Val::U8).map_err(|_| narrow("u8")(n))
+        }
+        Type::U16 => {
+            let n = v.as_u64().ok_or_else(|| err("u16"))?;
+            u16::try_from(n).map(Val::U16).map_err(|_| narrow("u16")(n))
+        }
+        Type::U32 => {
+            let n = v.as_u64().ok_or_else(|| err("u32"))?;
+            u32::try_from(n).map(Val::U32).map_err(|_| narrow("u32")(n))
+        }
         Type::U64 => v.as_u64().map(Val::U64).ok_or_else(|| err("u64")),
         Type::List(list) if matches!(list.ty(), Type::U8) => {
             let bytes: Vec<u8> = if let Some(s) = v.as_str() {
                 hex::decode(s.trim_start_matches("0x")).map_err(|_| err("hex byte string"))?
             } else if let Some(arr) = v.as_array() {
                 arr.iter()
-                    .map(|n| n.as_u64().map(|x| x as u8).ok_or_else(|| err("byte array")))
+                    .map(|x| {
+                        let n = x.as_u64().ok_or_else(|| err("byte array"))?;
+                        u8::try_from(n).map_err(|_| narrow("a byte (u8) array element")(n))
+                    })
                     .collect::<Result<Vec<u8>, _>>()?
             } else {
                 return Err(err("hex string or byte array"));
@@ -636,10 +698,9 @@ mod tests {
         let dispatch = CapsuleDispatch::load_from_dir(&capsules_root, None, None, None)
             .expect("loads cleanly");
         let names = dispatch.capsule_names();
-        // 7 BFR-INT-12 tool capsules + 3 supporting/test capsules
-        // (hello, echo-chain, eth-sender-test). The fleet has at
-        // LEAST the 7 BFR tools; the supporting ones come along
-        // as siblings in the same dir.
+        // 7 BFR-INT-12 tool capsules + 2 supporting capsules
+        // (hello, echo-chain). PBA-L6b-015: the eth-sender-test capsule
+        // moved to test-fixtures/ and is not part of the shipped fleet.
         for expected in &[
             "list-compliance-posture",
             "query-decisions-by-tenant",
@@ -711,6 +772,98 @@ tier = "bundled"
             "an unverified loose-dir capsule must be refused fail-closed"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PBA-L6b-015 regression: a capsule signed with the bundled key is NOT
+    /// runnable just because the signature verifies. `eth-sender-test` (a
+    /// signed test capsule with an eth-send capability) sat in the shipped
+    /// fleet and loaded; it must not be part of the runnable fleet.
+    #[test]
+    fn shipped_fleet_does_not_run_the_test_capsule_pba_l6b_015() {
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("fleet loads");
+        assert!(
+            !dispatch.has("eth-sender-test"),
+            "eth-sender-test must not be in the runnable fleet: {:?}",
+            dispatch.capsule_names()
+        );
+        assert!(dispatch.call_json("eth-sender-test", &serde_json::json!({})).is_err());
+    }
+
+    /// PBA-L6b-015 tripwire: the compiled-in allowlist and the shipped
+    /// `capsules/` fleet agree exactly. Every shipped signed capsule is
+    /// admitted (nothing refused), every allowlisted name ships, and no
+    /// test-only capsule sits in the fleet dir. Re-packing a capsule without
+    /// updating the allowlist (or vice versa) fails here.
+    #[test]
+    fn bundled_allowlist_matches_the_shipped_fleet_pba_l6b_015() {
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("fleet loads");
+        assert!(
+            dispatch.refused_capsules().is_empty(),
+            "shipped capsules refused by the allowlist: {:?}",
+            dispatch.refused_capsules()
+        );
+        let mut allowed: Vec<String> = FleetAllowlist::bundled()
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        allowed.sort();
+        assert_eq!(dispatch.capsule_names(), allowed);
+        for entry in std::fs::read_dir(capsules_root()).expect("read capsules/") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("test"), "test capsule {name:?} in the shipped fleet dir");
+        }
+    }
+
+    /// PBA-L6b-015: a signed capsule that is not allowlisted is refused with
+    /// a reason, and an explicit allowlist can admit it (fixture path).
+    #[test]
+    fn refused_capsule_reports_the_allowlist_reason_pba_l6b_015() {
+        let fixtures = capsules_root()
+            .parent()
+            .expect("repo root")
+            .join("test-fixtures")
+            .join("capsules");
+        let dispatch =
+            CapsuleDispatch::load_from_dir(&fixtures, None, None, None).expect("fixtures load");
+        assert!(!dispatch.has("eth-sender-test"));
+        let err = dispatch
+            .call_json("eth-sender-test", &serde_json::json!({}))
+            .expect_err("refused");
+        assert!(err.to_string().contains("fleet allowlist"), "{err}");
+
+        let fixture_list =
+            FleetAllowlist::from_entries(vec![crate::capsule::allowlist::AllowEntry {
+                name: "eth-sender-test".into(),
+                min_version: "0.1.0".into(),
+                content_hashes: vec![
+                    "sha256:f6364f40f252d5212a3bc3f203ccf4019dfb8850ce96bfb5c67ecedcbffd8086".into(),
+                ],
+            }]);
+        let dispatch = CapsuleDispatch::load_from_dir_with_allowlist(
+            &fixtures,
+            &fixture_list,
+            None,
+            None,
+            None,
+        )
+        .expect("fixtures load");
+        assert!(dispatch.has("eth-sender-test"));
+        // Same build, but the floor raised above it: rollback refused.
+        let raised = FleetAllowlist::from_entries(vec![crate::capsule::allowlist::AllowEntry {
+            name: "eth-sender-test".into(),
+            min_version: "0.2.0".into(),
+            content_hashes: vec![
+                "sha256:f6364f40f252d5212a3bc3f203ccf4019dfb8850ce96bfb5c67ecedcbffd8086".into(),
+            ],
+        }]);
+        let dispatch =
+            CapsuleDispatch::load_from_dir_with_allowlist(&fixtures, &raised, None, None, None)
+                .expect("fixtures load");
+        assert!(!dispatch.has("eth-sender-test"));
+        assert!(dispatch.refused_capsules()["eth-sender-test"].contains("below the allowlist floor"));
     }
 
     #[test]
@@ -862,6 +1015,94 @@ tier = "bundled"
         // fail-closed: wrong JSON shape for the declared type is an error, never a coerced value.
         assert!(json_to_val(&Type::U8, &serde_json::json!("not-a-number"), "a").is_err());
         assert!(json_to_val(&Type::String, &serde_json::json!(5), "a").is_err());
+    }
+
+    /// PBA-L6b-011 regression (PoC `poc_shell_truncate_panic.rs` variant 2):
+    /// out-of-range integers must be refused, never narrowed. Pre-fix
+    /// `n as u32` turned 4294967297 into U32(1) and a byte-array element 256
+    /// into U8(0).
+    #[test]
+    fn json_to_val_refuses_out_of_range_integers_pba_l6b_011() {
+        use wasmtime::component::types::Type;
+        let j = |v: serde_json::Value| v;
+        assert!(json_to_val(&Type::U8, &j(serde_json::json!(256)), "a").is_err());
+        assert!(json_to_val(&Type::U16, &j(serde_json::json!(65_536)), "a").is_err());
+        assert!(json_to_val(&Type::U32, &j(serde_json::json!(4_294_967_297u64)), "a").is_err());
+        // Boundaries still map exactly.
+        assert!(matches!(
+            json_to_val(&Type::U8, &serde_json::json!(255), "a"),
+            Ok(wasmtime::component::Val::U8(255))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U16, &serde_json::json!(65_535), "a"),
+            Ok(wasmtime::component::Val::U16(65_535))
+        ));
+        assert!(matches!(
+            json_to_val(&Type::U32, &serde_json::json!(4_294_967_295u64), "a"),
+            Ok(wasmtime::component::Val::U32(4_294_967_295))
+        ));
+        let err = json_to_val(&Type::U32, &serde_json::json!(4_294_967_297u64), "amount")
+            .expect_err("out of range");
+        assert!(
+            err.to_string().contains("amount") && err.to_string().contains("out of range"),
+            "typed error names the arg and the reason: {err}"
+        );
+    }
+
+    /// PBA-L6b-011 at the real entry point: `call_json` (what /run_skill
+    /// calls) with a byte-array element > 255 must fail BEFORE any chain
+    /// dispatch, so the effect a human is asked about is exactly the effect
+    /// that was requested. Pre-fix the `echo-chain` capsule forwarded
+    /// `[0x01, 0x01]` for a requested `[1, 257]`.
+    #[test]
+    fn call_json_refuses_a_wrapping_byte_array_pba_l6b_011() {
+        use crate::capsule::dispatcher::EthCallDispatcher;
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<Vec<u8>>>);
+        impl EthCallDispatcher for Recorder {
+            fn eth_call(&self, _to: &crate::capsule::wasm::Address, data: &[u8]) -> Result<Vec<u8>, String> {
+                self.0.lock().map_err(|e| e.to_string())?.push(data.to_vec());
+                Ok(vec![])
+            }
+        }
+        let rec = Arc::new(Recorder::default());
+        let dispatch =
+            CapsuleDispatch::load_from_dir(&capsules_root(), Some(rec.clone()), None, None)
+                .expect("fleet loads");
+        let to: Vec<u64> = hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40")
+            .expect("hex")
+            .into_iter()
+            .map(u64::from)
+            .collect();
+        let res = dispatch.call_json(
+            "echo-chain",
+            &serde_json::json!({ "to": to, "data": [1, 257] }),
+        );
+        assert!(res.is_err(), "a wrapping byte must be refused, got {res:?}");
+        assert!(
+            rec.0.lock().expect("lock").is_empty(),
+            "nothing may reach the chain dispatcher: {:?}",
+            rec.0.lock().expect("lock")
+        );
+        // The in-range request still goes through, byte-exact.
+        dispatch
+            .call_json("echo-chain", &serde_json::json!({ "to": to, "data": [1, 255] }))
+            .expect("in-range call runs");
+        assert_eq!(rec.0.lock().expect("lock").as_slice(), &[vec![1u8, 255]]);
+    }
+
+    /// PBA-L6b-011 tripwire (class: silent integer narrowing of caller JSON).
+    /// `json_to_val` must not use an `as` cast to a narrower integer type.
+    #[test]
+    fn tripwire_json_to_val_has_no_narrowing_casts_pba_l6b_011() {
+        let src = include_str!("dispatch.rs");
+        let start = src.find("fn json_to_val(").expect("json_to_val present");
+        let end = start + src[start..].find("\nfn val_to_json(").expect("val_to_json follows");
+        let body = &src[start..end];
+        for cast in [" as u8", " as u16", " as u32", " as usize", " as i8", " as i16", " as i32"] {
+            assert!(!body.contains(cast), "json_to_val narrows with `{cast}` (use try_from)");
+        }
     }
 
     #[test]

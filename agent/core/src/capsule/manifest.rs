@@ -80,6 +80,26 @@ impl Manifest {
         // advisory"), refuse to load it until per-path/per-socket enforcement
         // exists. No shipped capsule declares either today, so this is
         // fail-closed with no behavioral loss.
+        // PBA-L6b-012: a tier-high action needs signatures from two DISTINCT
+        // roles of `required_roles` (Quorum::NofM counts roles, not signers).
+        // Fewer than two distinct approving roles would make every such action
+        // permanently unapprovable, so refuse the manifest up front.
+        if self.risk.tier == RiskTier::High {
+            let distinct: std::collections::BTreeSet<Role> = self
+                .risk
+                .required_roles
+                .iter()
+                .copied()
+                .filter(|r| *r != Role::Auditor)
+                .collect();
+            if distinct.len() < 2 {
+                return Err(AgentError::Capsule(
+                    "[risk].tier = \"high\" requires at least two distinct approving roles in \
+                     required_roles (separation of duties, PBA-L6b-012)"
+                        .to_string(),
+                ));
+            }
+        }
         if !self.capability.filesystem.is_empty() {
             return Err(AgentError::Capsule(
                 "[capability].filesystem is declared but per-path enforcement is not implemented \
@@ -350,6 +370,27 @@ tier = "bundled"
         assert_eq!(m.signing.tier, SigningTier::Bundled);
         assert_eq!(m.capability.network, NetworkPolicy::None);
         assert_eq!(m.data_class.reads, vec![DataClass::Public]);
+    }
+
+    /// PBA-L6b-012: tier high needs two distinct approving roles (NofM counts
+    /// roles), otherwise every such action would be unapprovable.
+    #[test]
+    fn high_tier_requires_two_distinct_approving_roles_pba_l6b_012() {
+        let high = |roles: &str| {
+            WORKED_EXAMPLE
+                .replace(r#"tier = "low""#, r#"tier = "high""#)
+                .replace(r#"required_roles = ["Operator"]"#, &format!("required_roles = {roles}"))
+        };
+        for bad in [
+            r#"["Reviewer"]"#,
+            r#"["Reviewer", "Reviewer"]"#,
+            r#"["Reviewer", "Auditor"]"#,
+            "[]",
+        ] {
+            let err = Manifest::parse(&high(bad)).expect_err(bad);
+            assert!(err.to_string().contains("distinct approving roles"), "{bad}: {err}");
+        }
+        Manifest::parse(&high(r#"["Reviewer", "ComplianceOfficer"]"#)).expect("two roles ok");
     }
 
     #[test]

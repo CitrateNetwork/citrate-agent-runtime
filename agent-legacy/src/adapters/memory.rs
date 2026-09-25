@@ -176,7 +176,30 @@ impl<T: MemoryTransport> MemoryAdapter<T> {
             return Err(MemoryError::Config("BYOM connect token required".into()));
         }
         let origin = config.origin.trim_end_matches('/');
-        let url = format!("{origin}/mcp/u/{}", encode_path_segment(&config.sub));
+        // PBA-L6b-035: the connect token is a bearer credential; never send it
+        // over plain http except to a loopback gateway.
+        if !origin_is_secure(origin) {
+            return Err(MemoryError::Config(format!(
+                "memory gateway origin {origin:?} must be https (plain http only to loopback), \
+                 with no userinfo, query or fragment"
+            )));
+        }
+        // PBA-L6b-035: a principal made only of dots (literal or %2E) is a
+        // relative path step once the URL parser normalises it; refuse it.
+        if is_dot_segment(&config.sub) {
+            return Err(MemoryError::Config(format!(
+                "BYOM sub {:?} is not a valid principal (dot segment)",
+                config.sub
+            )));
+        }
+        let segment = encode_path_segment(&config.sub);
+        let url = format!("{origin}/mcp/u/{segment}");
+        // PBA-L6b-035: check the endpoint exactly as the transport will see it.
+        if !endpoint_is_exact(&url, &segment) {
+            return Err(MemoryError::Config(format!(
+                "memory endpoint {url:?} does not resolve to /mcp/u/<sub> on the configured origin"
+            )));
+        }
         Ok(Self {
             transport,
             url,
@@ -327,6 +350,52 @@ impl MemoryAdapter<ReqwestMemoryTransport> {
     }
 }
 
+/// PBA-L6b-035: `https://…`, or `http://` to a loopback host only; never
+/// userinfo, a query or a fragment. Parsed with the same WHATWG URL parser the
+/// transport (reqwest) uses, so the host checked here is the host connected to.
+fn origin_is_secure(origin: &str) -> bool {
+    let Ok(u) = url::Url::parse(origin) else {
+        return false;
+    };
+    if !u.username().is_empty()
+        || u.password().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+    {
+        return false;
+    }
+    match u.scheme() {
+        "https" => u.host().is_some(),
+        "http" => match u.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// PBA-L6b-035: true when `s` is only dots, counting `%2E`/`%2e` as a dot
+/// (what the URL parser treats as a `.`/`..` path step).
+fn is_dot_segment(s: &str) -> bool {
+    let lowered = s.to_ascii_lowercase().replace("%2e", ".");
+    !lowered.is_empty() && lowered.bytes().all(|b| b == b'.')
+}
+
+/// PBA-L6b-035: the parsed endpoint ends in exactly `/mcp/u/<segment>`, so no
+/// normalisation moved the request off the principal's path.
+fn endpoint_is_exact(url: &str, segment: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(segs) = u.path_segments() else {
+        return false;
+    };
+    let segs: Vec<&str> = segs.collect();
+    segs.len() >= 3 && segs[segs.len() - 3..] == ["mcp", "u", segment]
+}
+
 /// Percent-encode a path segment conservatively (agents' `sub` is usually an
 /// OIDC subject with `:`/`/`; keep the URL well-formed without a URL crate).
 fn encode_path_segment(s: &str) -> String {
@@ -392,6 +461,72 @@ mod tests {
             origin: "https://mem-gateway.example.com".into(),
             sub: "user-123".into(),
             connect_token: "connect.tok".into(),
+        }
+    }
+
+    /// PBA-L6b-035 regression: the connect token must not travel over plain
+    /// http (loopback excepted), and a `.`/`..` principal must not become a
+    /// path-traversal segment of the gateway URL.
+    #[test]
+    fn requires_https_and_encodes_dot_segments_pba_l6b_035() {
+        let t = || MockTransport::new(200, "{}");
+        for bad in ["http://mem-gateway.example.com", "ftp://mem.example.com", "mem.example.com"] {
+            assert!(
+                MemoryAdapter::new(MemoryAdapterConfig { origin: bad.into(), ..cfg() }, t()).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        for ok in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:9"] {
+            MemoryAdapter::new(MemoryAdapterConfig { origin: ok.into(), ..cfg() }, t())
+                .unwrap_or_else(|e| panic!("{ok}: {e:?}"));
+        }
+        for sub in ["..", "."] {
+            assert!(
+                MemoryAdapter::new(MemoryAdapterConfig { sub: sub.into(), ..cfg() }, t()).is_err(),
+                "dot segment {sub:?} must be refused"
+            );
+        }
+    }
+
+    /// PBA-L6b-035 verifier PoC (R2 re-verify): the origin check must agree
+    /// with the URL parser the transport uses. A userinfo prefix made a
+    /// remote host look like loopback to a string split, and a percent-encoded
+    /// dot-dot segment still normalised to `..` in the WHATWG parser.
+    #[test]
+    fn origin_and_sub_are_checked_as_the_url_parser_sees_them_pba_l6b_035() {
+        let t = || MockTransport::new(200, "{}");
+        for bad in [
+            "http://localhost:1@evil.example",
+            "http://127.0.0.1:x@evil.example",
+            "http://[::1]@evil.example",
+            "http://localhost@evil.example:8080",
+            "https://user:pw@mem-gateway.example.com",
+            "https://mem-gateway.example.com?x=1",
+            "https://mem-gateway.example.com#f",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+        ] {
+            assert!(
+                MemoryAdapter::new(MemoryAdapterConfig { origin: bad.into(), ..cfg() }, t()).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        for sub in ["..", ".", "...", "%2E%2E", "%2e", ".%2E", "%2e%2E%2e"] {
+            assert!(
+                MemoryAdapter::new(MemoryAdapterConfig { sub: sub.into(), ..cfg() }, t()).is_err(),
+                "dot-only sub {sub:?} must be refused"
+            );
+        }
+        // Accepted subs land as exactly one final segment under /mcp/u/ as the
+        // parser resolves the URL.
+        for sub in ["user-123", "did:citrate:agent:0xabc", "a/b", "a..b", ".hidden", "%2e%2e/x"] {
+            let a = MemoryAdapter::new(MemoryAdapterConfig { sub: sub.into(), ..cfg() }, t())
+                .unwrap_or_else(|e| panic!("{sub}: {e:?}"));
+            let parsed = url::Url::parse(&a.url).expect("adapter URL parses");
+            let segs: Vec<&str> = parsed.path_segments().expect("path").collect();
+            assert_eq!(segs.len(), 3, "{sub:?} -> {}", parsed.path());
+            assert_eq!(&segs[..2], &["mcp", "u"], "{sub:?} -> {}", parsed.path());
+            assert_eq!(parsed.host_str(), Some("mem-gateway.example.com"));
         }
     }
 

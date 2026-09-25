@@ -106,6 +106,16 @@ const SAFE_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// Default timeout for shell commands: 30 seconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// PBA-L6b-034: cap `s` at [`MAX_OUTPUT_BYTES`] on a UTF-8 char boundary and
+/// mark it truncated. Never panics.
+fn truncate_output(s: &mut String) {
+    if s.len() > MAX_OUTPUT_BYTES {
+        let cut = s.floor_char_boundary(MAX_OUTPUT_BYTES);
+        s.truncate(cut);
+        s.push_str("\n... (truncated)");
+    }
+}
+
 /// Maximum allowed timeout: 5 minutes.
 const MAX_TIMEOUT_MS: u64 = 300_000;
 
@@ -308,15 +318,12 @@ impl AgentTool for ShellExec {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-                // Truncate large outputs
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(MAX_OUTPUT_BYTES);
-                    stdout.push_str("\n... (truncated)");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(MAX_OUTPUT_BYTES);
-                    stderr.push_str("\n... (truncated)");
-                }
+                // Truncate large outputs.
+                // PBA-L6b-034: cut at the last char boundary at or below the
+                // cap; `truncate(MAX_OUTPUT_BYTES)` panicked when that byte
+                // fell inside a multi-byte character.
+                truncate_output(&mut stdout);
+                truncate_output(&mut stderr);
 
                 let combined = if stderr.is_empty() {
                     stdout.clone()

@@ -26,11 +26,37 @@ use std::sync::Arc;
 /// CIT-AGENT-9c-prod-impls.
 pub struct QueuedApprovalGate {
     queue: Arc<ApprovalQueue>,
+    /// PBA-L6b-012: the HUMAN who invoked the capsule. Recorded as the
+    /// proposer of every tier>=medium effect so separation of duties
+    /// ("the proposer cannot approve") is checked against a real signer id.
+    /// `None` = no accountable human is bound, and privileged effects are
+    /// refused at once (see `request`).
+    proposer: Option<Signer>,
 }
 
 impl QueuedApprovalGate {
+    /// A gate with no invoking human bound. Tier-low effects use the FIFO
+    /// track; tier>=medium effects are refused immediately (PBA-L6b-012 /
+    /// PBA-L6b-032) because nothing could ever approve them against SoD.
     pub fn new(queue: Arc<ApprovalQueue>) -> Self {
-        Self { queue }
+        Self {
+            queue,
+            proposer: None,
+        }
+    }
+
+    /// Bind the human operator who invokes capsules through this gate, by
+    /// their Ed25519 PUBLIC KEY. The proposer id is derived from the key
+    /// (`signer_id_from_pubkey`, the same fingerprint `add_signature` checks),
+    /// so it cannot be set to an arbitrary string that no signing key matches
+    /// (PBA-L6b-012). That key can then never count toward the quorum of an
+    /// effect it proposed.
+    pub fn with_proposer(mut self, operator_pubkey: [u8; 32]) -> Self {
+        self.proposer = Some(Signer {
+            id: crate::hitl::signer_id_from_pubkey(&operator_pubkey),
+            role: crate::capsule::manifest::Role::Operator,
+        });
+        self
     }
 }
 
@@ -89,15 +115,23 @@ impl ApprovalGate for QueuedApprovalGate {
             return outcome_to_result(outcome);
         }
 
-        // Tier medium/high/critical: route through the role-aware
-        // quorum. The proposer is the capsule itself (an Operator),
-        // which — by separation-of-duties — cannot count toward its
-        // own approval.
-        let payload = signing_payload(&req);
-        let proposer = Signer {
-            id: format!("capsule:{}", req.capsule_name),
-            role: crate::capsule::manifest::Role::Operator,
+        // Tier medium/high/critical: route through the role-aware quorum.
+        //
+        // PBA-L6b-012: the proposer is the HUMAN who invoked the capsule, not
+        // the capsule. With `capsule:<name>` as proposer the self-approval
+        // check compared signer ids against a string no key fingerprint can
+        // equal, so the invoking human could approve their own effect.
+        // PBA-L6b-032: with no human bound there is nobody accountable to
+        // propose, so refuse now rather than park the effect (and block this
+        // worker) for the 5-minute timeout.
+        let Some(proposer) = self.proposer.clone() else {
+            return Err(format!(
+                "{} effect from capsule {:?} refused: tier {:?} needs a role quorum and no \
+                 invoking human is bound to this approval gate",
+                req.method, req.capsule_name, req.tier
+            ));
         };
+        let payload = signing_payload(&req);
         let outcome = tokio::task::block_in_place(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
@@ -222,7 +256,10 @@ mod tests {
             .authorize(reviewer.pubkey(), Role::Reviewer)
             .authorize(compliance.pubkey(), Role::ComplianceOfficer);
         let queue = Arc::new(ApprovalQueue::new().with_signer_roster(Arc::new(roster)));
-        let gate = Arc::new(QueuedApprovalGate::new(queue.clone()));
+        // PBA-L6b-012: the invoking human is the proposer.
+        let operator = Ed25519FileSurface::from_seed([0x33; 32], Role::Operator);
+        let gate =
+            Arc::new(QueuedApprovalGate::new(queue.clone()).with_proposer(operator.pubkey()));
 
         let addr = [0xa6u8; 20];
         let data = vec![0xde, 0xad, 0xbe, 0xef];
@@ -254,8 +291,9 @@ mod tests {
             got.expect("role-aware entry should register")
         };
 
-        // (a) The anonymous single-click FIFO approve MUST NOT release it.
-        queue.approve();
+        // (a) The FIFO approve surface MUST NOT release it (it is not on the
+        // FIFO track, so an id-bound approve finds nothing to resolve).
+        assert!(queue.approve_by_id(&call_id).is_err());
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             !handle.is_finished(),
@@ -278,6 +316,84 @@ mod tests {
             .expect("gate resolves after quorum")
             .expect("join");
         assert!(res.is_ok(), "gate should approve once quorum met: {res:?}");
+    }
+
+    /// PBA-L6b-012 / PBA-L6b-032 regression: with no invoking human bound to
+    /// the gate, a tier>=medium effect is refused at once. Pre-fix the
+    /// proposer was recorded as `capsule:<name>` (so the self-approval check
+    /// compared against a name no human key can have) and the effect parked
+    /// for 5 minutes on a track the sidecar exposes no way to approve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_without_a_bound_human_refuses_privileged_effects_pba_l6b_012() {
+        let queue = Arc::new(ApprovalQueue::new());
+        let gate = Arc::new(QueuedApprovalGate::new(queue.clone()));
+        let req = ApprovalRequest {
+            capsule_name: "provision-user".to_string(),
+            method: "eth-send".to_string(),
+            to: [0xa6u8; 20],
+            data: vec![1, 2, 3],
+            tier: RiskTier::High,
+            required_roles: vec![Role::Reviewer, Role::ComplianceOfficer],
+        };
+        let g = gate.clone();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::spawn(async move { g.request(req) }),
+        )
+        .await
+        .expect("an unapprovable effect must be refused at once, not parked")
+        .expect("join");
+        assert!(res.is_err(), "privileged effect without a bound human must be refused");
+        assert_eq!(queue.role_pending_depth(), 0, "nothing parks on the role track");
+    }
+
+    /// PBA-L6b-012: with the invoking human bound as proposer, that human's
+    /// key cannot sign toward its own effect's quorum, even when the roster
+    /// also enrols it for an approving role.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_proposer_cannot_approve_own_effect_pba_l6b_012() {
+        let operator = Ed25519FileSurface::from_seed([0x44; 32], Role::Reviewer);
+        let roster = StaticSignerRoster::new().authorize(operator.pubkey(), Role::Reviewer);
+        let queue = Arc::new(ApprovalQueue::new().with_signer_roster(Arc::new(roster)));
+        let gate =
+            Arc::new(QueuedApprovalGate::new(queue.clone()).with_proposer(operator.pubkey()));
+        let (addr, data) = ([0xa7u8; 20], vec![9u8]);
+        let call_id = call_id_for("revoke-role", "eth-send", &addr, &data);
+        let req = ApprovalRequest {
+            capsule_name: "revoke-role".to_string(),
+            method: "eth-send".to_string(),
+            to: addr,
+            data,
+            tier: RiskTier::Medium,
+            required_roles: vec![Role::Reviewer],
+        };
+        let g = gate.clone();
+        let h = tokio::spawn(async move { g.request(req) });
+        let payload = loop {
+            if let Some(p) = queue.payload_for(&call_id) {
+                break p;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let own: Signature = operator.sign(&payload).expect("sign").into();
+        assert_eq!(
+            queue.add_signature(&call_id, own),
+            Err(crate::hitl::SignatureError::ProposerCannotSelfApprove)
+        );
+        queue.reject_action(&call_id).expect("cleanup");
+        assert!(h.await.expect("join").is_err());
+    }
+
+    /// PBA-L6b-012 tripwire: the production gate must never again record a
+    /// non-human (capsule-derived) proposer for a role-track effect.
+    #[test]
+    fn tripwire_gate_proposer_is_not_the_capsule_pba_l6b_012() {
+        let src = include_str!("prod_impls.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        assert!(
+            !prod.contains("format!(\"capsule:"),
+            "QueuedApprovalGate must not synthesize a capsule proposer"
+        );
     }
 
     /// Construction smoke — the production types build without

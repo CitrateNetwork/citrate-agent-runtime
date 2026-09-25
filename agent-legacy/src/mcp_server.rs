@@ -159,7 +159,17 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    /// PBA-L6b-035: the default constructor is STRICT — only grants signed by
+    /// an enrolled trust anchor are accepted (same as [`Self::new_strict`]).
+    /// Pre-fix `new` silently accepted unsigned grants.
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
+        Self::new_strict(registry)
+    }
+
+    /// Accept UNSIGNED grants (legacy / local development only). Named for
+    /// what it does so the insecure mode is always an explicit choice
+    /// (PBA-L6b-035).
+    pub fn new_insecure_unsigned_grants(registry: Arc<ToolRegistry>) -> Self {
         Self {
             registry,
             grants: tokio::sync::RwLock::new(Vec::new()),
@@ -319,8 +329,13 @@ impl McpServer {
             }
         }
 
-        // Check tool is in allowed list
-        if !grant.allowed_tools.is_empty() && !grant.allowed_tools.contains(&tool_name.to_string())
+        // Check tool is in allowed list.
+        // PBA-L6b-035: an EMPTY list grants nothing; "every tool" must be
+        // spelled out as "*". Pre-fix empty meant allow-all.
+        if !grant
+            .allowed_tools
+            .iter()
+            .any(|t| t == "*" || t == tool_name)
         {
             return Err(format!("Tool '{}' not in grant scope", tool_name));
         }
@@ -344,14 +359,25 @@ impl McpServer {
         // `/home/u/project/../../etc/shadow` slipped through. Use a lexical,
         // component-boundary containment check that rejects any parent-dir
         // traversal.
+        // PBA-L6b-035 (variant of the empty-scope idiom): an empty
+        // `allowed_paths` no longer means "any path".
         if let Some(path) = file_path {
-            if !grant.allowed_paths.is_empty() && !path_within_any(path, &grant.allowed_paths) {
+            if !path_within_any(path, &grant.allowed_paths) {
                 return Err(format!("Path '{}' not in grant's allowed paths", path));
             }
         }
 
-        // Check value ceiling for transaction tools
-        if let (Some(value), Some(max)) = (tx_value, grant.max_value_per_tx) {
+        // Check value ceiling for transaction tools.
+        // PBA-L6b-035: never skip the ceiling on a `None`. A wallet-write tool
+        // (or any call that declares a value) needs BOTH a declared value and
+        // a per-tx ceiling on the grant; pre-fix either `None` bypassed it.
+        if tx_value.is_some() || matches!(categorize_tool(tool_name), ToolCategory::WalletWrite) {
+            let value = tx_value.ok_or_else(|| {
+                format!("Tool '{}' moves value but the call declared no value", tool_name)
+            })?;
+            let max = grant.max_value_per_tx.ok_or_else(|| {
+                "Grant declares no per-transaction value ceiling".to_string()
+            })?;
             if value > max {
                 return Err(format!(
                     "Transaction value {} exceeds grant ceiling {}",
@@ -542,10 +568,84 @@ mod tests {
         assert_eq!(json["protocol"], "mcp");
     }
 
+    fn pba_grant(id: &str, tools: Vec<&str>, max: Option<u128>, policy: PolicyProfile) -> CapabilityGrant {
+        CapabilityGrant {
+            id: id.to_string(),
+            issuer: "0xuser".to_string(),
+            recipient: "hermes".to_string(),
+            allowed_tools: tools.into_iter().map(str::to_string).collect(),
+            max_value_per_tx: max,
+            allowed_paths: vec![],
+            expires_at: "2099-12-31T00:00:00Z".to_string(),
+            policy,
+            revoked: false,
+            connected_since: 0,
+            issuer_pubkey: Vec::new(),
+            signature: Vec::new(),
+        }
+    }
+
+    /// PBA-L6b-035 regression: the default constructor is strict (signed,
+    /// trust-anchored grants only). Pre-fix `McpServer::new` accepted
+    /// unsigned grants.
+    #[tokio::test]
+    async fn default_constructor_is_strict_pba_l6b_035() {
+        let server = McpServer::new(Arc::new(ToolRegistry::new()));
+        assert!(server.require_signed_grants());
+        assert!(server
+            .try_add_grant(pba_grant("g", vec!["check_balance"], None, PolicyProfile::ReadOnly))
+            .await
+            .is_err());
+    }
+
+    /// PBA-L6b-035 regression: an empty tool list grants nothing. Pre-fix it
+    /// meant "every tool".
+    #[tokio::test]
+    async fn empty_tool_scope_grants_nothing_pba_l6b_035() {
+        let mut server = McpServer::new(Arc::new(ToolRegistry::new()));
+        server.set_require_signed_grants(false);
+        server.add_grant(pba_grant("g", vec![], None, PolicyProfile::Maintainer)).await;
+        assert!(server.check_grant("g", "check_balance", None, None).await.is_err());
+        server.add_grant(pba_grant("w", vec!["*"], None, PolicyProfile::Maintainer)).await;
+        server
+            .check_grant("w", "check_balance", None, None)
+            .await
+            .expect("an explicit \"*\" still grants every tool");
+    }
+
+    /// PBA-L6b-035 variant: an empty path scope grants no path.
+    #[tokio::test]
+    async fn empty_path_scope_grants_no_path_pba_l6b_035() {
+        let mut server = McpServer::new(Arc::new(ToolRegistry::new()));
+        server.set_require_signed_grants(false);
+        server.add_grant(pba_grant("p", vec!["file_read"], None, PolicyProfile::Operator)).await;
+        assert!(server.check_grant("p", "file_read", Some("/etc/passwd"), None).await.is_err());
+    }
+
+    /// PBA-L6b-035 regression: a value-bearing call is refused unless both a
+    /// value and a per-tx ceiling are present. Pre-fix either `None` skipped
+    /// the ceiling check entirely.
+    #[tokio::test]
+    async fn tx_ceiling_is_not_skipped_on_none_pba_l6b_035() {
+        let mut server = McpServer::new(Arc::new(ToolRegistry::new()));
+        server.set_require_signed_grants(false);
+        server.add_grant(pba_grant("nomax", vec!["send_tx"], None, PolicyProfile::Operator)).await;
+        assert!(server.check_grant("nomax", "send_tx", None, Some(10u128.pow(30))).await.is_err());
+        server
+            .add_grant(pba_grant("max", vec!["send_tx"], Some(1_000), PolicyProfile::Operator))
+            .await;
+        assert!(
+            server.check_grant("max", "send_tx", None, None).await.is_err(),
+            "a wallet write with no declared value must not bypass the ceiling"
+        );
+        server.check_grant("max", "send_tx", None, Some(999)).await.expect("under the ceiling");
+        assert!(server.check_grant("max", "send_tx", None, Some(1_001)).await.is_err());
+    }
+
     #[tokio::test]
     async fn test_grant_check_missing() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let result = server
             .check_grant("nonexistent", "check_balance", None, None)
             .await;
@@ -555,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_check_valid() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-1".to_string(),
             issuer: "0xuser".to_string(),
@@ -615,7 +715,7 @@ mod tests {
         // AR-B-018: a file tool scoped to a directory cannot escape it via `..`
         // or a sibling-prefix path.
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-path".to_string(),
             issuer: "0xuser".to_string(),
@@ -660,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_check_wrong_tool() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-2".to_string(),
             issuer: "0xuser".to_string(),
@@ -683,7 +783,7 @@ mod tests {
     #[tokio::test]
     async fn test_revoke_grant() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-3".to_string(),
             issuer: "0xuser".to_string(),
@@ -709,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_expired() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-exp".to_string(),
             issuer: "0xuser".to_string(),
@@ -735,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_path_scope() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-path".to_string(),
             issuer: "0xuser".to_string(),
@@ -771,7 +871,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_value_ceiling() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let grant = CapabilityGrant {
             id: "grant-val".to_string(),
             issuer: "0xuser".to_string(),
@@ -854,7 +954,7 @@ mod tests {
                 risk: RiskLevel::Critical,
             }))
             .await;
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
 
         let guided = server.list_tools(&PolicyProfile::Guided).await;
         let names: Vec<_> = guided.iter().map(|t| t.name.as_str()).collect();
@@ -866,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn test_operator_can_call_sensitive_tools_but_guided_cannot() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
 
         let guided = CapabilityGrant {
             id: "grant-guided".to_string(),
@@ -962,7 +1062,7 @@ mod tests {
         // (`==` also rejects), but combined with the unit tests above,
         // any future regression that swaps `ct_grant_id_eq` back to `==`
         // will be caught by the type-level assertion.
-        let server = McpServer::new(Arc::new(ToolRegistry::new()));
+        let server = McpServer::new_insecure_unsigned_grants(Arc::new(ToolRegistry::new()));
         let grant = CapabilityGrant {
             id: "grant-cx02-last-byte-difference-test".to_string(),
             issuer: "0xuser".to_string(),
@@ -1031,7 +1131,7 @@ mod tests {
     #[tokio::test]
     async fn test_agt08_try_add_grant_rejects_malformed_expiry() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let mut grant = _signed_grant_for_test();
         grant.expires_at = "not-a-real-date".to_string();
         let err = server.try_add_grant(grant).await.expect_err("should error");
@@ -1041,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn test_agt08_try_add_grant_rejects_partial_signature() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         // Provide signature but no pubkey — non-strict mode still
         // verifies what was provided and rejects.
         let mut grant = _signed_grant_for_test();
@@ -1166,7 +1266,7 @@ mod tests {
     #[tokio::test]
     async fn test_agt08_check_grant_rejects_tampered_after_install() {
         let registry = Arc::new(ToolRegistry::new());
-        let server = McpServer::new(registry);
+        let server = McpServer::new_insecure_unsigned_grants(registry);
         let mut grant = _signed_grant_for_test();
         // Insert a properly signed grant.
         let original_sig = grant.signature.clone();

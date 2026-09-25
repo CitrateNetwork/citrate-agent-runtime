@@ -18,6 +18,8 @@ crate-type = ["rlib", "cdylib"]
 # `--profile dev` sidecar silently accepted self-minted keys. The runtime now
 # gates on `cfg!(test)` (the crate's own unit-test build only) OR this explicit
 # feature; a release/debug deployment fails closed unless this is set on purpose.
+# PBA-R2: enabling it is now a compile error in every build (lib.rs). Kept only
+# as a named, greppable marker; the crate's own unit tests use cfg!(test).
 insecure-dev-hitl = []
 
 [dependencies]
