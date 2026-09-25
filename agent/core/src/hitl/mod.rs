@@ -85,6 +85,10 @@ struct PendingEntry {
     #[allow(dead_code)] // held for future per-call display
     call: ToolCall,
     resolver: oneshot::Sender<ApprovalOutcome>,
+    /// PBA-L6b-009: per-submission nonce, so a waiter's cleanup (timeout or
+    /// cancellation) removes exactly the entry it pushed and never a later
+    /// entry that happens to share the call-id.
+    nonce: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +173,11 @@ pub enum SignatureError {
     /// The action's pending entry was not found (already settled, or
     /// never submitted).
     UnknownCallId,
+    /// PBA-L6b-009 — the entry matched, but its submitter is no longer
+    /// waiting (timed out or cancelled), so the decision reached nobody and
+    /// the effect will not run. Reported as an error so the ceremony does not
+    /// tell the human "approved" for an effect that never happened.
+    ResolverGone,
     /// CIT-AGENT-4b — attestation material is invalid: signature does
     /// not verify under the claimed pubkey, signer.id doesn't match
     /// the pubkey fingerprint, or signature length is wrong.
@@ -198,6 +207,10 @@ impl std::fmt::Display for SignatureError {
                 "role conflict: {existing:?} already signed; cannot also accept {attempted:?}"
             ),
             SignatureError::UnknownCallId => write!(f, "no pending action with that call_id"),
+            SignatureError::ResolverGone => write!(
+                f,
+                "the pending action's submitter is no longer waiting (timed out or cancelled)"
+            ),
             SignatureError::AttestationInvalid(m) => {
                 write!(f, "attestation invalid: {m}")
             }
@@ -247,6 +260,23 @@ pub struct ApprovalQueue {
     // `None`, `add_signature` fails closed in release builds (see
     // `signer_is_authorized`).
     signer_roster: Option<std::sync::Arc<dyn SignerRoster>>,
+    // PBA-L6b-009 — monotonically increasing submission nonce.
+    next_nonce: std::sync::atomic::AtomicU64,
+}
+
+/// PBA-L6b-009 — removes a FIFO submission's entry when its waiter goes away
+/// (resolved, timed out, or the future is dropped). Matching on the nonce
+/// makes the removal exact: it can never evict a different submission.
+struct FifoEvictGuard<'a> {
+    queue: &'a ApprovalQueue,
+    call_id: String,
+    nonce: u64,
+}
+
+impl Drop for FifoEvictGuard<'_> {
+    fn drop(&mut self) {
+        self.queue.evict_exact(&self.call_id, self.nonce);
+    }
 }
 
 impl ApprovalQueue {
@@ -284,40 +314,40 @@ impl ApprovalQueue {
         // *this* call by id, not blindly the FIFO head (which may by then be a
         // different, still-pending action).
         let call_id = call.call_id.clone();
+        let nonce = self
+            .next_nonce
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut q = match self.pending.lock() {
                 Ok(q) => q,
                 Err(_) => return ApprovalOutcomePublic::Rejected,
             };
-            q.push_back(PendingEntry { call, resolver: tx });
+            q.push_back(PendingEntry {
+                call,
+                resolver: tx,
+                nonce,
+            });
         }
+        // PBA-L6b-009: however this future ends — resolved, timed out, or
+        // dropped mid-wait — its own entry (and only its own) leaves the queue.
+        let _guard = FifoEvictGuard {
+            queue: self,
+            call_id,
+            nonce,
+        };
         // BFR-INT-12b WP-5 — race the resolver against the 5-min
         // timeout.
         match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
             Ok(Ok(ApprovalOutcome::Approved)) => ApprovalOutcomePublic::Approved,
             Ok(Ok(ApprovalOutcome::Rejected)) => ApprovalOutcomePublic::Rejected,
             Ok(Err(_)) => ApprovalOutcomePublic::Rejected, // sender dropped
-            Err(_) => {
-                self.evict_by_id(&call_id);
-                ApprovalOutcomePublic::TimedOut
-            }
+            Err(_) => ApprovalOutcomePublic::TimedOut,
         }
     }
 
-    /// Approve the head of the queue.
-    ///
-    /// AR-B-023: prefer [`approve_by_id`] on any surface where the approver
-    /// saw a specific call — a bare head-approve can land on an action the
-    /// approver never reviewed if the head changed (a timeout eviction, a
-    /// second queued effect) between the read and the approve.
-    pub fn approve(&self) {
-        self.pop_head_with(ApprovalOutcome::Approved);
-    }
-
-    /// Reject the head of the queue. See [`approve`] for the call-id caveat.
-    pub fn reject(&self) {
-        self.pop_head_with(ApprovalOutcome::Rejected);
-    }
+    // PBA-L6b-009: the id-less `approve()` / `reject()` ("resolve whatever is
+    // at the FIFO head") were removed. A human decision must name the call the
+    // human reviewed — use [`approve_by_id`] / [`reject_by_id`].
 
     /// AR-B-023 — approve a *specific* pending call by id. Resolves the entry
     /// only if it is at the head AND its call-id matches; a mismatch (the head
@@ -345,9 +375,13 @@ impl ApprovalQueue {
             .map_err(|_| SignatureError::UnknownCallId)?;
         match q.front() {
             Some(head) if head.call.call_id == call_id => {
-                let entry = q.pop_front().expect("front just matched");
-                let _ = entry.resolver.send(outcome);
-                Ok(())
+                let entry = q.pop_front().ok_or(SignatureError::UnknownCallId)?;
+                // PBA-L6b-009: a failed send means the submitter already
+                // gave up (timeout / cancellation); the effect will not run.
+                entry
+                    .resolver
+                    .send(outcome)
+                    .map_err(|_| SignatureError::ResolverGone)
             }
             // Head is a different action (or the queue is empty): refuse rather
             // than resolve the wrong call.
@@ -605,23 +639,21 @@ impl ApprovalQueue {
         grants.contains_key(tool_name)
     }
 
-    fn pop_head_with(&self, outcome: ApprovalOutcome) {
-        if let Ok(mut q) = self.pending.lock() {
-            if let Some(entry) = q.pop_front() {
-                let _ = entry.resolver.send(outcome);
-            }
-        }
-    }
-
     /// AR-B-023 — remove a specific timed-out entry by call-id. The previous
     /// `pop_front()` assumed the timed-out call was always at the head; when a
     /// later-queued call's timeout fired first (or the head had already been
     /// resolved), it evicted the WRONG entry, so a subsequent head-approve
     /// could resolve an action the operator never saw. Removing by id keeps
     /// each future's timeout scoped to its own entry.
-    fn evict_by_id(&self, call_id: &str) {
+    ///
+    /// PBA-L6b-009: matching is on (call_id, nonce), so a waiter can only ever
+    /// remove the entry it pushed itself.
+    fn evict_exact(&self, call_id: &str, nonce: u64) {
         if let Ok(mut q) = self.pending.lock() {
-            if let Some(pos) = q.iter().position(|e| e.call.call_id == call_id) {
+            if let Some(pos) = q
+                .iter()
+                .position(|e| e.nonce == nonce && e.call.call_id == call_id)
+            {
                 q.remove(pos);
             }
         }
@@ -1025,8 +1057,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(q.depth(), 2);
-        q.approve();
-        q.reject();
+        q.approve_by_id("call_first").expect("first is head");
+        q.reject_by_id("call_second").expect("second is head");
 
         let (o1, o2) = (t1.await.unwrap(), t2.await.unwrap());
         assert_eq!(o1, ApprovalOutcomePublic::Approved);
@@ -1084,6 +1116,7 @@ mod tests {
                     args: serde_json::json!({"scope": "defense_prime/777X"}),
                 },
                 resolver: tx,
+                nonce: 0,
             });
         }
         let view = q.peek().expect("head present");
@@ -1129,6 +1162,48 @@ mod tests {
         // Now B is the head and can be approved by its id.
         q.approve_by_id("B").expect("B is now head");
         assert_eq!(b.await.unwrap(), ApprovalOutcomePublic::Approved);
+    }
+
+    /// PBA-L6b-009 regression: `approve_by_id` must not report success when
+    /// the submitter is no longer waiting (timed out / cancelled). Pre-fix it
+    /// popped the entry, ignored the failed `send`, and returned `Ok(())` —
+    /// the ceremony was told "approved" for an effect that never ran.
+    #[test]
+    fn approve_by_id_on_a_gone_waiter_is_an_error_pba_l6b_009() {
+        let q = ApprovalQueue::new();
+        for approve in [true, false] {
+            let (tx, rx) = oneshot::channel();
+            drop(rx); // the waiter is gone
+            q.pending.lock().unwrap().push_back(PendingEntry {
+                call: mkcall("gone"),
+                resolver: tx,
+                nonce: 0,
+            });
+            let res = if approve {
+                q.approve_by_id("call_gone")
+            } else {
+                q.reject_by_id("call_gone")
+            };
+            assert!(res.is_err(), "resolving a gone waiter must not be Ok");
+            assert_eq!(res, Err(SignatureError::ResolverGone));
+            assert_eq!(q.depth(), 0, "the dead entry is still removed");
+        }
+    }
+
+    /// PBA-L6b-009 variant: a submitter whose future is dropped (the capsule
+    /// task aborted) must not leave its entry parked at the head for a later
+    /// approve to land on.
+    #[tokio::test]
+    async fn a_cancelled_submitter_is_evicted_pba_l6b_009() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit_with_outcome(mkcall("cancelled")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        h.abort();
+        let _ = h.await;
+        assert_eq!(q.depth(), 0, "a cancelled submission must leave the queue");
     }
 
     #[test]

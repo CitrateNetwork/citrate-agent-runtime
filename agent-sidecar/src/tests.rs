@@ -224,8 +224,8 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
         "tier-high effect must not surface on the anonymous FIFO queue"
     );
 
-    // The anonymous single-click FIFO approve MUST NOT release it (the exploit).
-    queue.approve();
+    // An id-bound FIFO approve cannot release it either: the effect is not on the FIFO track.
+    let _ = queue.approve_by_id(&queue.peek().map(|p| p.id).unwrap_or_default());
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
         queue.role_pending_depth(),
@@ -342,17 +342,15 @@ async fn approve_reject_require_the_bearer() {
 }
 
 #[tokio::test]
-async fn approve_on_an_empty_queue_is_an_honest_noop() {
-    // Nothing pending yet (no capsule has run) → resolved:false, but the endpoint is live so the
-    // ceremony can resolve the head the moment a chain effect enqueues.
+async fn approve_without_an_id_is_a_bad_request() {
+    // PBA-L6b-009: the id-less "approve whatever is at the FIFO head" path is gone. This test
+    // previously asserted an empty-body approve was a 200 no-op, i.e. it pinned the unbound path
+    // as correct. An approve that does not name the call the human reviewed is now a 400.
     let resp = app(state())
         .oneshot(authed("POST", "/approvals/approve"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let j = body_json(resp).await;
-    assert_eq!(j["ok"], true);
-    assert_eq!(j["resolved"], false);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -376,13 +374,13 @@ async fn approve_with_a_mismatched_call_id_is_a_conflict() {
 }
 
 #[tokio::test]
-async fn reject_on_an_empty_queue_is_an_honest_noop() {
+async fn reject_without_an_id_is_a_bad_request() {
+    // PBA-L6b-009: see approve_without_an_id_is_a_bad_request.
     let resp = app(state())
         .oneshot(authed("POST", "/approvals/reject"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["resolved"], false);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ── S6.3 — end-to-end ceremony bridge: an effect submitted (as a capsule's ApprovalGate does)
@@ -430,7 +428,7 @@ async fn a_chain_effect_surfaces_and_approve_lets_it_proceed() {
     // A capsule's eth-send submits + blocks on the outcome (here, directly via the queue's async API).
     let submitter = tokio::spawn(async move { q.submit_with_outcome(effect_call("c1")).await });
     wait_depth(&queue, 1).await; // the effect is now a pending approval (what /approvals shows)
-    queue.approve(); // exactly what POST /approvals/approve calls
+    queue.approve_by_id("c1").expect("c1 is the head"); // what POST /approvals/approve {id} calls
     let outcome = submitter.await.unwrap();
     assert!(
         matches!(outcome, ApprovalOutcomePublic::Approved),
@@ -444,7 +442,7 @@ async fn a_chain_effect_that_is_rejected_does_not_proceed() {
     let q = queue.clone();
     let submitter = tokio::spawn(async move { q.submit_with_outcome(effect_call("c2")).await });
     wait_depth(&queue, 1).await;
-    queue.reject(); // POST /approvals/reject
+    queue.reject_by_id("c2").expect("c2 is the head"); // POST /approvals/reject {id}
     let outcome = submitter.await.unwrap();
     assert!(
         matches!(outcome, ApprovalOutcomePublic::Rejected),
@@ -489,7 +487,78 @@ async fn approvals_exposes_the_raw_calldata_for_the_ceremony_bridge() {
         "the chain target is exposed"
     );
     assert_eq!(j[0]["data"], "0xdeadbeef", "the calldata is exposed");
+    assert_eq!(j[0]["id"], "cd1", "the call-id the ceremony must echo back is exposed");
 
-    queue.approve();
+    queue.approve_by_id("cd1").expect("cd1 is the head");
     let _ = submitter.await;
+}
+
+fn resolve_req(path: &str, body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn state_with(queue: Arc<ApprovalQueue>) -> Arc<AppState> {
+    Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue,
+        skills: vec![],
+        dispatch: None,
+        bearer: BEARER.to_string(),
+    })
+}
+
+/// PBA-L6b-009 regression: with a real effect pending, an approve/reject that does not name the
+/// call (empty body, `{}`, a non-string id, malformed JSON) must be refused with 400 and must NOT
+/// resolve the FIFO head. Pre-fix every one of these fell through to `queue.approve()` and released
+/// whatever was at the head, reviewed or not.
+#[tokio::test]
+async fn an_unbound_approve_never_resolves_the_head_pba_l6b_009() {
+    let queue = Arc::new(ApprovalQueue::new());
+    let q = queue.clone();
+    let submitter = tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("u1")).await });
+    wait_depth(&queue, 1).await;
+    let st = state_with(queue.clone());
+
+    for path in ["/approvals/approve", "/approvals/reject"] {
+        for body in ["", "{}", r#"{"id":5}"#, "not json", r#"{"call_id":"u1"}"#] {
+            let resp = app(st.clone()).oneshot(resolve_req(path, body)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{path} with body {body:?} must be refused"
+            );
+            assert_eq!(queue.depth(), 1, "{path} {body:?} must not resolve the head");
+        }
+    }
+    assert!(!submitter.is_finished(), "the effect must still be waiting on a human");
+
+    // The id-bound approve is the only way through.
+    let resp = app(st.clone())
+        .oneshot(resolve_req("/approvals/approve", r#"{"id":"u1"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["resolved"], true);
+    assert_eq!(submitter.await.unwrap(), ApprovalOutcomePublic::Approved);
+}
+
+/// PBA-L6b-009 tripwire (class: "resolve whatever is at the head"). The core queue must not regrow
+/// an id-less resolve API, and the sidecar must not call one. Source scan over both files so a
+/// re-introduction fails here even if a new test forgets to cover it.
+#[test]
+fn tripwire_no_idless_head_resolution_pba_l6b_009() {
+    let core = include_str!("../../agent/core/src/hitl/mod.rs");
+    let sidecar = include_str!("lib.rs");
+    for needle in ["pub fn approve(&self)", "pub fn reject(&self)", "fn pop_head_with"] {
+        assert!(!core.contains(needle), "hitl/mod.rs regrew an id-less resolve path: {needle}");
+    }
+    for needle in [".approve()", ".reject()"] {
+        assert!(!sidecar.contains(needle), "sidecar calls an id-less resolve path: {needle}");
+    }
 }

@@ -254,8 +254,9 @@ mod tests {
             got.expect("role-aware entry should register")
         };
 
-        // (a) The anonymous single-click FIFO approve MUST NOT release it.
-        queue.approve();
+        // (a) The FIFO approve surface MUST NOT release it (it is not on the
+        // FIFO track, so an id-bound approve finds nothing to resolve).
+        assert!(queue.approve_by_id(&call_id).is_err());
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             !handle.is_finished(),

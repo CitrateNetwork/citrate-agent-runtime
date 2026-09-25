@@ -270,16 +270,14 @@ async fn approvals(
 }
 
 /// S6.3 — the CEREMONY BRIDGE (approve half). citrate-core's SignatureCeremony, once the human
-/// approves the head pending approval, calls this to resolve it. The queue is a FIFO; approving the
-/// head unblocks the capsule host-fn that submitted it, which then performs the eth-send. Honest:
-/// approving an empty queue is a no-op (nothing was pending), reported as such.
+/// approves a pending approval, calls this with `{"id": "<call_id>"}` to resolve it. Approving
+/// unblocks the capsule host-fn that submitted it.
 ///
-/// AR-B-023: when the request body carries `{"id": "<call_id>"}`, the approval
-/// is BOUND to that call — if the queue head is a different action than the one
-/// the operator reviewed (a timeout eviction or a second queued effect changed
-/// the head), the request is refused with 409 CONFLICT and nothing is resolved.
-/// A body without an id keeps the legacy head-approve for backward compatibility
-/// with ceremony clients that have not yet adopted the id round-trip.
+/// AR-B-023 / PBA-L6b-009: the approval is BOUND to the call-id the human reviewed.
+/// * No `id` (empty body, `{}`, non-string id, malformed JSON) → 400; nothing is resolved. The
+///   legacy "approve whatever is at the FIFO head" path is gone.
+/// * The id is not the current head (a timeout eviction or a second queued effect changed the
+///   head), or its submitter already stopped waiting → 409 CONFLICT; nothing runs.
 async fn approve_head(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -305,38 +303,31 @@ async fn reject_head(
     resolve_body(&st, &body, false)
 }
 
-/// Shared approve/reject resolution. Binds to a call-id when the body supplies
-/// one (AR-B-023); otherwise falls back to the legacy head resolution.
+/// Extract the call-id the human reviewed from an approve/reject body. `None` for anything that is
+/// not a JSON object carrying a non-empty string `id` (PBA-L6b-009).
+fn requested_call_id(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let id = v.get("id")?.as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Shared approve/reject resolution, always bound to a call-id (AR-B-023 / PBA-L6b-009).
 fn resolve_body(
     st: &Arc<AppState>,
     body: &[u8],
     approve: bool,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let requested_id = (!body.is_empty())
-        .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
-        .flatten()
-        .and_then(|v| v.get("id").and_then(|s| s.as_str()).map(str::to_string));
-
-    if let Some(id) = requested_id {
-        let res = if approve {
-            st.queue.approve_by_id(&id)
-        } else {
-            st.queue.reject_by_id(&id)
-        };
-        return match res {
-            Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "resolved": true }))),
-            // The head is not the call the operator reviewed — refuse.
-            Err(_) => Err(StatusCode::CONFLICT),
-        };
-    }
-
-    let had = st.queue.depth() > 0;
-    if approve {
-        st.queue.approve();
+    let id = requested_call_id(body).ok_or(StatusCode::BAD_REQUEST)?;
+    let res = if approve {
+        st.queue.approve_by_id(&id)
     } else {
-        st.queue.reject();
+        st.queue.reject_by_id(&id)
+    };
+    match res {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "resolved": true }))),
+        // The head is not the call the operator reviewed, or its submitter is gone — refuse.
+        Err(_) => Err(StatusCode::CONFLICT),
     }
-    Ok(Json(serde_json::json!({ "ok": true, "resolved": had })))
 }
 
 async fn run_skill(
