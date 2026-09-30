@@ -345,10 +345,36 @@ fn finish(sink: &dyn EventSink, outcome: RunOutcome) -> RunOutcome {
     outcome
 }
 
-/// Run one user turn to completion (answer, stop, step limit, or failure), appending the user
-/// message, assistant messages and tool results to `history`.
+/// Run one user turn with the defaults (every tool offered, no context budget).
 pub fn run_turn(
     cfg: &LoopConfig,
+    llm: &dyn LlmClient,
+    tools: &ToolRegistry,
+    sink: &dyn EventSink,
+    stop: &StopFlag,
+    history: &mut Vec<Message>,
+    user: &str,
+) -> RunOutcome {
+    run_turn_with(
+        cfg,
+        &TurnOptions::default(),
+        llm,
+        tools,
+        sink,
+        stop,
+        history,
+        user,
+    )
+}
+
+/// Run one user turn to completion (answer, stop, step limit, or failure), appending the user
+/// message, assistant messages and tool results to `history`. `opts` bounds how many tool schemas
+/// are offered per request (HUP-S1.2 tool retrieval) and keeps the prompt within the model's
+/// context (compaction that must shrink, or an honest failure — never an overflow).
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_with(
+    cfg: &LoopConfig,
+    opts: &TurnOptions,
     llm: &dyn LlmClient,
     tools: &ToolRegistry,
     sink: &dyn EventSink,
@@ -365,10 +391,25 @@ pub fn run_turn(
         let mut messages = Vec::with_capacity(history.len() + 1);
         messages.push(Message::system(cfg.system_prompt.clone()));
         messages.extend(history.iter().cloned());
+        let offered = offered_tools(tools.specs(), history, user, opts.max_tools_per_request);
+        if let Some((budget, counter)) = &opts.budget {
+            let tool_tokens = counter.count(&serde_json::to_string(&offered).unwrap_or_default());
+            let inner = ContextBudget {
+                max_context_tokens: budget.max_context_tokens.saturating_sub(tool_tokens),
+                reserve_for_output: budget.reserve_for_output,
+            };
+            match compact_to_budget(&messages, &inner, counter.as_ref()) {
+                Ok(m) => messages = m,
+                Err(e) => {
+                    sink.emit(Event::Error { message: e.clone() });
+                    return finish(sink, RunOutcome::Failed(e));
+                }
+            }
+        }
         let req = CompletionRequest {
             model: cfg.model.clone(),
             messages,
-            tools: tools.specs().to_vec(),
+            tools: offered,
             max_tokens: cfg.max_tokens,
         };
         let turn = match llm.complete(&req) {
@@ -452,4 +493,192 @@ pub fn run_turn(
         message: format!("step budget of {} exhausted", cfg.max_steps),
     });
     finish(sink, RunOutcome::StepLimit)
+}
+
+// ---------------------------------------------------------------------------------------------
+// HUP-S1.2 — tool retrieval and the context budget
+// ---------------------------------------------------------------------------------------------
+
+/// Per-turn options beyond [`LoopConfig`].
+#[derive(Clone, Default)]
+pub struct TurnOptions {
+    /// Offer at most this many tool schemas per model request (plus any tool already used this
+    /// conversation). `None` offers every tool.
+    pub max_tools_per_request: Option<usize>,
+    /// Keep each request within this budget, counted with this counter.
+    pub budget: Option<(ContextBudget, Arc<dyn TokenCounter>)>,
+}
+
+/// Chooses which tool schemas to offer for a query. Tool schemas are the largest fixed cost in a
+/// small model's context, so only the relevant ones go in each request.
+pub trait ToolSelector: Send + Sync {
+    fn select(&self, query: &str, specs: &[ToolSpec], k: usize) -> Vec<ToolSpec>;
+}
+
+/// Deterministic keyword scorer over tool names (weighted) and descriptions. Snake_case names are
+/// split into words. With no signal at all it falls back to the first `k` tools in catalog order.
+/// (An embedding selector can implement the same trait once the knowledge graph is bundled.)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeywordSelector;
+
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "my", "me", "i", "is", "are",
+    "it", "its", "this", "that", "what", "whats", "how", "many", "much", "do", "does", "can",
+    "you", "please", "with", "from", "at", "by", "be",
+];
+
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 2 && !STOPWORDS.contains(w))
+        .map(|w| {
+            if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+                w[..w.len() - 1].to_string()
+            } else {
+                w.to_string()
+            }
+        })
+        .collect()
+}
+
+impl ToolSelector for KeywordSelector {
+    fn select(&self, query: &str, specs: &[ToolSpec], k: usize) -> Vec<ToolSpec> {
+        let q = words(query);
+        let mut scored: Vec<(usize, usize)> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let name = words(&s.name);
+                let desc = words(&s.description);
+                let score = q
+                    .iter()
+                    .map(|w| {
+                        3 * name.iter().filter(|n| *n == w).count()
+                            + desc.iter().filter(|d| *d == w).count()
+                    })
+                    .sum();
+                (i, score)
+            })
+            .collect();
+        if scored.iter().all(|(_, sc)| *sc == 0) {
+            return specs.iter().take(k).cloned().collect();
+        }
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored
+            .into_iter()
+            .filter(|(_, sc)| *sc > 0)
+            .take(k)
+            .map(|(i, _)| specs[i].clone())
+            .collect()
+    }
+}
+
+fn offered_tools(
+    specs: &[ToolSpec],
+    history: &[Message],
+    user: &str,
+    k: Option<usize>,
+) -> Vec<ToolSpec> {
+    let Some(k) = k else { return specs.to_vec() };
+    let in_use: Vec<&str> = history
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|c| c.name.as_str()))
+        .collect();
+    let mut out: Vec<ToolSpec> = specs
+        .iter()
+        .filter(|s| in_use.contains(&s.name.as_str()))
+        .cloned()
+        .collect();
+    for s in KeywordSelector.select(user, specs, k) {
+        if out.len() >= k.max(in_use.len()) {
+            break;
+        }
+        if !out.iter().any(|o| o.name == s.name) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Counts tokens. Production should use the model's own tokenizer (llama-server `/tokenize`); the
+/// character heuristic is a conservative default.
+pub trait TokenCounter: Send + Sync {
+    fn count(&self, s: &str) -> usize;
+    fn count_messages(&self, msgs: &[Message]) -> usize {
+        msgs.iter()
+            .map(|m| {
+                4 + self.count(&m.content)
+                    + m.tool_calls
+                        .iter()
+                        .map(|c| self.count(&c.name) + self.count(&c.arguments))
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+}
+
+/// About four characters per token, rounded up.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CharTokenCounter;
+
+impl TokenCounter for CharTokenCounter {
+    fn count(&self, s: &str) -> usize {
+        s.chars().count().div_ceil(4)
+    }
+}
+
+/// The model's context window and the room reserved for its reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub max_context_tokens: usize,
+    pub reserve_for_output: usize,
+}
+
+/// Fit `msgs` into `budget`: first elide old tool output (oldest first), then drop the oldest
+/// exchanges — never the system prompt or the latest user message, and never leaving an orphaned
+/// tool result. Compaction must shrink the prompt; if it still cannot fit, that is an error.
+pub fn compact_to_budget(
+    msgs: &[Message],
+    budget: &ContextBudget,
+    counter: &dyn TokenCounter,
+) -> Result<Vec<Message>, String> {
+    let limit = budget
+        .max_context_tokens
+        .saturating_sub(budget.reserve_for_output);
+    let fits = |m: &[Message]| counter.count_messages(m) <= limit;
+    if fits(msgs) {
+        return Ok(msgs.to_vec());
+    }
+    let before = counter.count_messages(msgs);
+    let mut out = msgs.to_vec();
+    let last_user = out
+        .iter()
+        .rposition(|m| m.role == Role::User)
+        .unwrap_or(out.len().saturating_sub(1));
+    for i in 0..last_user {
+        if out[i].role == Role::Tool && !out[i].content.starts_with("[elided") {
+            let n = out[i].content.chars().count();
+            out[i].content = format!("[elided: {n} characters of earlier tool output]");
+            if fits(&out) {
+                break;
+            }
+        }
+    }
+    while !fits(&out) {
+        let last_user = out.iter().rposition(|m| m.role == Role::User).unwrap_or(0);
+        if last_user <= 1 || out.len() <= 2 {
+            break;
+        }
+        out.remove(1);
+        while out.len() > 2 && out[1].role == Role::Tool {
+            out.remove(1);
+        }
+    }
+    if !fits(&out) || counter.count_messages(&out) >= before {
+        return Err(format!(
+            "the prompt exceeds the model's context budget ({} tokens available) even after compaction",
+            limit
+        ));
+    }
+    Ok(out)
 }

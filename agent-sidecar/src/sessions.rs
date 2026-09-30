@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_loop::{
-    run_turn, Event, EventSink, HostKind, LlmClient, LoopConfig, Message, StopFlag, ToolCall,
-    ToolHost, ToolOutcome, ToolRegistry, ToolSpec,
+    run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
+    LoopConfig, Message, StopFlag, ToolCall, ToolHost, ToolOutcome, ToolRegistry, ToolSpec,
+    TurnOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +105,11 @@ pub struct CreateSessionReq {
     pub max_steps: Option<u32>,
     pub max_tokens: Option<u32>,
     pub max_tool_calls_per_step: Option<u32>,
+    /// HUP-S1.2: offer at most this many tool schemas per request (default 8).
+    pub max_tools_per_request: Option<usize>,
+    /// HUP-S1.2: the model's context window in tokens; when given, every request is compacted to
+    /// fit (or the turn fails honestly).
+    pub context_tokens: Option<usize>,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -142,6 +148,7 @@ struct EventLog {
 pub struct Session {
     pub id: String,
     cfg: LoopConfig,
+    opts: TurnOptions,
     specs: Vec<ToolSpec>,
     llm: Arc<dyn LlmClient>,
     history: Mutex<Vec<Message>>,
@@ -341,9 +348,22 @@ impl SessionManager {
             max_tool_calls_per_step: req.max_tool_calls_per_step.unwrap_or(4).clamp(1, 16),
             max_tokens: req.max_tokens.unwrap_or(2048).clamp(64, MAX_TOKENS_CAP),
         };
+        let opts = TurnOptions {
+            max_tools_per_request: Some(req.max_tools_per_request.unwrap_or(8).clamp(1, 64)),
+            budget: req.context_tokens.map(|ctx| {
+                (
+                    ContextBudget {
+                        max_context_tokens: ctx.clamp(512, 1 << 20),
+                        reserve_for_output: cfg.max_tokens as usize,
+                    },
+                    Arc::new(CharTokenCounter) as Arc<dyn citrate_agent_loop::TokenCounter>,
+                )
+            }),
+        };
         let session = Arc::new(Session {
             id: id.clone(),
             cfg,
+            opts,
             specs: req.tools,
             llm: (self.llm_factory)(&req.llm),
             history: Mutex::new(Vec::new()),
@@ -395,8 +415,9 @@ impl SessionManager {
         tokio::task::spawn_blocking(move || {
             let sink = SessionSink(s.clone());
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            run_turn(
+            run_turn_with(
                 &s.cfg,
+                &s.opts,
                 s.llm.as_ref(),
                 &registry,
                 &sink,
