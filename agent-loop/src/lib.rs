@@ -93,6 +93,7 @@ pub enum HostKind {
 /// MCP-style tool annotations. Hints for the approval UI and for HIC routing; never enforcement
 /// on their own (the host enforces).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolAnnotations {
     pub read_only: bool,
     pub destructive: bool,
@@ -108,6 +109,7 @@ pub struct ToolSpec {
     /// JSON schema of the arguments.
     pub parameters: serde_json::Value,
     pub host: HostKind,
+    #[serde(default)]
     pub annotations: ToolAnnotations,
 }
 

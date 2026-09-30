@@ -18,12 +18,15 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod llm_http;
+pub mod sessions;
+
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -68,6 +71,8 @@ pub struct AppState {
     /// life of its background task; when none is free the request is refused with 429 instead of
     /// piling up blocked workers.
     pub run_slots: Arc<tokio::sync::Semaphore>,
+    /// HUP-S1.1b: Hermes's agent sessions (the turn loop runs here; core hosts the gated tools).
+    pub sessions: Arc<sessions::SessionManager>,
 }
 
 /// PBA-L6b-032: at most this many skills run at once.
@@ -98,7 +103,13 @@ pub(crate) fn load_dispatch_with_allowlist(
     queue: Arc<ApprovalQueue>,
 ) -> Option<Arc<CapsuleDispatch>> {
     let gate: Arc<dyn ApprovalGate> = Arc::new(QueuedApprovalGate::new(queue));
-    match CapsuleDispatch::load_from_dir_with_allowlist(capsule_dir, allowlist, None, None, Some(gate)) {
+    match CapsuleDispatch::load_from_dir_with_allowlist(
+        capsule_dir,
+        allowlist,
+        None,
+        None,
+        Some(gate),
+    ) {
         Ok(d) => Some(Arc::new(d)),
         Err(e) => {
             eprintln!("[citrate-agent-sidecar] no capsule dispatch ({capsule_dir:?}): {e}");
@@ -219,6 +230,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/approvals/reject", post(reject_head))
         .route("/run_skill", post(run_skill))
         .route("/stop", post(stop))
+        // HUP-S1.1b — agent sessions (ADR loop-in-sidecar).
+        .route("/sessions", post(create_session))
+        .route("/sessions/:id", delete(close_session))
+        .route("/sessions/:id/messages", post(send_message))
+        .route("/sessions/:id/events", get(session_events))
+        .route("/sessions/:id/tool_results", post(tool_results))
+        .route("/sessions/:id/stop", post(stop_session))
         .with_state(state)
 }
 
@@ -416,7 +434,9 @@ async fn run_skill(
     tokio::spawn(async move {
         let _permit = permit;
         if estop.is_stopped() {
-            eprintln!("[citrate-agent-sidecar] skill {name:?} aborted: e-stop engaged before start");
+            eprintln!(
+                "[citrate-agent-sidecar] skill {name:?} aborted: e-stop engaged before start"
+            );
             return;
         }
         let outcome = tokio::task::block_in_place(|| dispatch.call_json(&name, &args));
@@ -441,6 +461,8 @@ async fn stop(
         return Err(StatusCode::UNAUTHORIZED);
     }
     st.estop.trigger();
+    // HUP-S1.1b: the kill switch halts every agent session too.
+    st.sessions.stop_all();
     // PBA-L6b-010: freeze + drain the approval queue so nothing parked before the stop can be
     // released after it, and running skills cannot queue new effects.
     let drained = st.queue.freeze_and_drain();
@@ -464,5 +486,165 @@ impl CtEq for [u8] {
     }
 }
 
+// ── HUP-S1.1b: agent session routes ─────────────────────────────────────
+
+fn session_status(e: &sessions::SessionError) -> StatusCode {
+    match e {
+        sessions::SessionError::NotFound => StatusCode::NOT_FOUND,
+        sessions::SessionError::Busy => StatusCode::CONFLICT,
+        sessions::SessionError::TooMany => StatusCode::TOO_MANY_REQUESTS,
+        sessions::SessionError::Invalid(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
+async fn create_session(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let err = |c: StatusCode, m: &str| (c, Json(serde_json::json!({ "error": m })));
+    if !authorized(&headers, &st.bearer) {
+        return Err(err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    let req: sessions::CreateSessionReq = serde_json::from_slice(&body).map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            &format!("bad session request: {e}"),
+        )
+    })?;
+    match st.sessions.create(req) {
+        Ok(id) => Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id })))),
+        Err(e) => {
+            let msg = match &e {
+                sessions::SessionError::Invalid(m) => m.clone(),
+                sessions::SessionError::TooMany => {
+                    format!("at most {} sessions", sessions::MAX_SESSIONS)
+                }
+                _ => "refused".into(),
+            };
+            Err(err(session_status(&e), &msg))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MessageReq {
+    text: String,
+}
+
+async fn send_message(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if st.estop.is_stopped() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let req: MessageReq = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    st.sessions
+        .send(&id, req.text, st.dispatch.clone())
+        .map_err(|e| session_status(&e))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true, "accepted": true })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    wait_ms: u64,
+}
+
+async fn session_events(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Result<Json<sessions::EventsPage>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let session = st.sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let wait = std::time::Duration::from_millis(q.wait_ms.min(sessions::MAX_WAIT_MS));
+    Ok(Json(session.wait_events(q.after, wait).await))
+}
+
+async fn tool_results(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let session = st.sessions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let req: sessions::ToolResultReq =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let call_id = req.call_id.clone();
+    let outcome = sessions::outcome_from(req).map_err(|e| session_status(&e))?;
+    if session.deliver(&call_id, outcome) {
+        Ok(Json(serde_json::json!({ "ok": true, "delivered": true })))
+    } else {
+        // Nothing is waiting for that call (already answered, timed out, or never asked).
+        Err(StatusCode::CONFLICT)
+    }
+}
+
+async fn stop_session(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    st.sessions.stop(&id).map_err(|e| session_status(&e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "stopped": true })))
+}
+
+async fn close_session(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    st.sessions.close(&id).map_err(|e| session_status(&e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "closed": true })))
+}
+
+/// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
+/// deadlines (matching citrate-core's AI request bound).
+pub fn production_sessions() -> Arc<sessions::SessionManager> {
+    let timeout = std::time::Duration::from_secs(300);
+    Arc::new(sessions::SessionManager::new(
+        Arc::new(move |ep: &sessions::LlmEndpoint| {
+            Arc::new(llm_http::OpenAiCompatClient::new(
+                &ep.base_url,
+                &ep.bearer,
+                timeout,
+            )) as Arc<dyn citrate_agent_loop::LlmClient>
+        }),
+        timeout,
+    ))
+}
+
+#[cfg(test)]
+mod sessions_tests;
 #[cfg(test)]
 mod tests;

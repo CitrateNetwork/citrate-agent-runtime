@@ -59,6 +59,8 @@ dependencies = [
  "axum",
  "citrate-agent-core",
  "citrate-agent-legacy",
+ "citrate-agent-loop",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

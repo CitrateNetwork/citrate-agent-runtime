@@ -25,6 +25,7 @@ fn state() -> Arc<AppState> {
         dispatch: None,
         bearer: BEARER.to_string(),
         run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: production_sessions(),
     })
 }
 
@@ -209,7 +210,10 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
     // must adopt the role-aware submit_for_action/add_signature track.)
     let queue = Arc::new(ApprovalQueue::new());
     let dispatch = fixture_dispatch(queue.clone());
-    assert!(dispatch.is_some(), "the test-fixtures capsule dir must load");
+    assert!(
+        dispatch.is_some(),
+        "the test-fixtures capsule dir must load"
+    );
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue: queue.clone(),
@@ -220,6 +224,7 @@ async fn run_skill_surfaces_a_chain_effect_on_the_queue() {
         dispatch,
         bearer: BEARER.to_string(),
         run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: production_sessions(),
     });
 
     // `to` must be the capsule's allow-listed address so the effect reaches the gate (not rejected at
@@ -257,7 +262,10 @@ async fn run_skill_404s_for_an_unknown_skill() {
     // A loaded dispatch, but the name isn't in the catalog.
     let queue = Arc::new(ApprovalQueue::new());
     let dispatch = fixture_dispatch(queue.clone());
-    assert!(dispatch.is_some(), "the test-fixtures capsule dir must load");
+    assert!(
+        dispatch.is_some(),
+        "the test-fixtures capsule dir must load"
+    );
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue,
@@ -268,6 +276,7 @@ async fn run_skill_404s_for_an_unknown_skill() {
         dispatch,
         bearer: BEARER.to_string(),
         run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: production_sessions(),
     });
     let resp = app(st)
         .oneshot(run_body("no-such-skill", serde_json::json!({})))
@@ -487,7 +496,8 @@ async fn approvals_exposes_the_raw_calldata_for_the_ceremony_bridge() {
     // must surface them from the pending chain effect, not just a human summary.
     let queue = Arc::new(ApprovalQueue::new());
     let q = queue.clone();
-    let submitter = tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("cd1")).await });
+    let submitter =
+        tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("cd1")).await });
     wait_depth(&queue, 1).await;
 
     let st = Arc::new(AppState {
@@ -497,6 +507,7 @@ async fn approvals_exposes_the_raw_calldata_for_the_ceremony_bridge() {
         dispatch: None,
         bearer: BEARER.to_string(),
         run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: production_sessions(),
     });
     let resp = app(st).oneshot(authed("GET", "/approvals")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -506,7 +517,10 @@ async fn approvals_exposes_the_raw_calldata_for_the_ceremony_bridge() {
         "the chain target is exposed"
     );
     assert_eq!(j[0]["data"], "0xdeadbeef", "the calldata is exposed");
-    assert_eq!(j[0]["id"], "cd1", "the call-id the ceremony must echo back is exposed");
+    assert_eq!(
+        j[0]["id"], "cd1",
+        "the call-id the ceremony must echo back is exposed"
+    );
 
     queue.approve_by_id("cd1").expect("cd1 is the head");
     let _ = submitter.await;
@@ -530,6 +544,7 @@ fn state_with(queue: Arc<ApprovalQueue>) -> Arc<AppState> {
         dispatch: None,
         bearer: BEARER.to_string(),
         run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: production_sessions(),
     })
 }
 
@@ -541,22 +556,33 @@ fn state_with(queue: Arc<ApprovalQueue>) -> Arc<AppState> {
 async fn an_unbound_approve_never_resolves_the_head_pba_l6b_009() {
     let queue = Arc::new(ApprovalQueue::new());
     let q = queue.clone();
-    let submitter = tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("u1")).await });
+    let submitter =
+        tokio::spawn(async move { q.submit_with_outcome(chain_effect_call("u1")).await });
     wait_depth(&queue, 1).await;
     let st = state_with(queue.clone());
 
     for path in ["/approvals/approve", "/approvals/reject"] {
         for body in ["", "{}", r#"{"id":5}"#, "not json", r#"{"call_id":"u1"}"#] {
-            let resp = app(st.clone()).oneshot(resolve_req(path, body)).await.unwrap();
+            let resp = app(st.clone())
+                .oneshot(resolve_req(path, body))
+                .await
+                .unwrap();
             assert_eq!(
                 resp.status(),
                 StatusCode::BAD_REQUEST,
                 "{path} with body {body:?} must be refused"
             );
-            assert_eq!(queue.depth(), 1, "{path} {body:?} must not resolve the head");
+            assert_eq!(
+                queue.depth(),
+                1,
+                "{path} {body:?} must not resolve the head"
+            );
         }
     }
-    assert!(!submitter.is_finished(), "the effect must still be waiting on a human");
+    assert!(
+        !submitter.is_finished(),
+        "the effect must still be waiting on a human"
+    );
 
     // The id-bound approve is the only way through.
     let resp = app(st.clone())
@@ -575,11 +601,21 @@ async fn an_unbound_approve_never_resolves_the_head_pba_l6b_009() {
 fn tripwire_no_idless_head_resolution_pba_l6b_009() {
     let core = include_str!("../../agent/core/src/hitl/mod.rs");
     let sidecar = include_str!("lib.rs");
-    for needle in ["pub fn approve(&self)", "pub fn reject(&self)", "fn pop_head_with"] {
-        assert!(!core.contains(needle), "hitl/mod.rs regrew an id-less resolve path: {needle}");
+    for needle in [
+        "pub fn approve(&self)",
+        "pub fn reject(&self)",
+        "fn pop_head_with",
+    ] {
+        assert!(
+            !core.contains(needle),
+            "hitl/mod.rs regrew an id-less resolve path: {needle}"
+        );
     }
     for needle in [".approve()", ".reject()"] {
-        assert!(!sidecar.contains(needle), "sidecar calls an id-less resolve path: {needle}");
+        assert!(
+            !sidecar.contains(needle),
+            "sidecar calls an id-less resolve path: {needle}"
+        );
     }
 }
 
@@ -613,7 +649,10 @@ async fn stop_freezes_and_drains_the_approval_queue_pba_l6b_010() {
     wait_role_depth(&queue, 1).await;
     let st = state_with(queue.clone());
 
-    let resp = app(st.clone()).oneshot(authed("POST", "/stop")).await.unwrap();
+    let resp = app(st.clone())
+        .oneshot(authed("POST", "/stop"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Both parked effects are refused, not left pending.
@@ -631,14 +670,21 @@ async fn stop_freezes_and_drains_the_approval_queue_pba_l6b_010() {
     assert_eq!(queue.role_pending_depth(), 0);
 
     // While stopped the approval surface is closed.
-    let resp = app(st.clone()).oneshot(authed("GET", "/approvals")).await.unwrap();
+    let resp = app(st.clone())
+        .oneshot(authed("GET", "/approvals"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     for path in ["/approvals/approve", "/approvals/reject"] {
         let resp = app(st.clone())
             .oneshot(resolve_req(path, r#"{"id":"s1"}"#))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path} while stopped");
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} while stopped"
+        );
     }
 
     // A skill still running when the stop landed cannot queue a new effect: the gate refuses it
@@ -683,7 +729,10 @@ async fn status_counts_role_track_pending_pba_l6b_032() {
         .await
         .unwrap();
     let j = body_json(resp).await;
-    assert_eq!(j["rolePendingApprovals"], 1, "role-track pending must be visible: {j}");
+    assert_eq!(
+        j["rolePendingApprovals"], 1,
+        "role-track pending must be visible: {j}"
+    );
     queue.reject_action("rp1").unwrap();
     let _ = h.await;
 }
@@ -696,7 +745,11 @@ async fn run_skill_is_capped_pba_l6b_032() {
     let dispatch = fixture_dispatch(queue.clone());
     assert!(dispatch.is_some());
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS));
-    let held = slots.clone().acquire_many_owned(MAX_CONCURRENT_SKILLS as u32).await.unwrap();
+    let held = slots
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_SKILLS as u32)
+        .await
+        .unwrap();
     let st = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue,
@@ -707,15 +760,31 @@ async fn run_skill_is_capped_pba_l6b_032() {
         dispatch,
         bearer: BEARER.to_string(),
         run_slots: slots.clone(),
+        sessions: production_sessions(),
     });
-    let body = || run_body("eth-sender-test", serde_json::json!({"to": "0x00", "data": "0x00"}));
+    let body = || {
+        run_body(
+            "eth-sender-test",
+            serde_json::json!({"to": "0x00", "data": "0x00"}),
+        )
+    };
     let resp = app(st.clone()).oneshot(body()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    let s = body_json(app(st.clone()).oneshot(authed("GET", "/status")).await.unwrap()).await;
+    let s = body_json(
+        app(st.clone())
+            .oneshot(authed("GET", "/status"))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(s["runningSkills"], MAX_CONCURRENT_SKILLS);
     drop(held);
     let resp = app(st.clone()).oneshot(body()).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "a free slot admits the skill");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a free slot admits the skill"
+    );
     // The permit is released when the skill task ends.
     for _ in 0..400 {
         if slots.available_permits() == MAX_CONCURRENT_SKILLS {
