@@ -16,6 +16,7 @@ members = [
     "agent-loop",
     "agent-shell",
     "agent-guard",
+    "agent-records",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
