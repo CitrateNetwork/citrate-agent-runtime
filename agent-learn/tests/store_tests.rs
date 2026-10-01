@@ -540,7 +540,9 @@ fn a_memory_accept_whose_save_was_lost_can_be_accepted_again() {
     assert_eq!(report.reconciled, 1);
     match l.get(&id).map(|p| &p.state) {
         Some(ProposalState::PersistFailed { reason }) => {
-            assert!(reason.contains("accept again"), "{reason}")
+            assert!(reason.contains("accept again"), "{reason}");
+            // The reason is shown to the member: no stray source-indentation runs.
+            assert!(!reason.contains("  "), "{reason:?}")
         }
         other => panic!("{other:?}"),
     }

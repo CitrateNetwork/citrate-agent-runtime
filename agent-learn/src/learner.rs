@@ -593,8 +593,9 @@ impl Learner {
                 }
                 (ProposalState::Proposed, "learn.memory", Decision::Approved) => {
                     Some(ProposalState::PersistFailed {
-                        reason: "accepted before a restart; accept again so the app receives                                  the memory"
-                            .into(),
+                        reason:
+                            "accepted before a restart; accept again so the app receives the memory"
+                                .into(),
                     })
                 }
                 (ProposalState::Persisted, "skill.publish", Decision::Approved) => {
