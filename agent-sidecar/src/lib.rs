@@ -37,6 +37,7 @@ use citrate_agent_core::capsule::dispatcher::ApprovalGate;
 use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
 use citrate_agent_core::hitl::ApprovalQueue;
 use citrate_agent_legacy::estop::EmergencyStop;
+use citrate_agent_loop::interview;
 
 /// One installed skill (a capsule), surfaced to the `AgentHarnessDomain::skills` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +238,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
+        // HUP-S1.4 — tracks + briefs (the interview every client shares).
+        .route("/tracks", get(tracks))
+        .route("/briefs", post(create_brief))
+        .route("/briefs/check", post(check_brief))
         .with_state(state)
 }
 
@@ -641,6 +646,103 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
             )) as Arc<dyn citrate_agent_loop::LlmClient>
         }),
         timeout,
+    ))
+}
+
+// ---- HUP-S1.4: tracks + briefs ----
+
+type JsonErr = (StatusCode, Json<serde_json::Value>);
+
+fn json_err(c: StatusCode, m: &str) -> JsonErr {
+    (c, Json(serde_json::json!({ "error": m })))
+}
+
+fn bundled_tracks_or_500() -> Result<Vec<interview::Track>, JsonErr> {
+    interview::bundled_tracks().map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
+fn find_track(tracks: Vec<interview::Track>, id: &str) -> Result<interview::Track, JsonErr> {
+    tracks.into_iter().find(|t| t.id == id).ok_or_else(|| {
+        json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("no track {id:?}"),
+        )
+    })
+}
+
+async fn tracks(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<interview::Track>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(bundled_tracks_or_500()?))
+}
+
+#[derive(Deserialize)]
+struct BriefReq {
+    #[serde(default)]
+    track: Option<String>,
+    goal: String,
+    #[serde(default)]
+    answers: std::collections::BTreeMap<String, String>,
+}
+
+/// Answers → brief. Unanswered questions take their defaults; with no `track`, one is suggested
+/// from the goal (422 when nothing fits, so the client asks the member to pick).
+async fn create_brief(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: BriefReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad brief request: {e}")))?;
+    let id = match req.track.as_deref() {
+        Some(t) => t.to_string(),
+        None => interview::suggest_track(&req.goal)
+            .ok_or_else(|| {
+                json_err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "no track fits that goal; pick one from /tracks",
+                )
+            })?
+            .to_string(),
+    };
+    let track = find_track(bundled_tracks_or_500()?, &id)?;
+    let brief = interview::Brief::from_answers(&track, &req.goal, &req.answers)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    let markdown = brief.to_markdown();
+    Ok(Json(
+        serde_json::json!({ "brief": brief, "markdown": markdown }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CheckBriefReq {
+    brief: interview::Brief,
+}
+
+/// Validate a member-edited brief against its track (gates and workflow are not editable away).
+async fn check_brief(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: CheckBriefReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad brief: {e}")))?;
+    let track = find_track(bundled_tracks_or_500()?, &req.brief.track)?;
+    req.brief
+        .validate_edit(&track)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "markdown": req.brief.to_markdown() }),
     ))
 }
 

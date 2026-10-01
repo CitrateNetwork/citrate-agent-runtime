@@ -1,0 +1,43 @@
+id = "full-project"
+title = "Full project"
+summary = "A dApp end to end: contract, site, deploy (the hello-mint path)."
+persona = "Builder"
+skills = ["solidity", "foundry", "openzeppelin", "frontend-design", "trailofbits-audit"]
+workflow = "hello-mint"
+workflow_available = false
+ships_in = "HUP-S6"
+gates = [
+  "forge test passes",
+  "Slither: zero High findings",
+  "Aderyn: zero High findings",
+  "Medusa fuzz campaign (about 10 minutes) breaks no invariant",
+  "Dry run on an anvil fork of 40204 succeeds",
+  "Deploy only through a SignatureCeremony you approve, bound to the gated bytecode hash",
+]
+
+[[questions]]
+id = "name"
+ask = "Project name?"
+default = "Hello Mint"
+
+[[questions]]
+id = "standard"
+ask = "Which token standard?"
+choices = ["ERC-721", "ERC-1155"]
+default = "ERC-721"
+
+[[questions]]
+id = "supply"
+ask = "Maximum supply?"
+default = "500"
+
+[[questions]]
+id = "price"
+ask = "Mint price in SALT?"
+default = "1"
+
+[[questions]]
+id = "style"
+ask = "Site style?"
+choices = ["minimal", "playful", "bold"]
+default = "minimal"

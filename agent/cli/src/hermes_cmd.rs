@@ -11,9 +11,12 @@
 //!   app behind its approval gates, so a terminal session never has them. The model endpoint is
 //!   yours to name (`--llm-base-url`, loopback http or https); its key is read from an environment
 //!   variable you name (`--llm-key-env`), never from the command line.
+//! - `brief [--track <id>] --goal "…" [--defaults]` — the same interview the app runs (HUP-S1.4):
+//!   a few questions with defaults (Enter keeps the default), then the brief Hermes would build from.
 
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -82,6 +85,21 @@ pub enum HermesCmd {
     },
     /// Interactive chat: opens a headless session and follows each turn.
     Chat(ModelArgs),
+    /// Answer a track's interview and print the brief (no track: suggested from the goal).
+    Brief {
+        /// Track id (creative, code, smart-contract, project-management, full-project).
+        #[arg(long)]
+        track: Option<String>,
+        /// What you want to make.
+        #[arg(long)]
+        goal: String,
+        /// Skip the questions and take every default.
+        #[arg(long)]
+        defaults: bool,
+        /// Print the brief as JSON instead of markdown.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where the desktop app writes the sidecar bearer (Tauri `app_local_data_dir` + `hermes/`).
@@ -142,6 +160,90 @@ pub fn build_open_body(
         "tools": tools,
         "maxToolsPerRequest": 8,
     })
+}
+
+/// The `POST /briefs` body. Without a track the sidecar suggests one from the goal.
+pub fn build_brief_body(
+    track: Option<&str>,
+    goal: &str,
+    answers: &BTreeMap<String, String>,
+) -> Value {
+    let mut b = json!({ "goal": goal, "answers": answers });
+    if let Some(t) = track {
+        b["track"] = json!(t);
+    }
+    b
+}
+
+/// Ask a track's questions. A blank line keeps the default (the answer is left out, so the
+/// sidecar fills it and marks it "default"); a choice can be typed or picked by number; an
+/// invalid pick is asked again. End of input keeps the defaults for everything left.
+pub fn ask_questions(
+    track: &Value,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut answers = BTreeMap::new();
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    for q in track
+        .get("questions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let (id, ask, default) = (str_of(&q, "id"), str_of(&q, "ask"), str_of(&q, "default"));
+        let choices: Vec<String> = q
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        loop {
+            if !choices.is_empty() {
+                let listed: Vec<String> = choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{}) {c}", i + 1))
+                    .collect();
+                let _ = writeln!(out, "  {}", listed.join("  "));
+            }
+            let _ = write!(out, "{ask} [{default}] ");
+            let _ = out.flush();
+            let mut line = String::new();
+            if input.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                return Ok(answers);
+            }
+            let typed = line.trim();
+            if typed.is_empty() {
+                break;
+            }
+            if choices.is_empty() {
+                answers.insert(id.clone(), typed.to_string());
+                break;
+            }
+            let picked = match typed.parse::<usize>() {
+                Ok(n) if (1..=choices.len()).contains(&n) => Some(choices[n - 1].clone()),
+                Ok(_) => None,
+                Err(_) => choices
+                    .iter()
+                    .find(|c| c.eq_ignore_ascii_case(typed))
+                    .cloned(),
+            };
+            match picked {
+                Some(c) => {
+                    answers.insert(id.clone(), c);
+                    break;
+                }
+                None => {
+                    let _ = writeln!(out, "  pick 1-{} or type one of the choices", choices.len());
+                }
+            }
+        }
+    }
+    Ok(answers)
 }
 
 /// One readable line per interesting event (None for bookkeeping events).
@@ -351,6 +453,50 @@ fn run_inner(args: &HermesArgs) -> Result<(), String> {
         HermesCmd::Stop { session } => {
             check_session_id(session)?;
             c.post(&format!("/sessions/{session}/stop"), &json!({}))?;
+        }
+        HermesCmd::Brief {
+            track,
+            goal,
+            defaults,
+            json: as_json,
+        } => {
+            // First pass with no answers: validates the goal and resolves a suggested track.
+            let first = c.post(
+                "/briefs",
+                &build_brief_body(track.as_deref(), goal, &BTreeMap::new()),
+            )?;
+            let mut result = first.clone();
+            if !*defaults {
+                let id = first
+                    .pointer("/brief/track")
+                    .and_then(Value::as_str)
+                    .ok_or("the sidecar returned no track")?
+                    .to_string();
+                let tracks = c.get("/tracks")?;
+                let t = tracks
+                    .as_array()
+                    .and_then(|a| {
+                        a.iter()
+                            .find(|t| t.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    })
+                    .cloned()
+                    .ok_or_else(|| format!("track {id} not found"))?;
+                eprintln!(
+                    "Track: {} (press Enter to keep a default)",
+                    t.get("title").and_then(Value::as_str).unwrap_or(&id)
+                );
+                let answers =
+                    ask_questions(&t, &mut std::io::stdin().lock(), &mut std::io::stderr())?;
+                result = c.post("/briefs", &build_brief_body(Some(&id), goal, &answers))?;
+            }
+            if *as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result["brief"]).unwrap_or_default()
+                );
+            } else {
+                println!("{}", result["markdown"].as_str().unwrap_or(""));
+            }
         }
         HermesCmd::Chat(m) => {
             let id = c.open(m)?;

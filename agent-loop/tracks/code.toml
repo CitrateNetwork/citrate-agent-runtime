@@ -1,0 +1,35 @@
+id = "code"
+title = "Code"
+summary = "Changes to a codebase, proven by tests."
+persona = "Builder"
+skills = ["agentile-red-green", "toolchain"]
+workflow = "code-change"
+workflow_available = false
+ships_in = "HUP-S2"
+gates = [
+  "A failing test first, then the change that makes it pass",
+  "File writes only inside the folders you granted",
+  "Every write approved by you (HIC)",
+]
+
+[[questions]]
+id = "language"
+ask = "Which language or stack?"
+default = "detect it from the project"
+
+[[questions]]
+id = "scope"
+ask = "Which folder may I work in?"
+default = "the project folder you open"
+
+[[questions]]
+id = "proof"
+ask = "How should I prove it works?"
+choices = ["unit tests", "integration tests", "a command you name"]
+default = "unit tests"
+
+[[questions]]
+id = "diff"
+ask = "How big a change is OK?"
+choices = ["minimal diff", "refactor allowed"]
+default = "minimal diff"

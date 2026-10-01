@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod interview;
+
 // ---------------------------------------------------------------------------------------------
 // Messages and tools
 // ---------------------------------------------------------------------------------------------

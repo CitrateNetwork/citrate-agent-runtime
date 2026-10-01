@@ -533,3 +533,131 @@ async fn the_production_client_survives_create_and_close_inside_the_runtime() {
         "the session lock is not poisoned"
     );
 }
+
+// ---- HUP-S1.4: tracks + briefs (the interview every client shares) ----
+
+#[tokio::test]
+async fn tracks_and_briefs_are_bearer_gated() {
+    let st = state_with(vec![], Duration::from_secs(1));
+    for (m, p) in [
+        ("GET", "/tracks"),
+        ("POST", "/briefs"),
+        ("POST", "/briefs/check"),
+    ] {
+        let r = app(st.clone())
+            .oneshot(req(m, p, serde_json::json!({}), false))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{m} {p}");
+    }
+}
+
+#[tokio::test]
+async fn get_tracks_lists_the_five_launch_tracks_with_their_questions() {
+    let st = state_with(vec![], Duration::from_secs(1));
+    let r = app(st)
+        .oneshot(req("GET", "/tracks", serde_json::Value::Null, true))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json(r).await;
+    let tracks = v.as_array().expect("array");
+    assert_eq!(tracks.len(), 5);
+    assert!(tracks.iter().all(|t| t["questions"]
+        .as_array()
+        .map(|q| q.len() >= 3)
+        .unwrap_or(false)));
+}
+
+#[tokio::test]
+async fn post_briefs_uses_defaults_suggests_a_track_and_refuses_bad_answers() {
+    let st = state_with(vec![], Duration::from_secs(1));
+    // no track given: suggested from the goal; no answers: defaults
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/briefs",
+            serde_json::json!({"goal": "help me make an NFT project called Lemon Drops"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json(r).await;
+    assert_eq!(v["brief"]["track"], "full-project");
+    assert_eq!(v["brief"]["workflow"], "hello-mint");
+    assert!(v["markdown"].as_str().unwrap_or("").contains("## Gates"));
+
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/briefs",
+            serde_json::json!({"goal": "what's the weather"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "no track and none suggested"
+    );
+
+    let r = app(st)
+        .oneshot(req(
+            "POST",
+            "/briefs",
+            serde_json::json!({"track": "full-project", "goal": "x", "answers": {"standard": "ERC-20"}}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(json(r).await["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("one of"));
+}
+
+#[tokio::test]
+async fn briefs_check_accepts_wording_edits_and_refuses_a_dropped_gate() {
+    let st = state_with(vec![], Duration::from_secs(1));
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/briefs",
+            serde_json::json!({"track": "smart-contract", "goal": "a capped token"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    let mut brief = json(r).await["brief"].clone();
+    brief["goal"] = serde_json::json!("a capped token, 1M supply");
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/briefs/check",
+            serde_json::json!({"brief": brief}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(json(r).await["markdown"]
+        .as_str()
+        .unwrap_or("")
+        .contains("1M supply"));
+
+    let gates = brief["gates"].as_array().cloned().unwrap_or_default();
+    brief["gates"] = serde_json::json!(gates.into_iter().skip(1).collect::<Vec<_>>());
+    let r = app(st)
+        .oneshot(req(
+            "POST",
+            "/briefs/check",
+            serde_json::json!({"brief": brief}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
