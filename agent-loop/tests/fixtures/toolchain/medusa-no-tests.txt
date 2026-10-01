@@ -1,0 +1,3 @@
+⇾ Fuzzing with 10 workers
+⇾ Fuzzer stopped, test results follow below ...
+⇾ Test summary: 0 test(s) passed, 0 test(s) failed
