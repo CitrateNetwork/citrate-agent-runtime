@@ -216,6 +216,23 @@ fn a_symlinked_or_hard_linked_target_is_never_written() {
 }
 
 #[test]
+fn a_hard_linked_or_leaf_symlinked_sheet_is_never_read() {
+    let fx = Fx::new();
+    let host = fx.host(&both(&fx));
+    std::fs::hard_link(fx.other().join("secret.csv"), fx.books().join("hard.csv")).unwrap();
+    let r = read(&host, &fx.books().join("hard.csv"));
+    assert!(matches!(r, ToolOutcome::Denied(_)), "{r:?}");
+    std::os::unix::fs::symlink(fx.books().join("q3.csv"), fx.books().join("alias.csv")).unwrap();
+    let r = read(&host, &fx.books().join("alias.csv"));
+    assert!(matches!(r, ToolOutcome::Denied(_)), "{r:?}");
+    // The plain file still reads.
+    assert!(matches!(
+        read(&host, &fx.books().join("q3.csv")),
+        ToolOutcome::Ok(_)
+    ));
+}
+
+#[test]
 fn full_access_reads_are_untrusted() {
     let fx = Fx::new();
     let doc = fx.doc(|g| {
