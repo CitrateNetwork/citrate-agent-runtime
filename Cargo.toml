@@ -17,6 +17,11 @@ members = [
     "agent-shell",
     "agent-guard",
     "agent-records",
+    "agent-mcp-host",
+    "agent-anchor",
+    "agent-metering",
+    "agent-trajectory",
+    "agent-learn",
     "agent-checkpoints",
     "agent-grants",
 ]
