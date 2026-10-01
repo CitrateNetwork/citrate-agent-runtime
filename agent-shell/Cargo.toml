@@ -1,0 +1,16 @@
+[package]
+name = "citrate-agent-shell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermes's shell allowlist runner (HUP-S2.2): argv-only execution of allowlisted programs resolved from a fixed search path, scrubbed environment, caller-checked cwd, wall-clock timeout with process-group kill, capped output capture, and a RunReport for verifiers. Synchronous; run it on a blocking thread."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

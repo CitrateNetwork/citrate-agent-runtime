@@ -1165,6 +1165,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-shell"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "citrate-consensus"
 version = "0.4.0"
 source = "git+https://github.com/CitrateNetwork/citrate-chain.git?rev=f4a07811940a0962325d18e8ba44fea0ff50a3b4#f4a07811940a0962325d18e8ba44fea0ff50a3b4"
