@@ -1,6 +1,9 @@
 //! HUP-S1.9 — sidecar parity: every scenario in agent-loop's `parity-v1.json` (the same bytes that
 //! drive citrate-core's TypeScript loop) run through the sidecar's real wire parser
-//! (`llm_http::parse_turn`) feeding `run_turn`, i.e. the path a live sidecar session takes.
+//! (`llm_http::parse_turn`) feeding `run_turn`. Scope: the wire parser and the loop only. The
+//! session layer (`sessions.rs` config such as its default `max_steps`, and the core-host
+//! `tool_results` round trip) and citrate-core's `sidecarProvider.ts` are not exercised here, so a
+//! pass is loop parity, not end-to-end parity of the live core + sidecar path.
 #[path = "../../agent-loop/tests/parity_common/mod.rs"]
 mod parity_common;
 

@@ -42,7 +42,7 @@ impl LlmClient for ScriptLlm {
     fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
         self.seen.lock().unwrap().push(req.clone());
         let mut idx = self.idx.lock().unwrap();
-        if *idx >= self.entries.len() && !self.repeat_last {
+        if self.entries.is_empty() || (*idx >= self.entries.len() && !self.repeat_last) {
             return Err(LlmError::Provider("parity script exhausted".into()));
         }
         let entry = self.entries[(*idx).min(self.entries.len() - 1)].clone();
