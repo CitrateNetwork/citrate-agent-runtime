@@ -19,6 +19,9 @@ members = [
     "agent-records",
     "agent-metering",
     "agent-trajectory",
+    "agent-learn",
+    "agent-checkpoints",
+    "agent-grants",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
