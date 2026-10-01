@@ -161,6 +161,27 @@ fn a_refusal_in_the_worker_comes_back_as_the_same_outcome_kind() {
 }
 
 #[test]
+fn the_worker_checks_the_project_build_configuration_before_running() {
+    let s = Scratch::new();
+    s.fake_forge(0);
+    std::fs::write(
+        s.proj().join("foundry.toml"),
+        "[profile.default]\nffi = true\n",
+    )
+    .unwrap();
+    let w = s.worker();
+    wait_for("running", Duration::from_secs(20), || running(&w));
+    let host = RemoteToolHost::new(w, Duration::from_secs(30));
+    let out = host.execute(&forge_call(&s.proj()));
+    let ToolOutcome::Error(content) = out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    let env = ToolchainEnvelope::from_content(&content).unwrap();
+    assert_eq!(env.status, RunStatus::Refused, "{}", env.summary);
+    assert!(env.summary.contains("ffi"), "{}", env.summary);
+}
+
+#[test]
 fn killing_the_worker_restarts_it_and_the_next_call_works() {
     let s = Scratch::new();
     s.fake_forge(0);
