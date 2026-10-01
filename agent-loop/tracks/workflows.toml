@@ -1,0 +1,276 @@
+# Track workflows (HUP-S3.3, US-3.3 AC2). Each track maps to a workflow family; the first entry
+# for a track is its default and must equal the track's `workflow`. Every step is judged by
+# verifiers (src/lib.rs and src/verifiers_tooling.rs): only verifiers say done.
+#
+# Two kinds of evidence (src/workflows.rs, `Evidence`):
+# - tool-report: at least one verifier re-judges a tool's own report (forge, slither, aderyn,
+#   medusa) or a tool's result. The model's claim never counts.
+# - answer-shape: the verifiers check the shape of the answer and guard tools that must not run.
+#   These are weaker by design and the app labels them as such until a matching tool ships.
+#
+# Verifier kinds: tool_succeeded {tool}, tool_not_called {tool}, answer_contains {text},
+# json_field_equals {tool, pointer, value}, forge_tests_pass {}, sarif_below_threshold
+# {tool, threshold}, medusa_no_failures {}. Tool names must be in `KNOWN_TOOLS`.
+#
+# Workflows are definitions: no session route runs them yet, so each track's
+# `workflow_available` stays false until one does (Rule 1).
+
+# ---- creative ---------------------------------------------------------------------------------
+
+[[workflows]]
+id = "creative-project"
+track = "creative"
+title = "Creative project"
+summary = "Three directions, then the chosen one in full, reviewed before anything is published."
+
+[[workflows.steps]]
+id = "directions"
+instruction = "Offer three distinct directions for the brief, labeled Option 1, Option 2 and Option 3, each with a one-line description of layout, color and type."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "Option 1" },
+  { kind = "answer_contains", text = "Option 2" },
+  { kind = "answer_contains", text = "Option 3" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "draft"
+instruction = "Draft the direction the member picked in full. End with a line that reads: Review before publishing."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "Review before publishing" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows]]
+id = "copy-pass"
+track = "creative"
+title = "Copy pass"
+summary = "Tighten existing copy and show it side by side."
+
+[[workflows.steps]]
+id = "rewrite"
+instruction = "Rewrite the copy. Show the original under Before: and your version under After:."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "Before:" },
+  { kind = "answer_contains", text = "After:" },
+]
+
+# ---- code -------------------------------------------------------------------------------------
+
+[[workflows]]
+id = "code-change"
+track = "code"
+title = "Code change, test first"
+summary = "Name the failing test, then report the red and green runs. Checked by answer shape until a general test-runner tool ships."
+
+[[workflows.steps]]
+id = "plan"
+instruction = "Name the failing test you will write first and the file it goes in, on a line that starts with Test:."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "Test:" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "red-green"
+instruction = "Write the test and run it, then make the change and run it again. Report the failing run under Red: and the passing run under Green:."
+max_attempts = 3
+verifiers = [
+  { kind = "answer_contains", text = "Red:" },
+  { kind = "answer_contains", text = "Green:" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows]]
+id = "solidity-red-green"
+track = "code"
+title = "Solidity change, proven by forge"
+summary = "A Solidity change that forge test and slither judge."
+
+[[workflows.steps]]
+id = "tests"
+instruction = "Make the change and run forge_test on the project until every test passes."
+max_attempts = 3
+verifiers = [
+  { kind = "forge_tests_pass" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "scan"
+instruction = "Run slither_scan on the project and fix anything at High or above."
+max_attempts = 2
+verifiers = [
+  { kind = "sarif_below_threshold", tool = "slither_scan", threshold = "high" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+# ---- smart contract ---------------------------------------------------------------------------
+
+[[workflows]]
+id = "contract-build"
+track = "smart-contract"
+title = "Contract build"
+summary = "A contract tested, scanned and fuzzed. The deploy is a separate SignatureCeremony after the deploy gate."
+
+[[workflows.steps]]
+id = "tests"
+instruction = "Write the contract and its tests, then run forge_test until every test passes."
+max_attempts = 3
+verifiers = [
+  { kind = "forge_tests_pass" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "slither"
+instruction = "Run slither_scan and fix every finding at High or above."
+max_attempts = 2
+verifiers = [
+  { kind = "sarif_below_threshold", tool = "slither_scan", threshold = "high" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "aderyn"
+instruction = "Run aderyn_scan and fix every finding at High or above."
+max_attempts = 2
+verifiers = [
+  { kind = "sarif_below_threshold", tool = "aderyn_scan", threshold = "high" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "fuzz"
+instruction = "Run medusa_fuzz on the invariants and fix anything it breaks."
+max_attempts = 2
+verifiers = [
+  { kind = "medusa_no_failures" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows]]
+id = "audit-a-contract"
+track = "smart-contract"
+title = "Audit a contract"
+summary = "Scan with slither and aderyn, then report the verdict and findings by severity."
+
+[[workflows.steps]]
+id = "scan"
+instruction = "Run slither_scan and aderyn_scan on the project."
+max_attempts = 2
+verifiers = [
+  { kind = "tool_succeeded", tool = "slither_scan" },
+  { kind = "tool_succeeded", tool = "aderyn_scan" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "report"
+instruction = "Write the audit note. Start with a line Verdict: ready or Verdict: not ready, then a Findings: section by severity with locations."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "Verdict:" },
+  { kind = "answer_contains", text = "Findings:" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+# ---- project management -----------------------------------------------------------------------
+
+[[workflows]]
+id = "project-plan"
+track = "project-management"
+title = "Project plan"
+summary = "A plan with milestones and gates, proposed for approval before anything is written."
+
+[[workflows.steps]]
+id = "plan"
+instruction = "Propose the plan: each Milestone with its Gate. Do not write anything yet; the member approves the plan first."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "Milestone" },
+  { kind = "answer_contains", text = "Gate" },
+  { kind = "tool_not_called", tool = "journal_append" },
+]
+
+[[workflows]]
+id = "status-note"
+track = "project-management"
+title = "Status note"
+summary = "Read the journal and write a done, next and blocked note for the member to approve."
+
+[[workflows.steps]]
+id = "note"
+instruction = "Read the journal, then draft a status note with Done:, Next: and Blocked: sections. Do not append it yet."
+max_attempts = 2
+verifiers = [
+  { kind = "tool_succeeded", tool = "journal_read" },
+  { kind = "answer_contains", text = "Done:" },
+  { kind = "answer_contains", text = "Next:" },
+  { kind = "answer_contains", text = "Blocked:" },
+  { kind = "tool_not_called", tool = "journal_append" },
+]
+
+# ---- full project -----------------------------------------------------------------------------
+
+[[workflows]]
+id = "hello-mint"
+track = "full-project"
+title = "Hello Mint"
+summary = "The dApp path: contract tested, scanned and fuzzed, then a deploy plan that ends at the SignatureCeremony. The anvil-fork dry run and the deploy itself belong to the deploy gate."
+
+[[workflows.steps]]
+id = "tests"
+instruction = "Write the mint contract and its tests, then run forge_test until every test passes."
+max_attempts = 3
+verifiers = [
+  { kind = "forge_tests_pass" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "scans"
+instruction = "Run slither_scan and aderyn_scan and fix every finding at High or above."
+max_attempts = 2
+verifiers = [
+  { kind = "sarif_below_threshold", tool = "slither_scan", threshold = "high" },
+  { kind = "sarif_below_threshold", tool = "aderyn_scan", threshold = "high" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "fuzz"
+instruction = "Run medusa_fuzz on the mint invariants and fix anything it breaks."
+max_attempts = 2
+verifiers = [
+  { kind = "medusa_no_failures" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows.steps]]
+id = "deploy-plan"
+instruction = "Write the deploy plan for the member: what will be deployed, the gate results, and that the deploy happens only through the SignatureCeremony they approve. Do not deploy."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "SignatureCeremony" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
+
+[[workflows]]
+id = "launch-checklist"
+track = "full-project"
+title = "Launch checklist"
+summary = "A step-by-step checklist for a first dApp, for members learning the path."
+
+[[workflows.steps]]
+id = "checklist"
+instruction = "Write the launch checklist as unchecked items (- [ ]), one per step, from contract to site. Do not deploy."
+max_attempts = 2
+verifiers = [
+  { kind = "answer_contains", text = "- [ ]" },
+  { kind = "tool_not_called", tool = "contract_deploy" },
+]
