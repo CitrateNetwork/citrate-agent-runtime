@@ -122,11 +122,17 @@ async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the worker processes first (each gets a shutdown
+    // request and a grace period, well inside core's 5 s stop grace), then let the server drain.
+    // Off the async runtime: it joins the supervisor threads.
+    let sessions = state.sessions.clone();
     let served = axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+        })
         .await;
-    // HUP-S1.9: stop the worker processes cleanly (each gets a shutdown request and a grace
-    // period). Off the async runtime: it joins the supervisor threads.
+    // Idempotent: covers a server that ended without a signal.
     let sessions = state.sessions.clone();
     let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
     served?;
