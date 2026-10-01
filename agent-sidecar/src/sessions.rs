@@ -11,6 +11,15 @@
 //! - A **sidecar-hosted** tool is an installed capsule run through the capsule dispatch, whose chain
 //!   effects still park on the ceremony-grade approval queue.
 //! - The global e-stop halts every session.
+//! - HUP-S3.2: when a skills library is configured (`CITRATE_HERMES_SKILLS`, default off), every
+//!   session gets the skill description index in its system prompt and a pinned, sidecar-hosted
+//!   `skill_load` tool. Skills are instructions only; `skill_load` reads text and runs nothing.
+//! - HUP-S2.7 taint downgrade: tool specs carry `effect` / `trust` annotations (absent = effectful,
+//!   untrusted). Once a session has ingested untrusted content it stays tainted, and every
+//!   effectful call needs a member's explicit decision. A core-hosted call is only dispatched to
+//!   core in that state when the session was opened with `hicAware: true` (core's promise that a
+//!   `hic: "required"` call always goes to a person, with no auto or budget path); otherwise, and
+//!   for capsules, the sidecar declines the call itself.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,9 +28,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
+use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
 use citrate_agent_loop::{
-    run_turn, Event, EventSink, HostKind, LlmClient, LoopConfig, Message, StopFlag, ToolCall,
-    ToolHost, ToolOutcome, ToolRegistry, ToolSpec,
+    run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
+    LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
+    ToolSpec, TurnOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +45,8 @@ pub const MAX_STEPS_CAP: u32 = 32;
 pub const MAX_TOKENS_CAP: u32 = 8192;
 /// Longest a long-poll may wait.
 pub const MAX_WAIT_MS: u64 = 25_000;
+/// Token budget for the skill description index in a session's system prompt.
+pub const SKILL_INDEX_TOKENS: usize = 1500;
 
 /// Where the model lives and how to authenticate. Supplied by citrate-core, never by a webview.
 #[derive(Clone, Deserialize)]
@@ -104,6 +117,16 @@ pub struct CreateSessionReq {
     pub max_steps: Option<u32>,
     pub max_tokens: Option<u32>,
     pub max_tool_calls_per_step: Option<u32>,
+    /// HUP-S1.2: offer at most this many tool schemas per request (default 8).
+    pub max_tools_per_request: Option<usize>,
+    /// HUP-S1.2: the model's context window in tokens; when given, every request is compacted to
+    /// fit (or the turn fails honestly).
+    pub context_tokens: Option<usize>,
+    /// HUP-S2.7: core confirms that a tool call marked `hic: "required"` always goes to a person
+    /// for an explicit decision (no auto-approval, no budget path). Absent = false: the sidecar then
+    /// declines tainted effectful core calls itself.
+    #[serde(default)]
+    pub hic_aware: bool,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -114,6 +137,11 @@ pub struct ToolResultReq {
     /// "ok" | "denied" | "error"
     pub status: String,
     pub content: String,
+    /// HUP-S2.7: "untrusted" marks this one result as untrusted content (e.g. a file outside the
+    /// granted folders), which taints the session; "trusted" or absent defers to the tool's
+    /// annotation.
+    #[serde(default)]
+    pub trust: Option<String>,
 }
 
 /// One event with its sequence number, as served by `GET …/events`.
@@ -142,7 +170,10 @@ struct EventLog {
 pub struct Session {
     pub id: String,
     cfg: LoopConfig,
+    opts: TurnOptions,
     specs: Vec<ToolSpec>,
+    hic_aware: bool,
+    taint: TaintState,
     llm: Arc<dyn LlmClient>,
     history: Mutex<Vec<Message>>,
     log: Mutex<EventLog>,
@@ -150,6 +181,8 @@ pub struct Session {
     pub stop: StopFlag,
     busy: AtomicBool,
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
+    /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
+    skills: Option<Arc<SkillLibrary>>,
 }
 
 impl Session {
@@ -211,6 +244,11 @@ impl Session {
         }
     }
 
+    /// This session's taint (HUP-S2.7).
+    pub fn taint(&self) -> &TaintState {
+        &self.taint
+    }
+
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
     }
@@ -228,6 +266,8 @@ struct CoreHost {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     deadline: Duration,
     stop: StopFlag,
+    /// Core promised to route `hic: "required"` calls to a person (see `CreateSessionReq`).
+    hic_aware: bool,
 }
 
 impl ToolHost for CoreHost {
@@ -263,6 +303,16 @@ impl ToolHost for CoreHost {
         }
         outcome
     }
+
+    fn honors_explicit_approval(&self) -> bool {
+        self.hic_aware
+    }
+
+    /// The requirement reaches core in the `tool_call` event (`hic: "required"` + reason); core
+    /// asks the member and posts the decision back like any other result.
+    fn execute_with_explicit_approval(&self, call: &ToolCall, _reason: &str) -> ToolOutcome {
+        self.execute(call)
+    }
 }
 
 /// Executes sidecar-hosted tools: installed capsules through the capsule dispatch (whose chain
@@ -286,6 +336,27 @@ impl ToolHost for CapsuleHost {
     }
 }
 
+/// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, anything
+/// else to the capsule dispatch (when capsules are loaded).
+struct SidecarHost {
+    skills: Option<SkillHost>,
+    capsules: Option<CapsuleHost>,
+}
+
+impl ToolHost for SidecarHost {
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name == SKILL_LOAD_TOOL {
+            if let Some(h) = &self.skills {
+                return h.execute(call);
+            }
+        }
+        match &self.capsules {
+            Some(c) => c.execute(call),
+            None => ToolOutcome::Error(format!("'{}' is not available in this session", call.name)),
+        }
+    }
+}
+
 /// Why a session operation was refused (mapped to HTTP status by the routes).
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionError {
@@ -301,6 +372,7 @@ pub struct SessionManager {
     llm_factory: LlmFactory,
     core_tool_deadline: Duration,
     ids: AtomicU64,
+    skills: Option<Arc<SkillLibrary>>,
 }
 
 impl SessionManager {
@@ -310,13 +382,35 @@ impl SessionManager {
             llm_factory,
             core_tool_deadline,
             ids: AtomicU64::new(0),
+            skills: None,
         }
+    }
+
+    /// HUP-S3.2: offer this skills library to every new session. An empty library offers nothing.
+    pub fn with_skills(mut self, lib: Arc<SkillLibrary>) -> Self {
+        self.skills = if lib.is_empty() { None } else { Some(lib) };
+        self
     }
 
     pub fn create(&self, req: CreateSessionReq) -> Result<String, SessionError> {
         validate_endpoint(&req.llm.base_url).map_err(SessionError::Invalid)?;
         if req.model.trim().is_empty() {
             return Err(SessionError::Invalid("model is required".into()));
+        }
+        let mut specs = req.tools;
+        let mut system_prompt = req.system_prompt;
+        let mut pinned_tools = Vec::new();
+        if let Some(lib) = &self.skills {
+            if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{SKILL_LOAD_TOOL}' is reserved by the sidecar while skills are enabled"
+                )));
+            }
+            if let Some(section) = lib.prompt_section(SKILL_INDEX_TOKENS, &CharTokenCounter) {
+                system_prompt = format!("{system_prompt}\n\n{section}");
+            }
+            specs.push(skill_load_spec());
+            pinned_tools.push(SKILL_LOAD_TOOL.to_string());
         }
         let mut sessions = self
             .sessions
@@ -336,15 +430,31 @@ impl SessionManager {
         );
         let cfg = LoopConfig {
             model: req.model,
-            system_prompt: req.system_prompt,
+            system_prompt,
             max_steps: req.max_steps.unwrap_or(8).clamp(1, MAX_STEPS_CAP),
             max_tool_calls_per_step: req.max_tool_calls_per_step.unwrap_or(4).clamp(1, 16),
             max_tokens: req.max_tokens.unwrap_or(2048).clamp(64, MAX_TOKENS_CAP),
         };
+        let opts = TurnOptions {
+            max_tools_per_request: Some(req.max_tools_per_request.unwrap_or(8).clamp(1, 64)),
+            budget: req.context_tokens.map(|ctx| {
+                (
+                    ContextBudget {
+                        max_context_tokens: ctx.clamp(512, 1 << 20),
+                        reserve_for_output: cfg.max_tokens as usize,
+                    },
+                    Arc::new(CharTokenCounter) as Arc<dyn citrate_agent_loop::TokenCounter>,
+                )
+            }),
+            pinned_tools,
+        };
         let session = Arc::new(Session {
             id: id.clone(),
             cfg,
-            specs: req.tools,
+            opts,
+            specs,
+            hic_aware: req.hic_aware,
+            taint: TaintState::default(),
             llm: (self.llm_factory)(&req.llm),
             history: Mutex::new(Vec::new()),
             log: Mutex::new(EventLog {
@@ -355,6 +465,7 @@ impl SessionManager {
             stop: StopFlag::default(),
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            skills: self.skills.clone(),
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -386,17 +497,29 @@ impl SessionManager {
             pending: session.pending.clone(),
             deadline: self.core_tool_deadline,
             stop: session.stop.clone(),
+            hic_aware: session.hic_aware,
         });
-        let mut registry = ToolRegistry::new(session.specs.clone()).with_host(HostKind::Core, core);
-        if let Some(d) = capsules {
-            registry = registry.with_host(HostKind::Sidecar, Arc::new(CapsuleHost { dispatch: d }));
+        let mut registry = ToolRegistry::new(session.specs.clone())
+            .with_host(HostKind::Core, core)
+            .with_taint(session.taint.clone());
+        let skill_host = session.skills.clone().map(SkillHost::new);
+        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
+        if skill_host.is_some() || capsule_host.is_some() {
+            registry = registry.with_host(
+                HostKind::Sidecar,
+                Arc::new(SidecarHost {
+                    skills: skill_host,
+                    capsules: capsule_host,
+                }),
+            );
         }
         let s = session.clone();
         tokio::task::spawn_blocking(move || {
             let sink = SessionSink(s.clone());
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            run_turn(
+            run_turn_with(
                 &s.cfg,
+                &s.opts,
                 s.llm.as_ref(),
                 &registry,
                 &sink,
@@ -449,7 +572,17 @@ impl SessionManager {
 
 /// Parse a `tool_results` status into an outcome.
 pub fn outcome_from(req: ToolResultReq) -> Result<ToolOutcome, SessionError> {
+    let untrusted = match req.trust.as_deref() {
+        None | Some("trusted") => false,
+        Some("untrusted") => true,
+        Some(other) => {
+            return Err(SessionError::Invalid(format!(
+                "unknown trust {other:?} (trusted | untrusted)"
+            )))
+        }
+    };
     match req.status.as_str() {
+        "ok" if untrusted => Ok(ToolOutcome::Untrusted(req.content)),
         "ok" => Ok(ToolOutcome::Ok(req.content)),
         "denied" => Ok(ToolOutcome::Denied(req.content)),
         "error" => Ok(ToolOutcome::Error(req.content)),

@@ -1,0 +1,45 @@
+id = "smart-contract"
+title = "Smart contract + business logic"
+summary = "A Solidity contract, tested, fuzzed and audited before any deploy."
+persona = "Builder"
+skills = ["solidity", "foundry", "openzeppelin", "solady", "trailofbits-audit"]
+workflow = "contract-build"
+workflow_available = false
+ships_in = "HUP-S6"
+gates = [
+  "forge test passes",
+  "Slither: zero High findings",
+  "Aderyn: zero High findings",
+  "Medusa fuzz campaign (about 10 minutes) breaks no invariant",
+  "Dry run on an anvil fork of 40204 succeeds",
+  "Deploy only through a SignatureCeremony you approve, bound to the gated bytecode hash",
+]
+
+[[questions]]
+id = "standard"
+ask = "Which kind of contract?"
+choices = ["ERC-20", "ERC-721", "ERC-1155", "Governor", "custom"]
+default = "ERC-20"
+
+[[questions]]
+id = "library"
+ask = "Which library?"
+choices = ["OpenZeppelin", "Solady"]
+default = "OpenZeppelin"
+
+[[questions]]
+id = "access"
+ask = "Who controls admin functions?"
+choices = ["Ownable", "AccessControl roles"]
+default = "Ownable"
+
+[[questions]]
+id = "upgradeable"
+ask = "Upgradeable?"
+choices = ["no", "yes (UUPS)"]
+default = "no"
+
+[[questions]]
+id = "features"
+ask = "Any business rules beyond the standard?"
+default = "none"

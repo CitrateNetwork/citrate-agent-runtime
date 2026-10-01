@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 mod config;
 mod connect_cmd;
 mod doctor_cmd;
+mod hermes_cmd;
 
 #[derive(Parser, Debug)]
 #[command(name = "citrate-agent", version, about = "Citrate Agent CLI")]
@@ -22,6 +23,8 @@ enum Command {
     Doctor(doctor_cmd::DoctorArgs),
     /// Sign in and write the memory config so the agent needs no env vars.
     Connect(connect_cmd::ConnectArgs),
+    /// Drive the Hermes agent sidecar (status, sessions, events, chat).
+    Hermes(hermes_cmd::HermesArgs),
 }
 
 fn main() {
@@ -47,6 +50,8 @@ fn main() {
         // Synchronous — uses reqwest::blocking + a loopback listener, so it must
         // NOT run inside a tokio runtime.
         Command::Connect(args) => connect_cmd::run(args),
+        // Synchronous (reqwest::blocking) — must not run inside a tokio runtime.
+        Command::Hermes(args) => hermes_cmd::run(args),
     };
     std::process::exit(exit);
 }
