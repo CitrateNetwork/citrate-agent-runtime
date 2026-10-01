@@ -42,7 +42,9 @@
     { "name": "skill_write", "host": "core", "read_only": false },
     { "name": "skill_run", "host": "core", "read_only": true },
     { "name": "models_list", "host": "core", "read_only": true },
-    { "name": "contract_deploy", "host": "core", "read_only": false }
+    { "name": "contract_deploy", "host": "core", "read_only": false },
+    { "name": "fl_round_plan", "host": "core", "read_only": true },
+    { "name": "fl_round_start", "host": "core", "read_only": false }
   ],
   "config_divergences": [
     {
