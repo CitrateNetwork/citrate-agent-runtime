@@ -300,6 +300,43 @@ fn an_edit_is_not_written_over_a_file_that_changed_after_it_was_read() {
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "v3");
 }
 
+/// A change that fails after its snapshot leaves the step interrupted (never committed), so the
+/// list does not show it as a change that happened and undo of it restores nothing new.
+#[cfg(unix)]
+#[test]
+fn a_change_that_fails_after_the_snapshot_is_recorded_as_interrupted() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new();
+    let (tools, store) = s.tools();
+    let host = FileToolsHost::new(tools, "s1-fail").unwrap();
+    let dir = s.proj().join("locked");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("keep.txt");
+    std::fs::write(&f, "original").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // A privileged runner ignores directory permissions; nothing to prove there.
+    let probe = dir.join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let why = refused(
+        &host,
+        FS_WRITE_TOOL,
+        serde_json::json!({"path": f, "content": "agent"}),
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(why.contains("write failed"), "{why}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+    let steps = store.steps(&sid("s1-fail")).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(
+        steps[0].status,
+        citrate_agent_checkpoints::StepStatus::Interrupted
+    );
+}
+
 #[test]
 fn fs_delete_and_fs_rename_are_undone_exactly() {
     let s = Scratch::new();
