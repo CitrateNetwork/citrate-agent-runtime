@@ -727,6 +727,18 @@ async fn with_grants_the_toolchain_needs_read_and_write_folder_grants() {
     let env = forge_in_session(&fx, Some(full)).await;
     assert_eq!(env.status, RunStatus::Refused, "{}", env.summary);
 
+    // A write folder grant with only full access for reading: the read must be a folder grant.
+    let write_and_full = fx.doc(|g| {
+        g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
+        g.grant(
+            GrantRequest::full_access(fx.home(), 3600, MEMBER, "look"),
+            now(),
+        )
+        .unwrap();
+    });
+    let env = forge_in_session(&fx, Some(write_and_full)).await;
+    assert_eq!(env.status, RunStatus::Refused, "{}", env.summary);
+
     let rw = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
         g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
@@ -735,4 +747,61 @@ async fn with_grants_the_toolchain_needs_read_and_write_folder_grants() {
     assert_eq!(env.status, RunStatus::Completed, "{}", env.summary);
     let cwd = std::fs::read_to_string(fx.base.join("forge.cwd")).unwrap();
     assert_eq!(cwd.trim(), fx.proj().display().to_string());
+}
+
+/// Core's early refusal list is shorter than the sidecar's deny list, so core can store a grant
+/// rooted in a deny location (a browser profile folder, say), and that row stays in the document
+/// after it is revoked. Such a row can never allow anything (the deny list wins under every
+/// grant), so it must not make the sidecar refuse the member's whole document: that would refuse
+/// every new session and strip the grants from every open one.
+#[tokio::test]
+async fn a_grant_rooted_in_a_deny_location_grants_nothing_and_does_not_refuse_the_rest() {
+    let fx = Fx::new();
+    for d in [".mozilla/profile", ".password-store"] {
+        std::fs::create_dir_all(fx.home().join(d)).unwrap();
+    }
+    std::fs::write(fx.home().join(".mozilla/profile/cookies.sqlite"), "c").unwrap();
+    let mut doc = fx.doc(|g| {
+        g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
+    });
+    let row = |id: &str, root: PathBuf, revoked: Option<u64>| {
+        serde_json::json!({
+            "id": id, "kind": "folder", "root": root, "access": "read", "scope": "subtree",
+            "granted_at": now() - 10, "expires_at": null, "granted_by": "member",
+            "reason": "Granted in Settings", "revoked_at": revoked,
+        })
+    };
+    let rows = doc["grants"].as_array_mut().unwrap();
+    rows.push(row("g-2", fx.home().join(".mozilla"), None));
+    rows.push(row(
+        "g-3",
+        fx.home().join(".password-store"),
+        Some(now() - 5),
+    ));
+    doc["next_id"] = serde_json::json!(4);
+
+    let grants = SessionGrants::empty(fx.home());
+    let s = grants.replace(&doc).expect("the usable grants still load");
+    assert_eq!((s.total, s.active, s.ignored), (1, 1, 2));
+    let host = FileToolHost::new(Arc::new(grants));
+    assert!(matches!(
+        read(&host, &fx.proj().join("src/main.sol")),
+        ToolOutcome::Ok(_)
+    ));
+    assert!(is_denied(&read(
+        &host,
+        &fx.home().join(".mozilla/profile/cookies.sqlite")
+    )));
+
+    // A session opens with it, and the replace route takes it.
+    let (mgr, _) = manager(&fx, vec![], None);
+    let id = mgr
+        .create(create_req(Some(doc.clone())))
+        .expect("session opens");
+    let r = app(state(mgr.clone()))
+        .oneshot(http("POST", &format!("/sessions/{id}/grants"), doc, true))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(body_json(r).await["grants"]["ignored"], 2);
 }

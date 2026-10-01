@@ -79,6 +79,9 @@ const MAX_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_MEDUSA_TIMEOUT_SECS: u64 = 600;
 /// Extra wall-clock time a medusa run gets past its own `--timeout` to print its summary.
 const MEDUSA_GRACE_SECS: u64 = 60;
+/// HUP-S1.9: the longest a single toolchain run may take (the wall-clock cap plus medusa's grace);
+/// the worker call timeout is set above it.
+pub const LONGEST_RUN_SECS: u64 = MAX_TIMEOUT_SECS + MEDUSA_GRACE_SECS;
 /// Planset item 10: a call budget, not wall-clock minutes.
 const DEFAULT_MEDUSA_TEST_LIMIT: u64 = 50_000;
 const MAX_MEDUSA_TEST_LIMIT: u64 = 1_000_000;

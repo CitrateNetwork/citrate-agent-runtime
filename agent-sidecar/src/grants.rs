@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use citrate_agent_grants::{Decision, FolderGrants, GrantKind, GrantState, GrantStatus, Op};
+use citrate_agent_guard::{check_path, GuardContext};
 use citrate_agent_loop::{
     Effect, HostKind, ToolAnnotations, ToolCall, ToolHost, ToolOutcome, ToolSpec, Trust,
 };
@@ -60,6 +61,9 @@ fn now_secs() -> u64 {
 pub struct GrantSummary {
     pub total: usize,
     pub active: usize,
+    /// Rows of the last document set aside because their folder is in a deny location (they could
+    /// never allow anything).
+    pub ignored: usize,
 }
 
 /// One session's grant set. Clones of the `Arc` share it, so a replace reaches every tool host of
@@ -68,6 +72,7 @@ pub struct SessionGrants {
     home: PathBuf,
     clock: fn() -> u64,
     inner: RwLock<FolderGrants>,
+    ignored: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for SessionGrants {
@@ -88,6 +93,7 @@ impl SessionGrants {
             inner: RwLock::new(FolderGrants::new(&home, &home)),
             home,
             clock: now_secs,
+            ignored: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -99,12 +105,26 @@ impl SessionGrants {
 
     /// Parse and validate `doc` (a [`GrantState`] JSON value). On success the session uses it; on
     /// failure the session is left with an empty set and the reason is returned.
+    ///
+    /// A row whose folder is in a deny location is set aside (counted in
+    /// [`GrantSummary::ignored`]) instead of refusing the whole document: the deny list wins under
+    /// every grant, so such a row could never allow anything, and core's own early refusal list is
+    /// shorter than the deny list. Every other rule still refuses the whole document.
     pub fn replace(&self, doc: &serde_json::Value) -> Result<GrantSummary, String> {
+        let mut ignored = 0usize;
         let parsed = serde_json::from_value::<GrantState>(doc.clone())
             .map_err(|e| format!("not a grant document: {e}"))
-            .and_then(|st| {
+            .and_then(|mut st| {
+                let ctx = GuardContext::new(&self.home, &self.home);
+                let before = st.grants.len();
+                st.grants.retain(|g| check_path(&g.root, &ctx).is_ok());
+                ignored = before - st.grants.len();
                 FolderGrants::from_state(st, &self.home, &self.home).map_err(|e| e.to_string())
             });
+        self.ignored.store(
+            if parsed.is_ok() { ignored } else { 0 },
+            std::sync::atomic::Ordering::SeqCst,
+        );
         let mut slot = self
             .inner
             .write()
@@ -156,6 +176,21 @@ impl SessionGrants {
         Ok(read)
     }
 
+    /// The member's home these grants resolve against.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The grant set in use now, as a [`GrantState`] document (deny-location rows already set
+    /// aside). HUP-S1.9: sent with every toolchain call so the worker process checks the same set
+    /// again. A poisoned lock or an encoding failure yields `null`, which the worker refuses.
+    pub fn document(&self) -> serde_json::Value {
+        match self.inner.read() {
+            Ok(g) => serde_json::to_value(g.state()).unwrap_or(serde_json::Value::Null),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
     /// How many grants the session holds, and how many are live now.
     pub fn summary(&self) -> GrantSummary {
         match self.inner.read() {
@@ -167,11 +202,13 @@ impl SessionGrants {
                         .iter()
                         .filter(|v| v.status == GrantStatus::Active)
                         .count(),
+                    ignored: self.ignored.load(std::sync::atomic::Ordering::SeqCst),
                 }
             }
             Err(_) => GrantSummary {
                 total: 0,
                 active: 0,
+                ignored: 0,
             },
         }
     }

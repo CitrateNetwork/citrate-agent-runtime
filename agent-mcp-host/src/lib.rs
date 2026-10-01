@@ -33,7 +33,9 @@ pub mod config;
 pub mod error;
 pub mod host;
 pub mod mapping;
+pub mod probe;
 mod transport;
+pub mod user;
 
 pub use client::{
     CallResult, McpClient, RemoteTool, ServerInfo, PROTOCOL_VERSION, SUPPORTED_VERSIONS,

@@ -32,6 +32,14 @@
 //!   checked against those grants at use, and its toolchain project folder is checked against them
 //!   instead of `CITRATE_HERMES_TOOLCHAIN_ROOTS`. `POST /sessions/:id/grants` replaces the set. A
 //!   session opened without a document is unchanged (no file tools).
+//! - HUP-S10.3: a session opened with `unattended: true` (a daemon run) starts tainted, so every
+//!   effectful call needs a member's explicit decision from its first step. Absent, nothing changes.
+//! - HUP-S7.5: every session meters its turns ([`crate::metering`]): a `MeteringSink` observes the
+//!   event stream and the model client reports provider token usage onto the open turn. Finished
+//!   records go to the manager's `MeteringStore` (no conversation content).
+//! - HUP-S9.3: when trajectory recording is configured (`CITRATE_HERMES_TRAJECTORIES`, default
+//!   off), a session also carries a `TrajectoryRecorder`, exported (verified turns only, redacted)
+//!   when the session closes ([`crate::trajectory`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,11 +55,33 @@ use citrate_agent_loop::{
     ToolSpec, TurnOptions,
 };
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
+use citrate_agent_metering::{MeteringSink, SystemClock};
+use citrate_agent_trajectory::TrajectoryRecorder;
 use serde::{Deserialize, Serialize};
 
+use crate::anchor::AnchorService;
 use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
+use crate::metering::{MeteredLlm, MeteringStore, TeeSink};
 use crate::sheets::SheetToolHost;
 use crate::toolchain::ToolchainHost;
+use crate::trajectory::{export_session, ExportSummary, TrajectoryConfig};
+use crate::workers::WorkerSet;
+
+/// The toolchain as the session manager holds it: in process ([`ToolchainHost`], tests) or in
+/// its worker process ([`crate::workers::RemoteToolHost`], HUP-S1.9). A session opened with
+/// folder grants (HUP-S2.1) gets a host scoped to them: its project folder must be covered by live
+/// read and write folder grants, checked again at every call, and `CITRATE_HERMES_TOOLCHAIN_ROOTS`
+/// does not apply.
+pub trait ToolchainBackend: ToolHost {
+    /// This toolchain, checked against `grants` instead of its env roots.
+    fn scoped_to(&self, grants: Arc<SessionGrants>) -> Result<Arc<dyn ToolHost>, String>;
+}
+
+impl ToolchainBackend for ToolchainHost {
+    fn scoped_to(&self, grants: Arc<SessionGrants>) -> Result<Arc<dyn ToolHost>, String> {
+        Ok(Arc::new(self.for_grants(grants)?))
+    }
+}
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -64,6 +94,9 @@ pub const MAX_TOKENS_CAP: u32 = 8192;
 pub const MAX_WAIT_MS: u64 = 25_000;
 /// Token budget for the skill description index in a session's system prompt.
 pub const SKILL_INDEX_TOKENS: usize = 1500;
+/// HUP-S10.3: the taint source an unattended (daemon) session starts with. It appears in the
+/// `hic_reason` of every effectful call such a session makes.
+pub const UNATTENDED_TAINT_SOURCE: &str = "a scheduled daemon run nobody is watching";
 
 /// Where the model lives and how to authenticate. Supplied by citrate-core, never by a webview.
 #[derive(Clone, Deserialize)]
@@ -148,6 +181,12 @@ pub struct CreateSessionReq {
     /// no file tools, and the toolchain keeps its env roots.
     #[serde(default)]
     pub grants: Option<serde_json::Value>,
+    /// HUP-S10.3: a scheduled daemon run nobody is watching. The session starts tainted (source
+    /// [`UNATTENDED_TAINT_SOURCE`]), so every effectful call needs a member's explicit decision
+    /// from the first step, or is declined here when core is not `hic_aware`. Read-only calls run
+    /// as usual. Absent = false: nothing changes. The taint is never cleared for such a session.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -187,6 +226,19 @@ struct EventLog {
     events: VecDeque<Envelope>,
 }
 
+/// HUP-S10.3: a session's starting taint. An unattended (daemon) session starts in the HIC
+/// downgrade, as if it had already read untrusted content.
+fn initial_taint(unattended: bool) -> TaintState {
+    let taint = TaintState::default();
+    if unattended {
+        taint.taint(
+            UNATTENDED_TAINT_SOURCE,
+            "a scheduled run has no member watching, so every change it proposes needs an explicit decision",
+        );
+    }
+    taint
+}
+
 /// One conversation.
 pub struct Session {
     pub id: String,
@@ -204,8 +256,15 @@ pub struct Session {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
     skills: Option<Arc<SkillLibrary>>,
-    /// HUP-S6.3: present when this session was opened with the toolchain enabled.
-    toolchain: Option<Arc<ToolchainHost>>,
+    /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
+    /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
+    toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S7.5: derives one metering record per turn from the event stream.
+    metering: Arc<MeteringSink>,
+    /// Where this session's finished metering records go.
+    metering_store: Arc<MeteringStore>,
+    /// HUP-S9.3: present only when trajectory recording is configured.
+    trajectory: Option<(Arc<TrajectoryRecorder>, Arc<TrajectoryConfig>)>,
     /// HUP-S2.1: present when this session was opened with a grant document.
     grants: Option<Arc<SessionGrants>>,
 }
@@ -380,7 +439,7 @@ struct SidecarHost {
     /// HUP-S10.2: the sheet tools, present with the file tools.
     sheets: Option<SheetToolHost>,
     skills: Option<SkillHost>,
-    toolchain: Option<Arc<ToolchainHost>>,
+    toolchain: Option<Arc<dyn ToolHost>>,
     mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
 }
@@ -437,11 +496,16 @@ pub struct SessionManager {
     core_tool_deadline: Duration,
     ids: AtomicU64,
     skills: Option<Arc<SkillLibrary>>,
-    toolchain: Option<Arc<ToolchainHost>>,
+    toolchain: Option<Arc<dyn ToolchainBackend>>,
     mcp: Option<Arc<McpHost>>,
     /// HUP-S2.1: the member's home, for resolving grants (`~`, the deny list). `None` = sessions
     /// with a grant document are refused.
     grants_home: Option<std::path::PathBuf>,
+    /// HUP-S1.9: the worker processes behind sidecar-hosted tools (reported on `/workers`).
+    workers: Arc<WorkerSet>,
+    metering: Arc<MeteringStore>,
+    trajectories: Option<Arc<TrajectoryConfig>>,
+    anchor: Option<Arc<AnchorService>>,
 }
 
 impl SessionManager {
@@ -455,7 +519,41 @@ impl SessionManager {
             toolchain: None,
             mcp: None,
             grants_home: None,
+            workers: Arc::new(WorkerSet::default()),
+            metering: Arc::new(MeteringStore::in_memory()),
+            trajectories: None,
+            anchor: None,
         }
+    }
+
+    /// HUP-S7.5: where finished metering records go (default: in memory for this process).
+    pub fn with_metering(mut self, store: Arc<MeteringStore>) -> Self {
+        self.metering = store;
+        self
+    }
+
+    pub fn metering(&self) -> &Arc<MeteringStore> {
+        &self.metering
+    }
+
+    /// HUP-S9.3: record trajectories in every new session (default off).
+    pub fn with_trajectories(mut self, cfg: TrajectoryConfig) -> Self {
+        self.trajectories = Some(Arc::new(cfg));
+        self
+    }
+
+    pub fn trajectories(&self) -> Option<&Arc<TrajectoryConfig>> {
+        self.trajectories.as_ref()
+    }
+
+    /// HUP-S7.3: the nightly anchor store served by the `/anchor/*` routes (default none).
+    pub fn with_anchor(mut self, svc: Arc<AnchorService>) -> Self {
+        self.anchor = Some(svc);
+        self
+    }
+
+    pub fn anchor(&self) -> Option<&Arc<AnchorService>> {
+        self.anchor.as_ref()
     }
 
     /// HUP-S2.1: resolve session grants against this home directory.
@@ -464,10 +562,28 @@ impl SessionManager {
         self
     }
 
-    /// HUP-S6.3: offer the toolchain tools to every new session.
-    pub fn with_toolchain(mut self, host: Arc<ToolchainHost>) -> Self {
+    /// HUP-S6.3: offer the toolchain tools to every new session, executed by `host` (in
+    /// production the toolchain worker process, HUP-S1.9). A session opened with folder grants
+    /// (HUP-S2.1) gets the host scoped to its grants ([`ToolchainBackend::scoped_to`]).
+    pub fn with_toolchain(mut self, host: Arc<dyn ToolchainBackend>) -> Self {
         self.toolchain = Some(host);
         self
+    }
+
+    /// HUP-S1.9: the worker processes this manager's tools run in.
+    pub fn with_workers(mut self, workers: Arc<WorkerSet>) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// HUP-S1.9: one status entry per worker kind (see [`WorkerSet::report`]).
+    pub fn workers_report(&self) -> Vec<serde_json::Value> {
+        self.workers.report()
+    }
+
+    /// HUP-S1.9: stop every worker process cleanly (sidecar shutdown).
+    pub fn shutdown_workers(&self) {
+        self.workers.shutdown();
     }
 
     /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers
@@ -552,11 +668,10 @@ impl SessionManager {
                 Some(Arc::new(g))
             }
         };
-        let toolchain = match (&self.toolchain, &grants) {
-            (Some(t), Some(g)) => Some(Arc::new(
-                t.for_grants(g.clone()).map_err(SessionError::Invalid)?,
-            )),
-            (t, _) => t.clone(),
+        let toolchain: Option<Arc<dyn ToolHost>> = match (&self.toolchain, &grants) {
+            (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
+            (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
+            (None, _) => None,
         };
         let mut sessions = self
             .sessions
@@ -594,14 +709,36 @@ impl SessionManager {
             }),
             pinned_tools,
         };
+        let metering = Arc::new(MeteringSink::new(
+            id.clone(),
+            cfg.model.clone(),
+            specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            Arc::new(SystemClock::new()),
+        ));
+        // HUP-S10.3: a daemon run (`unattended`) starts tainted.
+        let taint = initial_taint(req.unattended);
+        let trajectory = self.trajectories.as_ref().map(|c| {
+            (
+                Arc::new(TrajectoryRecorder::new(
+                    id.clone(),
+                    cfg.model.clone(),
+                    taint.clone(),
+                )),
+                c.clone(),
+            )
+        });
+        let llm: Arc<dyn LlmClient> = Arc::new(MeteredLlm::new(
+            (self.llm_factory)(&req.llm),
+            metering.clone(),
+        ));
         let session = Arc::new(Session {
             id: id.clone(),
             cfg,
             opts,
             specs,
             hic_aware: req.hic_aware,
-            taint: TaintState::default(),
-            llm: (self.llm_factory)(&req.llm),
+            taint,
+            llm,
             history: Mutex::new(Vec::new()),
             log: Mutex::new(EventLog {
                 next_seq: 0,
@@ -614,6 +751,9 @@ impl SessionManager {
             skills: self.skills.clone(),
             toolchain,
             grants,
+            metering,
+            metering_store: self.metering.clone(),
+            trajectory,
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -679,7 +819,15 @@ impl SessionManager {
         }
         let s = session.clone();
         tokio::task::spawn_blocking(move || {
-            let sink = SessionSink(s.clone());
+            let session_sink = SessionSink(s.clone());
+            let mut observers: Vec<&dyn EventSink> = vec![s.metering.as_ref()];
+            if let Some((rec, _)) = &s.trajectory {
+                observers.push(rec.as_ref());
+            }
+            let sink = TeeSink {
+                observers,
+                last: &session_sink,
+            };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
             run_turn_with(
                 &s.cfg,
@@ -694,6 +842,8 @@ impl SessionManager {
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
+            // Workflow verdicts arrive after `done`, so drain only once the turn has returned.
+            s.metering_store.append(s.metering.take_records());
             s.busy.store(false, Ordering::SeqCst);
             s.notify.notify_waiters();
         });
@@ -718,7 +868,9 @@ impl SessionManager {
         list.len()
     }
 
-    pub fn close(&self, id: &str) -> Result<(), SessionError> {
+    /// Close a session. With trajectory recording on, its verified turns are exported now (a
+    /// session still mid-turn is exported with the turns it finished) and the summary returned.
+    pub fn close(&self, id: &str) -> Result<Option<ExportSummary>, SessionError> {
         let s = self
             .sessions
             .lock()
@@ -726,7 +878,14 @@ impl SessionManager {
             .and_then(|mut m| m.remove(id))
             .ok_or(SessionError::NotFound)?;
         s.stop.stop();
-        Ok(())
+        Ok(s.trajectory.as_ref().map(|(rec, cfg)| {
+            let history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            export_session(cfg, rec, &history, &s.id, now_ms)
+        }))
     }
 
     pub fn count(&self) -> usize {
