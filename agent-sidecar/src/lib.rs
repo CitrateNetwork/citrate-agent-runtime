@@ -20,6 +20,7 @@
 
 pub mod llm_http;
 pub mod sessions;
+pub mod toolchain;
 
 use std::sync::Arc;
 
@@ -741,7 +742,7 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
-/// `CITRATE_HERMES_SKILLS` is set.
+/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -765,10 +766,36 @@ pub fn production_sessions_with(
         Some(lib) => mgr.with_skills(lib),
         None => mgr,
     };
+    let mgr = match toolchain_from_env() {
+        Some(host) => mgr.with_toolchain(host),
+        None => mgr,
+    };
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
+}
+
+/// HUP-S6.3: the toolchain host when `CITRATE_HERMES_TOOLCHAIN=1` (default off → `None`). What it
+/// will use is logged to stderr for the operator.
+pub fn toolchain_from_env() -> Option<Arc<toolchain::ToolchainHost>> {
+    let cfg = toolchain::ToolchainConfig::from_env()?;
+    eprintln!(
+        "citrate-agent-sidecar: toolchain tools on: {} granted folder(s), solc {}",
+        cfg.roots.len(),
+        if cfg.solc.is_some() {
+            "configured"
+        } else {
+            "not found (builds will fail offline)"
+        }
+    );
+    match toolchain::ToolchainHost::new(cfg) {
+        Ok(h) => Some(Arc::new(h)),
+        Err(e) => {
+            eprintln!("citrate-agent-sidecar: toolchain tools off: {e}");
+            None
+        }
+    }
 }
 
 // ---- HUP-S1.4: tracks + briefs ----
@@ -874,5 +901,7 @@ mod sessions_tests;
 mod tests;
 #[cfg(test)]
 mod skills_session_tests;
+#[cfg(test)]
+mod toolchain_tests;
 #[cfg(test)]
 mod mcp_session_tests;

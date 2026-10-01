@@ -20,6 +20,9 @@
 //!   core in that state when the session was opened with `hicAware: true` (core's promise that a
 //!   `hic: "required"` call always goes to a person, with no auto or budget path); otherwise, and
 //!   for capsules, the sidecar declines the call itself.
+//! - HUP-S6.3: when the toolchain is enabled (`CITRATE_HERMES_TOOLCHAIN=1`, default off), every
+//!   session also offers the sidecar-hosted `forge_test`, `slither_scan`, `aderyn_scan` and
+//!   `medusa_fuzz` tools ([`crate::toolchain`]), whose results the toolchain verifiers judge.
 //! - HUP-S4.1: when an MCP allowlist is configured (`CITRATE_HERMES_MCP`, default off), every
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
@@ -40,6 +43,8 @@ use citrate_agent_loop::{
 };
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
+
+use crate::toolchain::ToolchainHost;
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -188,6 +193,8 @@ pub struct Session {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
     skills: Option<Arc<SkillLibrary>>,
+    /// HUP-S6.3: present when this session was opened with the toolchain enabled.
+    toolchain: Option<Arc<ToolchainHost>>,
 }
 
 impl Session {
@@ -341,11 +348,12 @@ impl ToolHost for CapsuleHost {
     }
 }
 
-/// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, an
-/// offered `mcp__…` tool to its MCP server (HUP-S4.1), anything else to the capsule dispatch
-/// (when capsules are loaded).
+/// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, the
+/// toolchain tools to the toolchain host (when enabled), an offered `mcp__…` tool to its MCP
+/// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
 struct SidecarHost {
     skills: Option<SkillHost>,
+    toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
 }
@@ -355,6 +363,11 @@ impl ToolHost for SidecarHost {
         if call.name == SKILL_LOAD_TOOL {
             if let Some(h) = &self.skills {
                 return h.execute(call);
+            }
+        }
+        if ToolchainHost::handles(&call.name) {
+            if let Some(t) = &self.toolchain {
+                return t.execute(call);
             }
         }
         if let Some(m) = &self.mcp {
@@ -385,6 +398,7 @@ pub struct SessionManager {
     core_tool_deadline: Duration,
     ids: AtomicU64,
     skills: Option<Arc<SkillLibrary>>,
+    toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<Arc<McpHost>>,
 }
 
@@ -396,8 +410,15 @@ impl SessionManager {
             core_tool_deadline,
             ids: AtomicU64::new(0),
             skills: None,
+            toolchain: None,
             mcp: None,
         }
+    }
+
+    /// HUP-S6.3: offer the toolchain tools to every new session.
+    pub fn with_toolchain(mut self, host: Arc<ToolchainHost>) -> Self {
+        self.toolchain = Some(host);
+        self
     }
 
     /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers
@@ -437,6 +458,15 @@ impl SessionManager {
             }
             specs.push(skill_load_spec());
             pinned_tools.push(SKILL_LOAD_TOOL.to_string());
+        }
+        if self.toolchain.is_some() {
+            if let Some(t) = specs.iter().find(|t| ToolchainHost::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while the toolchain is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(ToolchainHost::specs());
         }
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
@@ -501,6 +531,7 @@ impl SessionManager {
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills: self.skills.clone(),
+            toolchain: self.toolchain.clone(),
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -539,15 +570,21 @@ impl SessionManager {
             .with_taint(session.taint.clone());
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
+        let toolchain = session.toolchain.clone();
         let mcp_host = self
             .mcp
             .clone()
             .map(|h| McpToolHost::new(h, session.stop.clone()));
-        if skill_host.is_some() || capsule_host.is_some() || mcp_host.is_some() {
+        if skill_host.is_some()
+            || capsule_host.is_some()
+            || toolchain.is_some()
+            || mcp_host.is_some()
+        {
             registry = registry.with_host(
                 HostKind::Sidecar,
                 Arc::new(SidecarHost {
                     skills: skill_host,
+                    toolchain,
                     mcp: mcp_host,
                     capsules: capsule_host,
                 }),
