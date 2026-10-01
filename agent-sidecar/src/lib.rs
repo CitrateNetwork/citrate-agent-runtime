@@ -22,6 +22,7 @@ pub mod llm_http;
 pub mod mcp_probe;
 pub mod sessions;
 pub mod toolchain;
+mod toolchain_config;
 
 use std::sync::Arc;
 
