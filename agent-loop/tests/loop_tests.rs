@@ -78,8 +78,12 @@ fn spec(name: &str, host: HostKind) -> ToolSpec {
         description: format!("{name} tool"),
         parameters: serde_json::json!({"type": "object"}),
         host,
+        // HUP-S2.7: these are first-party read tools; say so explicitly (unannotated tools now
+        // default to effectful + untrusted, which would taint the session after one call).
         annotations: ToolAnnotations {
             read_only: true,
+            effect: Some(Effect::None),
+            trust: Some(Trust::Trusted),
             ..Default::default()
         },
     }

@@ -14,11 +14,15 @@
 //!   signs, never holds a key, and never decides an approval.
 //! - **Robust to small models:** unknown tools, malformed argument JSON, missing hosts and
 //!   over-long tool batches become tool *results* the model can recover from, never panics.
+//! - **Taint downgrade (HUP-S2.7):** once the session has ingested untrusted content, every
+//!   effectful tool call needs an explicit member decision (no auto-approval, no budget path) for
+//!   the rest of the session, unless a member clears it ([`TaintState`]; TLA+
+//!   `formal/TaintDowngrade.tla`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub mod interview;
 
@@ -92,8 +96,33 @@ pub enum HostKind {
     Sidecar,
 }
 
-/// MCP-style tool annotations. Hints for the approval UI and for HIC routing; never enforcement
-/// on their own (the host enforces).
+/// What running a tool can change (HUP-S2.7). An unannotated tool is treated as effectful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effect {
+    /// Reads only; changes nothing anywhere.
+    None,
+    /// Changes local or remote state (files, memory, messages, config…).
+    Write,
+    /// Moves value (SALT, gas, x402, faucet…).
+    Spend,
+    /// Asks for a signature (always through core's SignatureCeremony, never here).
+    Sign,
+}
+
+/// Whether a tool's output can be trusted as instructions-free context (HUP-S2.7). Web pages, MCP
+/// output, third-party skill bodies and files outside granted folders are untrusted. An
+/// unannotated tool's output is treated as untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    Trusted,
+    Untrusted,
+}
+
+/// MCP-style tool annotations. The first four are hints for the approval UI; `effect` and `trust`
+/// drive the taint downgrade, and both default to the safe side when absent (effectful,
+/// untrusted). The host still enforces its own gates.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolAnnotations {
@@ -101,6 +130,21 @@ pub struct ToolAnnotations {
     pub destructive: bool,
     pub idempotent: bool,
     pub open_world: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<Effect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<Trust>,
+}
+
+impl ToolAnnotations {
+    /// True unless the tool is explicitly annotated `effect: none`.
+    pub fn is_effectful(&self) -> bool {
+        self.effect != Some(Effect::None)
+    }
+    /// True unless the tool is explicitly annotated `trust: trusted`.
+    pub fn output_untrusted(&self) -> bool {
+        self.trust != Some(Trust::Trusted)
+    }
 }
 
 /// A tool offered to the model.
@@ -120,6 +164,9 @@ pub struct ToolSpec {
 pub enum ToolOutcome {
     /// The tool ran; its (possibly fenced) output.
     Ok(String),
+    /// The tool ran, but this particular output is untrusted whatever the tool's annotation says
+    /// (e.g. a file read that resolved outside the granted folders). Taints the session.
+    Untrusted(String),
     /// A human (or policy) declined the effect — nothing happened.
     Denied(String),
     /// The tool failed.
@@ -129,14 +176,14 @@ pub enum ToolOutcome {
 impl ToolOutcome {
     fn to_content(&self) -> String {
         match self {
-            ToolOutcome::Ok(s) => s.clone(),
+            ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) => s.clone(),
             ToolOutcome::Denied(why) => format!("declined: {why}. Nothing was done."),
             ToolOutcome::Error(e) => format!("tool error: {e}"),
         }
     }
     fn status(&self) -> &'static str {
         match self {
-            ToolOutcome::Ok(_) => "ok",
+            ToolOutcome::Ok(_) | ToolOutcome::Untrusted(_) => "ok",
             ToolOutcome::Denied(_) => "denied",
             ToolOutcome::Error(_) => "error",
         }
@@ -145,14 +192,109 @@ impl ToolOutcome {
 
 /// Executes tool calls for one [`HostKind`]. A core host typically suspends until citrate-core
 /// posts the result back (S1.1b); that is invisible to the loop.
+///
+/// After taint (HUP-S2.7) an effectful call needs an explicit member decision. A host that can
+/// guarantee that — every such call goes to a person, with no auto-approval and no budget path —
+/// says so with [`ToolHost::honors_explicit_approval`] and receives the call through
+/// [`ToolHost::execute_with_explicit_approval`]. Hosts that cannot are never handed such a call:
+/// the loop declines it instead (fail closed).
 pub trait ToolHost: Send + Sync {
     fn execute(&self, call: &ToolCall) -> ToolOutcome;
+    /// Whether this host routes explicit-approval calls to a person with no automatic path.
+    fn honors_explicit_approval(&self) -> bool {
+        false
+    }
+    /// Run a call that must be decided by a person. Only called when
+    /// [`ToolHost::honors_explicit_approval`] is true; the default declines.
+    fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        let _ = (call, reason);
+        ToolOutcome::Denied("this action needs a member's explicit approval".into())
+    }
+}
+
+/// The record of what tainted a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintRecord {
+    /// The tool whose output brought untrusted content in.
+    pub source: String,
+    pub reason: String,
+}
+
+/// A member's explicit decision to clear a session's taint. It carries the member's note so the
+/// decision is never empty; only a member-facing surface should construct one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberClear {
+    note: String,
+}
+
+impl MemberClear {
+    /// `None` for an empty note.
+    pub fn new(note: impl Into<String>) -> Option<Self> {
+        let note = note.into();
+        if note.trim().is_empty() {
+            None
+        } else {
+            Some(MemberClear { note })
+        }
+    }
+    pub fn note(&self) -> &str {
+        &self.note
+    }
+}
+
+/// A session's taint (HUP-S2.7). Clones share one state, so it survives across steps, turns and
+/// rebuilt registries. Monotone: once set it stays set until [`TaintState::clear_by_member`].
+/// A poisoned lock reads as tainted (fail closed).
+#[derive(Debug, Clone, Default)]
+pub struct TaintState(Arc<Mutex<Option<TaintRecord>>>);
+
+impl TaintState {
+    pub fn is_tainted(&self) -> bool {
+        self.0.lock().map(|g| g.is_some()).unwrap_or(true)
+    }
+    /// The taint record. Agrees with [`TaintState::is_tainted`]: a poisoned lock yields a record
+    /// even if none was written (fail closed), since `run_turn_with` gates on this.
+    pub fn record(&self) -> Option<TaintRecord> {
+        match self.0.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => Some(p.into_inner().clone().unwrap_or_else(|| TaintRecord {
+                source: "an unknown source".to_string(),
+                reason: "the session's taint state could not be read".to_string(),
+            })),
+        }
+    }
+    /// Mark the session tainted. Returns true only when this call flipped it (the first source is
+    /// kept).
+    pub fn taint(&self, source: &str, reason: &str) -> bool {
+        let mut g = match self.0.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if g.is_some() {
+            return false;
+        }
+        *g = Some(TaintRecord {
+            source: source.to_string(),
+            reason: reason.to_string(),
+        });
+        true
+    }
+    /// The only way a taint is cleared: an explicit member action. Returns what was cleared.
+    pub fn clear_by_member(&self, ack: MemberClear) -> Option<TaintRecord> {
+        let _ = ack;
+        let mut g = match self.0.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.take()
+    }
 }
 
 /// The tools on offer plus the host that runs each kind.
 pub struct ToolRegistry {
     specs: Vec<ToolSpec>,
     hosts: HashMap<HostKind, Arc<dyn ToolHost>>,
+    taint: TaintState,
 }
 
 impl ToolRegistry {
@@ -160,7 +302,17 @@ impl ToolRegistry {
         ToolRegistry {
             specs,
             hosts: HashMap::new(),
+            taint: TaintState::default(),
         }
+    }
+    /// Share a session's taint state (builder). A fresh registry starts untainted.
+    pub fn with_taint(mut self, taint: TaintState) -> Self {
+        self.taint = taint;
+        self
+    }
+    /// This session's taint state.
+    pub fn taint(&self) -> &TaintState {
+        &self.taint
     }
     /// Register the host for a kind (builder).
     pub fn with_host(mut self, kind: HostKind, host: Arc<dyn ToolHost>) -> Self {
@@ -248,10 +400,17 @@ pub enum Event {
     StepStart {
         step: u32,
     },
+    /// `host` is `None` when the call is not dispatched to any host (no such tool, or a call that
+    /// needs explicit approval its host cannot ask for). `hic: "required"` marks a call that needs
+    /// a member's explicit decision because the session is tainted; absent otherwise.
     ToolCall {
         step: u32,
         call: ToolCall,
         host: Option<HostKind>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hic: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hic_reason: Option<String>,
     },
     ToolResult {
         step: u32,
@@ -261,6 +420,12 @@ pub enum Event {
     },
     StepEnd {
         step: u32,
+    },
+    /// HUP-S2.7: the session just became tainted by `source`'s output. Emitted once per flip.
+    Tainted {
+        step: u32,
+        source: String,
+        reason: String,
     },
     Final {
         content: String,
@@ -288,6 +453,7 @@ impl Event {
             Event::ToolCall { .. } => "tool_call",
             Event::ToolResult { .. } => "tool_result",
             Event::StepEnd { .. } => "step_end",
+            Event::Tainted { .. } => "tainted",
             Event::Final { .. } => "final",
             Event::Verifier { .. } => "verifier",
             Event::Error { .. } => "error",
@@ -449,10 +615,12 @@ pub fn run_turn_with(
                 return finish(sink, RunOutcome::Stopped);
             }
             let spec = tools.spec(&call.name);
+            let over_cap = i as u32 >= cfg.max_tool_calls_per_step;
+            let host = spec.and_then(|s| tools.host(s.host));
             // Decide refusal BEFORE announcing the call: a `tool_call` event names a host only when
             // this loop will dispatch it, so a remote host acting on those events (core) never runs
             // a call the loop refused.
-            let refusal: Option<String> = if i as u32 >= cfg.max_tool_calls_per_step {
+            let refusal: Option<String> = if over_cap {
                 Some(format!(
                     "skipped: at most {} tool calls per step — call it again next step if still needed",
                     cfg.max_tool_calls_per_step
@@ -460,7 +628,7 @@ pub fn run_turn_with(
             } else {
                 match spec {
                     None => Some(format!("unknown tool '{}'", call.name)),
-                    Some(s) => {
+                    Some(_) => {
                         let args = if call.arguments.trim().is_empty() {
                             "{}"
                         } else {
@@ -471,7 +639,7 @@ pub fn run_turn_with(
                                 "the arguments were not valid JSON; retry with a JSON object"
                                     .into(),
                             )
-                        } else if tools.host(s.host).is_none() {
+                        } else if host.is_none() {
                             Some(format!("'{}' is not available in this session", call.name))
                         } else {
                             None
@@ -479,18 +647,46 @@ pub fn run_turn_with(
                     }
                 }
             };
-            let dispatch = match (&refusal, spec) {
-                (None, Some(s)) => tools.host(s.host).map(|h| (s.host, h)),
+            // HUP-S2.7: after taint, an effectful call needs a member's explicit decision.
+            let hic_reason = match spec {
+                Some(s) if refusal.is_none() && s.annotations.is_effectful() => {
+                    tools.taint().record().map(|r| {
+                        format!(
+                            "this session read untrusted content (from {}), so this action needs your explicit approval",
+                            r.source
+                        )
+                    })
+                }
+                _ => None,
+            };
+            // Fail closed: a host that cannot put the call in front of a person never gets it.
+            let refused_hic =
+                hic_reason.is_some() && host.is_some_and(|h| !h.honors_explicit_approval());
+            let dispatch = match (&refusal, spec, host) {
+                (None, Some(s), Some(h)) if !refused_hic => Some((s.host, h)),
                 _ => None,
             };
             sink.emit(Event::ToolCall {
                 step,
                 call: call.clone(),
                 host: dispatch.as_ref().map(|(k, _)| *k),
+                hic: hic_reason.as_ref().map(|_| "required"),
+                hic_reason: hic_reason.clone(),
             });
+            let mut ran = false;
             let outcome = match (dispatch, refusal) {
-                (Some((_, h)), _) => h.execute(call),
+                (Some((_, h)), _) => {
+                    ran = true;
+                    match &hic_reason {
+                        Some(reason) => h.execute_with_explicit_approval(call, reason),
+                        None => h.execute(call),
+                    }
+                }
                 (None, Some(why)) => ToolOutcome::Error(why),
+                (None, None) if refused_hic => ToolOutcome::Denied(
+                    "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
+                        .into(),
+                ),
                 (None, None) => {
                     ToolOutcome::Error(format!("'{}' is not available in this session", call.name))
                 }
@@ -502,6 +698,27 @@ pub fn run_turn_with(
                 status: outcome.status(),
                 content: content.clone(),
             });
+            // Taint when outside content entered the context: a result the host marked untrusted,
+            // or any output (incl. an error body) from a tool not annotated as trusted. Declined
+            // calls and loop-generated errors ingest nothing.
+            let ingested_untrusted = ran
+                && match &outcome {
+                    ToolOutcome::Untrusted(_) => true,
+                    ToolOutcome::Ok(_) | ToolOutcome::Error(_) => {
+                        spec.is_some_and(|s| s.annotations.output_untrusted())
+                    }
+                    ToolOutcome::Denied(_) => false,
+                };
+            if ingested_untrusted {
+                let reason = format!("{} returned untrusted content", call.name);
+                if tools.taint().taint(&call.name, &reason) {
+                    sink.emit(Event::Tainted {
+                        step,
+                        source: call.name.clone(),
+                        reason,
+                    });
+                }
+            }
             history.push(Message::tool_result(&call.id, content));
         }
         sink.emit(Event::StepEnd { step });
@@ -1002,5 +1219,36 @@ impl Planner for StaticPlanner {
             .iter()
             .find(|(keys, _)| keys.iter().any(|k| g.contains(&k.to_lowercase())))
             .map(|(_, w)| w)
+    }
+}
+
+#[cfg(test)]
+mod taint_state_tests {
+    use super::*;
+
+    fn poison(t: &TaintState) {
+        let inner = t.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = inner.lock().unwrap();
+            panic!("poison the taint lock");
+        })
+        .join();
+    }
+
+    #[test]
+    fn a_poisoned_untainted_state_reads_as_tainted_everywhere() {
+        let t = TaintState::default();
+        poison(&t);
+        assert!(t.is_tainted());
+        // run_turn_with gates on `record()`, so it must agree with `is_tainted()`.
+        assert!(t.record().is_some());
+    }
+
+    #[test]
+    fn a_poisoned_tainted_state_keeps_its_first_source() {
+        let t = TaintState::default();
+        assert!(t.taint("web_fetch", "untrusted"));
+        poison(&t);
+        assert_eq!(t.record().map(|r| r.source), Some("web_fetch".to_string()));
     }
 }
