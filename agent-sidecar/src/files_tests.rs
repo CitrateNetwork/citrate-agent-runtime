@@ -396,6 +396,59 @@ fn a_deny_listed_path_inside_a_write_grant_is_refused_before_any_snapshot() {
 }
 
 #[test]
+fn build_configuration_is_left_to_the_member_by_every_fs_tool() {
+    let s = Scratch::new();
+    let (tools, store) = s.tools();
+    let host = FileToolsHost::new(tools, "s1-cfg").unwrap();
+    std::fs::write(s.proj().join("foundry.toml"), "[profile.default]\n").unwrap();
+    std::fs::write(s.proj().join("notes.txt"), "plain").unwrap();
+    let toml = s.proj().join("foundry.toml");
+    for (tool, args) in [
+        (
+            FS_WRITE_TOOL,
+            serde_json::json!({"path": toml, "content": "x"}),
+        ),
+        (
+            FS_WRITE_TOOL,
+            serde_json::json!({"path": s.proj().join(".env"), "content": "x"}),
+        ),
+        (
+            FS_WRITE_TOOL,
+            serde_json::json!({"path": s.proj().join("sub/medusa.json"), "content": "{}"}),
+        ),
+        (
+            FS_WRITE_TOOL,
+            serde_json::json!({"path": s.proj().join(".cargo/config.toml"), "content": "x"}),
+        ),
+        (
+            FS_EDIT_TOOL,
+            serde_json::json!({"path": toml, "old_text": "default", "new_text": "x"}),
+        ),
+        (FS_DELETE_TOOL, serde_json::json!({"path": toml})),
+        (
+            FS_RENAME_TOOL,
+            serde_json::json!({"from": s.proj().join("notes.txt"), "to": s.proj().join("remappings.txt")}),
+        ),
+        (
+            FS_RENAME_TOOL,
+            serde_json::json!({"from": toml, "to": s.proj().join("old.toml")}),
+        ),
+    ] {
+        let why = refused(&host, tool, args.clone());
+        assert!(why.contains("build configuration"), "{tool} {args}: {why}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&toml).unwrap(),
+        "[profile.default]\n"
+    );
+    assert!(s.proj().join("notes.txt").exists());
+    for name in [".env", "sub", ".cargo", "remappings.txt", "old.toml"] {
+        assert!(!s.proj().join(name).exists(), "{name}");
+    }
+    assert_eq!(store.usage().unwrap().steps, 0, "nothing was snapshotted");
+}
+
+#[test]
 fn paths_outside_a_write_grant_are_refused() {
     let s = Scratch::new();
     let (tools, store) = s.tools();

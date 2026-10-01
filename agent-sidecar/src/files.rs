@@ -12,7 +12,9 @@
 //!
 //! Every call runs in this order:
 //!
-//! 1. **Grant and deny list.** Each path goes through [`FolderGrants::check`] for a write, which
+//! 1. **Grant and deny list.** Build configuration (`foundry.toml`, env files and the rest of
+//!    `toolchain_config::build_config_file`) is refused first: the member edits it. Each path
+//!    then goes through [`FolderGrants::check`] for a write, which
 //!    asks the agent-guard default-deny list first (credentials, keychains, browser profiles,
 //!    wallet storage, app data, shell history) and then needs a live write grant covering the
 //!    resolved path. A refusal here happens before anything is read or snapshotted, so the bytes
@@ -281,11 +283,24 @@ impl FileTools {
                 "{raw:?} is not an absolute path; use an absolute path inside a folder the member granted"
             )));
         }
+        // Build configuration is the member's to edit: no fs tool creates, changes, moves or
+        // removes it (checked on the path as given and as resolved).
+        if let Some(name) = crate::toolchain_config::build_config_file(p) {
+            return Err(Refusal::Policy(
+                crate::toolchain_config::build_config_refusal(&name),
+            ));
+        }
         match grants.check(p, Op::Write, (self.clock)()) {
             Decision::Allowed {
                 canonical,
                 grant_id,
             } => {
+                if let Some(name) = crate::toolchain_config::build_config_file(canonical.as_path())
+                {
+                    return Err(Refusal::Policy(
+                        crate::toolchain_config::build_config_refusal(&name),
+                    ));
+                }
                 let root = grants
                     .state()
                     .grants

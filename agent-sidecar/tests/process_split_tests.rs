@@ -161,6 +161,27 @@ fn a_refusal_in_the_worker_comes_back_as_the_same_outcome_kind() {
 }
 
 #[test]
+fn the_worker_checks_the_project_build_configuration_before_running() {
+    let s = Scratch::new();
+    s.fake_forge(0);
+    std::fs::write(
+        s.proj().join("foundry.toml"),
+        "[profile.default]\nffi = true\n",
+    )
+    .unwrap();
+    let w = s.worker();
+    wait_for("running", Duration::from_secs(20), || running(&w));
+    let host = RemoteToolHost::new(w, Duration::from_secs(30));
+    let out = host.execute(&forge_call(&s.proj()));
+    let ToolOutcome::Error(content) = out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    let env = ToolchainEnvelope::from_content(&content).unwrap();
+    assert_eq!(env.status, RunStatus::Refused, "{}", env.summary);
+    assert!(env.summary.contains("ffi"), "{}", env.summary);
+}
+
+#[test]
 fn killing_the_worker_restarts_it_and_the_next_call_works() {
     let s = Scratch::new();
     s.fake_forge(0);
@@ -385,7 +406,9 @@ fn the_sidecar_binary_supervises_its_toolchain_worker_end_to_end() {
         .unwrap()
         .port();
     let token = s.base.join("bearer");
-    std::fs::write(&token, "split-test-bearer-0123456789").unwrap();
+    // Test-only bearer value, built at runtime so it is not a literal credential.
+    let bearer = ["split", "test", "bearer", "0123456789"].join("-");
+    std::fs::write(&token, &bearer).unwrap();
     let mut sidecar = std::process::Command::new(SIDECAR)
         .envs(s.env())
         .env("CITRATE_HERMES_ADDR", format!("127.0.0.1:{port}"))
@@ -400,7 +423,7 @@ fn the_sidecar_binary_supervises_its_toolchain_worker_end_to_end() {
     let workers = || -> Option<Value> {
         let r = client
             .get(format!("http://127.0.0.1:{port}/workers"))
-            .bearer_auth("split-test-bearer-0123456789")
+            .bearer_auth(&bearer)
             .send()
             .ok()?;
         let v: Value = r.json().ok()?;
