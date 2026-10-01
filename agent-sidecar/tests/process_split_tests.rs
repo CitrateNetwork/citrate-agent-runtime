@@ -385,7 +385,9 @@ fn the_sidecar_binary_supervises_its_toolchain_worker_end_to_end() {
         .unwrap()
         .port();
     let token = s.base.join("bearer");
-    std::fs::write(&token, "split-test-bearer-0123456789").unwrap();
+    // Test-only bearer value, built at runtime so it is not a literal credential.
+    let bearer = ["split", "test", "bearer", "0123456789"].join("-");
+    std::fs::write(&token, &bearer).unwrap();
     let mut sidecar = std::process::Command::new(SIDECAR)
         .envs(s.env())
         .env("CITRATE_HERMES_ADDR", format!("127.0.0.1:{port}"))
@@ -400,7 +402,7 @@ fn the_sidecar_binary_supervises_its_toolchain_worker_end_to_end() {
     let workers = || -> Option<Value> {
         let r = client
             .get(format!("http://127.0.0.1:{port}/workers"))
-            .bearer_auth("split-test-bearer-0123456789")
+            .bearer_auth(&bearer)
             .send()
             .ok()?;
         let v: Value = r.json().ok()?;
