@@ -18,6 +18,7 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod grants;
 pub mod llm_http;
 pub mod sessions;
 pub mod toolchain;
@@ -239,6 +240,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
+        .route("/sessions/:id/grants", post(replace_grants))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -517,6 +519,7 @@ fn session_status(e: &sessions::SessionError) -> StatusCode {
         sessions::SessionError::Busy => StatusCode::CONFLICT,
         sessions::SessionError::TooMany => StatusCode::TOO_MANY_REQUESTS,
         sessions::SessionError::Invalid(_) => StatusCode::BAD_REQUEST,
+        sessions::SessionError::NoGrants => StatusCode::CONFLICT,
     }
 }
 
@@ -639,6 +642,40 @@ async fn stop_session(
     Ok(Json(serde_json::json!({ "ok": true, "stopped": true })))
 }
 
+/// HUP-S2.1: replace a session's folder grants with the member's current grant document (sent by
+/// citrate-core whenever the member grants, revokes, or a full-access window is turned on). A
+/// refused document answers 400 and leaves the session with no grants; a session opened without a
+/// document answers 409.
+async fn replace_grants(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let doc: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "the body must be a grant document"))?;
+    match session.replace_grants(&doc) {
+        Ok(summary) => Ok(Json(serde_json::json!({ "ok": true, "grants": summary }))),
+        Err(e) => {
+            let msg = match &e {
+                sessions::SessionError::Invalid(m) => m.clone(),
+                sessions::SessionError::NoGrants => {
+                    "this session was opened without folder grants".into()
+                }
+                _ => "refused".into(),
+            };
+            Err(json_err(session_status(&e), &msg))
+        }
+    }
+}
+
 async fn close_session(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -692,7 +729,10 @@ pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>
             s.name, s.dropped_source, s.kept_source
         );
     }
-    eprintln!("citrate-agent-sidecar: {} instruction skills loaded", lib.len());
+    eprintln!(
+        "citrate-agent-sidecar: {} instruction skills loaded",
+        lib.len()
+    );
     Some(Arc::new(lib))
 }
 
@@ -762,6 +802,11 @@ pub fn production_sessions_with(
         }),
         timeout,
     );
+    // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
+    let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
+        None => mgr,
+    };
     let mgr = match skills_from_env() {
         Some(lib) => mgr.with_skills(lib),
         None => mgr,
@@ -896,12 +941,14 @@ async fn check_brief(
 }
 
 #[cfg(test)]
-mod sessions_tests;
+mod grants_session_tests;
 #[cfg(test)]
-mod tests;
+mod mcp_session_tests;
+#[cfg(test)]
+mod sessions_tests;
 #[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]
-mod toolchain_tests;
+mod tests;
 #[cfg(test)]
-mod mcp_session_tests;
+mod toolchain_tests;

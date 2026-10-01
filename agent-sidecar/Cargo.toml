@@ -18,11 +18,15 @@ citrate-agent-loop = { path = "../agent-loop" }
 citrate-agent-shell = { path = "../agent-shell" }
 citrate-agent-guard = { path = "../agent-guard" }
 citrate-agent-mcp-host = { path = "../agent-mcp-host" }
+citrate-agent-grants = { path = "../agent-grants" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tower = "0.5"

@@ -27,6 +27,11 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S2.1: a session opened with the member's grant document (`grants`, sent by citrate-core)
+//!   is offered the sidecar-hosted file tools (`file_list`, `file_read`, `file_write`), each path
+//!   checked against those grants at use, and its toolchain project folder is checked against them
+//!   instead of `CITRATE_HERMES_TOOLCHAIN_ROOTS`. `POST /sessions/:id/grants` replaces the set. A
+//!   session opened without a document is unchanged (no file tools).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +49,7 @@ use citrate_agent_loop::{
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
 
+use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
 use crate::toolchain::ToolchainHost;
 
 /// At most this many open sessions (a session is a conversation, not a request).
@@ -137,6 +143,10 @@ pub struct CreateSessionReq {
     /// declines tainted effectful core calls itself.
     #[serde(default)]
     pub hic_aware: bool,
+    /// HUP-S2.1: the member's grant document (`citrate-agent-grants` `GrantState` JSON). Absent =
+    /// no file tools, and the toolchain keeps its env roots.
+    #[serde(default)]
+    pub grants: Option<serde_json::Value>,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -195,6 +205,8 @@ pub struct Session {
     skills: Option<Arc<SkillLibrary>>,
     /// HUP-S6.3: present when this session was opened with the toolchain enabled.
     toolchain: Option<Arc<ToolchainHost>>,
+    /// HUP-S2.1: present when this session was opened with a grant document.
+    grants: Option<Arc<SessionGrants>>,
 }
 
 impl Session {
@@ -263,6 +275,17 @@ impl Session {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// HUP-S2.1: this session's folder grants (`None` when it was opened without a document).
+    pub fn grants(&self) -> Option<&Arc<SessionGrants>> {
+        self.grants.as_ref()
+    }
+
+    /// HUP-S2.1: replace the grant set. A refused document leaves the session with no grants.
+    pub fn replace_grants(&self, doc: &serde_json::Value) -> Result<GrantSummary, SessionError> {
+        let g = self.grants.as_ref().ok_or(SessionError::NoGrants)?;
+        g.replace(doc).map_err(SessionError::Invalid)
     }
 }
 
@@ -352,6 +375,7 @@ impl ToolHost for CapsuleHost {
 /// toolchain tools to the toolchain host (when enabled), an offered `mcp__…` tool to its MCP
 /// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
 struct SidecarHost {
+    files: Option<FileToolHost>,
     skills: Option<SkillHost>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<McpToolHost>,
@@ -360,6 +384,11 @@ struct SidecarHost {
 
 impl ToolHost for SidecarHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if crate::grants::handles(&call.name) {
+            if let Some(f) = &self.files {
+                return f.execute(call);
+            }
+        }
         if call.name == SKILL_LOAD_TOOL {
             if let Some(h) = &self.skills {
                 return h.execute(call);
@@ -389,6 +418,8 @@ pub enum SessionError {
     Busy,
     TooMany,
     Invalid(String),
+    /// HUP-S2.1: the session was opened without a grant document, so it has no grants to replace.
+    NoGrants,
 }
 
 /// All sessions.
@@ -400,6 +431,9 @@ pub struct SessionManager {
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<Arc<McpHost>>,
+    /// HUP-S2.1: the member's home, for resolving grants (`~`, the deny list). `None` = sessions
+    /// with a grant document are refused.
+    grants_home: Option<std::path::PathBuf>,
 }
 
 impl SessionManager {
@@ -412,7 +446,14 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            grants_home: None,
         }
+    }
+
+    /// HUP-S2.1: resolve session grants against this home directory.
+    pub fn with_grants_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
+        self.grants_home = Some(home.into());
+        self
     }
 
     /// HUP-S6.3: offer the toolchain tools to every new session.
@@ -477,6 +518,34 @@ impl SessionManager {
             }
             specs.extend(mcp.specs());
         }
+        let grants = match req.grants {
+            None => None,
+            Some(doc) => {
+                let home = self.grants_home.as_ref().ok_or_else(|| {
+                    SessionError::Invalid(
+                        "folder grants need the member's home directory, which the sidecar does not know".into(),
+                    )
+                })?;
+                if let Some(t) = specs.iter().find(|t| crate::grants::handles(&t.name)) {
+                    return Err(SessionError::Invalid(format!(
+                        "the tool name '{}' is reserved by the sidecar while folder grants are given",
+                        t.name
+                    )));
+                }
+                let g = SessionGrants::empty(home);
+                g.replace(&doc).map_err(|e| {
+                    SessionError::Invalid(format!("the grant document was refused: {e}"))
+                })?;
+                specs.extend(crate::grants::file_tool_specs());
+                Some(Arc::new(g))
+            }
+        };
+        let toolchain = match (&self.toolchain, &grants) {
+            (Some(t), Some(g)) => Some(Arc::new(
+                t.for_grants(g.clone()).map_err(SessionError::Invalid)?,
+            )),
+            (t, _) => t.clone(),
+        };
         let mut sessions = self
             .sessions
             .lock()
@@ -531,7 +600,8 @@ impl SessionManager {
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills: self.skills.clone(),
-            toolchain: self.toolchain.clone(),
+            toolchain,
+            grants,
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -571,11 +641,13 @@ impl SessionManager {
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
         let toolchain = session.toolchain.clone();
+        let file_host = session.grants.clone().map(FileToolHost::new);
         let mcp_host = self
             .mcp
             .clone()
             .map(|h| McpToolHost::new(h, session.stop.clone()));
-        if skill_host.is_some()
+        if file_host.is_some()
+            || skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
             || mcp_host.is_some()
@@ -583,6 +655,7 @@ impl SessionManager {
             registry = registry.with_host(
                 HostKind::Sidecar,
                 Arc::new(SidecarHost {
+                    files: file_host,
                     skills: skill_host,
                     toolchain,
                     mcp: mcp_host,
