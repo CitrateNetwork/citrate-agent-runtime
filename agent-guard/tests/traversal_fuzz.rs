@@ -283,57 +283,83 @@ fn no_constructed_path_into_a_denied_root_is_ever_allowed() {
     let ctx = GuardContext::new(&w.home, &w.proj).with_project_root(&w.proj);
     let mut rng = XorShift(0x5EED_C17A_7E5A_2026);
 
+    // How much of the generated space resolves depends on the filesystem (case-sensitive ext4 on
+    // Linux resolves far fewer of the case-mutated names than case-insensitive APFS). So instead
+    // of a fixed iteration count, generate deterministic batches until the run is provably
+    // non-vacuous on every outcome, up to a hard cap.
+    const MIN_KNOWN: usize = 2_000;
+    const MIN_DENIED: usize = 1_000;
+    const MIN_ALLOWED: usize = 1_000;
+    const BATCH: usize = 500;
+    const MAX_BASES: usize = 30_000;
     let (mut total, mut oracle_known, mut oracle_denied, mut allowed) = (0, 0, 0, 0);
-    for _ in 0..3000 {
-        let base = if rng.chance(50) {
-            generate(&mut rng, &w.home)
-        } else {
-            generate_guided(&mut rng, &w)
-        };
-        // Each base is also tried as the parent of a new file (a write).
-        for s in [
-            base.clone(),
-            format!("{}/new_file.txt", base.trim_end_matches('/')),
-        ] {
-            total += 1;
-            let interp = interpret(&s, &w.home, &w.proj);
-            let target = os_target(&interp, 0);
-            let verdict = check_path(&s, &ctx);
+    let mut bases = 0;
+    while bases < MAX_BASES
+        && (bases < 3_000
+            || oracle_known < MIN_KNOWN
+            || oracle_denied < MIN_DENIED
+            || allowed < MIN_ALLOWED)
+    {
+        for _ in 0..BATCH {
+            bases += 1;
+            let base = if rng.chance(50) {
+                generate(&mut rng, &w.home)
+            } else {
+                generate_guided(&mut rng, &w)
+            };
+            // Each base is also tried as the parent of a new file (a write).
+            for s in [
+                base.clone(),
+                format!("{}/new_file.txt", base.trim_end_matches('/')),
+            ] {
+                total += 1;
+                let interp = interpret(&s, &w.home, &w.proj);
+                let target = os_target(&interp, 0);
+                let verdict = check_path(&s, &ctx);
 
-            if let Some(t) = &target {
-                oracle_known += 1;
-                if inside_any(t, &w.denied_roots) {
-                    oracle_denied += 1;
-                    assert!(
-                        verdict.is_err(),
-                        "ALLOWED {s:?}, which the OS resolves to {t:?} inside a denied root"
-                    );
-                }
-            }
-            if let Ok(p) = &verdict {
-                allowed += 1;
-                assert!(
-                    !inside_any(p.as_path(), &w.denied_roots),
-                    "ALLOWED {s:?} as {:?}, inside a denied root",
-                    p.as_path()
-                );
                 if let Some(t) = &target {
-                    assert_eq!(
-                        lower(p.as_path()),
-                        lower(t),
-                        "guard and OS disagree on where {s:?} lands"
+                    oracle_known += 1;
+                    if inside_any(t, &w.denied_roots) {
+                        oracle_denied += 1;
+                        assert!(
+                            verdict.is_err(),
+                            "ALLOWED {s:?}, which the OS resolves to {t:?} inside a denied root"
+                        );
+                    }
+                }
+                if let Ok(p) = &verdict {
+                    allowed += 1;
+                    assert!(
+                        !inside_any(p.as_path(), &w.denied_roots),
+                        "ALLOWED {s:?} as {:?}, inside a denied root",
+                        p.as_path()
                     );
+                    if let Some(t) = &target {
+                        assert_eq!(
+                            lower(p.as_path()),
+                            lower(t),
+                            "guard and OS disagree on where {s:?} lands"
+                        );
+                    }
                 }
             }
         }
     }
-    eprintln!("total={total} known={oracle_known} denied={oracle_denied} allowed={allowed}");
-    // Guard against a vacuous run: the generator must reach both outcomes a lot.
-    assert_eq!(total, 6_000);
-    assert!(oracle_known > 2_000, "oracle resolved only {oracle_known}");
-    assert!(
-        oracle_denied > 1_000,
-        "only {oracle_denied} denied-root hits"
+    eprintln!(
+        "bases={bases} total={total} known={oracle_known} denied={oracle_denied} allowed={allowed}"
     );
-    assert!(allowed > 1_000, "only {allowed} allowed paths");
+    // Guard against a vacuous run: every outcome must be reached many times, on every platform.
+    assert_eq!(total, bases * 2);
+    assert!(
+        oracle_known >= MIN_KNOWN,
+        "oracle resolved only {oracle_known} in {bases} bases"
+    );
+    assert!(
+        oracle_denied >= MIN_DENIED,
+        "only {oracle_denied} denied-root hits in {bases} bases"
+    );
+    assert!(
+        allowed >= MIN_ALLOWED,
+        "only {allowed} allowed paths in {bases} bases"
+    );
 }
