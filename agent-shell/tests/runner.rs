@@ -509,3 +509,106 @@ fn run_report_serializes_for_verifiers() {
     assert_eq!(v["stdout"], serde_json::json!("hi\n"));
     assert!(v["duration_ms"].is_u64());
 }
+
+// ------------------------------------------------- git read-only: review hardening
+
+#[test]
+fn git_options_that_read_files_outside_the_cwd_are_refused() {
+    let d = tmp();
+    let g = git_runner();
+    for args in [
+        vec!["blame", "--contents", "/etc/hosts", "f"],
+        vec!["blame", "--contents=/etc/hosts", "f"],
+        vec!["blame", "--ignore-revs-file", "/etc/hosts", "f"],
+        vec!["blame", "-S", "/etc/hosts", "f"],
+        vec!["blame", "-wS", "/etc/hosts", "f"],
+    ] {
+        let err = g.plan(&req("git", &args, d.path())).unwrap_err();
+        assert!(
+            matches!(err, ShellError::ArgumentRefused { .. }),
+            "git {args:?} must be refused, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn abbreviated_forms_of_denied_git_options_are_refused() {
+    let d = tmp();
+    let g = git_runner();
+    for args in [
+        vec!["blame", "--con", "/etc/hosts", "f"],
+        vec!["blame", "--conte=/etc/hosts", "f"],
+        vec!["blame", "--ignore-rev", "/etc/hosts", "f"],
+        vec!["blame", "--textc", "f"],
+        vec!["diff", "--outp=/tmp/x"],
+        vec!["diff", "--ext-d"],
+    ] {
+        let err = g.plan(&req("git", &args, d.path())).unwrap_err();
+        assert!(
+            matches!(err, ShellError::ArgumentRefused { .. }),
+            "git {args:?} must be refused, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_git_read_options_still_plan() {
+    let d = tmp();
+    let g = git_runner();
+    for args in [
+        vec!["log", "--oneline", "--stat", "--", "f"],
+        vec!["log", "-Sneedle"],
+        vec!["diff", "--text", "--name-only", "--cc"],
+        vec!["ls-files", "--exclude-standard"],
+        vec!["blame", "-w", "-L", "1,5", "f"],
+    ] {
+        g.plan(&req("git", &args, d.path()))
+            .unwrap_or_else(|e| panic!("git {args:?} should plan, got {e:?}"));
+    }
+}
+
+#[test]
+fn git_blame_does_not_run_textconv_drivers() {
+    let d = tmp();
+    let repo = d.path();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git");
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("f"), "a\n").expect("write");
+    git(&["add", "f"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "m",
+    ]);
+    let marker = repo.join("textconv-ran");
+    git(&[
+        "config",
+        "diff.probe.textconv",
+        &format!("touch {} ; cat", marker.display()),
+    ]);
+    std::fs::write(repo.join(".git/info/attributes"), "f diff=probe\n").expect("attrs");
+
+    let plan = git_runner()
+        .plan(&req("git", &["blame", "f"], repo))
+        .expect("plan");
+    assert!(plan.args.iter().any(|a| a == "--no-textconv"), "{plan:?}");
+
+    let r = git_runner()
+        .run(&req("git", &["blame", "f"], repo))
+        .expect("run");
+    assert_eq!(r.exit_code, Some(0), "{r:?}");
+    assert!(!marker.exists(), "blame ran a repository textconv driver");
+}

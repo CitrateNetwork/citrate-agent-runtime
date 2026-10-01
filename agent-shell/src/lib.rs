@@ -35,6 +35,8 @@
 //! allowlist bounds *which entry points* the agent can reach, not what those entry points do.
 //! The enforced controls are HIC approval (US-2.2 AC2), folder grants on the cwd, and the OS
 //! sandbox (no network, scratch HOME) that US-2.2 AC1 calls for, which is a separate work item.
+//! Repository-local git configuration is only partly pinned, so read-only git is not a
+//! no-prompt template either; it goes through HIC-1 approval until that sandbox exists.
 //! This crate never holds a key and never signs (Rule 3).
 //!
 //! Lifted from `citrate-agent-code` (`agent-code/src/tools/shell_exec.rs`,
@@ -184,11 +186,48 @@ pub const GIT_DENIED_ARG_PREFIXES: &[&str] = &[
     "--namespace",
     "--super-prefix",
     "--config-env",
+    "--contents",
+    "--ignore-revs-file",
 ];
+
+/// Exact git option names that are also leading fragments of a denied option, so the
+/// abbreviation check in [`denied_git_option`] must not treat them as abbreviations.
+const GIT_EXACT_OPTIONS_NOT_ABBREVIATIONS: &[&str] = &["--text"];
 
 /// Git subcommands that render diffs; the runner adds `--no-ext-diff --no-textconv` to them so
 /// diff rendering stays inside git itself.
 const GIT_DIFF_RENDERING: &[&str] = &["diff", "log", "show"];
+
+/// `git blame` applies textconv drivers by default and does not take `--no-ext-diff`; the
+/// runner adds `--no-textconv` to it.
+const GIT_TEXTCONV_ONLY: &[&str] = &["blame"];
+
+/// The denied option an argument names, if any. git's option parser accepts unambiguous
+/// abbreviations of long options, so a strict leading fragment of a denied option (other than
+/// the bare `--` separator and the exact options in [`GIT_EXACT_OPTIONS_NOT_ABBREVIATIONS`])
+/// is refused as well.
+fn denied_git_option(sub: &str, arg: &str) -> Option<&'static str> {
+    if let Some(p) = GIT_DENIED_ARG_PREFIXES
+        .iter()
+        .find(|p| arg.starts_with(**p))
+    {
+        return Some(p);
+    }
+    if arg.starts_with("--") {
+        let name = arg.split_once('=').map_or(arg, |(n, _)| n);
+        if name.len() > 2 && !GIT_EXACT_OPTIONS_NOT_ABBREVIATIONS.contains(&name) {
+            if let Some(p) = GIT_DENIED_ARG_PREFIXES.iter().find(|p| p.starts_with(name)) {
+                return Some(p);
+            }
+        }
+    }
+    // `git blame -S <file>` reads revisions from an arbitrary file; refuse it, including
+    // inside a cluster of short options.
+    if sub == "blame" && arg.starts_with('-') && !arg.starts_with("--") && arg.contains('S') {
+        return Some("-S");
+    }
+    None
+}
 
 /// How a program's arguments are constrained.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,7 +351,7 @@ fn check_args(program: &str, policy: &ArgPolicy, args: &[String]) -> Result<(), 
                 ));
             }
             for a in args {
-                if let Some(p) = GIT_DENIED_ARG_PREFIXES.iter().find(|p| a.starts_with(**p)) {
+                if let Some(p) = denied_git_option(sub, a) {
                     return Err(refuse(
                         a,
                         &format!("git option {p} is not permitted for the agent"),
@@ -334,6 +373,8 @@ fn effective_args(policy: &ArgPolicy, args: &[String]) -> Vec<String> {
                 out.push(sub.clone());
                 if GIT_DIFF_RENDERING.contains(&sub.as_str()) {
                     out.push("--no-ext-diff".to_string());
+                    out.push("--no-textconv".to_string());
+                } else if GIT_TEXTCONV_ONLY.contains(&sub.as_str()) {
                     out.push("--no-textconv".to_string());
                 }
                 out.extend(rest.iter().cloned());
