@@ -42,7 +42,8 @@
     { "name": "skill_write", "host": "core", "read_only": false },
     { "name": "skill_run", "host": "core", "read_only": true },
     { "name": "models_list", "host": "core", "read_only": true },
-    { "name": "contract_deploy", "host": "core", "read_only": false }
+    { "name": "contract_deploy", "host": "core", "read_only": false },
+    { "name": "get_verified_source", "host": "core", "read_only": true }
   ],
   "config_divergences": [
     {
