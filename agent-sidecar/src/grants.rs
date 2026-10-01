@@ -235,8 +235,8 @@ pub fn file_tool_specs() -> Vec<ToolSpec> {
         open_world: false,
         effect: Some(effect),
         // A folder-grant read is the member's own file: trusted. A read only full access covers
-        // returns ToolOutcome::Untrusted, which taints the session whatever this says. (This
-        // trust split is a conservative default, pending owner sign-off.)
+        // returns ToolOutcome::Untrusted, which taints the session whatever this says. (Owner
+        // decision 2026-10-01: folder-grant reads stay trusted; a per-grant switch may follow.)
         trust: Some(Trust::Trusted),
     };
     let spec =
