@@ -26,10 +26,11 @@ crate can only narrow access, never widen it.
 
 ## Status
 
-Implemented and tested in this crate. **Not wired into any caller yet.** The
-file tools (`agent-code`, `agent-legacy` sandbox), shell argument checks and
-capsule WASI preopens (S2.5) still use their own checks until a follow-up WP
-routes them through `check_path`.
+Implemented and tested in this crate. Capsule WASI preopens (S2.5) reach it
+through `agent-grants`: a folder is preopened for a capsule only after every
+entry below it passes the grant check, which runs `check_path` first. The file
+tools (`agent-code`, `agent-legacy` sandbox) and shell argument checks still
+use their own checks until a follow-up WP routes them through `check_path`.
 
 ## What is denied
 

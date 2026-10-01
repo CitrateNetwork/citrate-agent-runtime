@@ -462,6 +462,7 @@ fn a_non_browser_sidecar_call_after_taint_is_still_declined() {
             no_chromium(),
             citrate_agent_loop::StopFlag::default(),
         )),
+        ..Default::default()
     };
     use citrate_agent_loop::{ToolHost, ToolOutcome};
     assert!(host.honors_explicit_approval());
@@ -480,6 +481,7 @@ fn a_non_browser_sidecar_call_after_taint_is_still_declined() {
         mcp: None,
         capsules: None,
         browser: None,
+        ..Default::default()
     };
     assert!(
         !without.honors_explicit_approval(),

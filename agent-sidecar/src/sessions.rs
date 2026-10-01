@@ -32,6 +32,33 @@
 //!   untrusted; after taint each effectful browser action waits for the member's decision on the
 //!   browser control routes, so the sidecar host can honor explicit approval for those calls (and
 //!   still declines every other effectful sidecar call, as before). Unset, nothing here changes.
+//! - HUP-S5.2: when search is enabled (`CITRATE_HERMES_SEARCH=1`, default off), every session also
+//!   offers the sidecar-hosted `web_search` and `read_url` tools ([`crate::search`]). Their output is
+//!   untrusted, so a call taints the session. The two names are reserved while search is on.
+//! - HUP-S3.4: a session can run a declarative workflow (`POST …/workflows`,
+//!   [`crate::workflow_spec`]) through `citrate_agent_learn::run_verified_workflow`; a run whose
+//!   verifiers all passed is kept (the last [`MAX_RUNS_KEPT`]) as the evidence a learn proposal
+//!   needs. When learning is configured (`CITRATE_HERMES_LEARN_DIR`, default off), every session is
+//!   also offered the sidecar-hosted `learn_propose` tool ([`crate::learn`]), which proposes from
+//!   the session's last verified run and never persists anything itself.
+//! - HUP-S2.1: a session opened with the member's grant document (`grants`, sent by citrate-core)
+//!   is offered the sidecar-hosted file tools (`file_list`, `file_read`, `file_write`), each path
+//!   checked against those grants at use, and its toolchain project folder is checked against them
+//!   instead of `CITRATE_HERMES_TOOLCHAIN_ROOTS`. `POST /sessions/:id/grants` replaces the set. A
+//!   session opened without a document is unchanged (no file tools).
+//! - HUP-S10.3: a session opened with `unattended: true` (a daemon run) starts tainted, so every
+//!   effectful call needs a member's explicit decision from its first step. Absent, nothing changes.
+//! - HUP-S7.5: every session meters its turns ([`crate::metering`]): a `MeteringSink` observes the
+//!   event stream and the model client reports provider token usage onto the open turn. Finished
+//!   records go to the manager's `MeteringStore` (no conversation content).
+//! - HUP-S9.3: when trajectory recording is configured (`CITRATE_HERMES_TRAJECTORIES`, default
+//!   off), a session also carries a `TrajectoryRecorder`, exported (verified turns only, redacted)
+//!   when the session closes ([`crate::trajectory`]).
+//! - HUP-S2.9: when the file tools are enabled (`CITRATE_HERMES_FILES=1` with a grants file and a
+//!   checkpoint store, default off), every session also offers the sidecar-hosted `fs_write`,
+//!   `fs_edit`, `fs_delete` and `fs_rename` tools ([`crate::files`]). Each change is checked
+//!   against the folder grants and the default-deny list, then checkpointed under the session id,
+//!   so the member can undo it through the `/checkpoints` routes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,16 +69,45 @@ use std::time::{Duration, Instant};
 use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
 use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
+use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
 use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
     LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
-    ToolSpec, TurnOptions,
+    ToolSpec, TurnOptions, Workflow,
 };
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
+use citrate_agent_metering::{MeteringSink, SystemClock};
+use citrate_agent_trajectory::TrajectoryRecorder;
 use serde::{Deserialize, Serialize};
 
+use crate::anchor::AnchorService;
+use crate::decide::DecideService;
+use crate::files::{FileTools, FileToolsHost};
+use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
+use crate::metering::{MeteredLlm, MeteringStore, TeeSink};
+use crate::sheets::SheetToolHost;
 use crate::toolchain::ToolchainHost;
+use crate::trajectory::{export_session, ExportSummary, TrajectoryConfig};
+use crate::workers::WorkerSet;
+use citrate_agent_checkpoints::CheckpointStore;
+use citrate_agent_search::SearchHost;
+
+/// The toolchain as the session manager holds it: in process ([`ToolchainHost`], tests) or in
+/// its worker process ([`crate::workers::RemoteToolHost`], HUP-S1.9). A session opened with
+/// folder grants (HUP-S2.1) gets a host scoped to them: its project folder must be covered by live
+/// read and write folder grants, checked again at every call, and `CITRATE_HERMES_TOOLCHAIN_ROOTS`
+/// does not apply.
+pub trait ToolchainBackend: ToolHost {
+    /// This toolchain, checked against `grants` instead of its env roots.
+    fn scoped_to(&self, grants: Arc<SessionGrants>) -> Result<Arc<dyn ToolHost>, String>;
+}
+
+impl ToolchainBackend for ToolchainHost {
+    fn scoped_to(&self, grants: Arc<SessionGrants>) -> Result<Arc<dyn ToolHost>, String> {
+        Ok(Arc::new(self.for_grants(grants)?))
+    }
+}
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -64,6 +120,76 @@ pub const MAX_TOKENS_CAP: u32 = 8192;
 pub const MAX_WAIT_MS: u64 = 25_000;
 /// Token budget for the skill description index in a session's system prompt.
 pub const SKILL_INDEX_TOKENS: usize = 1500;
+/// Workflow runs remembered per session (oldest dropped first).
+pub const MAX_RUNS_KEPT: usize = 16;
+
+/// Where a workflow run is.
+#[derive(Clone)]
+pub enum RunState {
+    Running {
+        workflow_id: String,
+    },
+    /// Every verifier of every step passed.
+    Verified(Box<VerifiedRun>),
+    /// It failed, was stopped, or its verdicts did not add up.
+    Unverified {
+        workflow_id: String,
+        reason: String,
+    },
+}
+
+/// `GET /sessions/:id/workflows/:run`.
+#[derive(Debug, Serialize)]
+pub struct RunView {
+    pub run_id: String,
+    pub workflow_id: String,
+    /// "running" | "verified" | "unverified"
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+    /// The model's final answers per step (shown to the member, never evidence).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl RunView {
+    fn of(run_id: &str, st: &RunState) -> Self {
+        match st {
+            RunState::Running { workflow_id } => RunView {
+                run_id: run_id.into(),
+                workflow_id: workflow_id.clone(),
+                state: "running",
+                evidence: None,
+                answers: vec![],
+                reason: None,
+            },
+            RunState::Verified(run) => RunView {
+                run_id: run_id.into(),
+                workflow_id: run.evidence().workflow_id.clone(),
+                state: "verified",
+                evidence: Some(run.evidence().clone()),
+                answers: run.answers().to_vec(),
+                reason: None,
+            },
+            RunState::Unverified {
+                workflow_id,
+                reason,
+            } => RunView {
+                run_id: run_id.into(),
+                workflow_id: workflow_id.clone(),
+                state: "unverified",
+                evidence: None,
+                answers: vec![],
+                reason: Some(reason.clone()),
+            },
+        }
+    }
+}
+/// HUP-S10.3: the taint source an unattended (daemon) session starts with. It appears in the
+/// `hic_reason` of every effectful call such a session makes.
+pub const UNATTENDED_TAINT_SOURCE: &str = "a scheduled daemon run nobody is watching";
 
 /// Where the model lives and how to authenticate. Supplied by citrate-core, never by a webview.
 #[derive(Clone, Deserialize)]
@@ -144,6 +270,16 @@ pub struct CreateSessionReq {
     /// declines tainted effectful core calls itself.
     #[serde(default)]
     pub hic_aware: bool,
+    /// HUP-S2.1: the member's grant document (`citrate-agent-grants` `GrantState` JSON). Absent =
+    /// no file tools, and the toolchain keeps its env roots.
+    #[serde(default)]
+    pub grants: Option<serde_json::Value>,
+    /// HUP-S10.3: a scheduled daemon run nobody is watching. The session starts tainted (source
+    /// [`UNATTENDED_TAINT_SOURCE`]), so every effectful call needs a member's explicit decision
+    /// from the first step, or is declined here when core is not `hic_aware`. Read-only calls run
+    /// as usual. Absent = false: nothing changes. The taint is never cleared for such a session.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -183,6 +319,19 @@ struct EventLog {
     events: VecDeque<Envelope>,
 }
 
+/// HUP-S10.3: a session's starting taint. An unattended (daemon) session starts in the HIC
+/// downgrade, as if it had already read untrusted content.
+fn initial_taint(unattended: bool) -> TaintState {
+    let taint = TaintState::default();
+    if unattended {
+        taint.taint(
+            UNATTENDED_TAINT_SOURCE,
+            "a scheduled run has no member watching, so every change it proposes needs an explicit decision",
+        );
+    }
+    taint
+}
+
 /// One conversation.
 pub struct Session {
     pub id: String,
@@ -200,8 +349,21 @@ pub struct Session {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
     skills: Option<Arc<SkillLibrary>>,
-    /// HUP-S6.3: present when this session was opened with the toolchain enabled.
-    toolchain: Option<Arc<ToolchainHost>>,
+    /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
+    /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
+    toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S7.5: derives one metering record per turn from the event stream.
+    metering: Arc<MeteringSink>,
+    /// Where this session's finished metering records go.
+    metering_store: Arc<MeteringStore>,
+    /// HUP-S9.3: present only when trajectory recording is configured.
+    trajectory: Option<(Arc<TrajectoryRecorder>, Arc<TrajectoryConfig>)>,
+    /// HUP-S2.1: present when this session was opened with a grant document.
+    grants: Option<Arc<SessionGrants>>,
+    /// HUP-S2.9: present when this session was opened with the file tools enabled.
+    files: Option<Arc<FileTools>>,
+    /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
+    runs: Mutex<VecDeque<(String, RunState)>>,
 }
 
 impl Session {
@@ -270,6 +432,54 @@ impl Session {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// The model this session runs (recorded in a learn proposal's provenance).
+    pub fn model(&self) -> &str {
+        &self.cfg.model
+    }
+
+    fn set_run(&self, run_id: &str, state: RunState) {
+        if let Ok(mut runs) = self.runs.lock() {
+            if let Some(slot) = runs.iter_mut().find(|(id, _)| id == run_id) {
+                slot.1 = state;
+                return;
+            }
+            runs.push_back((run_id.to_string(), state));
+            while runs.len() > MAX_RUNS_KEPT {
+                runs.pop_front();
+            }
+        }
+    }
+
+    /// One workflow run, if this session still remembers it.
+    pub fn run(&self, run_id: &str) -> Option<RunState> {
+        self.runs.lock().ok().and_then(|r| {
+            r.iter()
+                .find(|(id, _)| id == run_id)
+                .map(|(_, st)| st.clone())
+        })
+    }
+
+    /// The session's most recent verified run, with its id.
+    pub fn last_verified(&self) -> Option<(String, VerifiedRun)> {
+        self.runs.lock().ok().and_then(|r| {
+            r.iter().rev().find_map(|(id, st)| match st {
+                RunState::Verified(v) => Some((id.clone(), (**v).clone())),
+                _ => None,
+            })
+        })
+    }
+
+    /// HUP-S2.1: this session's folder grants (`None` when it was opened without a document).
+    pub fn grants(&self) -> Option<&Arc<SessionGrants>> {
+        self.grants.as_ref()
+    }
+
+    /// HUP-S2.1: replace the grant set. A refused document leaves the session with no grants.
+    pub fn replace_grants(&self, doc: &serde_json::Value) -> Result<GrantSummary, SessionError> {
+        let g = self.grants.as_ref().ok_or(SessionError::NoGrants)?;
+        g.replace(doc).map_err(SessionError::Invalid)
     }
 }
 
@@ -359,11 +569,20 @@ impl ToolHost for CapsuleHost {
 /// toolchain tools to the toolchain host (when enabled), an offered `mcp__…` tool to its MCP
 /// server (HUP-S4.1), a `browser_*` tool to the browser (HUP-S5.1, when enabled), anything else
 /// to the capsule dispatch (when capsules are loaded).
+#[derive(Default)]
 pub(crate) struct SidecarHost {
+    pub(crate) files: Option<FileToolHost>,
+    /// HUP-S10.2: the sheet tools, present with the file tools.
+    pub(crate) sheets: Option<SheetToolHost>,
     pub(crate) skills: Option<SkillHost>,
-    pub(crate) toolchain: Option<Arc<ToolchainHost>>,
+    pub(crate) toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S2.9: the checkpointed file tools (`fs_write`, `fs_edit`, `fs_delete`, `fs_rename`).
+    pub(crate) fs_tools: Option<FileToolsHost>,
+    /// HUP-S5.2: `web_search` and `read_url`, when search is enabled.
+    pub(crate) search: Option<Arc<SearchHost>>,
     pub(crate) mcp: Option<McpToolHost>,
     pub(crate) capsules: Option<CapsuleHost>,
+    pub(crate) learn: Option<crate::learn::LearnToolHost>,
     pub(crate) browser: Option<BrowserToolHost>,
 }
 
@@ -374,6 +593,21 @@ impl ToolHost for SidecarHost {
                 return b.execute(call);
             }
         }
+        if call.name == crate::learn::LEARN_PROPOSE_TOOL {
+            if let Some(l) = &self.learn {
+                return l.execute(call);
+            }
+        }
+        if crate::grants::handles(&call.name) {
+            if let Some(f) = &self.files {
+                return f.execute(call);
+            }
+        }
+        if crate::sheets::handles(&call.name) {
+            if let Some(s) = &self.sheets {
+                return s.execute(call);
+            }
+        }
         if call.name == SKILL_LOAD_TOOL {
             if let Some(h) = &self.skills {
                 return h.execute(call);
@@ -382,6 +616,16 @@ impl ToolHost for SidecarHost {
         if ToolchainHost::handles(&call.name) {
             if let Some(t) = &self.toolchain {
                 return t.execute(call);
+            }
+        }
+        if SearchHost::handles(&call.name) {
+            if let Some(s) = &self.search {
+                return s.execute(call);
+            }
+        }
+        if FileTools::handles(&call.name) {
+            if let Some(f) = &self.fs_tools {
+                return f.execute(call);
             }
         }
         if let Some(m) = &self.mcp {
@@ -421,6 +665,8 @@ pub enum SessionError {
     Busy,
     TooMany,
     Invalid(String),
+    /// HUP-S2.1: the session was opened without a grant document, so it has no grants to replace.
+    NoGrants,
 }
 
 /// All sessions.
@@ -430,9 +676,23 @@ pub struct SessionManager {
     core_tool_deadline: Duration,
     ids: AtomicU64,
     skills: Option<Arc<SkillLibrary>>,
-    toolchain: Option<Arc<ToolchainHost>>,
+    toolchain: Option<Arc<dyn ToolchainBackend>>,
     mcp: Option<Arc<McpHost>>,
     browser: Option<Arc<BrowserService>>,
+    search: Option<Arc<SearchHost>>,
+    decide: Arc<DecideService>,
+    learn: Option<Arc<crate::learn::LearnService>>,
+    run_ids: AtomicU64,
+    files: Option<Arc<FileTools>>,
+    checkpoints: Option<Arc<CheckpointStore>>,
+    /// HUP-S2.1: the member's home, for resolving grants (`~`, the deny list). `None` = sessions
+    /// with a grant document are refused.
+    grants_home: Option<std::path::PathBuf>,
+    /// HUP-S1.9: the worker processes behind sidecar-hosted tools (reported on `/workers`).
+    workers: Arc<WorkerSet>,
+    metering: Arc<MeteringStore>,
+    trajectories: Option<Arc<TrajectoryConfig>>,
+    anchor: Option<Arc<AnchorService>>,
 }
 
 impl SessionManager {
@@ -446,7 +706,109 @@ impl SessionManager {
             toolchain: None,
             mcp: None,
             browser: None,
+            search: None,
+            decide: Arc::new(DecideService::default()),
+            learn: None,
+            run_ids: AtomicU64::new(0),
+            files: None,
+            checkpoints: None,
+            grants_home: None,
+            workers: Arc::new(WorkerSet::default()),
+            metering: Arc::new(MeteringStore::in_memory()),
+            trajectories: None,
+            anchor: None,
         }
+    }
+
+    /// HUP-S7.5: where finished metering records go (default: in memory for this process).
+    pub fn with_metering(mut self, store: Arc<MeteringStore>) -> Self {
+        self.metering = store;
+        self
+    }
+
+    pub fn metering(&self) -> &Arc<MeteringStore> {
+        &self.metering
+    }
+
+    /// HUP-S9.3: record trajectories in every new session (default off).
+    pub fn with_trajectories(mut self, cfg: TrajectoryConfig) -> Self {
+        self.trajectories = Some(Arc::new(cfg));
+        self
+    }
+
+    pub fn trajectories(&self) -> Option<&Arc<TrajectoryConfig>> {
+        self.trajectories.as_ref()
+    }
+
+    /// HUP-S7.3: the nightly anchor store served by the `/anchor/*` routes (default none).
+    pub fn with_anchor(mut self, svc: Arc<AnchorService>) -> Self {
+        self.anchor = Some(svc);
+        self
+    }
+
+    pub fn anchor(&self) -> Option<&Arc<AnchorService>> {
+        self.anchor.as_ref()
+    }
+
+    /// HUP-S2.1: resolve session grants against this home directory.
+    pub fn with_grants_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
+        self.grants_home = Some(home.into());
+        self
+    }
+
+    /// HUP-S2.9: serve the `/checkpoints` routes (list, undo a step, undo a session) from this
+    /// store. Independent of the file tools, so changes stay undoable after the tools are off.
+    pub fn with_checkpoints(mut self, store: Arc<CheckpointStore>) -> Self {
+        self.checkpoints = Some(store);
+        self
+    }
+
+    /// HUP-S2.9: offer the file tools to every new session. Their store also serves the
+    /// `/checkpoints` routes unless one was set with [`SessionManager::with_checkpoints`].
+    pub fn with_files(mut self, tools: Arc<FileTools>) -> Self {
+        if self.checkpoints.is_none() {
+            self.checkpoints = Some(tools.store().clone());
+        }
+        self.files = Some(tools);
+        self
+    }
+
+    /// HUP-S2.9: the undo checkpoint store (`None` when undo is not configured).
+    pub fn checkpoints(&self) -> Option<Arc<CheckpointStore>> {
+        self.checkpoints.clone()
+    }
+
+    /// HUP-S3.4: verified self-learning (the learn routes and the `learn_propose` tool).
+    pub fn with_learn(mut self, learn: Arc<crate::learn::LearnService>) -> Self {
+        self.learn = Some(learn);
+        self
+    }
+
+    /// HUP-S3.4: the learn service, when learning is configured.
+    pub fn learn(&self) -> Option<&Arc<crate::learn::LearnService>> {
+        self.learn.as_ref()
+    }
+
+    /// HUP-S5.2: offer `web_search` and `read_url` to every new session.
+    pub fn with_search(mut self, host: Arc<SearchHost>) -> Self {
+        self.search = Some(host);
+        self
+    }
+
+    /// HUP-S5.2: the search host, when search is enabled.
+    pub fn search(&self) -> Option<Arc<SearchHost>> {
+        self.search.clone()
+    }
+
+    /// HUP-S5.3: the `decide()` slot and its metering (the default has Jev off).
+    pub fn with_decide(mut self, svc: Arc<DecideService>) -> Self {
+        self.decide = svc;
+        self
+    }
+
+    /// HUP-S5.3: the `decide()` service.
+    pub fn decide_service(&self) -> Arc<DecideService> {
+        self.decide.clone()
     }
 
     /// HUP-S5.1: offer the browser tools to every new session.
@@ -460,10 +822,28 @@ impl SessionManager {
         self.browser.as_ref()
     }
 
-    /// HUP-S6.3: offer the toolchain tools to every new session.
-    pub fn with_toolchain(mut self, host: Arc<ToolchainHost>) -> Self {
+    /// HUP-S6.3: offer the toolchain tools to every new session, executed by `host` (in
+    /// production the toolchain worker process, HUP-S1.9). A session opened with folder grants
+    /// (HUP-S2.1) gets the host scoped to its grants ([`ToolchainBackend::scoped_to`]).
+    pub fn with_toolchain(mut self, host: Arc<dyn ToolchainBackend>) -> Self {
         self.toolchain = Some(host);
         self
+    }
+
+    /// HUP-S1.9: the worker processes this manager's tools run in.
+    pub fn with_workers(mut self, workers: Arc<WorkerSet>) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// HUP-S1.9: one status entry per worker kind (see [`WorkerSet::report`]).
+    pub fn workers_report(&self) -> Vec<serde_json::Value> {
+        self.workers.report()
+    }
+
+    /// HUP-S1.9: stop every worker process cleanly (sidecar shutdown).
+    pub fn shutdown_workers(&self) {
+        self.workers.shutdown();
     }
 
     /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers
@@ -513,6 +893,24 @@ impl SessionManager {
             }
             specs.extend(ToolchainHost::specs());
         }
+        if self.search.is_some() {
+            if let Some(t) = specs.iter().find(|t| SearchHost::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while search is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(SearchHost::specs());
+        }
+        if self.files.is_some() {
+            if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while the file tools are enabled",
+                    t.name
+                )));
+            }
+            specs.extend(FileTools::specs());
+        }
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -531,6 +929,49 @@ impl SessionManager {
             }
             specs.extend(browser_tools::specs());
         }
+        if self.learn.is_some() {
+            if specs
+                .iter()
+                .any(|t| t.name == crate::learn::LEARN_PROPOSE_TOOL)
+            {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while learning is on",
+                    crate::learn::LEARN_PROPOSE_TOOL
+                )));
+            }
+            specs.push(crate::learn::learn_propose_spec());
+        }
+        let grants = match req.grants {
+            None => None,
+            Some(doc) => {
+                let home = self.grants_home.as_ref().ok_or_else(|| {
+                    SessionError::Invalid(
+                        "folder grants need the member's home directory, which the sidecar does not know".into(),
+                    )
+                })?;
+                if let Some(t) = specs
+                    .iter()
+                    .find(|t| crate::grants::handles(&t.name) || crate::sheets::handles(&t.name))
+                {
+                    return Err(SessionError::Invalid(format!(
+                        "the tool name '{}' is reserved by the sidecar while folder grants are given",
+                        t.name
+                    )));
+                }
+                let g = SessionGrants::empty(home);
+                g.replace(&doc).map_err(|e| {
+                    SessionError::Invalid(format!("the grant document was refused: {e}"))
+                })?;
+                specs.extend(crate::grants::file_tool_specs());
+                specs.extend(crate::sheets::sheet_tool_specs());
+                Some(Arc::new(g))
+            }
+        };
+        let toolchain: Option<Arc<dyn ToolHost>> = match (&self.toolchain, &grants) {
+            (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
+            (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
+            (None, _) => None,
+        };
         let mut sessions = self
             .sessions
             .lock()
@@ -567,14 +1008,36 @@ impl SessionManager {
             }),
             pinned_tools,
         };
+        let metering = Arc::new(MeteringSink::new(
+            id.clone(),
+            cfg.model.clone(),
+            specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            Arc::new(SystemClock::new()),
+        ));
+        // HUP-S10.3: a daemon run (`unattended`) starts tainted.
+        let taint = initial_taint(req.unattended);
+        let trajectory = self.trajectories.as_ref().map(|c| {
+            (
+                Arc::new(TrajectoryRecorder::new(
+                    id.clone(),
+                    cfg.model.clone(),
+                    taint.clone(),
+                )),
+                c.clone(),
+            )
+        });
+        let llm: Arc<dyn LlmClient> = Arc::new(MeteredLlm::new(
+            (self.llm_factory)(&req.llm),
+            metering.clone(),
+        ));
         let session = Arc::new(Session {
             id: id.clone(),
             cfg,
             opts,
             specs,
             hic_aware: req.hic_aware,
-            taint: TaintState::default(),
-            llm: (self.llm_factory)(&req.llm),
+            taint,
+            llm,
             history: Mutex::new(Vec::new()),
             log: Mutex::new(EventLog {
                 next_seq: 0,
@@ -585,7 +1048,13 @@ impl SessionManager {
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills: self.skills.clone(),
-            toolchain: self.toolchain.clone(),
+            toolchain,
+            grants,
+            metering,
+            metering_store: self.metering.clone(),
+            trajectory,
+            files: self.files.clone(),
+            runs: Mutex::new(VecDeque::new()),
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -593,6 +1062,140 @@ impl SessionManager {
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// The tools a turn or workflow in this session can call: core-hosted ones park on core, and
+    /// the sidecar-hosted ones (skills, toolchain, MCP, learn, capsules) run here.
+    fn registry_for(
+        &self,
+        session: &Arc<Session>,
+        capsules: Option<Arc<CapsuleDispatch>>,
+    ) -> ToolRegistry {
+        let core = Arc::new(CoreHost {
+            pending: session.pending.clone(),
+            deadline: self.core_tool_deadline,
+            stop: session.stop.clone(),
+            hic_aware: session.hic_aware,
+        });
+        let mut registry = ToolRegistry::new(session.specs.clone())
+            .with_host(HostKind::Core, core)
+            .with_taint(session.taint.clone());
+        let skill_host = session.skills.clone().map(SkillHost::new);
+        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
+        let toolchain = session.toolchain.clone();
+        let files = session
+            .files
+            .clone()
+            .and_then(|t| FileToolsHost::new(t, &session.id));
+        let file_host = session.grants.clone().map(FileToolHost::new);
+        let sheet_host = session.grants.clone().map(SheetToolHost::new);
+        let search = self.search.clone();
+        let mcp_host = self
+            .mcp
+            .clone()
+            .map(|h| McpToolHost::new(h, session.stop.clone()));
+        let learn_host = self
+            .learn
+            .clone()
+            .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
+        let browser_host = self
+            .browser
+            .clone()
+            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        if file_host.is_some()
+            || skill_host.is_some()
+            || capsule_host.is_some()
+            || toolchain.is_some()
+            || files.is_some()
+            || search.is_some()
+            || mcp_host.is_some()
+            || learn_host.is_some()
+            || browser_host.is_some()
+        {
+            registry = registry.with_host(
+                HostKind::Sidecar,
+                Arc::new(SidecarHost {
+                    files: file_host,
+                    sheets: sheet_host,
+                    skills: skill_host,
+                    toolchain,
+                    fs_tools: files,
+                    search,
+                    mcp: mcp_host,
+                    capsules: capsule_host,
+                    learn: learn_host,
+                    browser: browser_host,
+                }),
+            );
+        }
+        registry
+    }
+
+    /// HUP-S3.4: run a workflow in this session on the blocking pool. Refuses while a turn or
+    /// another workflow is running. Returns the run id; read it with [`SessionManager::run_view`].
+    pub fn run_workflow(
+        &self,
+        id: &str,
+        wf: Workflow,
+        capsules: Option<Arc<CapsuleDispatch>>,
+    ) -> Result<String, SessionError> {
+        let session = self.get(id).ok_or(SessionError::NotFound)?;
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(SessionError::Busy);
+        }
+        let n = self.run_ids.fetch_add(1, Ordering::SeqCst) + 1;
+        let run_id = format!("wr-{n}");
+        session.set_run(
+            &run_id,
+            RunState::Running {
+                workflow_id: wf.id.clone(),
+            },
+        );
+        let registry = self.registry_for(&session, capsules);
+        let s = session.clone();
+        let rid = run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let sink = SessionSink(s.clone());
+            let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            let out = run_verified_workflow(
+                &s.id,
+                &s.cfg,
+                &s.opts,
+                s.llm.as_ref(),
+                &registry,
+                &sink,
+                &s.stop,
+                &mut history,
+                &wf,
+            );
+            if let Ok(mut h) = s.history.lock() {
+                *h = history;
+            }
+            s.set_run(
+                &rid,
+                match out {
+                    Ok(run) => RunState::Verified(Box::new(run)),
+                    Err(e) => RunState::Unverified {
+                        workflow_id: wf.id.clone(),
+                        reason: e.to_string(),
+                    },
+                },
+            );
+            s.busy.store(false, Ordering::SeqCst);
+            s.notify.notify_waiters();
+        });
+        Ok(run_id)
+    }
+
+    /// HUP-S3.4: one workflow run of this session.
+    pub fn run_view(&self, id: &str, run_id: &str) -> Result<RunView, SessionError> {
+        let session = self.get(id).ok_or(SessionError::NotFound)?;
+        let st = session.run(run_id).ok_or(SessionError::NotFound)?;
+        Ok(RunView::of(run_id, &st))
     }
 
     /// Start one user turn on the blocking pool. Refuses a second concurrent turn.
@@ -613,46 +1216,18 @@ impl SessionManager {
         {
             return Err(SessionError::Busy);
         }
-        let core = Arc::new(CoreHost {
-            pending: session.pending.clone(),
-            deadline: self.core_tool_deadline,
-            stop: session.stop.clone(),
-            hic_aware: session.hic_aware,
-        });
-        let mut registry = ToolRegistry::new(session.specs.clone())
-            .with_host(HostKind::Core, core)
-            .with_taint(session.taint.clone());
-        let skill_host = session.skills.clone().map(SkillHost::new);
-        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
-        let toolchain = session.toolchain.clone();
-        let mcp_host = self
-            .mcp
-            .clone()
-            .map(|h| McpToolHost::new(h, session.stop.clone()));
-        let browser_host = self
-            .browser
-            .clone()
-            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
-        if skill_host.is_some()
-            || capsule_host.is_some()
-            || toolchain.is_some()
-            || mcp_host.is_some()
-            || browser_host.is_some()
-        {
-            registry = registry.with_host(
-                HostKind::Sidecar,
-                Arc::new(SidecarHost {
-                    skills: skill_host,
-                    toolchain,
-                    mcp: mcp_host,
-                    capsules: capsule_host,
-                    browser: browser_host,
-                }),
-            );
-        }
+        let registry = self.registry_for(&session, capsules);
         let s = session.clone();
         tokio::task::spawn_blocking(move || {
-            let sink = SessionSink(s.clone());
+            let session_sink = SessionSink(s.clone());
+            let mut observers: Vec<&dyn EventSink> = vec![s.metering.as_ref()];
+            if let Some((rec, _)) = &s.trajectory {
+                observers.push(rec.as_ref());
+            }
+            let sink = TeeSink {
+                observers,
+                last: &session_sink,
+            };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
             run_turn_with(
                 &s.cfg,
@@ -667,6 +1242,8 @@ impl SessionManager {
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
+            // Workflow verdicts arrive after `done`, so drain only once the turn has returned.
+            s.metering_store.append(s.metering.take_records());
             s.busy.store(false, Ordering::SeqCst);
             s.notify.notify_waiters();
         });
@@ -691,7 +1268,9 @@ impl SessionManager {
         list.len()
     }
 
-    pub fn close(&self, id: &str) -> Result<(), SessionError> {
+    /// Close a session. With trajectory recording on, its verified turns are exported now (a
+    /// session still mid-turn is exported with the turns it finished) and the summary returned.
+    pub fn close(&self, id: &str) -> Result<Option<ExportSummary>, SessionError> {
         let s = self
             .sessions
             .lock()
@@ -699,7 +1278,14 @@ impl SessionManager {
             .and_then(|mut m| m.remove(id))
             .ok_or(SessionError::NotFound)?;
         s.stop.stop();
-        Ok(())
+        Ok(s.trajectory.as_ref().map(|(rec, cfg)| {
+            let history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            export_session(cfg, rec, &history, &s.id, now_ms)
+        }))
     }
 
     pub fn count(&self) -> usize {

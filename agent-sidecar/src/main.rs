@@ -15,10 +15,45 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
+//!                               the /checkpoints undo routes are served (optional)
+//!   CITRATE_HERMES_FILES        HUP-S2.9: `1` offers fs_write / fs_edit / fs_delete / fs_rename in
+//!                               every session; needs CITRATE_HERMES_GRANTS and the checkpoint
+//!                               store, else off (optional)
+//!   CITRATE_HERMES_GRANTS       absolute path of the folder-grants JSON core stores; read on every
+//!                               file-tool call (optional)
+//!   CITRATE_HERMES_METERING_DIR HUP-S7.5: absolute folder for the metering log (metering.jsonl);
+//!                               unset = turn records are kept in memory only (optional)
+//!   CITRATE_HERMES_TRAJECTORIES HUP-S9.3: absolute folder for verified, redacted trajectory
+//!                               exports at session close; unset = no recording (optional, off)
+//!   CITRATE_HERMES_RECORDS_DIR  HUP-S7.3: absolute folder of the HIC decision records to batch
+//!   CITRATE_HERMES_ANCHOR_DIR   HUP-S7.3: absolute folder for the anchor ledger; both must be set
+//!                               for the /anchor/* routes, else they answer "not configured"
+//!   CITRATE_HERMES_LEARN_DIR    HUP-S3.4: learn data folder (decision log + proposals file);
+//!                               with CITRATE_HERMES_LEARN_SKILLS_DIR, turns on the learn routes
+//!                               and the `learn_propose` tool; unset = learning off (optional)
+//!   CITRATE_HERMES_LEARN_SKILLS_DIR  the member's skills folder, where an accepted skill is
+//!                               written as <name>/SKILL.md (optional, see above)
+//!   CITRATE_HERMES_SEARCH       HUP-S5.2: `1` offers web_search + read_url in every session (optional)
+//!   CITRATE_HERMES_SEARXNG      absolute path of searxng-run (or its virtualenv); unset = web_search
+//!                               reports "not installed" (optional)
+//!   CITRATE_HERMES_SEARXNG_DATA folder for SearXNG's generated settings + log (optional)
+//!   CITRATE_HERMES_READER       `jina` opts read_url in to the third-party Jina Reader; anything else
+//!                               = local readability (optional)
+//!   CITRATE_HERMES_JINA_ENDPOINT / CITRATE_HERMES_JINA_KEY_FILE  Jina Reader base URL / key file
+//!   CITRATE_HERMES_JEV          HUP-S5.3: `1` turns the opt-in Jev decide() backend on, still per
+//!                               origin (CITRATE_HERMES_JEV_ORIGINS, CITRATE_HERMES_JEV_NON_WEB) and
+//!                               only with CITRATE_HERMES_JEV_KEY_FILE (optional)
+//!   CITRATE_HERMES_DECIDE_LOG   JSONL file for decide() metering (optional)
 //!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
 //!                               serves the /browser control routes; anything else = off (optional)
 //!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
 //!                               updater); unset = a system Chromium if one exists (optional)
+//!
+//! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
+//! process instead (stdio line protocol, started and supervised by the control-plane process; it
+//! reads the same `CITRATE_HERMES_TOOLCHAIN*` variables). On SIGTERM or Ctrl-C the control plane
+//! stops accepting requests and shuts its workers down cleanly before exiting.
 
 use std::sync::Arc;
 
@@ -30,8 +65,42 @@ fn required(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|_| format!("{key} is required"))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(agent_sidecar::workers::WORKER_ARG) {
+        let kind = args.get(1).map(String::as_str).unwrap_or("");
+        std::process::exit(agent_sidecar::workers::run_worker(kind));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(control_plane())
+}
+
+/// Resolves on SIGTERM (how citrate-core's supervisor stops the sidecar) or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
     let addr = required("CITRATE_HERMES_ADDR")?;
     let token_file = required("CITRATE_HERMES_TOKEN_FILE")?;
     let bearer = std::fs::read_to_string(&token_file)
@@ -87,6 +156,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app(state)).await?;
+    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the worker processes first (each gets a shutdown
+    // request and a grace period, well inside core's 5 s stop grace), then let the server drain.
+    // Off the async runtime: it joins the supervisor threads.
+    let sessions = state.sessions.clone();
+    let served = axum::serve(listener, app(state.clone()))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+        })
+        .await;
+    // Idempotent: covers a server that ended without a signal.
+    let sessions = state.sessions.clone();
+    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+    served?;
     Ok(())
 }

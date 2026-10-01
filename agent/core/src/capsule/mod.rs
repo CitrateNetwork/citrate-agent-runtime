@@ -23,6 +23,7 @@ pub mod linker;
 pub mod manifest;
 pub mod pack;
 pub mod prod_impls;
+pub mod sandbox;
 pub mod tiers;
 pub mod verify;
 pub mod wasm;
@@ -63,6 +64,17 @@ const INSTANTIATE_EPOCH_DELTA: u64 = 120;
 fn arm_instantiate_bounds(store: &mut wasmtime::Store<wasm::HostCtx>) {
     store.limiter(|state| &mut state.store_limits);
     store.set_epoch_deadline(INSTANTIATE_EPOCH_DELTA);
+}
+
+/// HUP-S2.5: give a host context exactly the filesystem and network the
+/// sandbox plan allows, before any capsule code runs. Every instantiate path
+/// goes through here, so no capsule ever starts with ambient access.
+fn sandboxed(
+    mut host: wasm::HostCtx,
+    plan: &sandbox::SandboxPlan,
+) -> Result<wasm::HostCtx, AgentError> {
+    host.apply_sandbox(plan)?;
+    Ok(host)
 }
 
 /// A loaded capsule: parsed manifest + unpacked archive entries. The
@@ -192,9 +204,10 @@ impl Capsule {
         let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
             .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
         let allow_list = self.parse_eth_call_allow_list()?;
+        let plan = sandbox::SandboxPlan::without_grants(&self.manifest)?;
         let mut store = wasmtime::Store::new(
             engine,
-            wasm::HostCtx::with_eth_call_allow_list(allow_list),
+            sandboxed(wasm::HostCtx::with_eth_call_allow_list(allow_list), &plan)?,
         );
         // AR-B-004 + AR-B-005: install the resource limiter and a bounded
         // instantiation deadline BEFORE `linker.instantiate`, so instantiate-time
@@ -232,25 +245,52 @@ impl Capsule {
         ),
         AgentError,
     > {
+        let plan = sandbox::SandboxPlan::without_grants(&self.manifest)?;
+        self.instantiate_sandboxed(
+            engine,
+            linker,
+            eth_call_dispatcher,
+            eth_send_dispatcher,
+            approval_gate,
+            &plan,
+        )
+    }
+
+    /// [`Self::instantiate_with_write_path`] under an explicit sandbox plan
+    /// (HUP-S2.5): the plan's preopens and socket allowlist are the only
+    /// filesystem and network the capsule gets.
+    pub fn instantiate_sandboxed(
+        &self,
+        engine: &wasmtime::Engine,
+        linker: &wasmtime::component::Linker<wasm::HostCtx>,
+        eth_call_dispatcher: Option<std::sync::Arc<dyn dispatcher::EthCallDispatcher>>,
+        eth_send_dispatcher: Option<std::sync::Arc<dyn dispatcher::EthSendDispatcher>>,
+        approval_gate: Option<std::sync::Arc<dyn dispatcher::ApprovalGate>>,
+        plan: &sandbox::SandboxPlan,
+    ) -> Result<
+        (
+            wasmtime::Store<wasm::HostCtx>,
+            wasmtime::component::Instance,
+        ),
+        AgentError,
+    > {
         let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
             .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
         let (read_allow, write_allow) = self.parse_chain_call_allow_lists()?;
-        let mut store = wasmtime::Store::new(
-            engine,
-            wasm::HostCtx::with_write_path(
-                read_allow,
-                write_allow,
-                eth_call_dispatcher,
-                eth_send_dispatcher,
-                approval_gate,
-                self.manifest.capsule.name.clone(),
-                // AR-B-003: carry the manifest's risk tier + required
-                // roles into the host context so the approval gate can
-                // enforce the role-bound quorum for privileged writes.
-                self.manifest.risk.tier,
-                self.manifest.risk.required_roles.clone(),
-            ),
+        let host = wasm::HostCtx::with_write_path(
+            read_allow,
+            write_allow,
+            eth_call_dispatcher,
+            eth_send_dispatcher,
+            approval_gate,
+            self.manifest.capsule.name.clone(),
+            // AR-B-003: carry the manifest's risk tier + required
+            // roles into the host context so the approval gate can
+            // enforce the role-bound quorum for privileged writes.
+            self.manifest.risk.tier,
+            self.manifest.risk.required_roles.clone(),
         );
+        let mut store = wasmtime::Store::new(engine, sandboxed(host, plan)?);
         // AR-B-004 + AR-B-005 — bound instantiate-time memory + compute.
         arm_instantiate_bounds(&mut store);
         let instance = linker
@@ -280,9 +320,13 @@ impl Capsule {
         let component = wasmtime::component::Component::from_binary(engine, &self.archive.wasm)
             .map_err(|e| AgentError::Capsule(format!("WASM component parse: {e}")))?;
         let allow_list = self.parse_eth_call_allow_list()?;
+        let plan = sandbox::SandboxPlan::without_grants(&self.manifest)?;
         let mut store = wasmtime::Store::new(
             engine,
-            wasm::HostCtx::with_dispatcher(allow_list, dispatcher),
+            sandboxed(
+                wasm::HostCtx::with_dispatcher(allow_list, dispatcher),
+                &plan,
+            )?,
         );
         // AR-B-004 + AR-B-005 — bound instantiate-time memory + compute.
         arm_instantiate_bounds(&mut store);
@@ -794,6 +838,76 @@ tier = "bundled"
                 ..Default::default()
             },
         }
+    }
+
+    /// HUP-S2.5: the sandbox plan reaches the store on the real instantiate
+    /// path. A capsule declaring a filesystem mount gets exactly the granted
+    /// preopen through `instantiate_sandboxed`, and nothing at all through
+    /// the default paths (no ambient filesystem).
+    #[test]
+    fn instantiate_paths_apply_the_sandbox_plan_hup_s2_5() {
+        use crate::capsule::sandbox::{FsMount, SandboxPlan};
+        use crate::capsule::wasm::EngineFactory;
+        use citrate_agent_grants::{Access, FolderGrants, GrantRequest};
+        use wasmtime_wasi::filesystem::WasiFilesystemView;
+        use wasmtime_wasi::p2::bindings::filesystem::preopens::Host as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = std::fs::canonicalize(tmp.path()).expect("canonical");
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let mut grants = FolderGrants::new(&home, &home);
+        grants
+            .grant(
+                GrantRequest::folder(&project, Access::Read, "0xmember", "test"),
+                100,
+            )
+            .expect("grant");
+
+        let mut capsule = bounds_test_capsule(wat::parse_str("(component)").expect("WAT"));
+        capsule.manifest.capability.filesystem = vec!["read:/work".to_string()];
+        let engine = EngineFactory::build().expect("engine");
+        let linker = capsule
+            .prepare_linker(&engine)
+            .expect("linker")
+            .into_linker();
+
+        let plan = SandboxPlan::resolve(
+            &capsule.manifest,
+            &[FsMount::new("/work", &project)],
+            &grants,
+            200,
+        )
+        .expect("plan");
+        let (mut store, _) = capsule
+            .instantiate_sandboxed(&engine, &linker, None, None, None, &plan)
+            .expect("instantiate");
+        let dirs = store
+            .data_mut()
+            .filesystem()
+            .get_directories()
+            .expect("dirs");
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].1, "/work");
+
+        let (mut store, _) = capsule
+            .instantiate_with_write_path(&engine, &linker, None, None, None)
+            .expect("instantiate");
+        assert!(store
+            .data_mut()
+            .filesystem()
+            .get_directories()
+            .expect("dirs")
+            .is_empty());
+        let (mut store, _) = capsule
+            .instantiate_with_store(&engine, &linker)
+            .expect("instantiate");
+        assert!(store
+            .data_mut()
+            .filesystem()
+            .get_directories()
+            .expect("dirs")
+            .is_empty());
     }
 
     /// PBA-L6b-014 regression: the per-memory 64 MiB cap alone did not bound

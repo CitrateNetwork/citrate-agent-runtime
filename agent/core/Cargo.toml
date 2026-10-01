@@ -85,6 +85,9 @@ wasmtime-wasi = "49"
 # in linker.rs (the wasmtime-wasi internal HasIo marker is private,
 # so we depend on the io crate directly). REM-12 wasmtime-26 → 45; 46 → 49 for RUSTSEC-2026-0314/0316.
 wasmtime-wasi-io = "49"
+# HUP-S2.5 — capsule WASI preopens are scoped to live folder grants. In-repo
+# path crate (agent-grants -> agent-guard); keyless, nothing in it signs.
+citrate-agent-grants = { path = "../../agent-grants" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
@@ -92,6 +95,8 @@ tokio = { version = "1", features = ["full", "test-util", "macros"] }
 # tests. Bumped alongside wasmtime to maintain WAT parser compatibility
 # with whatever component-model WAT syntax current wasmtime expects.
 wat = "1"
+# HUP-S2.5 — temp folders for the capsule sandbox (preopen) tests.
+tempfile = "3"
 
 # BFR-INT-wiremock-harness — JSON-RPC mock server for
 # RecorderClient async-method tests. Drains AT-poam-A-3 + AT-vp-1.
