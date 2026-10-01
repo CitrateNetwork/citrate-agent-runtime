@@ -26,6 +26,7 @@ pub mod escalation;
 pub mod mcp_probe;
 pub mod sessions;
 pub mod toolchain;
+mod toolchain_config;
 pub mod workers;
 pub mod trajectory;
 
