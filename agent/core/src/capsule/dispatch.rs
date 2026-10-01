@@ -170,8 +170,9 @@ impl CapsuleDispatch {
             // CIT-AGENT-3e: prefer the signed `.cps` archive. It loads through the FULL
             // verified path — content_hash + ed25519 publisher signature under the
             // bundled-tier key + WIT/capability cross-check — with NO env override. A
-            // present-but-invalid archive is a hard error, never a silent downgrade to
-            // the loose-dir path (that would be an integrity-downgrade attack).
+            // present-but-invalid archive refuses that capsule (HUP-S2.5, see below), never
+            // a silent downgrade to the loose-dir path (that would be an integrity-downgrade
+            // attack).
             let dir_name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())

@@ -767,6 +767,71 @@ tier = "bundled"
         assert!(!deny.permits_socket(implicit, SocketAddrUse::TcpBind));
     }
 
+    /// The socket rule is what the WASI host consults: on the real
+    /// `apply_sandbox` context an egress capsule cannot connect to an
+    /// address outside its allowlist, bind an explicit local address, or
+    /// listen. Loopback only; nothing leaves the machine.
+    #[test]
+    fn the_wasi_socket_layer_enforces_the_allowlist() {
+        use wasmtime_wasi::p2::bindings::sockets::instance_network::Host as _;
+        use wasmtime_wasi::p2::bindings::sockets::network::{
+            ErrorCode as NetErr, IpAddressFamily, IpSocketAddress,
+        };
+        use wasmtime_wasi::p2::bindings::sockets::tcp_create_socket::Host as _;
+        use wasmtime_wasi::p2::bindings::sync::sockets::tcp::HostTcpSocket;
+        use wasmtime_wasi::sockets::WasiSocketsView;
+
+        let m = manifest(
+            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\"]",
+            &[],
+        );
+        let mut host = sandboxed_host(&SandboxPlan::without_grants(&m).expect("plan"));
+        let code = |e: wasmtime_wasi::p2::SocketError| -> NetErr {
+            e.downcast().expect("a socket error code, not a trap")
+        };
+        let addr = |s: &str| -> IpSocketAddress { s.parse::<SocketAddr>().expect("addr").into() };
+        let mut net = host.sockets();
+
+        // Connect to a remote that is not on the allowlist.
+        let sock = net
+            .create_tcp_socket(IpAddressFamily::Ipv4)
+            .expect("tcp is on for an egress capsule");
+        let network = net.instance_network().expect("network");
+        let s = wasmtime::component::Resource::new_borrow(sock.rep());
+        let n = wasmtime::component::Resource::new_borrow(network.rep());
+        HostTcpSocket::start_connect(&mut net, s, n, addr("127.0.0.1:1")).expect("start");
+        let s = wasmtime::component::Resource::new_borrow(sock.rep());
+        let err = HostTcpSocket::finish_connect(&mut net, s).expect_err("not allowlisted");
+        assert_eq!(code(err), NetErr::AccessDenied);
+
+        // An explicit bind, and listening, are refused.
+        let sock = net.create_tcp_socket(IpAddressFamily::Ipv4).expect("tcp");
+        let s = wasmtime::component::Resource::new_borrow(sock.rep());
+        let n = wasmtime::component::Resource::new_borrow(network.rep());
+        let err = HostTcpSocket::start_bind(&mut net, s, n, addr("127.0.0.1:0"))
+            .expect_err("explicit bind");
+        assert_eq!(code(err), NetErr::AccessDenied);
+        // WASI 0.2 listens only on a bound socket; the ephemeral bind is
+        // the one bind the rule admits, and listening on it is refused.
+        let sock = net.create_tcp_socket(IpAddressFamily::Ipv4).expect("tcp");
+        let s = wasmtime::component::Resource::new_borrow(sock.rep());
+        let n = wasmtime::component::Resource::new_borrow(network.rep());
+        HostTcpSocket::start_bind(&mut net, s, n, addr("0.0.0.0:0")).expect("ephemeral bind");
+        let s = wasmtime::component::Resource::new_borrow(sock.rep());
+        HostTcpSocket::finish_bind(&mut net, s).expect("bound");
+        let s = wasmtime::component::Resource::new_borrow(sock.rep());
+        let err = HostTcpSocket::start_listen(&mut net, s).expect_err("listen");
+        assert_eq!(code(err), NetErr::AccessDenied);
+
+        // `none` gets no TCP socket at all.
+        let mut host = sandboxed_host(&SandboxPlan::deny_all());
+        let mut net = host.sockets();
+        let err = net
+            .create_tcp_socket(IpAddressFamily::Ipv4)
+            .expect_err("no tcp for a none capsule");
+        assert_eq!(code(err), NetErr::AccessDenied);
+    }
+
     // ── the WASI host functions a capsule calls ──────────────────
 
     fn only_preopen(
