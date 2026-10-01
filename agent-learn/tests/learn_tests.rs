@@ -1123,3 +1123,102 @@ fn a_written_skill_the_loader_would_not_load_is_rolled_back() {
         ProposalState::PersistFailed { .. }
     ));
 }
+
+#[test]
+fn two_contradicting_memories_accepted_one_after_the_other_end_as_both() {
+    // Two pending proposals give the same key different values. Accepting the first (with the
+    // other acknowledged) must not let the second be stored later as plain `true`: once the
+    // first is persisted it is a contradiction for the second, surfaced and stored as `both`.
+    let mut e = env();
+    let a = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("project.test-command", "forge test -vvv"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    let b = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("project.test-command", "npm test"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    let a_ref = format!("proposal:{}", a.id);
+    let b_ref = format!("proposal:{}", b.id);
+    let Persisted::Memory(ra) = e
+        .learner
+        .accept(
+            &a.id,
+            MemberAccept {
+                member: "m".into(),
+                acknowledged_conflicts: vec![b_ref.clone()],
+            },
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(ra.belnap, Belnap::True);
+    // The second accept must surface the now-persisted first memory as a contradiction.
+    match e.learner.accept(&b.id, accept("m")) {
+        Err(LearnError::UnacknowledgedConflicts(c)) => {
+            assert_eq!(c.len(), 1, "{c:?}");
+            assert_eq!(c[0].kind, ConflictKind::Contradiction);
+            assert_eq!(c[0].existing_id, a_ref);
+        }
+        other => panic!("expected the contradiction to be surfaced, got {other:?}"),
+    }
+    let Persisted::Memory(rb) = e
+        .learner
+        .accept(
+            &b.id,
+            MemberAccept {
+                member: "m".into(),
+                acknowledged_conflicts: vec![a_ref.clone()],
+            },
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rb.belnap, Belnap::Both);
+    assert_eq!(rb.contradicts, vec![a_ref.clone()]);
+    // And the same value as an accepted memory is not proposed again.
+    let r = e.learner.propose(
+        &verified_run(),
+        memory("Project.Test-Command", "forge  test -vvv"),
+        provenance(),
+        &[],
+    );
+    assert!(
+        matches!(r, Err(LearnError::AlreadyKnown { ref existing_id }) if *existing_id == a_ref),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_reject_reason_is_bounded_in_the_proposal_as_in_the_log() {
+    let mut e = env();
+    let p = e
+        .learner
+        .propose(&verified_run(), skill_content(), provenance(), &[])
+        .unwrap();
+    let long = "x".repeat(5000);
+    e.learner.reject(&p.id, "m", &long).unwrap();
+    let ProposalState::Rejected { reason, .. } = &e.learner.get(&p.id).unwrap().state else {
+        panic!("expected rejected")
+    };
+    assert_eq!(reason.chars().count(), 1000);
+    let Entry::Decision(d) = &records(&e.logdir)[0].record.entry else {
+        panic!("expected a decision")
+    };
+    assert_eq!(
+        &d.reason, reason,
+        "the proposal keeps what the log recorded"
+    );
+}

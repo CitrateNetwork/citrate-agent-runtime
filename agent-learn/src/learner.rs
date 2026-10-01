@@ -26,6 +26,8 @@ pub const MAX_PENDING: usize = 256;
 pub const MAX_USER_TAGS: usize = 8;
 /// The schema tag of a [`MemoryRecord`].
 pub const MEMORY_SCHEMA: &str = "citrate.learn.memory.v1";
+/// Longest reject reason kept, in characters (in the proposal and in the decision log).
+const MAX_REASON_CHARS: usize = 1000;
 /// Tag added to every publish so readers can tell learned skills apart.
 const LEARNED_TAG: &str = "hermes-learned";
 const PROPOSAL_DOMAIN: &[u8] = b"citrate.learn.proposal.v1\n";
@@ -170,7 +172,9 @@ pub struct MemoryRecord {
     pub key: String,
     pub value: String,
     pub belnap: Belnap,
-    /// Ids of the known memories this one contradicts (acknowledged by the member).
+    /// What this memory contradicts (acknowledged by the member): the id of a known memory
+    /// core passed in, or `proposal:<id>` for a memory accepted earlier from this learner
+    /// (core holds that one as the record with that `proposal_id`).
     pub contradicts: Vec<String>,
     pub content_sha256: String,
     pub evidence: Evidence,
@@ -513,7 +517,13 @@ impl Learner {
             });
         }
         for p in self.proposals.values() {
-            if Some(p.id.as_str()) == exclude || !p.state.awaiting_decision() {
+            if Some(p.id.as_str()) == exclude {
+                continue;
+            }
+            // A memory accepted from this learner is a known memory too, even before core
+            // passes it back in `known`: a later proposal that disagrees is a contradiction.
+            let accepted = matches!(p.state, ProposalState::Persisted);
+            if !accepted && !p.state.awaiting_decision() {
                 continue;
             }
             if let ProposalContent::Memory { key: pk, value: pv } = &p.content {
@@ -525,11 +535,23 @@ impl Learner {
                         existing_id: format!("proposal:{}", p.id),
                     });
                 }
-                out.push(Conflict {
-                    kind: ConflictKind::PendingProposal,
-                    existing_id: format!("proposal:{}", p.id),
-                    detail: format!("another pending proposal is about {}", collapse(key)),
-                    blocking: false,
+                out.push(if accepted {
+                    Conflict {
+                        kind: ConflictKind::Contradiction,
+                        existing_id: format!("proposal:{}", p.id),
+                        detail: format!(
+                            "a memory you accepted earlier says something different for {}",
+                            collapse(key)
+                        ),
+                        blocking: false,
+                    }
+                } else {
+                    Conflict {
+                        kind: ConflictKind::PendingProposal,
+                        existing_id: format!("proposal:{}", p.id),
+                        detail: format!("another pending proposal is about {}", collapse(key)),
+                        blocking: false,
+                    }
                 });
             }
         }
@@ -677,12 +699,13 @@ impl Learner {
         if !p.state.awaiting_decision() {
             return Err(Self::wrong_state(p));
         }
+        let reason: String = reason.chars().take(MAX_REASON_CHARS).collect();
         let ev = DecisionEvent {
             tier: HicTier::Hic1,
             kind: Self::decision_kind(p).into(),
             subject: Self::subject(p),
             decision: Decision::Denied,
-            reason: reason.chars().take(1000).collect(),
+            reason: reason.clone(),
             evidence: Self::evidence_refs(p),
         };
         self.log
@@ -691,7 +714,7 @@ impl Learner {
         if let Some(p) = self.proposals.get_mut(id) {
             p.state = ProposalState::Rejected {
                 by: member.to_string(),
-                reason: reason.to_string(),
+                reason,
             };
         }
         Ok(())
@@ -714,13 +737,15 @@ impl Learner {
             }
             ProposalContent::Memory { key, value } => {
                 let mut c = self.memory_conflicts(key, value, &[], Some(id))?;
-                // Contradictions with known memories were found at proposal time; keep them.
-                c.extend(
-                    p.conflicts
-                        .iter()
-                        .filter(|x| x.kind == ConflictKind::Contradiction)
-                        .cloned(),
-                );
+                // Contradictions with known memories were found at proposal time; keep them
+                // (once each: one with an accepted proposal is also in the fresh set).
+                for x in &p.conflicts {
+                    if x.kind == ConflictKind::Contradiction
+                        && !c.iter().any(|y| y.existing_id == x.existing_id)
+                    {
+                        c.push(x.clone());
+                    }
+                }
                 c
             }
         };
@@ -779,7 +804,12 @@ impl Learner {
                 let contradicts: Vec<String> = merged
                     .iter()
                     .filter(|c| c.kind == ConflictKind::Contradiction)
-                    .filter_map(|c| c.existing_id.strip_prefix("memory:").map(str::to_string))
+                    .map(|c| {
+                        c.existing_id
+                            .strip_prefix("memory:")
+                            .unwrap_or(&c.existing_id)
+                            .to_string()
+                    })
                     .collect();
                 Ok(Persisted::Memory(Box::new(MemoryRecord {
                     schema: MEMORY_SCHEMA.into(),

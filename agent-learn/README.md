@@ -39,12 +39,13 @@ Planset: citrate-core `.agentile/planset/2026-09-30-hermes-upskill/` (D-22, US-3
 | `same_name_skill` | a skill with this name is anywhere in the user skills folder (the loader scans it recursively, so a second copy would make both ambiguous) | yes: never overwritten |
 | `shadows_skill` | a skill with this name is in another configured source (bundled, team) | no: needs acknowledgement |
 | `pending_proposal` | another undecided proposal for the same skill name or memory key | no: needs acknowledgement |
-| `contradiction` | a known memory has the same key (case and spacing ignored) and a different value | no: needs acknowledgement; the record is stored as Belnap `both` with `contradicts` set, so core stops relying on either claim until the member resolves it |
+| `contradiction` | a known memory, or a memory accepted earlier from this learner (`proposal:<id>`), has the same key (case and spacing ignored) and a different value | no: needs acknowledgement; the record is stored as Belnap `both` with `contradicts` set, so core stops relying on either claim until the member resolves it |
 
 An identical item already saved, known, or pending is refused as `already_known`.
 Memory contradictions are found against the `known_memories` core passes at proposal time; at
-accept time only pending proposals are re-checked, because the runtime does not hold the
-memory store.
+accept time the learner re-checks pending proposals and the memories it has accepted itself
+(so of two contradicting proposals accepted one after the other, the second is stored as
+`both`), but not core's store, which the runtime does not hold.
 
 ## Publishing to SkillRegistry
 
