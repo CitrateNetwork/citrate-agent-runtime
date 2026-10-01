@@ -1,0 +1,16 @@
+[package]
+name = "citrate-agent-loop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermes's agent turn loop (HUP-S1.1a): bounded, stoppable, event-streaming, with injected LLM and tool hosts. Pure and offline-testable; the sidecar hosts it (ADR loop-in-sidecar)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+sha2 = "0.10"

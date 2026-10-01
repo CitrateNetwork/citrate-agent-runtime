@@ -59,8 +59,11 @@ dependencies = [
  "axum",
  "citrate-agent-core",
  "citrate-agent-legacy",
+ "citrate-agent-loop",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
 ]
@@ -1082,6 +1085,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-guard"
+version = "0.4.0"
+dependencies = [
+ "tempfile",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "citrate-agent-legacy"
 version = "0.4.0"
 dependencies = [
@@ -1104,6 +1115,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-loop"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "citrate-agent-records"
 version = "0.4.0"
 dependencies = [
@@ -1113,6 +1134,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "citrate-agent-shell"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

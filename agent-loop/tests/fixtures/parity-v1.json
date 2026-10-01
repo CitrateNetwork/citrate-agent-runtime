@@ -1,0 +1,632 @@
+{
+  "fixture": "hermes-loop-parity",
+  "version": 1,
+  "created": "2026-09-30",
+  "branch": "hup/s1-parity",
+  "author": "Larry Klosowski + Claude Opus 5.5",
+  "status": "active",
+  "purpose": "HUP-S1.9 parity suite. Every observable behavior of the TypeScript agent loop (citrate-core src/agent/harness.ts createAgentProvider) written as scripted model turns + scripted tool results + expected outcome, run byte-identically against (ts) harness.ts, (loop) citrate-agent-loop run_turn, and (sidecar) agent-sidecar parse_turn + run_turn. A scenario marked known_divergence names which side is correct; nothing here is papered over.",
+  "implementations": {
+    "ts": "citrate-core src/agent/harness.ts createAgentProvider, driven by a scripted inferTools + onToolCall (src/agent/parity/parity.test.ts)",
+    "loop": "citrate-agent-runtime agent-loop run_turn, driven by a scripted LlmClient + ToolHost (agent-loop/tests/parity_tests.rs); runs layer=loop scenarios only, wire-shape handling is not the loop's job",
+    "sidecar": "citrate-agent-runtime agent-sidecar llm_http::parse_turn feeding run_turn (agent-sidecar/tests/parity_wire_tests.rs); runs every scenario"
+  },
+  "schema": {
+    "tools[]": "the tools on offer, mirroring harness.ts AGENT_TOOLS (names, order) and READ_ONLY_AGENT_TOOLS (read_only). Every one is core-hosted: it executes through core's gated handlers.",
+    "model[]": "one entry per model request, in order: {message: <OpenAI choices[0].message object>} | {raw: <unparseable body string>} | {error: <transport error text>}. When model_repeat_last is true the last entry repeats forever.",
+    "tool_results[]": "one entry per host execution, in order: {ok: text} | {denied: reason} | {error: message}. tool_result_default is used once the list runs out. ts: ok/denied resolve onToolCall with the text (the store's gated handlers return a 'declined' sentence on a refusal); error rejects onToolCall. rust: ToolOutcome::Ok/Denied/Error.",
+    "stop_after_host_calls": "request a stop after this many host executions (the TS loop has no stop control).",
+    "expect": "the parity contract. outcome: answered|stopped|step_limit|failed. terminal: the last TS status / the sidecar provider's mapping of the Rust done event (answered,stopped -> done; step_limit,failed -> error). model_calls: requests made. host_calls: tool names the host executed, in order. tool_events: TS 'tool' statuses / Rust tool_call events. last_request_roles: roles of the non-system messages in the last model request. tool_messages: the tool-role messages in the last model request, in order. error_contains: per implementation, presentation wording differs.",
+    "known_divergence": "{reason, verdict, ts|loop|sidecar: per-implementation overrides of expect}. verdict rust_correct means the sidecar behavior is the intended one and the TS behavior retires with harness.ts; owner_decision means the owner must choose."
+  },
+  "limits": {
+    "ts_max_turns": 6,
+    "rust_max_steps": 6,
+    "rust_max_tool_calls_per_step": 4
+  },
+  "tools": [
+    { "name": "memory_search", "host": "core", "read_only": true },
+    { "name": "memory_recall", "host": "core", "read_only": true },
+    { "name": "app_navigate", "host": "core", "read_only": true },
+    { "name": "memory_assert", "host": "core", "read_only": false },
+    { "name": "journal_append", "host": "core", "read_only": false },
+    { "name": "journal_read", "host": "core", "read_only": true },
+    { "name": "node_status", "host": "core", "read_only": true },
+    { "name": "staking_status", "host": "core", "read_only": true },
+    { "name": "groups_list", "host": "core", "read_only": true },
+    { "name": "group_roster", "host": "core", "read_only": true },
+    { "name": "group_create", "host": "core", "read_only": false },
+    { "name": "group_invite", "host": "core", "read_only": false },
+    { "name": "directory_find", "host": "core", "read_only": true },
+    { "name": "skills_list", "host": "core", "read_only": true },
+    { "name": "skill_write", "host": "core", "read_only": false },
+    { "name": "skill_run", "host": "core", "read_only": true },
+    { "name": "models_list", "host": "core", "read_only": true },
+    { "name": "contract_deploy", "host": "core", "read_only": false }
+  ],
+  "config_divergences": [
+    {
+      "id": "default_turn_cap",
+      "ts": "AGENT_MAX_TURNS = 6 model requests per user turn",
+      "sidecar": "sessions.rs default max_steps = 8 (core's sidecar provider opens sessions without overriding it)",
+      "verdict": "owner_decision"
+    },
+    {
+      "id": "live_context_freshness",
+      "ts": "the live app context snapshot is taken once per user turn and sent with every model request of that turn (core ai.rs injects it as a system line)",
+      "sidecar": "core's sidecar provider appends the snapshot to the system prompt once, at session open; later turns in the same session see the session-start snapshot",
+      "verdict": "owner_decision"
+    },
+    {
+      "id": "cross_turn_history",
+      "ts": "each user turn re-sends the store's chat history as plain user/assistant text; earlier turns' tool calls and tool results are not carried",
+      "sidecar": "the session keeps the full transcript, including earlier turns' tool calls and tool results",
+      "verdict": "rust_correct"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "final_answer_no_tools",
+      "layer": "loop",
+      "behavior": "A reply with no tool calls is the final answer; it is returned verbatim and the turn ends.",
+      "user": "hello",
+      "model": [{ "message": { "role": "assistant", "content": "Hello from Hermes." } }],
+      "tool_results": [],
+      "expect": {
+        "outcome": "answered",
+        "final": "Hello from Hermes.",
+        "terminal": "done",
+        "model_calls": 1,
+        "host_calls": [],
+        "tool_events": 0,
+        "last_request_roles": ["user"],
+        "tool_messages": []
+      }
+    },
+    {
+      "id": "single_tool_then_answer",
+      "layer": "loop",
+      "behavior": "A tool call is executed through the host with the model's name and arguments; its result goes back as a tool message carrying the call id; the next reply answers.",
+      "user": "how does staking work?",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"staking\"}" } }]
+          }
+        },
+        { "message": { "role": "assistant", "content": "Staking locks 32,000 SALT." } }
+      ],
+      "tool_results": [{ "ok": "[1] Staking: lock 32000 SALT" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Staking locks 32,000 SALT.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["memory_search"],
+        "host_arguments": ["{\"query\":\"staking\"}"],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "tool_call_id": "c1", "content": "[1] Staking: lock 32000 SALT" }]
+      }
+    },
+    {
+      "id": "multiple_tools_one_step",
+      "layer": "loop",
+      "behavior": "Several tool calls in one reply run in order, each result fed back under its own call id, before the next model request.",
+      "user": "give me a status report",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              { "id": "c1", "type": "function", "function": { "name": "node_status", "arguments": "{}" } },
+              { "id": "c2", "type": "function", "function": { "name": "staking_status", "arguments": "{}" } },
+              { "id": "c3", "type": "function", "function": { "name": "groups_list", "arguments": "{}" } }
+            ]
+          }
+        },
+        { "message": { "role": "assistant", "content": "All good." } }
+      ],
+      "tool_results": [{ "ok": "synced at 100" }, { "ok": "staked 32000" }, { "ok": "[]" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "All good.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["node_status", "staking_status", "groups_list"],
+        "tool_events": 3,
+        "last_request_roles": ["user", "assistant", "tool", "tool", "tool"],
+        "tool_messages": [
+          { "tool_call_id": "c1", "content": "synced at 100" },
+          { "tool_call_id": "c2", "content": "staked 32000" },
+          { "tool_call_id": "c3", "content": "[]" }
+        ]
+      }
+    },
+    {
+      "id": "text_alongside_tool_calls_is_not_final",
+      "layer": "loop",
+      "behavior": "A reply that carries text AND tool calls is not the final answer: the tools run, the text is kept on the assistant message, and the loop continues.",
+      "user": "check my node",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "Let me check.",
+            "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "node_status", "arguments": "{}" } }]
+          }
+        },
+        { "message": { "role": "assistant", "content": "Your node is synced." } }
+      ],
+      "tool_results": [{ "ok": "synced" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Your node is synced.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["node_status"],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "last_request_assistant_content": "Let me check.",
+        "tool_messages": [{ "tool_call_id": "c1", "content": "synced" }]
+      }
+    },
+    {
+      "id": "tool_error_fed_back",
+      "layer": "loop",
+      "behavior": "A failing tool is fed back to the model as 'tool error: <message>' (never swallowed) and the loop continues.",
+      "user": "search my notes",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"notes\"}" } }]
+          }
+        },
+        { "message": { "role": "assistant", "content": "The memory daemon is offline." } }
+      ],
+      "tool_results": [{ "error": "memory daemon offline" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "The memory daemon is offline.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["memory_search"],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "tool_call_id": "c1", "content": "tool error: memory daemon offline" }]
+      }
+    },
+    {
+      "id": "declined_approval_fed_back",
+      "layer": "loop",
+      "behavior": "A write the member declines in the ceremony comes back as a result saying so; the loop continues and the model can explain. The loop never decides an approval itself.",
+      "user": "remember that my validator is alpha",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "memory_assert", "arguments": "{\"fact\":\"validator is alpha\"}" } }]
+          }
+        },
+        { "message": { "role": "assistant", "content": "You declined, so nothing was saved." } }
+      ],
+      "tool_results": [{ "denied": "the member declined the memory write" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "You declined, so nothing was saved.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["memory_assert"],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "tool_call_id": "c1", "content_contains": "the member declined the memory write" }]
+      }
+    },
+    {
+      "id": "turn_cap_exhausted",
+      "layer": "loop",
+      "behavior": "A model that never stops calling tools is cut off after the turn cap with an honest error, never looped forever and never given a fabricated answer.",
+      "user": "loop forever",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"x\"}" } }]
+          }
+        }
+      ],
+      "model_repeat_last": true,
+      "tool_results": [],
+      "tool_result_default": { "ok": "again" },
+      "expect": {
+        "outcome": "step_limit",
+        "terminal": "error",
+        "model_calls": 6,
+        "host_calls": ["memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search"],
+        "tool_events": 6,
+        "last_request_roles": ["user", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool"],
+        "error_contains": { "ts": "tool-turn limit", "loop": "step budget of 6 exhausted", "sidecar": "step budget of 6 exhausted" }
+      }
+    },
+    {
+      "id": "answer_on_last_allowed_turn",
+      "layer": "loop",
+      "behavior": "An answer on the final allowed model request is still an answer (the cap is inclusive).",
+      "user": "dig deep",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"1\"}" } }] } },
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"2\"}" } }] } },
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"3\"}" } }] } },
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c4", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"4\"}" } }] } },
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c5", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"5\"}" } }] } },
+        { "message": { "role": "assistant", "content": "Found it on the sixth try." } }
+      ],
+      "tool_results": [],
+      "tool_result_default": { "ok": "partial" },
+      "expect": {
+        "outcome": "answered",
+        "final": "Found it on the sixth try.",
+        "terminal": "done",
+        "model_calls": 6,
+        "host_calls": ["memory_search", "memory_search", "memory_search", "memory_search", "memory_search"],
+        "tool_events": 5
+      }
+    },
+    {
+      "id": "provider_error",
+      "layer": "loop",
+      "behavior": "A model/transport failure ends the turn with an honest error carrying the cause; no reply is fabricated and no tool runs.",
+      "user": "hi",
+      "model": [{ "error": "gateway unreachable" }],
+      "tool_results": [],
+      "expect": {
+        "outcome": "failed",
+        "terminal": "error",
+        "model_calls": 1,
+        "host_calls": [],
+        "tool_events": 0,
+        "last_request_roles": ["user"],
+        "error_contains": { "ts": "gateway unreachable", "loop": "gateway unreachable", "sidecar": "gateway unreachable" }
+      }
+    },
+    {
+      "id": "provider_error_after_tool",
+      "layer": "loop",
+      "behavior": "A model failure after a tool already ran still ends in an honest error; the completed tool is not rolled back or hidden.",
+      "user": "check then answer",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "node_status", "arguments": "{}" } }] } },
+        { "error": "gateway timed out" }
+      ],
+      "tool_results": [{ "ok": "synced" }],
+      "expect": {
+        "outcome": "failed",
+        "terminal": "error",
+        "model_calls": 2,
+        "host_calls": ["node_status"],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "tool_call_id": "c1", "content": "synced" }],
+        "error_contains": { "ts": "gateway timed out", "loop": "gateway timed out", "sidecar": "gateway timed out" }
+      }
+    },
+    {
+      "id": "history_carried_into_request",
+      "layer": "loop",
+      "behavior": "Prior conversation is sent with the new user message, in order, on the first request of the turn.",
+      "history": [
+        { "role": "user", "content": "my node is called alpha" },
+        { "role": "assistant", "content": "Noted." }
+      ],
+      "user": "what is my node called?",
+      "model": [{ "message": { "role": "assistant", "content": "It is called alpha." } }],
+      "tool_results": [],
+      "expect": {
+        "outcome": "answered",
+        "final": "It is called alpha.",
+        "terminal": "done",
+        "model_calls": 1,
+        "host_calls": [],
+        "tool_events": 0,
+        "first_request_messages": [
+          { "role": "user", "content": "my node is called alpha" },
+          { "role": "assistant", "content": "Noted." },
+          { "role": "user", "content": "what is my node called?" }
+        ]
+      }
+    },
+    {
+      "id": "empty_reply",
+      "layer": "loop",
+      "behavior": "TS: an assistant message with empty content and no tool calls is treated as a final answer of empty text.",
+      "user": "say nothing",
+      "model": [{ "message": { "role": "assistant", "content": "" } }],
+      "tool_results": [],
+      "expect": {
+        "outcome": "answered",
+        "final": "",
+        "terminal": "done",
+        "model_calls": 1,
+        "host_calls": [],
+        "tool_events": 0
+      },
+      "known_divergence": {
+        "reason": "The loop itself matches TS (an empty AssistantTurn is an empty answer), but the sidecar's wire parser rejects an empty assistant message as an unusable response, so the member sees an honest error instead of a blank bubble.",
+        "verdict": "rust_correct",
+        "sidecar": {
+          "outcome": "failed",
+          "terminal": "error",
+          "final": null,
+          "error_contains": "empty assistant message"
+        }
+      }
+    },
+    {
+      "id": "malformed_tool_arguments",
+      "layer": "loop",
+      "behavior": "TS: arguments that are not valid JSON are passed to the host unchanged; core's handler silently falls back to empty arguments and runs the tool.",
+      "user": "status please",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "node_status", "arguments": "{not json" } }] } },
+        { "message": { "role": "assistant", "content": "Done." } }
+      ],
+      "tool_results": [{ "ok": "synced" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Done.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": [],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "tool_call_id": "c1", "content_contains": "not valid JSON" }]
+      },
+      "known_divergence": {
+        "reason": "The Rust loop refuses to dispatch a call whose arguments do not parse and tells the model to retry with a JSON object; the TS loop dispatches it and the handler runs the tool with empty arguments, which hides the model's mistake.",
+        "verdict": "rust_correct",
+        "ts": {
+          "host_calls": ["node_status"],
+          "host_arguments": ["{not json"],
+          "tool_messages": [{ "tool_call_id": "c1", "content": "synced" }]
+        }
+      }
+    },
+    {
+      "id": "unknown_tool",
+      "layer": "loop",
+      "behavior": "TS: a tool name that is not offered is still passed to the host; core's handler has no branch for it and answers 'ok'.",
+      "user": "teleport me",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "teleport", "arguments": "{}" } }] } },
+        { "message": { "role": "assistant", "content": "I cannot do that." } }
+      ],
+      "tool_results": [{ "ok": "ok" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "I cannot do that.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": [],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "tool_call_id": "c1", "content": "tool error: unknown tool 'teleport'" }]
+      },
+      "known_divergence": {
+        "reason": "The Rust loop answers an unknown tool with an error the model can recover from and never reaches a host; the TS loop reaches core's handler, which reports 'ok' for a tool that does not exist.",
+        "verdict": "rust_correct",
+        "ts": {
+          "host_calls": ["teleport"],
+          "tool_messages": [{ "tool_call_id": "c1", "content": "ok" }]
+        }
+      }
+    },
+    {
+      "id": "per_step_tool_cap",
+      "layer": "loop",
+      "behavior": "TS: every tool call in one reply runs, with no per-reply cap.",
+      "user": "check five things",
+      "model": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              { "id": "c1", "type": "function", "function": { "name": "node_status", "arguments": "{}" } },
+              { "id": "c2", "type": "function", "function": { "name": "staking_status", "arguments": "{}" } },
+              { "id": "c3", "type": "function", "function": { "name": "groups_list", "arguments": "{}" } },
+              { "id": "c4", "type": "function", "function": { "name": "skills_list", "arguments": "{}" } },
+              { "id": "c5", "type": "function", "function": { "name": "models_list", "arguments": "{}" } }
+            ]
+          }
+        },
+        { "message": { "role": "assistant", "content": "Checked." } }
+      ],
+      "tool_results": [{ "ok": "r1" }, { "ok": "r2" }, { "ok": "r3" }, { "ok": "r4" }, { "ok": "r5" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Checked.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["node_status", "staking_status", "groups_list", "skills_list"],
+        "tool_events": 5,
+        "last_request_roles": ["user", "assistant", "tool", "tool", "tool", "tool", "tool"],
+        "tool_messages": [
+          { "tool_call_id": "c1", "content": "r1" },
+          { "tool_call_id": "c2", "content": "r2" },
+          { "tool_call_id": "c3", "content": "r3" },
+          { "tool_call_id": "c4", "content": "r4" },
+          { "tool_call_id": "c5", "content_contains": "at most 4 tool calls per step" }
+        ]
+      },
+      "known_divergence": {
+        "reason": "The Rust loop bounds tool runs per reply (sidecar default 4) and tells the model to call the rest next step; the TS loop has no per-reply bound.",
+        "verdict": "rust_correct",
+        "ts": {
+          "host_calls": ["node_status", "staking_status", "groups_list", "skills_list", "models_list"],
+          "tool_messages": [
+            { "tool_call_id": "c1", "content": "r1" },
+            { "tool_call_id": "c2", "content": "r2" },
+            { "tool_call_id": "c3", "content": "r3" },
+            { "tool_call_id": "c4", "content": "r4" },
+            { "tool_call_id": "c5", "content": "r5" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stop_requested_during_tool",
+      "layer": "loop",
+      "behavior": "TS: the loop has no stop control; once started it runs until an answer, an error or the turn cap.",
+      "user": "do a long task",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "node_status", "arguments": "{}" } }] } },
+        { "message": { "role": "assistant", "content": "Finished." } }
+      ],
+      "tool_results": [{ "ok": "synced" }],
+      "stop_after_host_calls": 1,
+      "expect": {
+        "outcome": "stopped",
+        "terminal": "done",
+        "model_calls": 1,
+        "host_calls": ["node_status"],
+        "tool_events": 1,
+        "last_request_roles": ["user"],
+        "tool_messages": []
+      },
+      "known_divergence": {
+        "reason": "The Rust loop checks its stop flag before every model request and every tool run, so a stop takes effect at the next boundary; the TS loop cannot be stopped mid-turn.",
+        "verdict": "rust_correct",
+        "ts": {
+          "outcome": "answered",
+          "final": "Finished.",
+          "model_calls": 2,
+          "last_request_roles": ["user", "assistant", "tool"],
+          "tool_messages": [{ "tool_call_id": "c1", "content": "synced" }]
+        }
+      }
+    },
+    {
+      "id": "unparseable_model_message",
+      "layer": "wire",
+      "behavior": "A model body that is not JSON ends the turn with an honest error; nothing is fabricated.",
+      "user": "hi",
+      "model": [{ "raw": "this is not json" }],
+      "tool_results": [],
+      "expect": {
+        "outcome": "failed",
+        "terminal": "error",
+        "model_calls": 1,
+        "host_calls": [],
+        "tool_events": 0,
+        "error_contains": { "ts": "could not parse the model message", "sidecar": "not JSON" }
+      }
+    },
+    {
+      "id": "missing_tool_call_id",
+      "layer": "wire",
+      "behavior": "A tool call without an id gets a synthesized id; the tool message refers back to that same id.",
+      "user": "status",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "type": "function", "function": { "name": "node_status", "arguments": "{}" } }] } },
+        { "message": { "role": "assistant", "content": "Synced." } }
+      ],
+      "tool_results": [{ "ok": "synced" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Synced.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["node_status"],
+        "tool_events": 1,
+        "last_request_roles": ["user", "assistant", "tool"],
+        "tool_messages": [{ "content": "synced", "id_synthesized": true }]
+      }
+    },
+    {
+      "id": "missing_tool_arguments",
+      "layer": "wire",
+      "behavior": "A tool call without an arguments field is dispatched with '{}'.",
+      "user": "status",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "node_status" } }] } },
+        { "message": { "role": "assistant", "content": "Synced." } }
+      ],
+      "tool_results": [{ "ok": "synced" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Synced.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["node_status"],
+        "host_arguments": ["{}"],
+        "tool_events": 1,
+        "tool_messages": [{ "tool_call_id": "c1", "content": "synced" }]
+      }
+    },
+    {
+      "id": "object_tool_arguments",
+      "layer": "wire",
+      "behavior": "TS: arguments sent as a JSON object instead of a string are passed through as an object, so core's handler cannot parse them and runs the tool with empty arguments.",
+      "user": "search staking",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "memory_search", "arguments": { "query": "staking" } } }] } },
+        { "message": { "role": "assistant", "content": "Found it." } }
+      ],
+      "tool_results": [{ "ok": "hit" }],
+      "expect": {
+        "outcome": "answered",
+        "final": "Found it.",
+        "terminal": "done",
+        "model_calls": 2,
+        "host_calls": ["memory_search"],
+        "host_arguments": ["{\"query\":\"staking\"}"],
+        "tool_events": 1,
+        "tool_messages": [{ "tool_call_id": "c1", "content": "hit" }]
+      },
+      "known_divergence": {
+        "reason": "The sidecar parser normalizes object arguments to a JSON string, so the tool receives the model's real arguments; the TS loop forwards the object as-is and the handler's parse of it fails silently.",
+        "verdict": "rust_correct",
+        "ts": { "host_arguments": [{ "query": "staking" }] }
+      }
+    },
+    {
+      "id": "nameless_tool_call",
+      "layer": "wire",
+      "behavior": "TS: a tool call with no function name is still passed to the host with an empty name; core's handler answers 'ok'.",
+      "user": "do something",
+      "model": [
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c1", "type": "function", "function": { "arguments": "{}" } }] } },
+        { "message": { "role": "assistant", "content": "Done." } }
+      ],
+      "tool_results": [{ "ok": "ok" }],
+      "expect": {
+        "outcome": "failed",
+        "terminal": "error",
+        "model_calls": 1,
+        "host_calls": [],
+        "tool_events": 0,
+        "error_contains": { "ts": "", "sidecar": "empty assistant message" }
+      },
+      "known_divergence": {
+        "reason": "The sidecar parser drops a tool call that names no tool; with no text either, the reply is unusable and the turn fails honestly. The TS loop dispatches a nameless call and core's handler reports 'ok'.",
+        "verdict": "rust_correct",
+        "ts": {
+          "outcome": "answered",
+          "final": "Done.",
+          "terminal": "done",
+          "model_calls": 2,
+          "host_calls": [""],
+          "tool_events": 1,
+          "tool_messages": [{ "tool_call_id": "c1", "content": "ok" }]
+        }
+      }
+    }
+  ]
+}

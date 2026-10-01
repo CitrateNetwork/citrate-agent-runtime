@@ -4,6 +4,8 @@
 //!   CITRATE_HERMES_ADDR         loopback control bind, e.g. 127.0.0.1:19700 (required)
 //!   CITRATE_HERMES_TOKEN_FILE   path to the 0600 bearer-token file citrate-core wrote (required)
 //!   CITRATE_HERMES_CAPSULES     capsule (skill) directory to load; default ./capsules (optional)
+//!   CITRATE_HERMES_SKILLS       HUP-S3.2: SKILL.md instruction-skill directories, a path list in
+//!                               precedence order (first wins); unset = no skills (optional)
 
 use std::sync::Arc;
 
@@ -47,15 +49,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         skills,
         dispatch,
         bearer,
-        run_slots: Arc::new(tokio::sync::Semaphore::new(agent_sidecar::MAX_CONCURRENT_SKILLS)),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(
+            agent_sidecar::MAX_CONCURRENT_SKILLS,
+        )),
+        sessions: agent_sidecar::production_sessions(),
     });
 
     // AR-B-024: the control plane is a bearer-authed LOOPBACK plane by contract.
     // Refuse to bind a non-loopback address (e.g. 0.0.0.0) unless the operator
     // explicitly opts in via CITRATE_HERMES_ALLOW_NONLOOPBACK=1, so a
     // misconfiguration cannot silently expose run_skill/approve to the network.
-    let allow_nonloopback =
-        std::env::var("CITRATE_HERMES_ALLOW_NONLOOPBACK").as_deref() == Ok("1");
+    let allow_nonloopback = std::env::var("CITRATE_HERMES_ALLOW_NONLOOPBACK").as_deref() == Ok("1");
     agent_sidecar::enforce_loopback_bind(&addr, allow_nonloopback)?;
 
     eprintln!(
