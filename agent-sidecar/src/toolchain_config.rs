@@ -18,6 +18,11 @@
 //!   narrower rule).
 //!
 //! Nothing here returns file contents to the model: a refusal names the file and the setting.
+//!
+//! [`build_config_file`] is the matching rule for the agent's file tools: build configuration
+//! (the files above, plus `foundry.toml`, `remappings.txt`, `package.json`, `aderyn.toml`,
+//! make/just files and `.cargo/config*`) is edited by the member, never created, changed, moved
+//! or removed by the agent.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -41,6 +46,38 @@ fn other_build_config(name: &str) -> bool {
 fn env_file(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == ".env" || n.starts_with(".env.")
+}
+
+/// Whether `path` names build configuration the agent's file tools leave to the member. Returns
+/// the file name for the refusal. Matching is on the last component, any case.
+pub(crate) fn build_config_file(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let n = name.to_ascii_lowercase();
+    let in_cargo_dir = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|d| d.eq_ignore_ascii_case(".cargo"));
+    let hit = env_file(&n)
+        || other_build_config(&n)
+        || matches!(
+            n.as_str(),
+            "foundry.toml"
+                | "remappings.txt"
+                | "package.json"
+                | "aderyn.toml"
+                | "makefile"
+                | "gnumakefile"
+                | "justfile"
+        )
+        || (in_cargo_dir && n.starts_with("config"));
+    hit.then_some(name)
+}
+
+/// The refusal the file tools give for [`build_config_file`].
+pub(crate) fn build_config_refusal(name: &str) -> String {
+    format!(
+        "{name} is build configuration, which the member edits; the agent's file tools do not create, change, move or remove it"
+    )
 }
 
 /// Refuse (with the reason) when the project's build configuration asks for more than the agent

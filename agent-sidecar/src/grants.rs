@@ -13,7 +13,10 @@
 //!   [`FolderGrants::check`] at the moment of use, so an expired or revoked grant allows nothing
 //!   from that instant. Reads covered by a folder grant are trusted context; reads that only full
 //!   access covers come back untrusted and taint the session (HUP-S2.7). Writes need a live
-//!   write grant; full access never writes.
+//!   write grant; full access never writes. Reads and listings never follow a symbolic link at
+//!   the last component and leave out files with other hard links. Build configuration
+//!   (`foundry.toml`, env files and the rest of [`crate::toolchain_config::build_config_file`])
+//!   is the member's to edit: `file_write` refuses it.
 //! * **Toolchain project folder** (HUP-S6.3). When the session has a grant document it replaces
 //!   `CITRATE_HERMES_TOOLCHAIN_ROOTS`: the project must be covered by live read **and** write
 //!   folder grants (forge reads the sources and writes `out/` and `cache/`).
@@ -313,6 +316,9 @@ impl FileToolHost {
     }
 
     fn list(&self, path: &Path) -> ToolOutcome {
+        if let Some(why) = leaf_link(path) {
+            return ToolOutcome::Denied(why);
+        }
         let (dir, kind) = match self.grants.check(path, Op::Read) {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
@@ -321,20 +327,25 @@ impl FileToolHost {
             Ok(r) => r,
             Err(e) => return ToolOutcome::Error(format!("cannot list {}: {e}", dir.display())),
         };
-        let mut names: Vec<(String, std::fs::FileType)> = rd
+        // DirEntry metadata does not follow a symlink, so a link is listed as a link.
+        let mut names: Vec<(String, std::fs::Metadata)> = rd
             .filter_map(|e| e.ok())
             .filter_map(|e| {
-                let ft = e.file_type().ok()?;
-                Some((e.file_name().to_string_lossy().into_owned(), ft))
+                let m = e.metadata().ok()?;
+                Some((e.file_name().to_string_lossy().into_owned(), m))
             })
             .collect();
         names.sort_by(|a, b| a.0.cmp(&b.0));
         let mut entries = Vec::new();
         let mut hidden = 0usize;
         let mut truncated = false;
-        for (name, ft) in names {
-            // Show only what the agent could read itself (the deny list wins here too).
-            if self.grants.check(&dir.join(&name), Op::Read).is_err() {
+        for (name, meta) in names {
+            let ft = meta.file_type();
+            // Show only what the agent could read itself (the deny list wins here too; a file
+            // with other hard links is not read, so it is not listed).
+            if (ft.is_file() && hard_linked(&meta))
+                || self.grants.check(&dir.join(&name), Op::Read).is_err()
+            {
                 hidden += 1;
                 continue;
             }
@@ -369,6 +380,9 @@ impl FileToolHost {
     }
 
     fn read(&self, path: &Path) -> ToolOutcome {
+        if let Some(why) = leaf_link(path) {
+            return ToolOutcome::Denied(why);
+        }
         let (file, kind) = match self.grants.check(path, Op::Read) {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
@@ -383,6 +397,12 @@ impl FileToolHost {
         };
         if !meta.is_file() {
             return ToolOutcome::Error(format!("{} is not a regular file", file.display()));
+        }
+        if hard_linked(&meta) {
+            return ToolOutcome::Denied(format!(
+                "{} has other hard links, so it may be a file outside the grant; it was not read",
+                file.display()
+            ));
         }
         if meta.len() > MAX_READ_BYTES {
             return ToolOutcome::Error(format!(
@@ -421,10 +441,16 @@ impl FileToolHost {
                 content.len()
             ));
         }
+        if let Some(name) = crate::toolchain_config::build_config_file(path) {
+            return ToolOutcome::Denied(crate::toolchain_config::build_config_refusal(&name));
+        }
         let (file, _) = match self.grants.check(path, Op::Write) {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
         };
+        if let Some(name) = crate::toolchain_config::build_config_file(&file) {
+            return ToolOutcome::Denied(crate::toolchain_config::build_config_refusal(&name));
+        }
         match std::fs::symlink_metadata(&file) {
             Ok(m) if m.file_type().is_symlink() => {
                 return ToolOutcome::Denied(format!("{} is a symbolic link", file.display()))
@@ -473,6 +499,18 @@ impl ToolHost for FileToolHost {
             },
             other => ToolOutcome::Error(format!("'{other}' is not a file tool")),
         }
+    }
+}
+
+/// A refusal when `path` itself (the last component, as given) is a symbolic link: the read
+/// tools do not follow one, even to a place the grants cover.
+pub(crate) fn leaf_link(path: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Some(format!(
+            "{} is a symbolic link, which the file tools do not follow",
+            path.display()
+        )),
+        _ => None,
     }
 }
 
