@@ -14,6 +14,7 @@ members = [
     "hermes/discord",
     "agent-sidecar",
     "agent-loop",
+    "agent-shell",
     "agent-guard",
 ]
 default-members = ["agent/cli"]
