@@ -122,6 +122,46 @@ impl UnsignedAnchorCall {
             data: anchor_calldata(AnchorKind::NightlyMerkle, &root),
         }
     }
+
+    /// Check that the call is what it says it is, for a call that crossed a process boundary
+    /// (for example read back from JSON) before core shows it on an approval card: chain 40204,
+    /// no value, `data` decodes strictly to exactly `kind` and `root`, and `to`, when present, is
+    /// a `0x`-prefixed 20-byte hex address.
+    pub fn validate(&self) -> Result<()> {
+        if self.chain_id != CITRATE_CHAIN_ID {
+            return Err(Error::BadCalldata(format!(
+                "chain id {} is not {CITRATE_CHAIN_ID}",
+                self.chain_id
+            )));
+        }
+        if self.value != 0 {
+            return Err(Error::BadCalldata("an anchor call moves no value".into()));
+        }
+        let (kind, root) = decode_anchor_calldata(&self.data)?;
+        if kind != self.kind || root != self.root {
+            return Err(Error::BadCalldata(
+                "data does not encode the call's kind and root".into(),
+            ));
+        }
+        if let Some(to) = &self.to {
+            check_address(to)?;
+        }
+        Ok(())
+    }
+}
+
+/// A `0x`-prefixed 20-byte hex address (any letter case; no checksum check).
+pub(crate) fn check_address(s: &str) -> Result<()> {
+    let ok = s
+        .strip_prefix("0x")
+        .is_some_and(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::BadCalldata(
+            "registry address is not 0x followed by 40 hex digits".into(),
+        ))
+    }
 }
 
 mod hex_bytes {

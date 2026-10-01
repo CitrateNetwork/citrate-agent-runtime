@@ -85,6 +85,29 @@ impl LedgerEntry {
     }
 }
 
+/// An entry read from disk must be one this ledger could have written: a non-empty range whose
+/// count matches it, and for a batched day a root whose commitment is the stored one (an
+/// incomplete day has neither).
+fn check_entry(e: &LedgerEntry) -> Result<()> {
+    let bad = |what: &str| Err(Error::Corrupt(format!("day {}: {what}", e.day)));
+    if e.last_seq < e.first_seq || e.last_seq - e.first_seq != e.count.wrapping_sub(1) {
+        return bad("count does not match the seq range");
+    }
+    match e.status {
+        EntryStatus::Batched => match e.header() {
+            Some(h) if h.well_formed() && e.commitment == Some(h.commitment()) => Ok(()),
+            _ => bad("the stored commitment is not the commitment of the stored batch"),
+        },
+        EntryStatus::Incomplete if e.tree_root.is_none() && e.commitment.is_none() => {
+            if e.confirmed.is_some() {
+                return bad("an incomplete day cannot be confirmed");
+            }
+            Ok(())
+        }
+        EntryStatus::Incomplete => bad("an incomplete day carries a root"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LedgerFile {
@@ -153,6 +176,18 @@ impl AnchorLedger {
                 return Err(Error::Corrupt(
                     "entries are not in strictly increasing day order".into(),
                 ));
+            }
+        }
+        for (i, e) in file.entries.iter().enumerate() {
+            check_entry(e)?;
+            if let Some(o) = file.entries[i + 1..]
+                .iter()
+                .find(|o| o.overlaps(e.first_seq, e.last_seq))
+            {
+                return Err(Error::Corrupt(format!(
+                    "days {} and {} claim the same records",
+                    e.day, o.day
+                )));
             }
         }
         Ok(file)

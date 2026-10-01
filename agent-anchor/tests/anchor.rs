@@ -8,8 +8,8 @@ use std::sync::Arc;
 use citrate_agent_anchor::{
     anchor_calldata, build_day_batch, decode_anchor_calldata, is_anchored_calldata, pending_days,
     plan_day, prove, verify_proof, verify_record_proof, AnchorKind, AnchorLedger, BatchHeader,
-    EntryStatus, Error, NightlyPlan, RecordOutcome, Tree, ANCHOR_SELECTOR, ANCHOR_SIGNATURE,
-    CITRATE_CHAIN_ID, COMMITMENT_DOMAIN, IS_ANCHORED_SELECTOR,
+    EntryStatus, Error, NightlyPlan, RecordOutcome, Tree, UnsignedAnchorCall, ANCHOR_SELECTOR,
+    ANCHOR_SIGNATURE, CITRATE_CHAIN_ID, COMMITMENT_DOMAIN, IS_ANCHORED_SELECTOR,
 };
 use citrate_agent_records::merkle::{self, RetainedLeaf};
 use citrate_agent_records::{
@@ -704,4 +704,155 @@ fn prove_says_so_when_a_batched_day_was_pruned_afterwards() {
         panic!("ready from the ledger")
     };
     assert_eq!(again, commitment);
+}
+
+// ---------------------------------------------------------------------------------------------
+// review hardening (HUP-S7.3 adversarial review)
+
+#[test]
+fn verify_record_proof_refuses_a_self_consistent_record_that_is_not_the_leaf() {
+    let rec = tempfile::tempdir().unwrap();
+    let led = tempfile::tempdir().unwrap();
+    log_with_days(rec.path(), 10, &[3], LogConfig::default());
+    let ledger = AnchorLedger::open(led.path()).unwrap();
+    let NightlyPlan::Ready { commitment, .. } =
+        plan_day(rec.path(), &ledger, 10, 11 * DAY, None).unwrap()
+    else {
+        panic!("ready")
+    };
+    let p = prove(rec.path(), &ledger, 1).unwrap().expect("proof");
+    let real = read::get(rec.path(), 1).unwrap().expect("record");
+    assert!(verify_record_proof(&real, &p, &commitment).unwrap());
+    // Same seq, same day, a body that hashes to its own stored hash, but not the batched record.
+    let mut forged = real;
+    forged.record.prev = "00".repeat(32);
+    forged.hash = forged.record.hash_hex().unwrap();
+    assert!(forged.hash_matches().unwrap());
+    assert!(!verify_record_proof(&forged, &p, &commitment).unwrap());
+}
+
+#[test]
+fn unsigned_call_validate_accepts_a_built_call_and_refuses_an_inconsistent_one() {
+    let root = [0x33u8; 32];
+    let to = "0x00000000000000000000000000000000000000aA";
+    let good = UnsignedAnchorCall::nightly(root, Some(to));
+    good.validate().unwrap();
+    UnsignedAnchorCall::nightly(root, None).validate().unwrap();
+
+    let mut x = good.clone();
+    x.data = anchor_calldata(AnchorKind::NightlyMerkle, &[0x44u8; 32]);
+    assert!(x.validate().is_err(), "data names another root than `root`");
+    let mut x = good.clone();
+    x.data = anchor_calldata(AnchorKind::PerApproval, &root);
+    assert!(x.validate().is_err(), "data names another kind");
+    let mut x = good.clone();
+    x.kind = AnchorKind::PerCapsule;
+    assert!(x.validate().is_err(), "kind field disagrees");
+    let mut x = good.clone();
+    x.value = 1;
+    assert!(x.validate().is_err(), "value");
+    let mut x = good.clone();
+    x.chain_id = 1;
+    assert!(x.validate().is_err(), "chain id");
+    for bad in [
+        "",
+        "0x",
+        "00000000000000000000000000000000000000aa00",
+        "0x00000000000000000000000000000000000000a",
+        "0x00000000000000000000000000000000000000aaa",
+        "0x00000000000000000000000000000000000000zz",
+        " 0x00000000000000000000000000000000000000aa",
+    ] {
+        let mut x = good.clone();
+        x.to = Some(bad.to_owned());
+        assert!(x.validate().is_err(), "address {bad:?}");
+    }
+    // A call read back from JSON with its data swapped is refused.
+    let mut v = serde_json::to_value(&good).unwrap();
+    v["data"] = serde_json::Value::String(format!(
+        "0x{}",
+        hex::encode(anchor_calldata(AnchorKind::NightlyMerkle, &[0x55u8; 32]))
+    ));
+    let back: UnsignedAnchorCall = serde_json::from_value(v).unwrap();
+    assert!(back.validate().is_err());
+}
+
+#[test]
+fn plan_refuses_a_malformed_registry_address_and_records_nothing() {
+    let rec = tempfile::tempdir().unwrap();
+    let led = tempfile::tempdir().unwrap();
+    log_with_days(rec.path(), 100, &[2], LogConfig::default());
+    let ledger = AnchorLedger::open(led.path()).unwrap();
+    assert!(matches!(
+        plan_day(rec.path(), &ledger, 100, 101 * DAY, Some("not-an-address")),
+        Err(Error::BadCalldata(_))
+    ));
+    assert!(ledger.entries().unwrap().is_empty());
+    let NightlyPlan::Ready { call, .. } = plan_day(
+        rec.path(),
+        &ledger,
+        100,
+        101 * DAY,
+        Some("0x00000000000000000000000000000000000000aa"),
+    )
+    .unwrap() else {
+        panic!("ready")
+    };
+    call.validate().unwrap();
+}
+
+#[test]
+fn ledger_refuses_to_open_an_inconsistent_file() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let ledger = AnchorLedger::open(d.path()).unwrap();
+        let b = build_day_batch(3, &leaves(3, 0, 4))
+            .unwrap()
+            .expect("batch");
+        ledger.record_batched(b.header(), 1).unwrap();
+        let c = build_day_batch(4, &leaves(4, 4, 2))
+            .unwrap()
+            .expect("batch");
+        ledger.record_batched(c.header(), 1).unwrap();
+    }
+    let path = d.path().join("ANCHOR_LEDGER.json");
+    let good: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    AnchorLedger::open(d.path()).unwrap();
+
+    let reopen_with = |v: &serde_json::Value| {
+        fs::write(&path, serde_json::to_vec(v).unwrap()).unwrap();
+        AnchorLedger::open(d.path())
+    };
+    // A stored commitment that is not the commitment of the stored header.
+    let mut v = good.clone();
+    v["entries"][0]["commitment"] = serde_json::Value::String("ab".repeat(32));
+    assert!(
+        matches!(reopen_with(&v), Err(Error::Corrupt(_))),
+        "commitment"
+    );
+    // A batched entry with no root.
+    let mut v = good.clone();
+    v["entries"][0]["tree_root"] = serde_json::Value::Null;
+    assert!(matches!(reopen_with(&v), Err(Error::Corrupt(_))), "no root");
+    // A count that disagrees with the range.
+    let mut v = good.clone();
+    v["entries"][0]["count"] = serde_json::json!(9);
+    assert!(matches!(reopen_with(&v), Err(Error::Corrupt(_))), "count");
+    // Two days claiming the same record.
+    let mut v = good.clone();
+    v["entries"][1]["status"] = serde_json::json!("incomplete");
+    v["entries"][1]["tree_root"] = serde_json::Value::Null;
+    v["entries"][1]["commitment"] = serde_json::Value::Null;
+    v["entries"][1]["first_seq"] = serde_json::json!(3);
+    v["entries"][1]["count"] = serde_json::json!(3);
+    assert!(matches!(reopen_with(&v), Err(Error::Corrupt(_))), "overlap");
+    // An incomplete entry carrying a commitment.
+    let mut v = good.clone();
+    v["entries"][1]["status"] = serde_json::json!("incomplete");
+    assert!(
+        matches!(reopen_with(&v), Err(Error::Corrupt(_))),
+        "incomplete with root"
+    );
+    // The untouched file still opens.
+    reopen_with(&good).unwrap();
 }

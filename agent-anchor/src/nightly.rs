@@ -7,7 +7,7 @@ use std::path::Path;
 use citrate_agent_records::merkle::{retained_leaves, utc_day};
 
 use crate::batch::{build_day_batch, AnchorProof, BatchHeader};
-use crate::calldata::UnsignedAnchorCall;
+use crate::calldata::{check_address, UnsignedAnchorCall};
 use crate::error::{Error, Result};
 use crate::ledger::{AnchorLedger, EntryStatus, LedgerEntry};
 
@@ -49,7 +49,8 @@ fn ready(header: BatchHeader, registry: Option<&str>, newly_recorded: bool) -> N
 /// Plan UTC day `day` at wall-clock `now_ms`. Only a closed day (before today) is batched, so no
 /// record can join a day after its root is fixed. Verifies the record chain first (a broken chain
 /// is an error) and records the batch, or the incomplete report, in the ledger. `registry` is the
-/// `AnchorRegistry` address for the unsigned call, when known.
+/// `AnchorRegistry` address for the unsigned call, when known; a malformed address is refused
+/// ([`Error::BadCalldata`]) before anything is recorded.
 pub fn plan_day(
     records_dir: &Path,
     ledger: &AnchorLedger,
@@ -60,6 +61,9 @@ pub fn plan_day(
     let today = utc_day(now_ms);
     if day >= today {
         return Err(Error::DayNotClosed { day, today });
+    }
+    if let Some(to) = registry {
+        check_address(to)?;
     }
     let existing = ledger.get(day)?;
     if let Some(e) = &existing {
