@@ -27,6 +27,11 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S5.1: when the browser is enabled (`CITRATE_HERMES_BROWSER=1`, default off), every
+//!   session is offered the sidecar-hosted `browser_*` tools (names reserved). Page content is
+//!   untrusted; after taint each effectful browser action waits for the member's decision on the
+//!   browser control routes, so the sidecar host can honor explicit approval for those calls (and
+//!   still declines every other effectful sidecar call, as before). Unset, nothing here changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +39,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
+use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
 use citrate_agent_loop::{
@@ -329,7 +336,7 @@ impl ToolHost for CoreHost {
 
 /// Executes sidecar-hosted tools: installed capsules through the capsule dispatch (whose chain
 /// effects still park on the approval queue for a human).
-struct CapsuleHost {
+pub(crate) struct CapsuleHost {
     dispatch: Arc<CapsuleDispatch>,
 }
 
@@ -350,16 +357,23 @@ impl ToolHost for CapsuleHost {
 
 /// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, the
 /// toolchain tools to the toolchain host (when enabled), an offered `mcp__…` tool to its MCP
-/// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
-struct SidecarHost {
-    skills: Option<SkillHost>,
-    toolchain: Option<Arc<ToolchainHost>>,
-    mcp: Option<McpToolHost>,
-    capsules: Option<CapsuleHost>,
+/// server (HUP-S4.1), a `browser_*` tool to the browser (HUP-S5.1, when enabled), anything else
+/// to the capsule dispatch (when capsules are loaded).
+pub(crate) struct SidecarHost {
+    pub(crate) skills: Option<SkillHost>,
+    pub(crate) toolchain: Option<Arc<ToolchainHost>>,
+    pub(crate) mcp: Option<McpToolHost>,
+    pub(crate) capsules: Option<CapsuleHost>,
+    pub(crate) browser: Option<BrowserToolHost>,
 }
 
 impl ToolHost for SidecarHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if browser_tools::handles(&call.name) {
+            if let Some(b) = &self.browser {
+                return b.execute(call);
+            }
+        }
         if call.name == SKILL_LOAD_TOOL {
             if let Some(h) = &self.skills {
                 return h.execute(call);
@@ -378,6 +392,24 @@ impl ToolHost for SidecarHost {
         match &self.capsules {
             Some(c) => c.execute(call),
             None => ToolOutcome::Error(format!("'{}' is not available in this session", call.name)),
+        }
+    }
+
+    /// HUP-S5.1: only the browser can put an action in front of the member (its decision routes).
+    /// Without the browser this stays false, so the loop declines as before.
+    fn honors_explicit_approval(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        match &self.browser {
+            Some(b) if browser_tools::handles(&call.name) => {
+                b.execute_with_explicit_approval(call, reason)
+            }
+            _ => ToolOutcome::Denied(
+                "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
+                    .into(),
+            ),
         }
     }
 }
@@ -400,6 +432,7 @@ pub struct SessionManager {
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<Arc<McpHost>>,
+    browser: Option<Arc<BrowserService>>,
 }
 
 impl SessionManager {
@@ -412,7 +445,19 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            browser: None,
         }
+    }
+
+    /// HUP-S5.1: offer the browser tools to every new session.
+    pub fn with_browser(mut self, browser: Arc<BrowserService>) -> Self {
+        self.browser = Some(browser);
+        self
+    }
+
+    /// HUP-S5.1: the browser worker (`None` when the browser is off).
+    pub fn browser(&self) -> Option<&Arc<BrowserService>> {
+        self.browser.as_ref()
     }
 
     /// HUP-S6.3: offer the toolchain tools to every new session.
@@ -476,6 +521,15 @@ impl SessionManager {
                 )));
             }
             specs.extend(mcp.specs());
+        }
+        if self.browser.is_some() {
+            if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while the browser is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(browser_tools::specs());
         }
         let mut sessions = self
             .sessions
@@ -575,10 +629,15 @@ impl SessionManager {
             .mcp
             .clone()
             .map(|h| McpToolHost::new(h, session.stop.clone()));
+        let browser_host = self
+            .browser
+            .clone()
+            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
         if skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
             || mcp_host.is_some()
+            || browser_host.is_some()
         {
             registry = registry.with_host(
                 HostKind::Sidecar,
@@ -587,6 +646,7 @@ impl SessionManager {
                     toolchain,
                     mcp: mcp_host,
                     capsules: capsule_host,
+                    browser: browser_host,
                 }),
             );
         }

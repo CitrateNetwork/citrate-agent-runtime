@@ -15,6 +15,10 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
+//!                               serves the /browser control routes; anything else = off (optional)
+//!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
+//!                               updater); unset = a system Chromium if one exists (optional)
 
 use std::sync::Arc;
 

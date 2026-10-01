@@ -57,6 +57,7 @@ name = "agent-sidecar"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "citrate-agent-browser",
  "citrate-agent-core",
  "citrate-agent-guard",
  "citrate-agent-legacy",
@@ -1009,6 +1010,19 @@ dependencies = [
  "sha3",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "citrate-agent-browser"
+version = "0.4.0"
+dependencies = [
+ "citrate-agent-loop",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+ "tungstenite",
+ "url",
 ]
 
 [[package]]
