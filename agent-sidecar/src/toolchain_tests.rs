@@ -559,7 +559,9 @@ fn slither_scan_reads_sarif_from_stdout_whatever_the_exit_code() {
             "--sarif",
             "-",
             "--exclude-dependencies",
-            "--disable-color"
+            "--disable-color",
+            "--compile-force-framework",
+            "foundry"
         ]
     );
     // FOUNDRY_* reach the forge build slither starts.
@@ -723,6 +725,189 @@ fn output_over_the_capture_cap_is_not_judged() {
     assert!(matches!(out, ToolOutcome::Error(_)));
     assert_eq!(env.status, RunStatus::Failed);
     assert!(env.summary.contains("capture limit"), "{}", env.summary);
+}
+
+// ------------------------------------------------------------------------------------------
+// Project build configuration (checked before anything runs)
+// ------------------------------------------------------------------------------------------
+
+/// The call is refused with `needle` in the summary and the stand-in never ran.
+fn assert_config_refused(s: &Scratch, tool: &str, needle: &str) {
+    let program = match tool {
+        FORGE_TEST_TOOL => "forge",
+        SLITHER_SCAN_TOOL => "slither",
+        ADERYN_SCAN_TOOL => "aderyn",
+        _ => "medusa",
+    };
+    let _ = std::fs::remove_file(s.base.join(format!("{program}.args")));
+    let (out, env) = run(&s.host(), tool, serde_json::json!({"project": s.proj()}));
+    assert!(
+        matches!(out, ToolOutcome::Error(_)),
+        "{tool}: {}",
+        env.summary
+    );
+    assert_eq!(env.status, RunStatus::Refused, "{tool}: {}", env.summary);
+    assert!(env.summary.contains(needle), "{tool}: {}", env.summary);
+    assert!(
+        !s.base.join(format!("{program}.args")).exists(),
+        "{program} ran although the project configuration was refused"
+    );
+}
+
+fn fake_all(s: &Scratch) {
+    s.fake("forge", Some("forge-test-pass.json"), "", 0);
+    s.fake("slither", Some("slither-medium.sarif"), "", 0);
+    s.fake("aderyn", Some("slither-medium.sarif"), "", 0);
+    s.fake("medusa", None, "", 0);
+}
+
+const ALL_TOOLS: [&str; 4] = [
+    FORGE_TEST_TOOL,
+    SLITHER_SCAN_TOOL,
+    ADERYN_SCAN_TOOL,
+    MEDUSA_FUZZ_TOOL,
+];
+
+#[test]
+fn a_foundry_toml_that_turns_on_ffi_in_any_profile_is_refused() {
+    let s = Scratch::new();
+    fake_all(&s);
+    std::fs::write(
+        s.proj().join("foundry.toml"),
+        "[profile.default]\nsrc = \"src\"\n\n[profile.ci]\nffi = true\n",
+    )
+    .unwrap();
+    for tool in ALL_TOOLS {
+        assert_config_refused(&s, tool, "ffi");
+    }
+}
+
+#[test]
+fn fs_permissions_beyond_reading_inside_the_project_are_refused() {
+    for perms in [
+        r#"[{ access = "read-write", path = "./" }]"#,
+        r#"[{ access = "write", path = "./out" }]"#,
+        r#"[{ access = true, path = "./" }]"#,
+        r#"[{ access = "read", path = "/" }]"#,
+        r#"[{ access = "read", path = "../" }]"#,
+        r#"[{ access = "read", path = "~/x" }]"#,
+        r#"[{ access = "read" }]"#,
+        r#""read""#,
+    ] {
+        let s = Scratch::new();
+        fake_all(&s);
+        std::fs::write(
+            s.proj().join("foundry.toml"),
+            format!("[profile.default]\nfs_permissions = {perms}\n"),
+        )
+        .unwrap();
+        assert_config_refused(&s, FORGE_TEST_TOOL, "fs_permissions");
+    }
+}
+
+#[test]
+fn read_only_fs_permissions_inside_the_project_still_run() {
+    let s = Scratch::new();
+    fake_all(&s);
+    std::fs::write(
+        s.proj().join("foundry.toml"),
+        "[profile.default]\nffi = false\nsolc = \"0.8.36\"\nfs_permissions = [{ access = \"read\", path = \"./out\" }, { access = \"none\", path = \"./\" }]\n",
+    )
+    .unwrap();
+    let (_, env) = run(
+        &s.host(),
+        FORGE_TEST_TOOL,
+        serde_json::json!({"project": s.proj()}),
+    );
+    assert_eq!(env.status, RunStatus::Completed, "{}", env.summary);
+}
+
+#[test]
+fn a_compiler_given_as_a_file_path_is_refused() {
+    for line in [
+        "solc = \"./bin/solc\"",
+        "solc_version = \"/usr/local/bin/solc\"",
+        "solc = \"solc-custom\"",
+    ] {
+        let s = Scratch::new();
+        fake_all(&s);
+        std::fs::write(
+            s.proj().join("foundry.toml"),
+            format!("[profile.default]\n{line}\n"),
+        )
+        .unwrap();
+        assert_config_refused(&s, FORGE_TEST_TOOL, "solc");
+    }
+}
+
+#[test]
+fn an_unreadable_foundry_toml_is_refused() {
+    let s = Scratch::new();
+    fake_all(&s);
+    std::fs::write(s.proj().join("foundry.toml"), "[profile.default\nffi = ").unwrap();
+    assert_config_refused(&s, FORGE_TEST_TOOL, "foundry.toml");
+}
+
+#[test]
+fn the_nearest_foundry_toml_above_the_project_is_checked_too() {
+    let s = Scratch::new();
+    fake_all(&s);
+    std::fs::write(
+        s.root().join("foundry.toml"),
+        "[profile.default]\nffi = true\n",
+    )
+    .unwrap();
+    assert_config_refused(&s, FORGE_TEST_TOOL, "ffi");
+}
+
+#[test]
+fn an_env_file_in_the_project_is_refused() {
+    for name in [".env", ".env.local"] {
+        let s = Scratch::new();
+        fake_all(&s);
+        std::fs::write(s.proj().join(name), "RPC_URL=http://127.0.0.1:8545\n").unwrap();
+        for tool in ALL_TOOLS {
+            assert_config_refused(&s, tool, name);
+        }
+    }
+}
+
+#[test]
+fn other_build_tool_configs_in_the_project_are_refused() {
+    for name in [
+        "slither.config.json",
+        "medusa.json",
+        "hardhat.config.ts",
+        "hardhat.config.js",
+        "truffle-config.js",
+    ] {
+        let s = Scratch::new();
+        fake_all(&s);
+        std::fs::write(s.proj().join(name), "{}").unwrap();
+        for tool in ALL_TOOLS {
+            assert_config_refused(&s, tool, name);
+        }
+    }
+}
+
+#[test]
+fn a_plain_project_still_runs_every_tool() {
+    let s = Scratch::new();
+    fake_all(&s);
+    std::fs::write(
+        s.proj().join("foundry.toml"),
+        "[profile.default]\nsrc = \"src\"\nlibs = [\"lib\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        s.proj().join("remappings.txt"),
+        "forge-std/=lib/forge-std/src/\n",
+    )
+    .unwrap();
+    for tool in ALL_TOOLS {
+        let (_, env) = run(&s.host(), tool, serde_json::json!({"project": s.proj()}));
+        assert_ne!(env.status, RunStatus::Refused, "{tool}: {}", env.summary);
+    }
 }
 
 // ------------------------------------------------------------------------------------------
