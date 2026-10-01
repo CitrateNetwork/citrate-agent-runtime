@@ -50,6 +50,7 @@ use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
+use crate::sheets::SheetToolHost;
 use crate::toolchain::ToolchainHost;
 
 /// At most this many open sessions (a session is a conversation, not a request).
@@ -376,6 +377,8 @@ impl ToolHost for CapsuleHost {
 /// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
 struct SidecarHost {
     files: Option<FileToolHost>,
+    /// HUP-S10.2: the sheet tools, present with the file tools.
+    sheets: Option<SheetToolHost>,
     skills: Option<SkillHost>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<McpToolHost>,
@@ -387,6 +390,11 @@ impl ToolHost for SidecarHost {
         if crate::grants::handles(&call.name) {
             if let Some(f) = &self.files {
                 return f.execute(call);
+            }
+        }
+        if crate::sheets::handles(&call.name) {
+            if let Some(s) = &self.sheets {
+                return s.execute(call);
             }
         }
         if call.name == SKILL_LOAD_TOOL {
@@ -526,7 +534,10 @@ impl SessionManager {
                         "folder grants need the member's home directory, which the sidecar does not know".into(),
                     )
                 })?;
-                if let Some(t) = specs.iter().find(|t| crate::grants::handles(&t.name)) {
+                if let Some(t) = specs
+                    .iter()
+                    .find(|t| crate::grants::handles(&t.name) || crate::sheets::handles(&t.name))
+                {
                     return Err(SessionError::Invalid(format!(
                         "the tool name '{}' is reserved by the sidecar while folder grants are given",
                         t.name
@@ -537,6 +548,7 @@ impl SessionManager {
                     SessionError::Invalid(format!("the grant document was refused: {e}"))
                 })?;
                 specs.extend(crate::grants::file_tool_specs());
+                specs.extend(crate::sheets::sheet_tool_specs());
                 Some(Arc::new(g))
             }
         };
@@ -642,6 +654,7 @@ impl SessionManager {
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
         let toolchain = session.toolchain.clone();
         let file_host = session.grants.clone().map(FileToolHost::new);
+        let sheet_host = session.grants.clone().map(SheetToolHost::new);
         let mcp_host = self
             .mcp
             .clone()
@@ -656,6 +669,7 @@ impl SessionManager {
                 HostKind::Sidecar,
                 Arc::new(SidecarHost {
                     files: file_host,
+                    sheets: sheet_host,
                     skills: skill_host,
                     toolchain,
                     mcp: mcp_host,

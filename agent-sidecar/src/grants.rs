@@ -440,19 +440,19 @@ impl ToolHost for FileToolHost {
 }
 
 #[cfg(unix)]
-fn hard_linked(m: &std::fs::Metadata) -> bool {
+pub(crate) fn hard_linked(m: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     m.nlink() > 1
 }
 
 #[cfg(not(unix))]
-fn hard_linked(_m: &std::fs::Metadata) -> bool {
+pub(crate) fn hard_linked(_m: &std::fs::Metadata) -> bool {
     false
 }
 
 /// Open without following a symlink at the leaf (where the OS allows), so a link swapped in after
 /// the check is refused instead of followed.
-fn open_nofollow(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_nofollow(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
     if write {
         o.write(true).create(true).truncate(true);

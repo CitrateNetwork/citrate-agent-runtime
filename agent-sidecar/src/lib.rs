@@ -21,6 +21,7 @@
 pub mod grants;
 pub mod llm_http;
 pub mod sessions;
+pub mod sheets;
 pub mod toolchain;
 
 use std::sync::Arc;
@@ -946,6 +947,8 @@ mod grants_session_tests;
 mod mcp_session_tests;
 #[cfg(test)]
 mod sessions_tests;
+#[cfg(test)]
+mod sheets_session_tests;
 #[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]
