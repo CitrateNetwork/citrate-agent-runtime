@@ -50,10 +50,11 @@
 //!
 //! ## Status
 //!
-//! Implemented and tested in this crate. Not wired into the agent sessions,
-//! the file tools or capsule preopens yet, and core has no Grants UI yet;
-//! both are later work packages. The persistence format ([`GrantState`]) is
-//! what core will store.
+//! Implemented and tested in this crate. Capsule WASI preopens are scoped
+//! to these grants (`citrate_agent_core::capsule::sandbox`, HUP-S2.5). Not
+//! wired into the agent sessions or the file tools yet, the sidecar passes no
+//! grants to capsules yet, and core has no Grants UI yet; those are later work
+//! packages. The persistence format ([`GrantState`]) is what core will store.
 
 use citrate_agent_guard::{check_path, Denied, GuardContext};
 use serde::{Deserialize, Serialize};

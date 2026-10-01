@@ -11,6 +11,26 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Whether `t` from server `sc` is offered to the model, and as which spec. `taken` says whether
+/// an exposed name is already used. The same decision drives the session host and the dry-run
+/// probe (HUP-S4.4), so the review screen shows exactly what a session would get.
+pub(crate) fn offer(
+    sc: &ServerConfig,
+    t: &crate::client::RemoteTool,
+    taken: impl Fn(&str) -> bool,
+) -> Result<ToolSpec, String> {
+    let spec = to_spec(&sc.name, t)?;
+    if !sc.allow_write_tools && spec.annotations.effect != Some(Effect::None) {
+        return Err(
+            "not annotated read-only, and this server does not allow write tools".to_string(),
+        );
+    }
+    if taken(&spec.name) {
+        return Err("its name collides after mapping".to_string());
+    }
+    Ok(spec)
+}
+
 /// A server's state as shown to the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,25 +121,11 @@ impl McpHost {
             match connected {
                 Ok((client, tools)) => {
                     for t in tools {
-                        match to_spec(&sc.name, &t) {
+                        match offer(sc, &t, |n| routes.contains_key(n)) {
                             Err(why) => e.skipped.push(format!("{}: {why}", t.name)),
                             Ok(spec) => {
-                                if !sc.allow_write_tools
-                                    && spec.annotations.effect != Some(Effect::None)
-                                {
-                                    e.skipped.push(format!(
-                                        "{}: not annotated read-only, and this server does not allow write tools",
-                                        t.name
-                                    ));
-                                } else if routes.contains_key(&spec.name) {
-                                    e.skipped.push(format!(
-                                        "{}: its name collides after mapping",
-                                        t.name
-                                    ));
-                                } else {
-                                    routes.insert(spec.name.clone(), (idx, t.name.clone()));
-                                    e.specs.push(spec);
-                                }
+                                routes.insert(spec.name.clone(), (idx, t.name.clone()));
+                                e.specs.push(spec);
                             }
                         }
                     }

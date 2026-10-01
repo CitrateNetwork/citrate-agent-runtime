@@ -57,18 +57,25 @@ name = "agent-sidecar"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "citrate-agent-anchor",
  "citrate-agent-core",
+ "citrate-agent-escalation",
  "citrate-agent-guard",
  "citrate-agent-legacy",
  "citrate-agent-loop",
  "citrate-agent-mcp-host",
+ "citrate-agent-metering",
+ "citrate-agent-records",
  "citrate-agent-shell",
+ "citrate-agent-trajectory",
  "citrate-agent-workers",
+ "hex",
  "libc",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tower",
 ]
@@ -1073,6 +1080,7 @@ version = "0.4.0"
 dependencies = [
  "base64",
  "ciborium",
+ "citrate-agent-grants",
  "citrate-wallet-core",
  "ed25519-dalek",
  "hex",
@@ -1082,6 +1090,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tar",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -1113,6 +1122,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "wiremock",
+]
+
+[[package]]
+name = "citrate-agent-escalation"
+version = "0.4.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

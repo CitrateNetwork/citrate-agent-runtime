@@ -15,6 +15,13 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_METERING_DIR HUP-S7.5: absolute folder for the metering log (metering.jsonl);
+//!                               unset = turn records are kept in memory only (optional)
+//!   CITRATE_HERMES_TRAJECTORIES HUP-S9.3: absolute folder for verified, redacted trajectory
+//!                               exports at session close; unset = no recording (optional, off)
+//!   CITRATE_HERMES_RECORDS_DIR  HUP-S7.3: absolute folder of the HIC decision records to batch
+//!   CITRATE_HERMES_ANCHOR_DIR   HUP-S7.3: absolute folder for the anchor ledger; both must be set
+//!                               for the /anchor/* routes, else they answer "not configured"
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it

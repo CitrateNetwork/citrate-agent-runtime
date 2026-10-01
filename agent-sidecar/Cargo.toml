@@ -19,6 +19,11 @@ citrate-agent-shell = { path = "../agent-shell" }
 citrate-agent-guard = { path = "../agent-guard" }
 citrate-agent-mcp-host = { path = "../agent-mcp-host" }
 citrate-agent-workers = { path = "../agent-workers" }
+citrate-agent-metering = { path = "../agent-metering" }
+citrate-agent-trajectory = { path = "../agent-trajectory" }
+citrate-agent-anchor = { path = "../agent-anchor" }
+hex = "0.4"
+citrate-agent-escalation = { path = "../agent-escalation" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -26,6 +31,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+citrate-agent-records = { path = "../agent-records" }
+tempfile = "3"
 tower = "0.5"
 sha2 = "0.10"
 

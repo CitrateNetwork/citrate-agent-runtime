@@ -25,6 +25,7 @@ members = [
     "agent-checkpoints",
     "agent-grants",
     "agent-workers",
+    "agent-escalation",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
