@@ -6,6 +6,8 @@
 //!   CITRATE_HERMES_CAPSULES     capsule (skill) directory to load; default ./capsules (optional)
 //!   CITRATE_HERMES_SKILLS       HUP-S3.2: SKILL.md instruction-skill directories, a path list in
 //!                               precedence order (first wins); unset = no skills (optional)
+//!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
+//!                               `.json` extension); unset = no MCP (optional)
 
 use std::sync::Arc;
 
@@ -43,6 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => skills,
     };
 
+    // MCP servers are started and handshaken off the async runtime (blocking I/O).
+    let mcp = tokio::task::spawn_blocking(agent_sidecar::mcp_from_env)
+        .await
+        .ok()
+        .flatten();
+
     let state = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue,
@@ -52,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_slots: Arc::new(tokio::sync::Semaphore::new(
             agent_sidecar::MAX_CONCURRENT_SKILLS,
         )),
-        sessions: agent_sidecar::production_sessions(),
+        sessions: agent_sidecar::production_sessions_with(mcp),
     });
 
     // AR-B-024: the control plane is a bearer-authed LOOPBACK plane by contract.
