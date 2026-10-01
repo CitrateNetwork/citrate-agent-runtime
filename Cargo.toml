@@ -13,6 +13,7 @@ members = [
     "hermes/core",
     "hermes/discord",
     "agent-sidecar",
+    "agent-records",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
