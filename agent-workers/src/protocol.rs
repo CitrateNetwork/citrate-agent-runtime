@@ -83,6 +83,22 @@ fn write_response<W: Write>(out: &Mutex<W>, resp: &Response) {
     let Ok(mut line) = serde_json::to_string(resp) else {
         return;
     };
+    if line.len() > MAX_LINE_BYTES {
+        // The supervisor skips an over-long line, which would leave the caller waiting for its
+        // whole timeout. Answer the same id with a short error instead.
+        let short = Response {
+            id: resp.id,
+            result: None,
+            error: Some(format!(
+                "the worker's answer is too large for the wire ({} bytes, limit {MAX_LINE_BYTES})",
+                line.len()
+            )),
+        };
+        let Ok(l) = serde_json::to_string(&short) else {
+            return;
+        };
+        line = l;
+    }
     line.push('\n');
     if let Ok(mut w) = out.lock() {
         // A write error means the supervisor is gone; the read side sees EOF next.
@@ -273,6 +289,31 @@ mod tests {
         let next = read_line_capped(&mut cur).unwrap().unwrap();
         assert!(next.contains("\"id\":5"));
         assert_eq!(read_line_capped(&mut cur).unwrap(), None);
+    }
+
+    struct Huge;
+    impl Handler for Huge {
+        fn call(&self, _params: Value) -> Result<Value, String> {
+            Ok(Value::String("x".repeat(MAX_LINE_BYTES)))
+        }
+    }
+
+    #[test]
+    fn a_response_too_long_for_the_wire_comes_back_as_an_error_with_its_id() {
+        // The supervisor drops an over-long line, so an oversized answer would otherwise leave
+        // the caller waiting for its whole call timeout.
+        let input = "{\"id\":7,\"method\":\"call\",\"params\":null}\n";
+        let out = Shared::default();
+        serve(Cursor::new(input), out.clone(), Arc::new(Huge));
+        let r = wait_responses(&out, 1);
+        assert_eq!(r.len(), 1, "one answer, small enough to be read back");
+        assert_eq!(r[0].id, 7);
+        assert!(r[0].result.is_none());
+        assert!(
+            r[0].error.as_deref().unwrap_or("").contains("too large"),
+            "{:?}",
+            r[0].error
+        );
     }
 
     #[test]

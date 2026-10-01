@@ -355,3 +355,18 @@ fn the_status_serializes_with_stable_lowercase_names() {
     assert!(v["pid"].is_u64());
     assert_eq!(v["restarts"], 0);
 }
+
+#[test]
+fn a_request_too_large_for_the_wire_is_refused_at_once_not_left_to_time_out() {
+    let w = Worker::start(spec("echo"), fast_policy());
+    wait_for("running", Duration::from_secs(15), || running(&w));
+    let pad = "x".repeat(citrate_agent_workers::protocol::MAX_LINE_BYTES);
+    let t0 = std::time::Instant::now();
+    let r = w.call(json!({ "pad": pad }), Duration::from_secs(20));
+    assert!(
+        matches!(&r, Err(WorkerError::Remote(e)) if e.contains("too large")),
+        "{r:?}"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(5), "refused promptly");
+    assert!(w.call(json!({"ok": 1}), Duration::from_secs(5)).is_ok());
+}

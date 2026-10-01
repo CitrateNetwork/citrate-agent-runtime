@@ -227,6 +227,14 @@ impl Inner {
             params,
         })
         .map_err(|e| WorkerError::Remote(format!("could not encode the request: {e}")))?;
+        if line.len() > protocol::MAX_LINE_BYTES {
+            // The worker would skip it and the caller would wait out its whole timeout.
+            return Err(WorkerError::Remote(format!(
+                "the request is too large for the worker wire ({} bytes, limit {})",
+                line.len(),
+                protocol::MAX_LINE_BYTES
+            )));
+        }
         line.push('\n');
         let (tx, rx) = mpsc::channel();
         self.lock().pending.insert(id, tx);
