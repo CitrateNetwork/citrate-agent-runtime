@@ -1,0 +1,19 @@
+[package]
+name = "citrate-agent-checkpoints"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Undo checkpoints for agent file writes (HUP-S2.9): before a tool writes, deletes or renames a file inside a granted folder, the prior state is snapshotted into a content-addressed blob store with a per-step manifest; a step or a whole session can be undone exactly, with conflict detection. Optional git mode commits a checkpoint to a private ref without touching HEAD, the index or the branch. Keyless."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"

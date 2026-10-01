@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod interview;
 pub mod skills;
+pub mod verifiers_tooling;
 
 // ---------------------------------------------------------------------------------------------
 // Messages and tools
@@ -967,8 +968,8 @@ pub enum Verdict {
 }
 
 /// A deterministic external check. Verifiers decide outcomes; the model's opinion never does.
-/// (Command/exit-code, test-report and SARIF verifiers are sidecar-hosted and land with the
-/// toolchain in S2/S6; they implement this same trait.)
+/// The toolchain verifiers (forge test report, SARIF, medusa summary; HUP-S6.3) implement this
+/// same trait in [`verifiers_tooling`].
 pub trait Verifier: Send + Sync {
     fn name(&self) -> String;
     fn verify(&self, ctx: &VerifyContext) -> Verdict;
