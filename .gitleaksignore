@@ -1,0 +1,2 @@
+# Test-only bearer literal in a sidecar test (replaced later in the same branch).
+e0d827e0303b043849351dcd2fba482bec2c9a83:agent-sidecar/tests/process_split_tests.rs:generic-api-key:388

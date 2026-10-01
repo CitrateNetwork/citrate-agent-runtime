@@ -40,8 +40,14 @@ Implemented and tested in this crate, and wired into the agent sidecar
   `file_list`, `file_read` and `file_write`. Every path goes through
   `check` at the moment of use. Reads covered by a folder grant are trusted
   context; reads only full access covers come back untrusted and taint the
-  session (HUP-S2.7). Writes refuse a leaf symlink (opened with
-  `O_NOFOLLOW`) and a file with other hard links.
+  session (HUP-S2.7). Folder-grant reads stay trusted by owner decision: the
+  member chose to grant that folder. A per-grant trust switch is an option for
+  later; it would change this document's schema, so core and this crate would
+  move together. Reads, listings and writes refuse a leaf symlink (opened with
+  `O_NOFOLLOW`) and a file with other hard links. `file_write` refuses build
+  configuration (`foundry.toml`, `remappings.txt`, env files, `package.json`,
+  make files, `.cargo/config*` and the other front-end configs listed in
+  `agent-sidecar/src/toolchain_config.rs`); the member edits those.
 - The toolchain tools (HUP-S6.3) check their project folder against the
   session's grants (live read **and** write folder grants) instead of
   `CITRATE_HERMES_TOOLCHAIN_ROOTS` when a document is present.
