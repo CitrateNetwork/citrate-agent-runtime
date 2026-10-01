@@ -389,6 +389,23 @@ impl std::fmt::Display for LlmError {
 /// configured gateway; tests: a script).
 pub trait LlmClient: Send + Sync {
     fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError>;
+
+    /// HUP-S7.5: [`LlmClient::complete`] plus the token usage the provider reported for this
+    /// call. The default reports none: a client that cannot see usage says "unknown", never zero.
+    fn complete_with_usage(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        self.complete(req).map(|t| (t, None))
+    }
+}
+
+/// Token usage one model call reported (HUP-S7.5 metering). Taken from the provider's own
+/// response; nothing here is estimated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------------------------

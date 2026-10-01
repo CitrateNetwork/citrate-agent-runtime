@@ -18,9 +18,13 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod anchor;
+mod chain_routes;
 pub mod llm_http;
+pub mod metering;
 pub mod sessions;
 pub mod toolchain;
+pub mod trajectory;
 
 use std::sync::Arc;
 
@@ -245,6 +249,17 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S7.5: the daily metering report + opt-in BenchmarkRegistry calldata (built, never sent)
+        .route("/metering/daily", get(chain_routes::metering_daily))
+        .route(
+            "/metering/benchmark",
+            post(chain_routes::metering_benchmark),
+        )
+        // HUP-S7.3: nightly anchor batch (core signs with the anchor key; nothing is sent here)
+        .route("/anchor/status", get(chain_routes::anchor_status))
+        .route("/anchor/plan", post(chain_routes::anchor_plan))
+        .route("/anchor/confirm", post(chain_routes::anchor_confirm))
+        .route("/anchor/proof", get(chain_routes::anchor_proof))
         .with_state(state)
 }
 
@@ -647,8 +662,17 @@ async fn close_session(
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    st.sessions.close(&id).map_err(|e| session_status(&e))?;
-    Ok(Json(serde_json::json!({ "ok": true, "closed": true })))
+    // A trajectory export at close writes files: keep it off the async workers.
+    let sessions = st.sessions.clone();
+    let exported = tokio::task::spawn_blocking(move || sessions.close(&id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| session_status(&e))?;
+    let mut body = serde_json::json!({ "ok": true, "closed": true });
+    if let Some(summary) = exported {
+        body["trajectory"] = serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
+    }
+    Ok(Json(body))
 }
 
 /// HUP-S3.2: parse `CITRATE_HERMES_SKILLS` — a platform path list (`:` on unix, `;` on windows)
@@ -768,6 +792,27 @@ pub fn production_sessions_with(
     };
     let mgr = match toolchain_from_env() {
         Some(host) => mgr.with_toolchain(host),
+        None => mgr,
+    };
+    let mgr = mgr.with_metering(metering::metering_from_env());
+    let mgr = match trajectory::TrajectoryConfig::from_env() {
+        Some(cfg) => {
+            eprintln!(
+                "citrate-agent-sidecar: trajectory recording on (verified turns only, redacted) into {}",
+                cfg.dir().display()
+            );
+            mgr.with_trajectories(cfg)
+        }
+        None => mgr,
+    };
+    let mgr = match anchor::AnchorPaths::from_env() {
+        Some(paths) => match anchor::AnchorService::from_paths(&paths) {
+            Ok(svc) => mgr.with_anchor(Arc::new(svc)),
+            Err(e) => {
+                eprintln!("citrate-agent-sidecar: anchor store unavailable: {e}");
+                mgr
+            }
+        },
         None => mgr,
     };
     Arc::new(match mcp {
@@ -896,12 +941,16 @@ async fn check_brief(
 }
 
 #[cfg(test)]
-mod sessions_tests;
+mod anchor_route_tests;
 #[cfg(test)]
-mod tests;
+mod mcp_session_tests;
+#[cfg(test)]
+mod metering_session_tests;
+#[cfg(test)]
+mod sessions_tests;
 #[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]
-mod toolchain_tests;
+mod tests;
 #[cfg(test)]
-mod mcp_session_tests;
+mod toolchain_tests;
