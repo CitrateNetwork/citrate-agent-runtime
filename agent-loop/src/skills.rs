@@ -773,6 +773,9 @@ impl SkillLibrary {
     /// [`SkillLibrary::report`].
     pub fn load(sources: &[SkillSource]) -> Self {
         let mut lib = SkillLibrary::default();
+        // Names that an earlier source holds ambiguously: a later source may not fill them, or
+        // precedence would invert.
+        let mut ambiguous: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for src in sources {
             if !src.root.is_dir() {
                 lib.report.rejected.push(Rejected {
@@ -797,8 +800,12 @@ impl SkillLibrary {
                 }
                 match load_one(&dir, &src.label) {
                     Ok(skill) => {
-                        accepted += 1;
-                        found.entry(skill.name.clone()).or_default().push(skill);
+                        let copies = found.entry(skill.name.clone()).or_default();
+                        // The same directory reached twice (through a symlink) is one skill.
+                        if !copies.iter().any(|c| c.dir == skill.dir) {
+                            accepted += 1;
+                            copies.push(skill);
+                        }
                     }
                     Err(reason) => lib.report.rejected.push(Rejected { path, reason }),
                 }
@@ -814,6 +821,7 @@ impl SkillLibrary {
                             ),
                         });
                     }
+                    ambiguous.insert(name);
                     continue;
                 }
                 let Some(skill) = copies.pop() else { continue };
@@ -822,6 +830,14 @@ impl SkillLibrary {
                         name,
                         kept_source: kept.source.clone(),
                         dropped_source: src.label.clone(),
+                    });
+                } else if ambiguous.contains(&name) {
+                    lib.report.rejected.push(Rejected {
+                        path: skill.dir.join("SKILL.md"),
+                        reason: format!(
+                            "skill name '{name}' is ambiguous in a higher-precedence source; not loaded from '{}'",
+                            src.label
+                        ),
                     });
                 } else {
                     lib.skills.insert(name, skill);

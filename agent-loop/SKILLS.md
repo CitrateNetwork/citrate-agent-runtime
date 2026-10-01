@@ -45,8 +45,9 @@ core-supplied tool may not use the name `skill_load`.
   and lists. Anchors, aliases, tags, nesting, duplicate keys and unknown keys are refused.
   Claude Code extension keys (`argument-hint`, `disable-model-invocation`, `user-invocable`,
   `model`, `type`, `version`) are recorded and otherwise ignored.
-- A name twice inside one source is ambiguous: every copy is refused. A name in a later source is
-  shadowed and reported.
+- A name twice inside one source is ambiguous: every copy is refused, and a later source may not
+  fill that name either. The same directory reached twice through a symlink counts once. A name
+  in a later source is shadowed and reported.
 - Discovery skips hidden directories, stops at depth 6, 4096 directories and 512 skills per source.
 - Bundled files: at most 64 listed, up to three directory levels deep. Symlinked directories are not followed; a symlinked
   file is listed only if it resolves inside the skill. A read must name a listed file and must

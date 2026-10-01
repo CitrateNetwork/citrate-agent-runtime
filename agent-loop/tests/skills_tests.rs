@@ -648,3 +648,63 @@ fn a_pinned_tool_is_offered_even_when_retrieval_would_drop_it() {
         vec![SKILL_LOAD_TOOL.to_string(), "node_status".to_string()]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review hardening (HUP-S3.2 adversarial review)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_ambiguous_name_in_an_earlier_source_is_not_filled_by_a_later_source() {
+    let user = Scratch::new("amb-user");
+    let bundled = Scratch::new("amb-bundled");
+    skill(&user.path().join("a"), "deploy", "One.", "USER A");
+    skill(&user.path().join("b"), "deploy", "Two.", "USER B");
+    skill(bundled.path(), "deploy", "Bundled.", "BUNDLED BODY");
+    let lib = SkillLibrary::load(&[
+        SkillSource::new("user", user.path()),
+        SkillSource::new("bundled", bundled.path()),
+    ]);
+    // Precedence holds even when the earlier source is ambiguous: the later copy must not win.
+    assert!(lib.get("deploy").is_none(), "{:?}", lib.names());
+    assert!(lib.report().rejected.iter().any(|r| r
+        .path
+        .starts_with(bundled.path().canonicalize().unwrap())
+        || r.path.starts_with(bundled.path())));
+}
+
+#[cfg(unix)]
+#[test]
+fn one_skill_reached_twice_through_a_symlink_is_not_a_duplicate() {
+    let s = Scratch::new("alias");
+    skill(&s.path().join("real"), "auditor", "Audits.", "BODY");
+    std::os::unix::fs::symlink(s.path().join("real"), s.path().join("alias")).unwrap();
+    let lib = SkillLibrary::load(&[SkillSource::new("user", s.path())]);
+    assert_eq!(lib.names(), vec!["auditor"], "{:?}", lib.report());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_listed_ref_swapped_for_an_escaping_symlink_after_load_is_refused() {
+    let s = Scratch::new("swap");
+    let dir = skill(s.path(), "auditor", "Audits.", "b");
+    write(&dir.join("references/checklist.md"), "ok");
+    write(&s.path().join("secret.txt"), "TOP SECRET");
+    let host = SkillHost::new(Arc::new(SkillLibrary::load(&[SkillSource::new(
+        "user",
+        s.path(),
+    )])));
+    // The file was listed at load time; it is replaced by a link out of the skill afterwards.
+    std::fs::remove_file(dir.join("references/checklist.md")).unwrap();
+    std::os::unix::fs::symlink(
+        s.path().join("secret.txt"),
+        dir.join("references/checklist.md"),
+    )
+    .unwrap();
+    let out = host.execute(&call(
+        serde_json::json!({"name": "auditor", "ref": "references/checklist.md"}),
+    ));
+    assert!(
+        matches!(out, ToolOutcome::Error(ref e) if !e.contains("TOP SECRET")),
+        "{out:?}"
+    );
+}
