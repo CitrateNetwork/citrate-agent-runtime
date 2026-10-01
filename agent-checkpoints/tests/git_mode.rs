@@ -229,3 +229,34 @@ fn the_temporary_index_is_cleaned_up() {
         .unwrap_or_default();
     assert!(left.is_empty(), "{left:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_checkpoint_never_runs_repository_hooks_or_fsmonitor() {
+    // Review fix: a checkpoint runs no program the repository configures (hooks, fsmonitor).
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo_with_commit();
+    let marker = r.repo.parent().expect("parent").join("ran");
+    let script = format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display());
+    let hooks = r.repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).expect("mkdir");
+    for name in ["reference-transaction", "post-index-change"] {
+        let h = hooks.join(name);
+        fs::write(&h, &script).expect("hook");
+        fs::set_permissions(&h, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let mon = r.repo.parent().expect("parent").join("fsmon.sh");
+    fs::write(&mon, &script).expect("fsmonitor");
+    fs::set_permissions(&mon, fs::Permissions::from_mode(0o755)).expect("chmod");
+    git(
+        &r.repo,
+        &["config", "core.fsmonitor", &mon.display().to_string()],
+    );
+
+    fs::write(r.repo.join("tracked.txt"), b"changed").expect("w");
+    let store = open(&r);
+    let s = SessionId::new("nohooks").expect("sid");
+    let cp = store.git_checkpoint(&s, &r.repo, "x").expect("checkpoint");
+    assert!(cp.created);
+    assert!(!marker.exists(), "a repository-configured program ran");
+}

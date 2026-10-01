@@ -734,6 +734,20 @@ impl CheckpointStore {
                 }
             }
         }
+        // Re-check every path against its granted folder as it is now: the folder must still be
+        // the same real directory and no parent may have become a symbolic link since the step,
+        // so a restore can never land outside the folder.
+        for m in &steps {
+            if canonical_root(&m.root)? != m.root {
+                return Err(Error::Path {
+                    path: m.root.display().to_string(),
+                    reason: "the granted folder moved or is now a symbolic link".into(),
+                });
+            }
+            for e in &m.entries {
+                resolve(&m.root, &m.root, Path::new(&e.path))?;
+            }
+        }
         // Preflight against a virtual view, so a multi-step undo is checked as a whole.
         let mut virt: HashMap<PathBuf, Fingerprint> = HashMap::new();
         let mut conflicts = Vec::new();

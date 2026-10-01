@@ -7,7 +7,8 @@
 //! index (honours `.gitignore`; paths outside the folder keep their indexed state), `write-tree`,
 //! `commit-tree --no-gpg-sign` with a fixed identity, then `update-ref` with the previous value
 //! as a compare-and-swap. `git add` does write blob objects into the repository's object store;
-//! that is the only change, and it is invisible to `status`, `log`, and the branch.
+//! that is the only change, and it is invisible to `status`, `log`, and the branch. Every git
+//! call runs with hooks and fsmonitor turned off.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -55,7 +56,17 @@ const SCRUB_ENV: [&str; 9] = [
 
 fn git(dir: &Path, index: Option<&Path>, args: &[&OsStr]) -> Result<Output> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
+    // Run no program the repository configures: no hooks (update-ref would run the
+    // reference-transaction hook) and no fsmonitor (consulted by `add`).
+    cmd.arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
+        .args(args);
     for k in SCRUB_ENV {
         cmd.env_remove(k);
     }

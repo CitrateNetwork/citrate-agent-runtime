@@ -1019,3 +1019,33 @@ fn the_store_directory_is_private_to_the_member() {
         "snapshots are copies of member files"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn undo_refuses_when_a_parent_directory_became_a_symlink_since_the_step() {
+    // Review fix: undo re-checks each path against the granted folder, so a parent directory
+    // swapped for a link after the step can never steer a restore outside the folder.
+    let f = fx();
+    fs::create_dir_all(f.root.join("a")).expect("mkdir");
+    fs::write(f.root.join("a/f.txt"), b"prior").expect("seed");
+    let store = open(&f);
+    let s = sid("swap");
+    let step = store
+        .begin_step(&s, &f.root, &[Change::write("a/f.txt", b"post")])
+        .expect("begin");
+    fs::write(f.root.join("a/f.txt"), b"post").expect("write");
+    step.commit().expect("commit");
+
+    let outside = f._tmp.path().join("outside");
+    fs::create_dir_all(&outside).expect("mkdir");
+    fs::write(outside.join("f.txt"), b"post").expect("outside file");
+    fs::rename(f.root.join("a"), f._tmp.path().join("moved-a")).expect("move a away");
+    std::os::unix::fs::symlink(&outside, f.root.join("a")).expect("symlink");
+
+    let err = store.undo_step(&s, 1).expect_err("must refuse");
+    match &err {
+        Error::Path { reason, .. } => assert!(reason.contains("symbolic link"), "{reason}"),
+        other => panic!("expected Path, got {other:?}"),
+    }
+    assert_eq!(read(&outside.join("f.txt")), b"post", "outside untouched");
+}

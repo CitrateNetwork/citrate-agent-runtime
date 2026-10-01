@@ -90,11 +90,15 @@ pub(crate) fn install(store: &Path, mut s: Staged) -> Result<()> {
 pub(crate) fn copy_verified(store: &Path, hex: &str, dest: &Path) -> Result<()> {
     let src = blob_path(store, hex);
     let mut input = File::open(&src).map_err(|e| missing_or_io(&src, hex, e))?;
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-        .map_err(io_err(dest))?;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        // Owner-only until the caller gives it the prior mode and renames it into place.
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut out = opts.open(dest).map_err(io_err(dest))?;
     let mut guard = TempGuard::new(dest.to_path_buf());
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -206,5 +210,22 @@ mod tests {
             Err(Error::Corrupt { .. })
         ));
         assert!(!dest.exists(), "partial copy removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_verified_creates_the_restore_copy_owner_only() {
+        // The copy sits in the member's folder until it is given its prior mode and renamed into
+        // place; it must not be readable by others in the meantime.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().expect("tempdir");
+        let hex = crate::state::sha256_hex(b"secret");
+        let p = blob_path(d.path(), &hex);
+        fs::create_dir_all(p.parent().expect("shard")).expect("mkdir");
+        fs::write(&p, b"secret").expect("w");
+        let dest = d.path().join("out");
+        copy_verified(d.path(), &hex, &dest).expect("copy");
+        let mode = fs::metadata(&dest).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
