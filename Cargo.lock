@@ -1085,6 +1085,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-grants"
+version = "0.4.0"
+dependencies = [
+ "citrate-agent-guard",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "citrate-agent-guard"
 version = "0.4.0"
 dependencies = [
