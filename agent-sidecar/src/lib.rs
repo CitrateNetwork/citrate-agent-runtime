@@ -905,3 +905,5 @@ mod skills_session_tests;
 mod toolchain_tests;
 #[cfg(test)]
 mod mcp_session_tests;
+#[cfg(test)]
+mod daemon_session_tests;

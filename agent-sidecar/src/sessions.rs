@@ -27,6 +27,8 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S10.3: a session opened with `unattended: true` (a daemon run) starts tainted, so every
+//!   effectful call needs a member's explicit decision from its first step. Absent, nothing changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -57,6 +59,9 @@ pub const MAX_TOKENS_CAP: u32 = 8192;
 pub const MAX_WAIT_MS: u64 = 25_000;
 /// Token budget for the skill description index in a session's system prompt.
 pub const SKILL_INDEX_TOKENS: usize = 1500;
+/// HUP-S10.3: the taint source an unattended (daemon) session starts with. It appears in the
+/// `hic_reason` of every effectful call such a session makes.
+pub const UNATTENDED_TAINT_SOURCE: &str = "a scheduled daemon run nobody is watching";
 
 /// Where the model lives and how to authenticate. Supplied by citrate-core, never by a webview.
 #[derive(Clone, Deserialize)]
@@ -137,6 +142,12 @@ pub struct CreateSessionReq {
     /// declines tainted effectful core calls itself.
     #[serde(default)]
     pub hic_aware: bool,
+    /// HUP-S10.3: a scheduled daemon run nobody is watching. The session starts tainted (source
+    /// [`UNATTENDED_TAINT_SOURCE`]), so every effectful call needs a member's explicit decision
+    /// from the first step, or is declined here when core is not `hic_aware`. Read-only calls run
+    /// as usual. Absent = false: nothing changes. The taint is never cleared for such a session.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -174,6 +185,19 @@ pub struct EventsPage {
 struct EventLog {
     next_seq: u64,
     events: VecDeque<Envelope>,
+}
+
+/// HUP-S10.3: a session's starting taint. An unattended (daemon) session starts in the HIC
+/// downgrade, as if it had already read untrusted content.
+fn initial_taint(unattended: bool) -> TaintState {
+    let taint = TaintState::default();
+    if unattended {
+        taint.taint(
+            UNATTENDED_TAINT_SOURCE,
+            "a scheduled run has no member watching, so every change it proposes needs an explicit decision",
+        );
+    }
+    taint
 }
 
 /// One conversation.
@@ -519,7 +543,7 @@ impl SessionManager {
             opts,
             specs,
             hic_aware: req.hic_aware,
-            taint: TaintState::default(),
+            taint: initial_taint(req.unattended),
             llm: (self.llm_factory)(&req.llm),
             history: Mutex::new(Vec::new()),
             log: Mutex::new(EventLog {
