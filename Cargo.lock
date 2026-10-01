@@ -1135,6 +1135,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-guard"
+version = "0.4.0"
+dependencies = [
+ "tempfile",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "citrate-agent-legacy"
 version = "0.4.0"
 dependencies = [
