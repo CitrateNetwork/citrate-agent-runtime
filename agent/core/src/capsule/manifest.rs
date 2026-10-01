@@ -71,15 +71,29 @@ impl Manifest {
                     .to_string(),
             ));
         }
-        // AR-B-011: the `[capability].filesystem` allow-list and a
-        // `network != "none"` policy are PARSED but NEVER enforced — `HostCtx`
-        // builds an empty `WasiCtx` with no preopens and no `socket_addr_check`,
-        // so the declaration reads as a working control while nothing consults
-        // it. Rather than let a manifest advertise a capability the runtime
-        // cannot physically enforce (RFC §4.5: "enforcement is physical, not
-        // advisory"), refuse to load it until per-path/per-socket enforcement
-        // exists. No shipped capsule declares either today, so this is
-        // fail-closed with no behavioral loss.
+        // HUP-S2.5: filesystem and network declarations are enforced by the
+        // capsule sandbox (`capsule::sandbox`): WASI preopens scoped to live
+        // folder grants, and a socket allowlist. A declaration is a ceiling;
+        // the sandbox opens nothing the member has not granted. Malformed
+        // declarations are refused here, at load.
+        crate::capsule::filesystem::parse_all(&self.capability.filesystem)?;
+        let allow = crate::capsule::sandbox::parse_network_allow(&self.capability.network_allow)?;
+        match self.capability.network {
+            NetworkPolicy::EgressAllowed if allow.is_empty() => {
+                return Err(AgentError::Capsule(
+                    "[capability].network = \"egress-allowed\" needs a non-empty \
+                     [capability].network_allow list of exact ip:port addresses"
+                        .to_string(),
+                ));
+            }
+            NetworkPolicy::None | NetworkPolicy::BrokerOnly if !allow.is_empty() => {
+                return Err(AgentError::Capsule(
+                    "[capability].network_allow is only valid with network = \"egress-allowed\""
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         // PBA-L6b-012: a tier-high action needs signatures from two DISTINCT
         // roles of `required_roles` (Quorum::NofM counts roles, not signers).
         // Fewer than two distinct approving roles would make every such action
@@ -100,22 +114,6 @@ impl Manifest {
                 ));
             }
         }
-        if !self.capability.filesystem.is_empty() {
-            return Err(AgentError::Capsule(
-                "[capability].filesystem is declared but per-path enforcement is not implemented \
-                 (AR-B-011): the runtime builds an empty WASI preopen table, so the allow-list \
-                 would be inert. Remove the declaration until filesystem sandboxing is wired."
-                    .to_string(),
-            ));
-        }
-        if self.capability.network != NetworkPolicy::None {
-            return Err(AgentError::Capsule(
-                "[capability].network != \"none\" is declared but network enforcement is not \
-                 implemented (AR-B-011): the runtime installs no socket_addr_check, so the policy \
-                 would be inert. Keep network = \"none\" until egress enforcement is wired."
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 }
@@ -135,6 +133,13 @@ pub struct CapabilitySet {
     #[serde(default)]
     pub chain_calls: Vec<String>,
     pub subagent_spawn: bool,
+    /// HUP-S2.5: the exact remote socket addresses (`ip:port`, IPv6 as
+    /// `[addr]:port`) an `egress-allowed` capsule may connect or send to.
+    /// Enforced by the WASI socket check in `capsule::sandbox`; name lookup
+    /// stays disabled, so entries are addresses, never host names. Must be
+    /// empty unless `network = "egress-allowed"`, and non-empty when it is.
+    #[serde(default)]
+    pub network_allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,23 +420,87 @@ tier = "bundled"
         assert!(msg.contains("break_glass"), "actual: {msg}");
     }
 
+    /// HUP-S2.5: a filesystem declaration is now enforced by WASI preopens
+    /// scoped to live folder grants (`capsule::sandbox`), so a well-formed
+    /// one loads. It is a ceiling, not a grant: nothing is opened until a
+    /// member's grant covers the mounted folder.
     #[test]
-    fn reject_declared_but_unenforced_filesystem_capability() {
-        // AR-B-011: a filesystem allow-list is inert (no preopens are wired), so
-        // a manifest declaring one must be refused rather than advertise a
-        // control the runtime cannot enforce.
-        let bad = WORKED_EXAMPLE.replace("filesystem = []", r#"filesystem = ["read:/data"]"#);
-        let err = Manifest::parse(&bad).expect_err("unenforced filesystem capability refused");
-        assert!(err.to_string().contains("filesystem"), "actual: {err}");
+    fn filesystem_declaration_loads_now_that_preopens_enforce_it() {
+        let ok = WORKED_EXAMPLE.replace("filesystem = []", r#"filesystem = ["read:/data"]"#);
+        let m = Manifest::parse(&ok).expect("declared filesystem capability loads");
+        assert_eq!(m.capability.filesystem, vec!["read:/data".to_string()]);
     }
 
     #[test]
-    fn reject_declared_but_unenforced_network_capability() {
-        // AR-B-011: network != "none" is inert (no socket_addr_check), so it
-        // must be refused at load.
+    fn malformed_filesystem_entry_is_refused_at_parse() {
+        for bad in [
+            r#"["exec:/bin"]"#,
+            r#"["read:relative"]"#,
+            r#"["read:/data/../etc"]"#,
+        ] {
+            let m = WORKED_EXAMPLE.replace("filesystem = []", &format!("filesystem = {bad}"));
+            let err = Manifest::parse(&m).expect_err(bad);
+            assert!(err.to_string().contains("filesystem"), "{bad}: {err}");
+        }
+    }
+
+    /// Egress is enforced by a socket allowlist: `egress-allowed` without
+    /// `network_allow` would reach nothing, so it is refused as a mistake.
+    #[test]
+    fn egress_allowed_requires_a_network_allowlist() {
         let bad = WORKED_EXAMPLE.replace(r#"network = "none""#, r#"network = "egress-allowed""#);
-        let err = Manifest::parse(&bad).expect_err("unenforced network capability refused");
-        assert!(err.to_string().contains("network"), "actual: {err}");
+        let err = Manifest::parse(&bad).expect_err("egress without an allowlist");
+        assert!(err.to_string().contains("network_allow"), "actual: {err}");
+    }
+
+    #[test]
+    fn egress_allowed_with_exact_socket_addresses_loads() {
+        let ok = WORKED_EXAMPLE.replace(
+            r#"network = "none""#,
+            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\", \"[2001:db8::1]:8443\"]",
+        );
+        let m = Manifest::parse(&ok).expect("egress with an allowlist loads");
+        assert_eq!(m.capability.network, NetworkPolicy::EgressAllowed);
+        assert_eq!(m.capability.network_allow.len(), 2);
+    }
+
+    #[test]
+    fn network_allowlist_without_egress_is_refused() {
+        for policy in ["none", "broker-only"] {
+            let bad = WORKED_EXAMPLE.replace(
+                r#"network = "none""#,
+                &format!("network = \"{policy}\"\nnetwork_allow = [\"203.0.113.7:443\"]"),
+            );
+            let err = Manifest::parse(&bad).expect_err(policy);
+            assert!(err.to_string().contains("network_allow"), "{policy}: {err}");
+        }
+    }
+
+    #[test]
+    fn network_allowlist_entries_must_be_exact_remote_addresses() {
+        for bad in [
+            "example.com:443",
+            "0.0.0.0:443",
+            "203.0.113.7:0",
+            "203.0.113.7",
+            "[::]:443",
+        ] {
+            let m = WORKED_EXAMPLE.replace(
+                r#"network = "none""#,
+                &format!("network = \"egress-allowed\"\nnetwork_allow = [\"{bad}\"]"),
+            );
+            let err = Manifest::parse(&m).expect_err(bad);
+            assert!(err.to_string().contains("network_allow"), "{bad}: {err}");
+        }
+    }
+
+    /// `broker-only` loads: the capsule gets no direct socket at all (the
+    /// sandbox denies every address); traffic goes through host brokers.
+    #[test]
+    fn broker_only_loads_and_has_no_allowlist() {
+        let ok = WORKED_EXAMPLE.replace(r#"network = "none""#, r#"network = "broker-only""#);
+        let m = Manifest::parse(&ok).expect("broker-only loads");
+        assert!(m.capability.network_allow.is_empty());
     }
 
     #[test]
