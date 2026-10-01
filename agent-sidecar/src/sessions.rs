@@ -23,6 +23,10 @@
 //! - HUP-S6.3: when the toolchain is enabled (`CITRATE_HERMES_TOOLCHAIN=1`, default off), every
 //!   session also offers the sidecar-hosted `forge_test`, `slither_scan`, `aderyn_scan` and
 //!   `medusa_fuzz` tools ([`crate::toolchain`]), whose results the toolchain verifiers judge.
+//! - HUP-S4.1: when an MCP allowlist is configured (`CITRATE_HERMES_MCP`, default off), every
+//!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
+//!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
+//!   reserved. Unset, nothing here changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +41,7 @@ use citrate_agent_loop::{
     LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
     ToolSpec, TurnOptions,
 };
+use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::toolchain::ToolchainHost;
@@ -344,11 +349,12 @@ impl ToolHost for CapsuleHost {
 }
 
 /// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, the
-/// toolchain tools to the toolchain host (when enabled), anything else to the capsule dispatch
-/// (when capsules are loaded).
+/// toolchain tools to the toolchain host (when enabled), an offered `mcp__…` tool to its MCP
+/// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
 struct SidecarHost {
     skills: Option<SkillHost>,
     toolchain: Option<Arc<ToolchainHost>>,
+    mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
 }
 
@@ -362,6 +368,11 @@ impl ToolHost for SidecarHost {
         if ToolchainHost::handles(&call.name) {
             if let Some(t) = &self.toolchain {
                 return t.execute(call);
+            }
+        }
+        if let Some(m) = &self.mcp {
+            if m.handles(&call.name) {
+                return m.execute(call);
             }
         }
         match &self.capsules {
@@ -388,6 +399,7 @@ pub struct SessionManager {
     ids: AtomicU64,
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<ToolchainHost>>,
+    mcp: Option<Arc<McpHost>>,
 }
 
 impl SessionManager {
@@ -399,6 +411,7 @@ impl SessionManager {
             ids: AtomicU64::new(0),
             skills: None,
             toolchain: None,
+            mcp: None,
         }
     }
 
@@ -406,6 +419,18 @@ impl SessionManager {
     pub fn with_toolchain(mut self, host: Arc<ToolchainHost>) -> Self {
         self.toolchain = Some(host);
         self
+    }
+
+    /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers
+    /// nothing and reserves nothing.
+    pub fn with_mcp(mut self, host: Arc<McpHost>) -> Self {
+        self.mcp = if host.is_empty() { None } else { Some(host) };
+        self
+    }
+
+    /// HUP-S4.1: the configured MCP servers (`None` when MCP is not configured).
+    pub fn mcp_status(&self) -> Option<Vec<ServerStatus>> {
+        self.mcp.as_ref().map(|h| h.status())
     }
 
     /// HUP-S3.2: offer this skills library to every new session. An empty library offers nothing.
@@ -442,6 +467,15 @@ impl SessionManager {
                 )));
             }
             specs.extend(ToolchainHost::specs());
+        }
+        if let Some(mcp) = &self.mcp {
+            if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is in the 'mcp__' namespace, which is reserved while MCP servers are configured",
+                    t.name
+                )));
+            }
+            specs.extend(mcp.specs());
         }
         let mut sessions = self
             .sessions
@@ -537,12 +571,21 @@ impl SessionManager {
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
         let toolchain = session.toolchain.clone();
-        if skill_host.is_some() || capsule_host.is_some() || toolchain.is_some() {
+        let mcp_host = self
+            .mcp
+            .clone()
+            .map(|h| McpToolHost::new(h, session.stop.clone()));
+        if skill_host.is_some()
+            || capsule_host.is_some()
+            || toolchain.is_some()
+            || mcp_host.is_some()
+        {
             registry = registry.with_host(
                 HostKind::Sidecar,
                 Arc::new(SidecarHost {
                     skills: skill_host,
                     toolchain,
+                    mcp: mcp_host,
                     capsules: capsule_host,
                 }),
             );

@@ -13,6 +13,8 @@
 //!   CITRATE_HERMES_TOOLCHAIN_PATH   toolchain search path override, a path list (optional)
 //!   CITRATE_HERMES_SOLC         absolute path of the solc forge should use; default: the pinned
 //!                               0.8.36 in the per-user svm dir when present (optional)
+//!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
+//!                               `.json` extension); unset = no MCP (optional)
 
 use std::sync::Arc;
 
@@ -50,6 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => skills,
     };
 
+    // MCP servers are started and handshaken off the async runtime (blocking I/O).
+    let mcp = tokio::task::spawn_blocking(agent_sidecar::mcp_from_env)
+        .await
+        .ok()
+        .flatten();
+
     let state = Arc::new(AppState {
         estop: EmergencyStop::new(),
         queue,
@@ -59,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_slots: Arc::new(tokio::sync::Semaphore::new(
             agent_sidecar::MAX_CONCURRENT_SKILLS,
         )),
-        sessions: agent_sidecar::production_sessions(),
+        sessions: agent_sidecar::production_sessions_with(mcp),
     });
 
     // AR-B-024: the control plane is a bearer-authed LOOPBACK plane by contract.

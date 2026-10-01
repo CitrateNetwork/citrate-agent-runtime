@@ -243,6 +243,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
         .route("/briefs/check", post(check_brief))
+        // HUP-S4.1: the configured MCP servers (read-only status).
+        .route("/mcp/servers", get(mcp_servers))
         .with_state(state)
 }
 
@@ -278,6 +280,21 @@ async fn status(
         role_pending_approvals: st.queue.role_pending_depth(),
         running_skills: MAX_CONCURRENT_SKILLS.saturating_sub(st.run_slots.available_permits()),
     }))
+}
+
+/// HUP-S4.1: `{configured, servers}`. Never the URL, env, or the servers' instructions text.
+async fn mcp_servers(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let body = match st.sessions.mcp_status() {
+        Some(list) => serde_json::json!({ "configured": true, "servers": list }),
+        None => serde_json::json!({ "configured": false, "servers": [] }),
+    };
+    Ok(Json(body))
 }
 
 async fn skills(
@@ -679,10 +696,61 @@ pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>
     Some(Arc::new(lib))
 }
 
+/// HUP-S4.1: read and validate an MCP allowlist file and connect to its servers. `Ok(None)` for
+/// an allowlist with no servers. Blocking (spawns processes, runs handshakes): call it off the
+/// async runtime. A server that fails to start is reported in its status, not here.
+pub fn mcp_from_path(
+    path: &std::path::Path,
+) -> Result<Option<Arc<citrate_agent_mcp_host::McpHost>>, String> {
+    let cfg = citrate_agent_mcp_host::config::McpConfig::load(path)?;
+    if cfg.servers.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(citrate_agent_mcp_host::McpHost::connect(
+        &cfg,
+    ))))
+}
+
+/// HUP-S4.1: the MCP host named by `CITRATE_HERMES_MCP` (default unset → `None`, no MCP). An
+/// invalid file is logged to stderr and yields no MCP (fail closed); the sidecar still runs.
+pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
+    let value = std::env::var(citrate_agent_mcp_host::config::MCP_CONFIG_ENV).ok()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    match mcp_from_path(std::path::Path::new(&value)) {
+        Ok(Some(host)) => {
+            for s in host.status() {
+                eprintln!(
+                    "citrate-agent-sidecar: MCP server '{}' ({}): {:?}, {} tools{}",
+                    s.name,
+                    s.transport,
+                    s.state,
+                    s.tools,
+                    s.error.map(|e| format!(", {e}")).unwrap_or_default()
+                );
+            }
+            Some(host)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("citrate-agent-sidecar: MCP disabled: {e}");
+            None
+        }
+    }
+}
+
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
 /// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
+    production_sessions_with(None)
+}
+
+/// [`production_sessions`] plus the MCP host when one is configured (HUP-S4.1).
+pub fn production_sessions_with(
+    mcp: Option<Arc<citrate_agent_mcp_host::McpHost>>,
+) -> Arc<sessions::SessionManager> {
     let timeout = std::time::Duration::from_secs(300);
     let mgr = sessions::SessionManager::new(
         Arc::new(move |ep: &sessions::LlmEndpoint| {
@@ -698,8 +766,12 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
         Some(lib) => mgr.with_skills(lib),
         None => mgr,
     };
-    Arc::new(match toolchain_from_env() {
+    let mgr = match toolchain_from_env() {
         Some(host) => mgr.with_toolchain(host),
+        None => mgr,
+    };
+    Arc::new(match mcp {
+        Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
 }
@@ -831,3 +903,5 @@ mod tests;
 mod skills_session_tests;
 #[cfg(test)]
 mod toolchain_tests;
+#[cfg(test)]
+mod mcp_session_tests;
