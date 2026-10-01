@@ -227,17 +227,29 @@ pub(crate) fn walk(dir: &Path, mode: Mode, mut visit: impl FnMut(&StoredRecord))
                 _ => return Err(IntegrityError::TornTail { segment: segname }.into()),
             }
         }
-        let mut all_stale = !seg.records.is_empty();
-        for r in &seg.records {
-            let b = &r.record;
-            if b.seq < floor {
-                // Left behind by a crash between writing CHECKPOINT and deleting the segment.
-                if b.seq + 1 == floor && checkpoint.as_ref().is_some_and(|cp| cp.prev != r.hash) {
+        // A segment whose records all precede the checkpoint was left behind by a crash between
+        // writing CHECKPOINT and deleting it. Pruning drops whole segments from the front, so
+        // such a segment is only legitimate before the first retained record; anywhere else a
+        // pre-checkpoint record is out of order and is checked (and refused) like any other.
+        let all_stale = !seg.records.is_empty() && seg.records.iter().all(|r| r.record.seq < floor);
+        if all_stale {
+            if w.count > 0 {
+                return Err(IntegrityError::SeqGap {
+                    expected: expect_seq,
+                    found: seg.records.first().map_or(0, |r| r.record.seq),
+                }
+                .into());
+            }
+            if let Some(r) = seg.records.iter().find(|r| r.record.seq + 1 == floor) {
+                if checkpoint.as_ref().is_some_and(|cp| cp.prev != r.hash) {
                     return Err(IntegrityError::CheckpointMismatch.into());
                 }
-                continue;
             }
-            all_stale = false;
+            w.stale_segments.push(path.clone());
+            continue;
+        }
+        for r in &seg.records {
+            let b = &r.record;
             if b.v != SCHEMA_VERSION {
                 return Err(IntegrityError::UnknownVersion { seq: b.seq, v: b.v }.into());
             }
@@ -294,14 +306,17 @@ pub(crate) fn walk(dir: &Path, mode: Mode, mut visit: impl FnMut(&StoredRecord))
             last_ts = b.ts_ms;
             w.tip = Some((b.seq, r.hash.clone(), b.ts_ms));
         }
-        if all_stale {
-            w.stale_segments.push(path.clone());
-        }
     }
 
     match (&head, &w.tip) {
         (None, None) if checkpoint.is_none() => {}
         (None, _) => return Err(IntegrityError::HeadMissing.into()),
+        // Right after a prune dropped every record (one retained segment) and before the next
+        // append lands, the retained chain is empty and HEAD names the checkpoint's last record.
+        (Some(h), None)
+            if checkpoint.as_ref().is_some_and(|cp| {
+                h.seq.checked_add(1) == Some(cp.next_seq) && h.hash == cp.prev
+            }) => {}
         (Some(h), None) => {
             return Err(IntegrityError::Truncated {
                 head_seq: h.seq,

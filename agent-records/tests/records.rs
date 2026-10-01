@@ -1062,3 +1062,94 @@ fn a_proof_that_stops_at_a_subtree_root_is_rejected() {
     let subtree = merkle::merkle_root(&leaves[..2]).unwrap();
     assert!(!merkle::verify_path(&leaves[0], 0, 4, &path[..1], &subtree));
 }
+
+// ── pruning edge cases found in review ──────────────────────────────────────────────────
+
+/// Fill a pruning log until the first CHECKPOINT exists. Returns the config and the first line
+/// ever written (record 0), which by then is pruned.
+fn fill_until_pruned(d: &Path, max_segments: usize) -> (LogConfig, String) {
+    let cfg = LogConfig {
+        max_segment_bytes: 1500,
+        max_segments: Some(max_segments),
+    };
+    let log = open_cfg(d, cfg.clone(), clock(DAY));
+    let first = approve(&log, "op 0");
+    let first_line = lines(&segments(d)[0])[0].clone();
+    done(&log, first);
+    let mut i = 1;
+    while !d.join("CHECKPOINT").exists() {
+        assert!(i < 300, "pruning never happened");
+        let s = approve(&log, &format!("op {i}"));
+        done(&log, s);
+        i += 1;
+    }
+    (cfg, first_line)
+}
+
+#[test]
+fn a_crash_after_pruning_every_record_and_before_the_next_append_reopens() {
+    // max_segments = 1: a rotation prunes every record. A crash before the record that caused
+    // the rotation lands leaves an empty retained chain with HEAD on the checkpoint's record.
+    let d = tempfile::tempdir().unwrap();
+    let (cfg, _) = fill_until_pruned(d.path(), 1);
+    let cp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(d.path().join("CHECKPOINT")).unwrap()).unwrap();
+    let next_seq = cp["next_seq"].as_u64().unwrap();
+    let last = segments(d.path()).pop().unwrap();
+    fs::write(&last, b"").unwrap();
+    let head = serde_json::json!({ "seq": next_seq - 1, "hash": cp["prev"] });
+    fs::write(d.path().join("HEAD"), head.to_string()).unwrap();
+
+    let rep = verify_dir(d.path()).unwrap();
+    assert_eq!((rep.count, rep.tip), (0, None));
+    let log = open_cfg(d.path(), cfg.clone(), clock(DAY));
+    assert_eq!(approve(&log, "after the crash"), next_seq);
+    drop(log);
+    assert!(verify_dir(d.path()).is_ok());
+
+    // a HEAD that does not name the checkpoint's record is still truncation
+    fs::write(&last, b"").unwrap();
+    let head = serde_json::json!({ "seq": next_seq + 5, "hash": cp["prev"] });
+    fs::write(d.path().join("HEAD"), head.to_string()).unwrap();
+    assert!(matches!(
+        integrity(verify_dir(d.path())),
+        IntegrityError::Truncated { .. }
+    ));
+}
+
+#[test]
+fn a_pre_checkpoint_record_inside_the_retained_chain_is_detected() {
+    let d = tempfile::tempdir().unwrap();
+    let (_cfg, first_line) = fill_until_pruned(d.path(), 2);
+    let last = segments(d.path()).pop().unwrap();
+    let original = lines(&last);
+
+    // a pruned record put back at the start of a retained segment
+    let mut l = original.clone();
+    l.insert(0, first_line.clone());
+    write_lines(&last, &l);
+    assert!(matches!(
+        integrity(verify_dir(d.path())),
+        IntegrityError::SeqGap { .. }
+    ));
+
+    // or appended after the tip
+    let mut l = original.clone();
+    l.push(first_line.clone());
+    write_lines(&last, &l);
+    assert!(matches!(
+        integrity(verify_dir(d.path())),
+        IntegrityError::SeqGap { .. }
+    ));
+
+    // or as a whole stale-looking segment after the retained chain
+    write_lines(&last, &original);
+    let after = d.path().join("seg-99999999.jsonl");
+    write_lines(&after, &[first_line]);
+    assert!(matches!(
+        integrity(verify_dir(d.path())),
+        IntegrityError::SeqGap { .. }
+    ));
+    fs::remove_file(&after).unwrap();
+    assert!(verify_dir(d.path()).is_ok());
+}
