@@ -231,6 +231,104 @@ fn a_write_never_follows_a_symlink_or_a_hard_link_out() {
     );
 }
 
+fn rw(fx: &Fx) -> serde_json::Value {
+    fx.doc(|g| {
+        g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
+        g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
+    })
+}
+
+fn list(host: &FileToolHost, p: &Path) -> ToolOutcome {
+    host.execute(&call(FILE_LIST_TOOL, serde_json::json!({ "path": p })))
+}
+
+#[test]
+fn file_write_leaves_build_configuration_to_the_member() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.proj().join(".cargo")).unwrap();
+    let host = FileToolHost::new(fx.grants(&rw(&fx)));
+    for name in [
+        "foundry.toml",
+        "Foundry.TOML",
+        "remappings.txt",
+        ".env",
+        ".env.local",
+        "slither.config.json",
+        "medusa.json",
+        "hardhat.config.ts",
+        "truffle-config.js",
+        "package.json",
+        "aderyn.toml",
+        "Makefile",
+        "GNUmakefile",
+        "justfile",
+        ".cargo/config.toml",
+        ".cargo/config",
+        "src/foundry.toml",
+    ] {
+        let p = fx.proj().join(name);
+        let before = std::fs::read(&p).ok();
+        let out = write(&host, &p, "x");
+        match &out {
+            ToolOutcome::Denied(why) => {
+                assert!(why.contains("build configuration"), "{name}: {why}")
+            }
+            other => panic!("{name}: expected a refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&p).ok(), before, "{name} changed");
+    }
+    // Ordinary sources still write.
+    assert!(matches!(
+        write(&host, &fx.proj().join("src/Config.sol"), "contract C {}"),
+        ToolOutcome::Ok(_)
+    ));
+}
+
+#[test]
+fn reads_refuse_hard_linked_files() {
+    let fx = Fx::new();
+    std::fs::hard_link(fx.other().join("notes.txt"), fx.proj().join("hard.txt")).unwrap();
+    std::fs::write(fx.proj().join("a.txt"), "a").unwrap();
+    std::fs::hard_link(fx.proj().join("a.txt"), fx.proj().join("b.txt")).unwrap();
+    let host = FileToolHost::new(fx.grants(&rw(&fx)));
+    for name in ["hard.txt", "a.txt", "b.txt"] {
+        let out = read(&host, &fx.proj().join(name));
+        assert!(is_denied(&out), "{name}: {out:?}");
+    }
+    // A listing leaves them out.
+    let ToolOutcome::Ok(body) = list(&host, &fx.proj()) else {
+        panic!("list failed");
+    };
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    for name in ["hard.txt", "a.txt", "b.txt"] {
+        assert!(!names.contains(&name), "{name} listed: {names:?}");
+    }
+    assert!(names.contains(&"src"), "{names:?}");
+}
+
+#[test]
+fn reads_never_follow_a_symlink_at_the_leaf() {
+    let fx = Fx::new();
+    symlink(fx.proj().join("src/main.sol"), fx.proj().join("alias.sol")).unwrap();
+    symlink(fx.proj().join("src"), fx.proj().join("srclink")).unwrap();
+    let host = FileToolHost::new(fx.grants(&rw(&fx)));
+    let out = read(&host, &fx.proj().join("alias.sol"));
+    assert!(is_denied(&out), "{out:?}");
+    let out = list(&host, &fx.proj().join("srclink"));
+    assert!(is_denied(&out), "{out:?}");
+    // The real paths still work.
+    assert!(matches!(
+        read(&host, &fx.proj().join("src/main.sol")),
+        ToolOutcome::Ok(_)
+    ));
+}
+
 #[test]
 fn full_access_never_reaches_credentials_or_env() {
     let fx = Fx::new();
