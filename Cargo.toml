@@ -17,6 +17,7 @@ members = [
     "agent-shell",
     "agent-guard",
     "agent-records",
+    "agent-checkpoints",
 ]
 default-members = ["agent/cli"]
 resolver = "2"

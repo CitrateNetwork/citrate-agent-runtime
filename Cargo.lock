@@ -1007,6 +1007,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-checkpoints"
+version = "0.4.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "citrate-agent-cli"
 version = "0.4.0"
 dependencies = [
