@@ -309,33 +309,35 @@ fn read_xlsx(bytes: &[u8], sheet: Option<&str>, limits: &Limits) -> Result<Sheet
             })?,
         None => names.first().cloned().ok_or(OfficeError::NoSheets)?,
     };
-    let range = wb
-        .worksheet_range(&name)
+    // Cells are streamed and only those inside the limits are kept, so memory follows the
+    // limits, not the sheet's layout. Positions are kept: a cell's row and column indexes match
+    // the sheet.
+    let mut cells = wb
+        .worksheet_cells_reader(&name)
         .map_err(|e| OfficeError::Unreadable(e.to_string()))?;
     let mut c = Collector::new(limits);
-    // The range starts at its first used cell: pad so cell positions match the sheet.
-    let (row0, col0) = range
-        .start()
-        .map(|(r, c)| (r as usize, c as usize))
-        .unwrap_or((0, 0));
-    for _ in 0..row0 {
-        if !c.has_room() {
-            break;
+    while let Some(cell) = cells
+        .next_cell()
+        .map_err(|e| OfficeError::Unreadable(e.to_string()))?
+    {
+        let (r, col) = cell.get_position();
+        let (r, col) = (r as usize, col as usize);
+        if r >= limits.max_rows || col >= limits.max_cols {
+            c.truncated = true;
+            continue;
         }
-        c.push(std::iter::empty());
-    }
-    for row in range.rows() {
-        if !c.has_room() {
-            break;
+        let value = c.cut(xlsx_cell(&Data::from(cell.get_value().clone())));
+        if value == Cell::Empty {
+            continue;
         }
-        let lead = std::iter::repeat_n(Cell::Empty, col0);
-        c.push(lead.chain(row.iter().map(xlsx_cell)));
-    }
-    // Trailing empty cells carry nothing.
-    for r in &mut c.rows {
-        while matches!(r.last(), Some(Cell::Empty)) {
-            r.pop();
+        if c.rows.len() <= r {
+            c.rows.resize(r + 1, Vec::new());
         }
+        let row = &mut c.rows[r];
+        if row.len() <= col {
+            row.resize(col + 1, Cell::Empty);
+        }
+        row[col] = value;
     }
     Ok(SheetData {
         sheet_names: names,

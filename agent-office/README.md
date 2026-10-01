@@ -23,7 +23,7 @@ and hand the bytes here.
 | Bounded output | rows, columns and cell text over the limits are cut on read (`truncated: true`) and refused whole on write |
 | No formulas written | `.xlsx` cells are written as string, number or boolean; CSV text that a spreadsheet would run (`= + - @`, tab, CR, unless a plain number) gets a leading apostrophe |
 | Values read, not formulas | `.xlsx` returns cached values; dates as their displayed text |
-| Cell positions kept | an `.xlsx` range that starts below or right of A1 is padded so row/column indexes match the sheet |
+| Cell positions kept | `.xlsx` cells are streamed and placed at their own row/column indexes (a sheet that starts below or right of A1 is padded); only cells inside the limits are held |
 
 Limits (`Limits::default()` and the sidecar's `SHEET_LIMITS`) are conservative defaults, pending
 owner sign-off: 10 MiB files, 64 MiB inflated workbook, 5,000 rows, 200 columns, 8,192 characters

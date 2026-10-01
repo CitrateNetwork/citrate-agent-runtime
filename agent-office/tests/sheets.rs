@@ -275,3 +275,51 @@ fn xlsx_keeps_cell_positions_when_the_sheet_starts_below_and_right_of_a1() {
     let back = read_sheet(SheetFormat::Xlsx, &bytes, None, &Limits::default()).unwrap();
     assert_eq!(back.rows, r);
 }
+
+#[test]
+fn xlsx_reading_stops_at_the_row_column_and_cell_limits_and_says_so() {
+    let wide: Vec<Vec<Cell>> = (0..12)
+        .map(|i| {
+            (0..5)
+                .map(|j| Cell::Number(f64::from(i * 10 + j)))
+                .collect()
+        })
+        .collect();
+    let bytes = write_sheet(SheetFormat::Xlsx, None, &wide, &Limits::default()).unwrap();
+    let limits = Limits {
+        max_rows: 10,
+        max_cols: 3,
+        ..Limits::default()
+    };
+    let s = read_sheet(SheetFormat::Xlsx, &bytes, None, &limits).unwrap();
+    assert_eq!(s.rows.len(), 10);
+    assert!(s.rows.iter().all(|r| r.len() == 3), "{:?}", s.rows);
+    assert_eq!(s.rows[9][2], Cell::Number(92.0));
+    assert!(s.truncated);
+
+    // Only columns past the limit: still truncated.
+    let cols_only = Limits {
+        max_cols: 3,
+        ..Limits::default()
+    };
+    let s = read_sheet(SheetFormat::Xlsx, &bytes, None, &cols_only).unwrap();
+    assert_eq!(s.rows.len(), 12);
+    assert!(s.rows.iter().all(|r| r.len() == 3));
+    assert!(s.truncated);
+
+    // Inside every limit: nothing cut.
+    let s = read_sheet(SheetFormat::Xlsx, &bytes, None, &Limits::default()).unwrap();
+    assert_eq!(s.rows, wide);
+    assert!(!s.truncated);
+
+    // A long cell is cut to the character limit.
+    let long = vec![vec![text(&"y".repeat(500))]];
+    let bytes = write_sheet(SheetFormat::Xlsx, None, &long, &Limits::default()).unwrap();
+    let short = Limits {
+        max_cell_chars: 100,
+        ..Limits::default()
+    };
+    let s = read_sheet(SheetFormat::Xlsx, &bytes, None, &short).unwrap();
+    assert_eq!(s.rows[0][0], text(&"y".repeat(100)));
+    assert!(s.truncated);
+}
