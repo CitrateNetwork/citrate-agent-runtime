@@ -31,6 +31,7 @@ pub mod mcp_probe;
 pub mod sessions;
 pub mod sheets;
 pub mod toolchain;
+mod toolchain_config;
 pub mod workflow_spec;
 pub mod workers;
 pub mod trajectory;
