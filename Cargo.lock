@@ -58,6 +58,7 @@ version = "0.4.0"
 dependencies = [
  "axum",
  "citrate-agent-core",
+ "citrate-agent-escalation",
  "citrate-agent-guard",
  "citrate-agent-legacy",
  "citrate-agent-loop",
@@ -1111,6 +1112,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "wiremock",
+]
+
+[[package]]
+name = "citrate-agent-escalation"
+version = "0.4.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

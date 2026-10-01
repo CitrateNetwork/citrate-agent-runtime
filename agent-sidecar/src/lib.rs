@@ -18,6 +18,7 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod escalation;
 pub mod llm_http;
 pub mod sessions;
 pub mod toolchain;
@@ -245,6 +246,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
+        // key per request), and the registry route's status (disabled in this build).
+        .route("/escalations", post(escalation::escalate))
+        .route("/escalations/registry", get(escalation::registry_status))
         .with_state(state)
 }
 
@@ -905,3 +910,5 @@ mod skills_session_tests;
 mod toolchain_tests;
 #[cfg(test)]
 mod mcp_session_tests;
+#[cfg(test)]
+mod escalation_tests;
