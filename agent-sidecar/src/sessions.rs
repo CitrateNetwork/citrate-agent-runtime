@@ -45,6 +45,7 @@ use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::toolchain::ToolchainHost;
+use crate::workers::WorkerSet;
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -193,8 +194,9 @@ pub struct Session {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
     skills: Option<Arc<SkillLibrary>>,
-    /// HUP-S6.3: present when this session was opened with the toolchain enabled.
-    toolchain: Option<Arc<ToolchainHost>>,
+    /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
+    /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
+    toolchain: Option<Arc<dyn ToolHost>>,
 }
 
 impl Session {
@@ -353,7 +355,7 @@ impl ToolHost for CapsuleHost {
 /// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
 struct SidecarHost {
     skills: Option<SkillHost>,
-    toolchain: Option<Arc<ToolchainHost>>,
+    toolchain: Option<Arc<dyn ToolHost>>,
     mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
 }
@@ -398,8 +400,10 @@ pub struct SessionManager {
     core_tool_deadline: Duration,
     ids: AtomicU64,
     skills: Option<Arc<SkillLibrary>>,
-    toolchain: Option<Arc<ToolchainHost>>,
+    toolchain: Option<Arc<dyn ToolHost>>,
     mcp: Option<Arc<McpHost>>,
+    /// HUP-S1.9: the worker processes behind sidecar-hosted tools (reported on `/workers`).
+    workers: Arc<WorkerSet>,
 }
 
 impl SessionManager {
@@ -412,13 +416,31 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            workers: Arc::new(WorkerSet::default()),
         }
     }
 
-    /// HUP-S6.3: offer the toolchain tools to every new session.
-    pub fn with_toolchain(mut self, host: Arc<ToolchainHost>) -> Self {
+    /// HUP-S6.3: offer the toolchain tools to every new session, executed by `host` (in
+    /// production the toolchain worker process, HUP-S1.9).
+    pub fn with_toolchain(mut self, host: Arc<dyn ToolHost>) -> Self {
         self.toolchain = Some(host);
         self
+    }
+
+    /// HUP-S1.9: the worker processes this manager's tools run in.
+    pub fn with_workers(mut self, workers: Arc<WorkerSet>) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// HUP-S1.9: one status entry per worker kind (see [`WorkerSet::report`]).
+    pub fn workers_report(&self) -> Vec<serde_json::Value> {
+        self.workers.report()
+    }
+
+    /// HUP-S1.9: stop every worker process cleanly (sidecar shutdown).
+    pub fn shutdown_workers(&self) {
+        self.workers.shutdown();
     }
 
     /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers

@@ -21,6 +21,7 @@
 pub mod llm_http;
 pub mod sessions;
 pub mod toolchain;
+pub mod workers;
 
 use std::sync::Arc;
 
@@ -245,6 +246,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S1.9: the worker processes (toolchain, browser) and their health
+        .route("/workers", get(workers_status))
         .with_state(state)
 }
 
@@ -295,6 +298,19 @@ async fn mcp_servers(
         None => serde_json::json!({ "configured": false, "servers": [] }),
     };
     Ok(Json(body))
+}
+
+/// `GET /workers` — one entry per worker kind: state, health, pid, restarts, last exit. Bearer.
+async fn workers_status(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(
+        serde_json::json!({ "workers": st.sessions.workers_report() }),
+    ))
 }
 
 async fn skills(
@@ -742,7 +758,8 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
-/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
+/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1` (run in
+/// the supervised toolchain worker process, HUP-S1.9).
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -766,36 +783,31 @@ pub fn production_sessions_with(
         Some(lib) => mgr.with_skills(lib),
         None => mgr,
     };
-    let mgr = match toolchain_from_env() {
-        Some(host) => mgr.with_toolchain(host),
-        None => mgr,
+    // HUP-S1.9: the toolchain runs in its own supervised worker process (this binary started
+    // with `--worker toolchain`), so a crash there never takes the loop down.
+    let mgr = match std::env::current_exe() {
+        Ok(exe) => match workers::toolchain_worker_from_env(exe) {
+            Some(worker) => mgr
+                .with_toolchain(Arc::new(workers::RemoteToolHost::new(
+                    worker.clone(),
+                    workers::TOOLCHAIN_CALL_TIMEOUT,
+                )))
+                .with_workers(Arc::new(workers::WorkerSet::with_toolchain(worker))),
+            None => mgr,
+        },
+        Err(e) => {
+            if toolchain::ToolchainConfig::from_env().is_some() {
+                eprintln!(
+                    "citrate-agent-sidecar: toolchain tools off: cannot locate this binary to start the worker: {e}"
+                );
+            }
+            mgr
+        }
     };
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
-}
-
-/// HUP-S6.3: the toolchain host when `CITRATE_HERMES_TOOLCHAIN=1` (default off → `None`). What it
-/// will use is logged to stderr for the operator.
-pub fn toolchain_from_env() -> Option<Arc<toolchain::ToolchainHost>> {
-    let cfg = toolchain::ToolchainConfig::from_env()?;
-    eprintln!(
-        "citrate-agent-sidecar: toolchain tools on: {} granted folder(s), solc {}",
-        cfg.roots.len(),
-        if cfg.solc.is_some() {
-            "configured"
-        } else {
-            "not found (builds will fail offline)"
-        }
-    );
-    match toolchain::ToolchainHost::new(cfg) {
-        Ok(h) => Some(Arc::new(h)),
-        Err(e) => {
-            eprintln!("citrate-agent-sidecar: toolchain tools off: {e}");
-            None
-        }
-    }
 }
 
 // ---- HUP-S1.4: tracks + briefs ----

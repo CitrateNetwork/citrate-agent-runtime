@@ -63,6 +63,8 @@ dependencies = [
  "citrate-agent-loop",
  "citrate-agent-mcp-host",
  "citrate-agent-shell",
+ "citrate-agent-workers",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -1238,6 +1240,15 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "citrate-agent-workers"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
