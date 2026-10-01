@@ -187,10 +187,12 @@ impl SheetToolHost {
             Ok(m) if !m.is_file() => {
                 return ToolOutcome::Error(format!("{} is not a regular file", file.display()))
             }
-            Ok(m) if hard_linked(&m) => return ToolOutcome::Denied(format!(
-                "{} has other hard links, so it may be a file outside the grant; it was not read",
-                file.display()
-            )),
+            Ok(m) if hard_linked(&m) => {
+                return ToolOutcome::Denied(format!(
+                    "{} has other hard links, so it was not read",
+                    file.display()
+                ))
+            }
             Ok(m) if m.len() > SHEET_LIMITS.max_bytes => {
                 return ToolOutcome::Error(format!(
                     "{} is {} bytes; sheet_read reads at most {}",
