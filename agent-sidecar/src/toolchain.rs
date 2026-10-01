@@ -5,7 +5,7 @@
 //! | tool           | program | fixed argv                                                       | verdict                    |
 //! |----------------|---------|------------------------------------------------------------------|----------------------------|
 //! | `forge_test`   | forge   | `test --json [--match-test T] [--match-contract C]`              | all tests pass             |
-//! | `slither_scan` | slither | `. --sarif - --exclude-dependencies --disable-color`             | no finding ≥ `fail_on`     |
+//! | `slither_scan` | slither | `. --sarif - --exclude-dependencies --disable-color --compile-force-framework foundry` | no finding ≥ `fail_on` |
 //! | `aderyn_scan`  | aderyn  | `. --output aderyn-report.sarif --stdout --skip-update-check`    | no finding ≥ `fail_on`     |
 //! | `medusa_fuzz`  | medusa  | `fuzz --no-color --test-limit N --timeout S`                     | no failed property/assert  |
 //!
@@ -27,8 +27,13 @@
 //! pinned solc 0.8.36 in the per-user svm directory when it is there; without either a build
 //! fails with forge's own "can't install missing solc in offline mode" error.
 //!
+//! **Project configuration.** Before a run, the project's build configuration is checked
+//! ([`crate::toolchain_config`]): a project that turns on `ffi`, sets `fs_permissions` beyond
+//! reading inside the project, names a compiler by path, or holds env files or other build
+//! front-end configs is refused with the reason, and nothing runs.
+//!
 //! **Honest scope.** These are fixed argv templates, but the programs execute project code by
-//! design (forge tests, FFI when a project's `foundry.toml` enables it, compilation). There is
+//! design (forge tests in the EVM, compilation). There is
 //! no OS sandbox yet (US-2.2 AC1 is a separate work item), and a session stop or the e-stop does
 //! not interrupt a run in progress; the wall-clock timeout bounds it. aderyn and medusa are
 //! often not installed: the tools then say so and their verifiers fail, never pass. This module
@@ -333,6 +338,9 @@ impl ToolchainHost {
         if self.cfg.roots.is_empty() {
             return refuse("no project folder is granted to the toolchain".into());
         }
+        if let Err(e) = crate::toolchain_config::check_project_config(&project) {
+            return refuse(e);
+        }
         let plan = match plan_call(tool, &args) {
             Ok(p) => p,
             Err(e) => return refuse(e),
@@ -454,6 +462,8 @@ fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
                 "-",
                 "--exclude-dependencies",
                 "--disable-color",
+                "--compile-force-framework",
+                "foundry",
             ]),
             threshold: severity_arg(args)?,
             wall_secs: int_arg(args, "timeout_secs", DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS)?,
