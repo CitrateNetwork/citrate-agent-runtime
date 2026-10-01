@@ -41,6 +41,7 @@
     { "name": "skills_list", "host": "core", "read_only": true },
     { "name": "skill_write", "host": "core", "read_only": false },
     { "name": "skill_run", "host": "core", "read_only": true },
+    { "name": "widget_create", "host": "core", "read_only": false },
     { "name": "models_list", "host": "core", "read_only": true },
     { "name": "contract_deploy", "host": "core", "read_only": false }
   ],

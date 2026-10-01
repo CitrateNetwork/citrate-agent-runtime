@@ -22,6 +22,18 @@
 //!                               store, else off (optional)
 //!   CITRATE_HERMES_GRANTS       absolute path of the folder-grants JSON core stores; read on every
 //!                               file-tool call (optional)
+//!   CITRATE_HERMES_METERING_DIR HUP-S7.5: absolute folder for the metering log (metering.jsonl);
+//!                               unset = turn records are kept in memory only (optional)
+//!   CITRATE_HERMES_TRAJECTORIES HUP-S9.3: absolute folder for verified, redacted trajectory
+//!                               exports at session close; unset = no recording (optional, off)
+//!   CITRATE_HERMES_RECORDS_DIR  HUP-S7.3: absolute folder of the HIC decision records to batch
+//!   CITRATE_HERMES_ANCHOR_DIR   HUP-S7.3: absolute folder for the anchor ledger; both must be set
+//!                               for the /anchor/* routes, else they answer "not configured"
+//!
+//! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
+//! process instead (stdio line protocol, started and supervised by the control-plane process; it
+//! reads the same `CITRATE_HERMES_TOOLCHAIN*` variables). On SIGTERM or Ctrl-C the control plane
+//! stops accepting requests and shuts its workers down cleanly before exiting.
 
 use std::sync::Arc;
 
@@ -33,8 +45,42 @@ fn required(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|_| format!("{key} is required"))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(agent_sidecar::workers::WORKER_ARG) {
+        let kind = args.get(1).map(String::as_str).unwrap_or("");
+        std::process::exit(agent_sidecar::workers::run_worker(kind));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(control_plane())
+}
+
+/// Resolves on SIGTERM (how citrate-core's supervisor stops the sidecar) or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
     let addr = required("CITRATE_HERMES_ADDR")?;
     let token_file = required("CITRATE_HERMES_TOKEN_FILE")?;
     let bearer = std::fs::read_to_string(&token_file)
@@ -90,6 +136,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app(state)).await?;
+    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the worker processes first (each gets a shutdown
+    // request and a grace period, well inside core's 5 s stop grace), then let the server drain.
+    // Off the async runtime: it joins the supervisor threads.
+    let sessions = state.sessions.clone();
+    let served = axum::serve(listener, app(state.clone()))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+        })
+        .await;
+    // Idempotent: covers a server that ended without a signal.
+    let sessions = state.sessions.clone();
+    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+    served?;
     Ok(())
 }

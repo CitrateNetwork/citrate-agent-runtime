@@ -1,8 +1,8 @@
 ---
 created: 2026-10-01
-branch: hup/n3-folder-grants
+branch: hup/n3-folder-grants (wiring: hup/n4-grants-e2e)
 author: Larry Klosowski + Claude Opus 5.5
-status: implemented (not yet wired into sessions, file tools or core UI)
+status: implemented; wired into agent-sidecar sessions (hup/n4-grants-e2e); capsule preopens (S2.5) still later
 ---
 
 # citrate-agent-grants
@@ -28,13 +28,44 @@ grants.revoke(&id, now)?;
 
 ## Status
 
-Implemented and tested in this crate. The sidecar file tools (`fs_write`,
-`fs_edit`, `fs_delete`, `fs_rename`, HUP-S2.9) check every write through
-[`FolderGrants::check`](src/lib.rs), reading the grants file named by
-`CITRATE_HERMES_GRANTS` on every call; they are off unless
-`CITRATE_HERMES_FILES=1`. **Not wired in yet:** capsule WASI preopens (S2.5)
-do not call it, and citrate-core has no Grants screen or store for it, so it
-writes no grants file. Until then nothing in a member's experience changes.
+Implemented and tested in this crate, and wired into the agent sidecar
+(`agent-sidecar/src/grants.rs`, branch `hup/n4-grants-e2e`):
+
+- citrate-core stores the member's document (see *Persistence*) and sends it
+  in `POST /sessions` (`grants`) and again on every change
+  (`POST /sessions/:id/grants`, replace). A refused document answers 400 and
+  leaves the session with **no** grants, so a refused update never keeps an
+  older, broader set alive.
+- A session opened with a document is offered the sidecar-hosted file tools
+  `file_list`, `file_read` and `file_write`. Every path goes through
+  `check` at the moment of use. Reads covered by a folder grant are trusted
+  context; reads only full access covers come back untrusted and taint the
+  session (HUP-S2.7). Writes refuse a leaf symlink (opened with
+  `O_NOFOLLOW`) and a file with other hard links.
+- The toolchain tools (HUP-S6.3) check their project folder against the
+  session's grants (live read **and** write folder grants) instead of
+  `CITRATE_HERMES_TOOLCHAIN_ROOTS` when a document is present.
+- A session opened without a document is unchanged: no file tools, and the
+  toolchain keeps its env roots.
+
+Capsule WASI preopens (S2.5, `citrate_agent_core::capsule::sandbox`) are
+scoped to these grants: a capsule mount opens only a folder covered by live
+whole-folder grants, after every entry below it passes `check`. The sidecar
+does not yet pass a session's grants to its capsules (so they get no folder).
+
+With the toolchain in its worker process (HUP-S1.9), a grants session sends
+its current grant document with every toolchain call and the worker checks
+the project against it again.
+
+The checkpointed sidecar file tools (`fs_write`, `fs_edit`, `fs_delete`,
+`fs_rename`, HUP-S2.9) also check every write through `FolderGrants::check`,
+reading the grants file named by `CITRATE_HERMES_GRANTS` on every call; they
+are off unless `CITRATE_HERMES_FILES=1` and a checkpoint store is configured.
+Core does not yet point `CITRATE_HERMES_GRANTS` at its grant store, so for
+members these tools stay off.
+
+Not wired yet: grants for capsules in sidecar sessions, and the older
+`agent-legacy` path checks.
 
 ## Model
 
