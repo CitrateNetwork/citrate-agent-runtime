@@ -349,6 +349,10 @@ const DOTENV_TEMPLATES: &[&str] = &[
     ".env.defaults",
 ];
 
+/// macOS mounts the data volume a second time under `/System/Volumes/Data`
+/// (firmlinks), so a root-anchored rule also matches after this prefix.
+const DATA_VOLUME_ALIAS: &[&str] = &["system", "volumes", "data"];
+
 /// Symlinks followed per check before failing closed (matches Linux ELOOP).
 const MAX_SYMLINKS: usize = 40;
 
@@ -393,7 +397,11 @@ fn match_rules(path: &Path) -> Result<(), Denied> {
     let keys = folded_components(path);
     for rule in RULES {
         let hit = match rule.anchor {
-            Anchor::Root => run_matches(&keys, rule.run),
+            Anchor::Root => {
+                run_matches(&keys, rule.run)
+                    || (run_matches(&keys, DATA_VOLUME_ALIAS)
+                        && run_matches(&keys[DATA_VOLUME_ALIAS.len()..], rule.run))
+            }
             Anchor::Anywhere => (0..keys.len()).any(|i| run_matches(&keys[i..], rule.run)),
         };
         if hit {

@@ -218,6 +218,23 @@ fn system_secret_paths_are_denied() {
 }
 
 #[test]
+fn system_secret_paths_are_denied_under_the_macos_data_volume_alias() {
+    // macOS exposes the data volume a second time under /System/Volumes/Data,
+    // so root-anchored rules must match through that prefix as well.
+    let (_t, _h, ctx) = fixture();
+    for p in [
+        "/System/Volumes/Data/private/etc/sudoers",
+        "/System/Volumes/Data/private/etc/ssh/ssh_host_ed25519_key",
+        "/System/Volumes/Data/private/var/db/dslocal/nodes/Default/users/root.plist",
+        "/system/volumes/data/PRIVATE/etc/master.passwd",
+    ] {
+        denied_as(p, &ctx, DenyCategory::SystemPath);
+    }
+    // The alias alone, and ordinary files under it, stay reachable.
+    allowed("/System/Volumes/Data/private/etc/hosts", &ctx);
+}
+
+#[test]
 fn ordinary_system_paths_are_allowed() {
     let (_t, _h, ctx) = fixture();
     // `/etc/hosts` exists on macOS and Linux; resolving `/etc` -> `/private/etc`

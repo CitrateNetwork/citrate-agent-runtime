@@ -35,7 +35,8 @@ routes them through `check_path`.
 
 Rules match folded path components (see "Matching"). "Anywhere" rules match
 at any depth, so `~/.ssh`, `/root/.ssh` and another user's `/home/x/.ssh` are
-all denied; "root" rules only match from the filesystem root.
+all denied; "root" rules only match from the filesystem root (or from the
+macOS data-volume alias `/System/Volumes/Data`, which reaches the same files).
 
 | Category | Anchor | Locations |
 |---|---|---|
