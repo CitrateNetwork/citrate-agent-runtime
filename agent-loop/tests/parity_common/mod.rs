@@ -173,9 +173,22 @@ pub fn run_scenario(
                 description: format!("{n} (parity)"),
                 parameters: serde_json::json!({"type": "object"}),
                 host: HostKind::Core,
-                annotations: ToolAnnotations {
-                    read_only: t["read_only"].as_bool().unwrap_or(false),
-                    ..ToolAnnotations::default()
+                // Annotated the way the app annotates its own tools (HUP-A8): reads are
+                // `effect: none`, the rest `write`, and results from the app's gated handlers are
+                // trusted. Parity covers the untainted loop; the taint downgrade (HUP-S2.7) has its
+                // own suite (taint_tests.rs), and harness.ts has no taint concept to compare with.
+                annotations: {
+                    let read_only = t["read_only"].as_bool().unwrap_or(false);
+                    ToolAnnotations {
+                        read_only,
+                        effect: Some(if read_only {
+                            citrate_agent_loop::Effect::None
+                        } else {
+                            citrate_agent_loop::Effect::Write
+                        }),
+                        trust: Some(citrate_agent_loop::Trust::Trusted),
+                        ..ToolAnnotations::default()
+                    }
                 },
             }
         })
