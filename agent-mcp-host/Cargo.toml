@@ -1,0 +1,27 @@
+[package]
+name = "citrate-agent-mcp-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermes's MCP host (HUP-S4.1): one MCP client per allowlisted server over stdio (env-filtered child process) or streamable HTTP (loopback or https), with tools mapped to agent-loop tool specs. MCP output is always untrusted and taints the session. Keyless: never signs."
+
+[dependencies]
+citrate-agent-loop = { path = "../agent-loop" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+
+# A real, tiny MCP server over stdio, used only by this crate's integration tests. It is not
+# installed or shipped (the workspace default member is agent/cli).
+[[bin]]
+name = "citrate-mcp-fixture-server"
+path = "fixtures/stdio_server.rs"
+test = false
+doc = false
