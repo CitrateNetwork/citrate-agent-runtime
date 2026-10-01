@@ -470,3 +470,66 @@ fn the_wire_mapping_round_trips_tool_calls() {
     assert!(llm_http::parse_turn(r#"{"choices":[{"message":{"content":""}}]}"#).is_err());
     assert!(llm_http::parse_turn("not json").is_err());
 }
+
+/// Regression (found by the S1.8 end-to-end smoke): the production model client must be safe to
+/// create and drop inside the async runtime. reqwest's blocking client owns an internal runtime;
+/// building or dropping it in an async handler panicked and poisoned the session lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_production_client_survives_create_and_close_inside_the_runtime() {
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue: Arc::new(ApprovalQueue::new()),
+        skills: vec![],
+        dispatch: None,
+        bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: production_sessions(),
+    });
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/sessions",
+            create_body("http://127.0.0.1:9/v1"),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let id = json(r).await["id"].as_str().unwrap().to_string();
+    // A turn against a closed port fails honestly (no panic), and the session keeps working.
+    app(st.clone())
+        .oneshot(req(
+            "POST",
+            &format!("/sessions/{id}/messages"),
+            serde_json::json!({"text": "hi"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    let evs = wait_for(&st, &id, "done").await;
+    assert!(evs.iter().any(|e| e["type"] == "error"), "{evs:?}");
+    let r = app(st.clone())
+        .oneshot(req(
+            "DELETE",
+            &format!("/sessions/{id}"),
+            serde_json::Value::Null,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/sessions",
+            create_body("http://127.0.0.1:9/v1"),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::CREATED,
+        "the session lock is not poisoned"
+    );
+}
