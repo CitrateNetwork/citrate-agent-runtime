@@ -5,7 +5,8 @@
 #![cfg(unix)]
 
 use citrate_agent_grants::{
-    Access, Decision, FolderGrants, GrantError, GrantRequest, GrantState, Op, STATE_VERSION,
+    Access, Decision, FolderGrants, GrantError, GrantRequest, GrantState, GrantStatus, Op,
+    STATE_VERSION,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -207,4 +208,38 @@ fn state_values_can_be_loaded_directly() {
         Op::Read,
         T0
     )));
+}
+
+#[test]
+fn a_stored_grant_is_inert_before_its_granted_at() {
+    // A stored grant's window is [granted_at, expires_at). A full-access
+    // grant whose granted_at lies far ahead of the clock (a bad clock when it
+    // was written, or an edited file) must not be live now: otherwise its
+    // 24 h bound would be measured from the wrong instant and it would stay
+    // live until long after now + 24 h.
+    let (_t, home, proj) = fixture();
+    let mut g = FolderGrants::new(&home, &proj);
+    g.grant(GrantRequest::full_access(&home, 3600, MEMBER, "look"), T0)
+        .expect("grant");
+    g.grant(GrantRequest::folder(&proj, Access::Read, MEMBER, "r"), T0)
+        .expect("grant");
+    let later = T0 + 10 * 365 * 86_400;
+    let doc = tamper(&g.to_json().expect("json"), |v| {
+        v["grants"][0]["granted_at"] = later.into();
+        v["grants"][0]["expires_at"] = (later + 3600).into();
+        v["grants"][1]["granted_at"] = later.into();
+    });
+    let back = FolderGrants::from_json(&doc, &home, &proj).expect("load");
+    let file = proj.join("src/a.rs").display().to_string();
+    let home_file = home.display().to_string();
+    for now in [T0, T0 + 3600, later - 1] {
+        assert!(!is_allowed(&back.check(&file, Op::Read, now)), "{now}");
+        assert!(!is_allowed(&back.check(&home_file, Op::Read, now)), "{now}");
+    }
+    assert!(back
+        .list(T0)
+        .iter()
+        .all(|v| v.status == GrantStatus::NotYetActive));
+    assert!(is_allowed(&back.check(&file, Op::Read, later)));
+    assert!(!is_allowed(&back.check(&home_file, Op::Read, later + 3600)));
 }

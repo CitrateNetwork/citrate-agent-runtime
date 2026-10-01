@@ -73,7 +73,7 @@ not true only because nothing is ever allowed.
 
 | Mutant | Caught by |
 |---|---|
-| coverage judged on the lexical location (the legacy `..`-first order) | `NoParentEscape` |
+| coverage judged on the lexical location (a `..`-first order) | `NoParentEscape` |
 | guard checks only the request as written, not the resolved target | `SecretsNeverReadable` |
 | revocation ignored | `ExpiredGrantInert` |
 | expiry inclusive (`t <= exp`) | `ExpiredGrantInert` |

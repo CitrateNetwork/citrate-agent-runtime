@@ -33,9 +33,8 @@
 //!
 //! Paths are resolved by agent-guard the way the kernel resolves them:
 //! component by component, following each symlink where it is met, so
-//! `link/..` is the parent of the link's *target*. (The `agent-legacy`
-//! sandbox popped `..` lexically before canonicalizing; that order is wrong
-//! for `link/..` and is not repeated here.) The existing part of the result
+//! `link/..` is the parent of the link's *target*. No `..` is ever popped
+//! lexically before resolution. The existing part of the result
 //! is then passed through `std::fs::canonicalize` only to pick up the
 //! on-disk spelling on case-insensitive volumes, and the guard is asked
 //! again about that spelling; the two must agree exactly or the check fails
@@ -136,9 +135,14 @@ pub struct Grant {
 }
 
 impl Grant {
-    /// Live at `now`: not revoked and not expired.
+    /// Live at `now`: not revoked, already granted and not expired. The
+    /// window is `[granted_at, expires_at)`, so a stored grant dated ahead of
+    /// the clock is inert until then and full access stays bounded by its
+    /// TTL from the instant it starts.
     pub fn is_active(&self, now: u64) -> bool {
-        self.revoked_at.is_none() && self.expires_at.is_none_or(|t| now < t)
+        self.revoked_at.is_none()
+            && self.granted_at <= now
+            && self.expires_at.is_none_or(|t| now < t)
     }
 
     fn covers(&self, path: &Path) -> bool {
@@ -306,6 +310,8 @@ pub enum Decision {
 /// Lifecycle state for the Grants list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GrantStatus {
+    /// Dated after `now` (`granted_at > now`): allows nothing yet.
+    NotYetActive,
     Active,
     Expired,
     Revoked,
@@ -460,6 +466,8 @@ impl FolderGrants {
                 grant: g.clone(),
                 status: if g.revoked_at.is_some() {
                     GrantStatus::Revoked
+                } else if now < g.granted_at {
+                    GrantStatus::NotYetActive
                 } else if g.is_active(now) {
                     GrantStatus::Active
                 } else {
@@ -699,6 +707,7 @@ mod tests {
     #[test]
     fn active_window_is_half_open() {
         let mut g = grant("/a", GrantScope::Subtree);
+        assert!(!g.is_active(9));
         assert!(g.is_active(10));
         assert!(g.is_active(19));
         assert!(!g.is_active(20));

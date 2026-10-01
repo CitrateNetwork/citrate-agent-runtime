@@ -51,8 +51,10 @@ A grant is `(root, access, scope, expiry, granted_by, reason)`, stored as a
 
 Rules enforced when a grant is created **and** when stored grants are loaded:
 
-- The root must pass the default-deny list (`citrate-agent-guard`) and be an
-  existing folder. A grant cannot be rooted in `~/.ssh`, a keychain, and so on.
+- The root must pass the default-deny list (`citrate-agent-guard`). A grant
+  cannot be rooted in `~/.ssh`, a keychain, and so on. At creation the root
+  must also be an existing folder; a stored grant whose folder was deleted
+  later still loads and simply covers nothing that exists.
 - Write access to the filesystem root is refused.
 - `granted_by` and `reason` must be non-empty.
 - **Full access is read-only** and always expires, at most
@@ -64,8 +66,8 @@ Rules enforced when a grant is created **and** when stored grants are loaded:
 
 `check(path, op, now)`:
 
-1. **Folder grants.** The live folder grants for `op` (not revoked, `now <
-   expires_at`) become the guard's project roots. The guard resolves the
+1. **Folder grants.** The live folder grants for `op` (not revoked,
+   `granted_at <= now < expires_at`) become the guard's project roots. The guard resolves the
    path the way the kernel does (each symlink followed where it is met, so
    `link/..` is the parent of the link's target) and checks every location it
    visits against the deny list. The existing part of the result is put in
@@ -82,19 +84,19 @@ The deny list always wins: no grant of any kind reaches a location it
 denies. Expiry is evaluated at the `now` the caller passes on every check, so a
 grant stops working the second it expires; nothing has to sweep it.
 
-### What is not repeated from `agent-legacy`
+### Relation to the `agent-legacy` path checks
 
-- `adapters/sandbox.rs` normalized `..` lexically **before** canonicalizing,
-  so `<root>/link/../x` with `link -> /elsewhere/dir` was judged as `<root>/x`
-  while the kernel opens `/elsewhere/x`. Resolution here is the guard's
-  kernel-order walk. Test `dotdot_after_a_symlink_is_the_parent_of_the_target_not_of_the_link`
-  and the fuzz both fail when the lexical-first order is put back.
-- `mcp_server.rs` `path_within_any` is lexical only and rejects every `..`.
-  Here `..` is allowed and resolved; containment is a component-wise prefix
-  test on resolved paths (`/a/proj-old` is not inside `/a/proj`).
-- Both compared against roots that were never canonicalized. Roots here are
-  stored canonical, so a granted folder later replaced by a symlink grants
-  nothing new.
+The older path checks in `agent-legacy` (`adapters/sandbox.rs`,
+`mcp_server.rs`) are not reused; moving them onto this crate or agent-guard
+is a later work package. What this crate does instead:
+
+- Resolution is the guard's kernel-order walk; `..` is never popped
+  lexically before resolution. Test `dotdot_after_a_symlink_is_the_parent_of_the_target_not_of_the_link`
+  and the fuzz both fail when a lexical-first order is put in.
+- Containment is a component-wise prefix test on resolved paths
+  (`/a/proj-old` is not inside `/a/proj`).
+- Roots are stored canonical, so a granted folder later replaced by a
+  symlink grants nothing new.
 
 `CapabilityGrant` in `agent-legacy/src/canonical.rs` carries `allowed_paths`
 inside a signed, tool-scoped grant for external MCP runtimes. That type and
@@ -145,8 +147,10 @@ root in the deny list, write on `/`, empty member or reason, expiry not after
 grant time, full access that is writable, unbounded or longer than 24 h).
 Failing closed means a corrupted file grants nothing. Revoked and expired
 grants stay in the document for the Grants list; `list(now)` returns each with
-its status (`Active`, `Expired`, `Revoked`) and `remaining_secs`, the
-full-access countdown.
+its status (`NotYetActive`, `Active`, `Expired`, `Revoked`) and
+`remaining_secs`, the full-access countdown. A grant's window is
+`[granted_at, expires_at)`: a stored grant dated ahead of the clock allows
+nothing until then, so full access stays within 24 h of when it starts.
 
 Core should store the document under its own app-data directory
 (`ai.citrate.core*`), which agent-guard denies to the agent, so the agent
@@ -171,8 +175,9 @@ is point-in-time: re-check at use, which is cheap.
   at use time (half-open), zero TTL, immediate and final revocation, full
   access read-only and at most 24 h, request validation, canonical stored
   root, list status and countdown, most specific grant.
-- `tests/persistence.rs` (4): round trip, field names and version, 13
-  tampered documents refused, loading from a `GrantState` value.
+- `tests/persistence.rs` (5): round trip, field names and version, 13
+  tampered documents refused, loading from a `GrantState` value, a stored
+  grant dated ahead of the clock staying inert until its `granted_at`.
 - `tests/traversal_fuzz.rs` (2): a fixed-seed generator in agent-guard's
   style against a real tree with live, revoked and expired grants, deny
   locations and symlinks (out, in, `..` traps, relative, dangling, into the
