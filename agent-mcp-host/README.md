@@ -89,9 +89,12 @@ live here:
   (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `title`), the
   effective annotations after the spec defaults, `trust: "untrusted"`, and whether a
   session would be offered it (with the reason when not). It never carries the URL, the
-  environment, or the server's `instructions` text. The whole probe is bounded by
-  `PROBE_TIMEOUT` (20 s); the sidecar runs one probe at a time (429 otherwise) and
-  answers 422 `{errors: [{field, message}]}` for an invalid entry.
+  environment, or the server's `instructions` text. The answer is bounded by
+  `PROBE_TIMEOUT` (20 s): past it the caller gets a failed report, while the probe's own
+  worker keeps going until the server stops answering within the per-request cap (also
+  20 s) or the listing ends, and only then stops the server. The sidecar runs one probe at a time (429 otherwise) and answers
+  422 `{errors: [{field, message}]}` for an invalid entry. The reserved names and the
+  loader env denylist are placeholders pending owner sign-off.
 
 The sidecar still reads only the allowlist file named by `CITRATE_HERMES_MCP` at start;
 core writes that file with the enabled, reviewed entries.

@@ -21,7 +21,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 /// Names kept for the servers Hermes ships with (planset 02 §5), so a user entry can never take a
-/// built-in server's tool namespace.
+/// built-in server's tool namespace. Pending owner sign-off: a conservative placeholder list.
 pub const RESERVED_SERVER_NAMES: &[&str] = &[
     "citrate",
     "citrate-node",
@@ -50,7 +50,9 @@ const MAX_ENV_KEY: usize = 128;
 const MAX_ARGS: usize = 64;
 const MAX_ENV: usize = 64;
 
-/// Env names that change which code a process loads or runs at start-up.
+/// Env names that change which code a process loads or runs at start-up. Pending owner sign-off:
+/// a conservative placeholder denylist (it refuses some legitimate uses, such as memory flags in
+/// `NODE_OPTIONS`; those can be passed as program arguments instead).
 const LOADER_ENV_EXACT: &[&str] = &[
     "NODE_OPTIONS",
     "NODE_PATH",
