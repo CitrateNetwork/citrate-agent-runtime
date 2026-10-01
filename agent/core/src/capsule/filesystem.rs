@@ -55,10 +55,18 @@ impl FilesystemEntry {
                 "[capability].filesystem path '{path_str}' must be absolute (start with '/')"
             )));
         }
-        Ok(FilesystemEntry {
-            access,
-            path: PathBuf::from(path_str),
-        })
+        let path = PathBuf::from(path_str);
+        // HUP-S2.5: the path is the guest mount point of a WASI preopen; a
+        // `..` component would make the mount point ambiguous, so refuse it.
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AgentError::Capsule(format!(
+                "[capability].filesystem path '{path_str}' must not contain '..'"
+            )));
+        }
+        Ok(FilesystemEntry { access, path })
     }
 }
 
@@ -93,6 +101,12 @@ mod tests {
     fn reject_relative_path() {
         let err = FilesystemEntry::parse("read:./relative").expect_err("relative path rejected");
         assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn reject_parent_dir_component() {
+        let err = FilesystemEntry::parse("read:/data/../etc").expect_err("'..' rejected");
+        assert!(err.to_string().contains(".."), "actual: {err}");
     }
 
     #[test]
