@@ -1,0 +1,21 @@
+[package]
+name = "citrate-agent-learn"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verified self-learning for Hermes (HUP-S3.4): skill and memory proposals that can only come from a workflow whose verifiers passed, member accept or reject recorded in the HIC decision log, conflict surfacing, persistence of accepted skills as SKILL.md, typed memory records for core, and a build-only SkillRegistry publish payload. Keyless: nothing here signs or sends."
+
+[dependencies]
+citrate-agent-loop = { path = "../agent-loop" }
+citrate-agent-records = { path = "../agent-records" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+sha3 = { workspace = true }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

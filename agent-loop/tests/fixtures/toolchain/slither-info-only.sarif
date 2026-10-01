@@ -1,0 +1,57 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Slither",
+          "informationUri": "https://github.com/crytic/slither",
+          "version": "0.11.6",
+          "rules": [
+            {
+              "id": "3-0-solc-version",
+              "name": "solc-version",
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "0.0"
+              },
+              "shortDescription": {
+                "text": "Incorrect versions of Solidity"
+              },
+              "help": {
+                "text": "\nDeploy with a recent version of Solidity (at least 0.8.0) with no known severe issues.\n\nUse a simple pragma version that allows any of these versions.\nConsider using the latest version of Solidity for testing."
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "3-0-solc-version",
+          "message": {
+            "text": "Version constraint ^0.8.20 contains known severe issues (https://solidity.readthedocs.io/en/latest/bugs.html)\n\t- VerbatimInvalidDeduplication\n\t- FullInlinerNonExpressionSplitArgumentEvaluationOrder\n\t- MissingSideEffectsOnSelectorAccess.\nIt is used by:\n\t- ^0.8.20 (src/Counter.sol#2)\n",
+            "markdown": "Version constraint ^0.8.20 contains known severe issues (https://solidity.readthedocs.io/en/latest/bugs.html)\n\t- VerbatimInvalidDeduplication\n\t- FullInlinerNonExpressionSplitArgumentEvaluationOrder\n\t- MissingSideEffectsOnSelectorAccess.\nIt is used by:\n\t- [^0.8.20](src/Counter.sol#L2)\n"
+          },
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/Counter.sol"
+                },
+                "region": {
+                  "startLine": 2,
+                  "endLine": 2
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "id": "7d34996579a593f197ae0afeb57b0c9c2a1f614b911fe26e66c8c4d598774677"
+          }
+        }
+      ]
+    }
+  ]
+}

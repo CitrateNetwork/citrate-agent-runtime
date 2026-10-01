@@ -1,0 +1,19 @@
+[package]
+name = "citrate-agent-trajectory"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verified-trajectory export (HUP-S9.3): turns whose workflow verifiers all passed become a JSONL training set, redacted by default (secrets, bearer tokens, seed phrases, paths outside granted roots, wallet addresses, emails), with a value-free redaction report. Tainted sessions are excluded unless explicitly allowed. Local only: nothing here uploads."
+
+[dependencies]
+citrate-agent-loop = { path = "../agent-loop" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"
+
+[dev-dependencies]
+sha2 = "0.10"
+tempfile = "3"

@@ -1,0 +1,5 @@
+⇾ Reading the configuration file at: medusa.json
+⇾ Compiling targets with crytic-compile
+⇾ Fuzzing with 10 workers
+⇾ fuzz: elapsed:       0s, calls:          0 (     0/sec), seq/s:      0, branches:     12, corpus:     0, failures: 0/0, gas/s:            0
+⇾ fuzz: elapsed:       3s, calls:      24512 (  8170/sec), seq/s:     81, branches:     34, corpus:     6, failures: 0/245, gas/s:      1234567
