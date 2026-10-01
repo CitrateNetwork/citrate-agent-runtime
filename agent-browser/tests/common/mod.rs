@@ -19,6 +19,16 @@ pub const LOGIN: &str = r#"<!doctype html><html><head><title>Example login</titl
 <button disabled>Later</button>
 </body></html>"#;
 
+/// A page that changes its own address (same document, `history.pushState`) once the test sets
+/// [`SPA_MOVE`]; it asks the server every 100 ms.
+pub const SPA: &str = r#"<!doctype html><html><head><title>Single page</title></head>
+<body><h1>Cart</h1><button onclick="document.title='clicked'">Continue</button>
+<script>var t = setInterval(function(){ fetch('/should-move').then(function(r){ return r.text(); }).then(function(x){ if (x === 'yes') { clearInterval(t); history.pushState({}, '', '/spa?moved=1'); } }).catch(function(){}); }, 100);</script>
+</body></html>"#;
+
+/// Set by a test to make the [`SPA`] page move.
+pub static SPA_MOVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub const NEXT: &str = r#"<!doctype html><html><head><title>Welcome page</title></head>
 <body><h1>Welcome</h1><p id="who"></p>
 <script>document.getElementById('who').textContent = 'Signed in as ' + new URLSearchParams(location.search).get('email');</script>
@@ -53,6 +63,11 @@ pub fn serve() -> String {
                 let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let (status, body) = if path.starts_with("/login") {
                     ("200 OK", LOGIN)
+                } else if path.starts_with("/spa") {
+                    ("200 OK", SPA)
+                } else if path.starts_with("/should-move") {
+                    let yes = SPA_MOVE.load(std::sync::atomic::Ordering::SeqCst);
+                    ("200 OK", if yes { "yes" } else { "no" })
                 } else if path.starts_with("/next") {
                     ("200 OK", NEXT)
                 } else {
@@ -106,4 +121,38 @@ pub fn free_port() -> u16 {
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
         .unwrap_or(0)
+}
+
+/// Serve a redirect (302) from every path to `to` on 127.0.0.1; returns the base URL.
+pub fn serve_redirect(to: String) -> String {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let to = to.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(&stream);
+                loop {
+                    let mut l = String::new();
+                    match reader.read_line(&mut l) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if l == "\r\n" || l == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let mut s = &stream;
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    format!("http://{addr}")
 }

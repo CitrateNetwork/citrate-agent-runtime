@@ -273,8 +273,34 @@ fn attach_needs_consent_per_session_and_per_origin() {
     let frame = wait_for(|| svc.frame(0).filter(|f| !f.data.is_empty()), 10).expect("a frame");
     assert!(!frame.withheld);
 
-    // Revoking consent stops reads at once and withholds frames.
+    // Revoking consent stops reads and actions at once.
+    let go = snap
+        .refs
+        .iter()
+        .find(|r| r.name == "Continue")
+        .cloned()
+        .expect("the Continue button");
     svc.revoke_origin(&base).expect("revokes");
+    assert!(matches!(
+        svc.snapshot(),
+        Err(BrowserError::NeedsConsent { .. })
+    ));
+    assert!(
+        matches!(
+            svc.act(&go.r#ref, &Action::Click),
+            Err(BrowserError::NeedsConsent { .. })
+        ),
+        "no click on an origin whose consent was revoked"
+    );
+
+    // A consented origin that redirects to one without consent: the landing page is refused.
+    let redirector = common::serve_redirect(format!("{base}/login"));
+    svc.allow_origin(&redirector, false)
+        .expect("consents to the redirector only");
+    match svc.navigate(&format!("{redirector}/go")) {
+        Err(BrowserError::NeedsConsent { origin }) => assert_eq!(origin, base),
+        other => panic!("expected NeedsConsent for the redirect target, got {other:?}"),
+    }
     assert!(matches!(
         svc.snapshot(),
         Err(BrowserError::NeedsConsent { .. })

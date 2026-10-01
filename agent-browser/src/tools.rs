@@ -229,6 +229,31 @@ impl BrowserToolHost {
     }
 }
 
+impl BrowserToolHost {
+    /// Run `browser_act`; with `version`, only if the page is still the one the member was asked
+    /// about.
+    fn execute_act(&self, call: &ToolCall, version: Option<u64>) -> ToolOutcome {
+        if self.stop.is_stopped() {
+            return ToolOutcome::Denied("the session was stopped".to_string());
+        }
+        let a = match parse_act(call) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::Error(e),
+        };
+        let done = match version {
+            Some(v) => self.service.act_if_unchanged(&a.r#ref, &a.action, v),
+            None => self.service.act(&a.r#ref, &a.action),
+        };
+        match done {
+            Ok(s) => ToolOutcome::Untrusted(s),
+            Err(e) => {
+                self.service.clear_highlight();
+                outcome_of_error(e)
+            }
+        }
+    }
+}
+
 impl ToolHost for BrowserToolHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         if self.stop.is_stopped() {
@@ -258,16 +283,7 @@ impl ToolHost for BrowserToolHost {
                 )),
                 Err(e) => outcome_of_error(e),
             },
-            ACT => {
-                let a = match parse_act(call) {
-                    Ok(a) => a,
-                    Err(e) => return ToolOutcome::Error(e),
-                };
-                match self.service.act(&a.r#ref, &a.action) {
-                    Ok(s) => ToolOutcome::Untrusted(s),
-                    Err(e) => outcome_of_error(e),
-                }
-            }
+            ACT => self.execute_act(call, None),
             SCREENSHOT => match self.service.screenshot() {
                 Ok((p, bytes)) => ToolOutcome::Untrusted(fence(
                     &p.url,
@@ -294,6 +310,9 @@ impl ToolHost for BrowserToolHost {
         if self.service.is_stopped() {
             return ToolOutcome::Denied(BrowserError::Stopped.to_string());
         }
+        // What the member is shown is bound to the page as it is now: an allowed click or entry
+        // runs only if no new snapshot was taken and the page did not move in the meantime.
+        let version = self.service.page_version();
         // Validate before asking: never put a malformed request in front of the member.
         let valid = match call.name.as_str() {
             NAVIGATE => parse_url(call).map(|_| ()),
@@ -311,6 +330,7 @@ impl ToolHost for BrowserToolHost {
             .service
             .request_approval(&call.name, &summary, reason, &move || stop.is_stopped());
         match decision {
+            Decision::Allowed if call.name == ACT => self.execute_act(call, Some(version)),
             Decision::Allowed => self.execute(call),
             Decision::Denied(why) => {
                 self.service.clear_highlight();

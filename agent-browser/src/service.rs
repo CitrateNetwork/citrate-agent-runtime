@@ -14,7 +14,7 @@
 //! browser tool runs again until the member resumes.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,8 @@ pub struct BrowserConfig {
     pub command_timeout: Duration,
     pub navigation_timeout: Duration,
     pub launch_timeout: Duration,
-    /// How long an action waits for the member before it is denied.
+    /// How long an action waits for the member before it is denied. The 120 s default is a
+    /// conservative placeholder, pending owner sign-off.
     pub approval_timeout: Duration,
     pub denylist: Denylist,
     pub snapshot_limits: SnapshotLimits,
@@ -190,6 +191,10 @@ struct Shared {
     target: Mutex<Option<String>>,
     consent_needed: Mutex<Option<ConsentNeeded>>,
     mode: Mutex<Option<Mode>>,
+    /// Bumped whenever the refs the member could have been shown stop being current: a new
+    /// snapshot, or the main frame moving to another address (including same-document moves).
+    /// An approved action runs only if this is unchanged since the member was asked.
+    page_version: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -226,6 +231,7 @@ impl Shared {
                     if let Some(u) = frame["url"].as_str() {
                         *lock(&self.url) = u.to_string();
                     }
+                    self.page_version.fetch_add(1, Ordering::SeqCst);
                 }
                 None
             }
@@ -235,6 +241,7 @@ impl Shared {
                     if let Some(u) = ev.params["url"].as_str() {
                         *lock(&self.url) = u.to_string();
                     }
+                    self.page_version.fetch_add(1, Ordering::SeqCst);
                 }
                 None
             }
@@ -484,6 +491,7 @@ impl BrowserService {
         let nodes = r["nodes"].as_array().cloned().unwrap_or_default();
         let snap = build_snapshot(&nodes, self.cfg.snapshot_limits);
         live.snapshot = Some(snap.clone());
+        self.shared.page_version.fetch_add(1, Ordering::SeqCst);
         let title = self.title(live);
         Ok((PageInfo { url, title }, snap))
     }
@@ -522,8 +530,25 @@ impl BrowserService {
         self.shared.frames.set_highlight(None);
     }
 
+    /// Which page and snapshot the refs refer to right now. Read it when asking the member about
+    /// an action and pass it to [`BrowserService::act_if_unchanged`], so the allowed action runs
+    /// only on what the member was shown.
+    pub fn page_version(&self) -> u64 {
+        self.shared.page_version.load(Ordering::SeqCst)
+    }
+
     /// Click or type into an element by its ref from the latest snapshot.
     pub fn act(&self, r: &str, action: &Action) -> Result<String> {
+        self.act_at(r, action, None)
+    }
+
+    /// [`BrowserService::act`], refused if the page or snapshot changed since `version` (from
+    /// [`BrowserService::page_version`]): a new snapshot, or the page moved to another address.
+    pub fn act_if_unchanged(&self, r: &str, action: &Action, version: u64) -> Result<String> {
+        self.act_at(r, action, Some(version))
+    }
+
+    fn act_at(&self, r: &str, action: &Action, version: Option<u64>) -> Result<String> {
         let mut guard = self.ensure_live()?;
         let live = guard
             .as_mut()
@@ -547,6 +572,11 @@ impl BrowserService {
                     "there is no element [{r}] in the latest snapshot; take a new browser_snapshot"
                 ))
             })?;
+        if version.is_some_and(|v| v != self.page_version()) {
+            return Err(BrowserError::StaleRef(
+                "the page changed while the member was deciding, so nothing was done; take a new browser_snapshot".to_string(),
+            ));
+        }
         if entry.disabled {
             return Err(BrowserError::Failed(format!(
                 "[{r}] {} \"{}\" is disabled",

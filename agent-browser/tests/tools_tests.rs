@@ -188,8 +188,16 @@ fn a_session_stop_or_a_browser_stop_ends_the_wait_as_denied() {
         )
     });
     wait_pending(&svc).expect("asked");
+    let asked_at = Instant::now();
     stop.stop();
-    assert!(matches!(t.join().expect("joins"), ToolOutcome::Denied(_)));
+    match t.join().expect("joins") {
+        ToolOutcome::Denied(w) => assert!(w.contains("session was stopped"), "{w}"),
+        other => panic!("expected a denial, got {other:?}"),
+    }
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(2),
+        "a session stop ends the wait promptly, not at the deadline"
+    );
 
     let host = Arc::new(BrowserToolHost::new(svc.clone(), StopFlag::default()));
     let h = host.clone();
@@ -352,4 +360,88 @@ fn in_the_loop_reading_a_page_taints_and_the_next_click_waits_for_the_member() {
         .any(|e| matches!(e, Event::Tainted { source, .. } if source == "browser_navigate")));
     assert!(registry.taint().is_tainted());
     assert!(svc.status().url.contains("/next"), "{}", svc.status().url);
+}
+
+/// Run `browser_act` through the explicit-approval path on another thread and return its handle
+/// once the member is being asked.
+fn ask_in_background(
+    svc: &Arc<BrowserService>,
+    args: &'static str,
+) -> std::thread::JoinHandle<ToolOutcome> {
+    let host = Arc::new(BrowserToolHost::new(svc.clone(), StopFlag::default()));
+    let t = std::thread::spawn(move || {
+        host.execute_with_explicit_approval(&call("browser_act", args), "tainted")
+    });
+    wait_pending(svc).expect("the member is asked");
+    t
+}
+
+#[test]
+fn an_approval_is_bound_to_the_snapshot_the_member_was_shown() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let base = common::serve();
+    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let login = format!("{base}/login");
+    svc.navigate(&login).expect("navigates");
+    svc.snapshot().expect("snapshot");
+
+    // While the member decides, the page is read again (another session, say): the refs the
+    // member was shown are no longer the ones the click would use.
+    let t = ask_in_background(&svc, r#"{"ref":"e2","action":"click"}"#);
+    svc.navigate(&login).expect("navigates again");
+    svc.snapshot().expect("a new snapshot");
+    let id = svc.pending_action().expect("still waiting").id;
+    svc.decide(&id, true).expect("allows");
+    match t.join().expect("joins") {
+        ToolOutcome::Error(e) => assert!(e.contains("changed"), "{e}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        svc.status().url.contains("/login"),
+        "nothing was clicked: {}",
+        svc.status().url
+    );
+
+    // Unchanged page: the allowed click runs.
+    let t = ask_in_background(&svc, r#"{"ref":"e2","action":"click"}"#);
+    let id = svc.pending_action().expect("waiting").id;
+    svc.decide(&id, true).expect("allows");
+    assert!(matches!(
+        t.join().expect("joins"),
+        ToolOutcome::Untrusted(_)
+    ));
+    assert!(svc.status().url.contains("/next"), "{}", svc.status().url);
+}
+
+#[test]
+fn an_approval_is_void_when_the_page_moves_on_by_itself() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let base = common::serve();
+    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    svc.navigate(&format!("{base}/spa")).expect("navigates");
+    let (_, snap) = svc.snapshot().expect("snapshot");
+    assert!(
+        snap.refs.iter().any(|r| r.name == "Continue"),
+        "{}",
+        snap.text
+    );
+
+    let t = ask_in_background(&svc, r#"{"ref":"e1","action":"click"}"#);
+    // The page changes its own address (history.pushState) while the member decides.
+    common::SPA_MOVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let end = Instant::now() + Duration::from_secs(4);
+    while !svc.status().url.contains("moved") && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(svc.status().url.contains("moved"), "{}", svc.status().url);
+    let id = svc.pending_action().expect("still waiting").id;
+    svc.decide(&id, true).expect("allows");
+    match t.join().expect("joins") {
+        ToolOutcome::Error(e) => assert!(e.contains("changed"), "{e}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
