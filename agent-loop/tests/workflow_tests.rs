@@ -49,7 +49,11 @@ fn spec(n: &str) -> ToolSpec {
         description: n.into(),
         parameters: serde_json::json!({"type":"object"}),
         host: HostKind::Core,
-        annotations: Default::default(),
+        // HUP-S2.7: first-party tools whose output is trusted (unannotated output now taints).
+        annotations: ToolAnnotations {
+            trust: Some(Trust::Trusted),
+            ..Default::default()
+        },
     }
 }
 fn call(id: &str, n: &str) -> AssistantTurn {

@@ -661,3 +661,282 @@ async fn briefs_check_accepts_wording_edits_and_refuses_a_dropped_gate() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+// ---------------------------------------------------------------------------------------------
+// HUP-S2.7 — taint annotations through session tool specs, and the HIC downgrade over the wire
+// ---------------------------------------------------------------------------------------------
+
+fn taint_body(hic_aware: Option<bool>) -> serde_json::Value {
+    let mut b = serde_json::json!({
+        "model": "gemma-4",
+        "systemPrompt": "You are Hermes.",
+        "llm": {"baseUrl": "http://127.0.0.1:18080/v1", "bearer": "k"},
+        "tools": [
+            {"name": "web_fetch", "description": "fetch a page", "parameters": {"type": "object"},
+             "host": "core", "annotations": {"effect": "none", "trust": "untrusted"}},
+            {"name": "write_note", "description": "write a note", "parameters": {"type": "object"},
+             "host": "core", "annotations": {"effect": "write", "trust": "trusted"}},
+            {"name": "node_status", "description": "node", "parameters": {"type": "object"},
+             "host": "core", "annotations": {"effect": "none", "trust": "trusted"}}
+        ]
+    });
+    if let Some(h) = hic_aware {
+        b["hicAware"] = serde_json::json!(h);
+    }
+    b
+}
+
+fn tc(id: &str, name: &str) -> AssistantTurn {
+    AssistantTurn::tools(vec![ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: "{}".into(),
+    }])
+}
+
+async fn create_with(st: &Arc<AppState>, body: serde_json::Value) -> String {
+    let r = app(st.clone())
+        .oneshot(req("POST", "/sessions", body, true))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    json(r).await["id"].as_str().unwrap().to_string()
+}
+
+async fn post_result(st: &Arc<AppState>, id: &str, body: serde_json::Value) -> StatusCode {
+    let mut status = StatusCode::CONFLICT;
+    for _ in 0..40 {
+        let r = app(st.clone())
+            .oneshot(req(
+                "POST",
+                &format!("/sessions/{id}/tool_results"),
+                body.clone(),
+                true,
+            ))
+            .await
+            .unwrap();
+        status = r.status();
+        if status != StatusCode::CONFLICT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    status
+}
+
+async fn say(st: &Arc<AppState>, id: &str, text: &str) {
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            &format!("/sessions/{id}/messages"),
+            serde_json::json!({ "text": text }),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_hic_aware_core_a_tainted_write_is_refused_in_the_sidecar() {
+    let st = state_with(
+        vec![
+            tc("c1", "web_fetch"),
+            tc("c2", "write_note"),
+            AssistantTurn::text("ok"),
+        ],
+        Duration::from_secs(10),
+    );
+    // The existing core client sends no hicAware: it defaults to false.
+    let id = create_with(&st, taint_body(None)).await;
+    say(&st, &id, "read then write").await;
+    wait_for(&st, &id, "tool_call").await;
+    let s = post_result(
+        &st,
+        &id,
+        serde_json::json!({"callId": "c1", "status": "ok", "content": "<html>page</html>"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let evs = wait_for(&st, &id, "done").await;
+    let tainted = evs
+        .iter()
+        .find(|e| e["type"] == "tainted")
+        .expect("tainted event");
+    assert_eq!(tainted["source"], "web_fetch");
+    let c2 = evs
+        .iter()
+        .find(|e| e["type"] == "tool_call" && e["call"]["id"] == "c2")
+        .unwrap();
+    assert_eq!(c2["hic"], "required");
+    assert!(c2["host"].is_null(), "not dispatched to core: {c2}");
+    let r2 = evs
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["call_id"] == "c2")
+        .unwrap();
+    assert_eq!(r2["status"], "denied");
+    // The untainted first call kept today's wire shape.
+    let c1 = evs
+        .iter()
+        .find(|e| e["type"] == "tool_call" && e["call"]["id"] == "c1")
+        .unwrap();
+    assert_eq!(c1["host"], "core");
+    assert!(c1.get("hic").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hic_aware_core_receives_the_tainted_write_marked_required() {
+    let st = state_with(
+        vec![
+            tc("c1", "web_fetch"),
+            tc("c2", "write_note"),
+            AssistantTurn::text("ok"),
+        ],
+        Duration::from_secs(10),
+    );
+    let id = create_with(&st, taint_body(Some(true))).await;
+    say(&st, &id, "read then write").await;
+    wait_for(&st, &id, "tool_call").await;
+    post_result(
+        &st,
+        &id,
+        serde_json::json!({"callId": "c1", "status": "ok", "content": "page"}),
+    )
+    .await;
+    let s = post_result(
+        &st,
+        &id,
+        serde_json::json!({"callId": "c2", "status": "ok", "content": "written after the member approved"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "core is asked, and answers");
+    let evs = wait_for(&st, &id, "done").await;
+    let c2 = evs
+        .iter()
+        .find(|e| e["type"] == "tool_call" && e["call"]["id"] == "c2")
+        .unwrap();
+    assert_eq!(c2["host"], "core");
+    assert_eq!(c2["hic"], "required");
+    assert!(c2["hic_reason"].as_str().unwrap().contains("web_fetch"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_taint_outlives_the_turn_that_caused_it() {
+    let st = state_with(
+        vec![
+            tc("c1", "web_fetch"),
+            AssistantTurn::text("read it"),
+            tc("c2", "write_note"),
+            AssistantTurn::text("ok"),
+        ],
+        Duration::from_secs(10),
+    );
+    let id = create_with(&st, taint_body(None)).await;
+    say(&st, &id, "read").await;
+    wait_for(&st, &id, "tool_call").await;
+    post_result(
+        &st,
+        &id,
+        serde_json::json!({"callId": "c1", "status": "ok", "content": "page"}),
+    )
+    .await;
+    wait_for(&st, &id, "done").await;
+    // wait until the session is idle again, then send the second turn
+    for _ in 0..40 {
+        if !st.sessions.get(&id).unwrap().is_busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    say(&st, &id, "now write").await;
+    let mut evs = vec![];
+    for _ in 0..40 {
+        evs = st
+            .sessions
+            .get(&id)
+            .unwrap()
+            .events_after(0)
+            .events
+            .into_iter()
+            .map(|e| serde_json::to_value(e.event).unwrap())
+            .collect::<Vec<_>>();
+        if evs.iter().filter(|e| e["type"] == "done").count() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let c2 = evs
+        .iter()
+        .find(|e| e["type"] == "tool_call" && e["call"]["id"] == "c2")
+        .expect("second turn's call");
+    assert_eq!(c2["hic"], "required");
+    assert_eq!(evs.iter().filter(|e| e["type"] == "tainted").count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn core_can_mark_one_result_untrusted() {
+    let st = state_with(
+        vec![
+            tc("c1", "node_status"),
+            tc("c2", "write_note"),
+            AssistantTurn::text("ok"),
+        ],
+        Duration::from_secs(10),
+    );
+    let id = create_with(&st, taint_body(None)).await;
+    say(&st, &id, "x").await;
+    wait_for(&st, &id, "tool_call").await;
+    // An unknown trust value is refused, not guessed.
+    let bad = post_result(
+        &st,
+        &id,
+        serde_json::json!({"callId": "c1", "status": "ok", "content": "x", "trust": "maybe"}),
+    )
+    .await;
+    assert_eq!(bad, StatusCode::BAD_REQUEST);
+    let s = post_result(
+        &st,
+        &id,
+        serde_json::json!({"callId": "c1", "status": "ok", "content": "outside text", "trust": "untrusted"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let evs = wait_for(&st, &id, "done").await;
+    assert!(evs
+        .iter()
+        .any(|e| e["type"] == "tainted" && e["source"] == "node_status"));
+    let c2 = evs
+        .iter()
+        .find(|e| e["type"] == "tool_call" && e["call"]["id"] == "c2")
+        .unwrap();
+    assert_eq!(c2["hic"], "required");
+}
+
+#[test]
+fn tool_result_trust_maps_to_the_outcome() {
+    let mk = |status: &str, trust: Option<&str>| sessions::ToolResultReq {
+        call_id: "c".into(),
+        status: status.into(),
+        content: "body".into(),
+        trust: trust.map(String::from),
+    };
+    use citrate_agent_loop::ToolOutcome;
+    assert_eq!(
+        sessions::outcome_from(mk("ok", None)),
+        Ok(ToolOutcome::Ok("body".into()))
+    );
+    assert_eq!(
+        sessions::outcome_from(mk("ok", Some("trusted"))),
+        Ok(ToolOutcome::Ok("body".into()))
+    );
+    assert_eq!(
+        sessions::outcome_from(mk("ok", Some("untrusted"))),
+        Ok(ToolOutcome::Untrusted("body".into()))
+    );
+    assert!(sessions::outcome_from(mk("ok", Some("maybe"))).is_err());
+    // denied/error keep their meaning; a denied call ran nothing so trust is irrelevant.
+    assert_eq!(
+        sessions::outcome_from(mk("denied", Some("untrusted"))),
+        Ok(ToolOutcome::Denied("body".into()))
+    );
+}
