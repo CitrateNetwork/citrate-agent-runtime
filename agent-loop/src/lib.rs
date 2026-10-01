@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod interview;
+pub mod skills;
 
 // ---------------------------------------------------------------------------------------------
 // Messages and tools
@@ -567,7 +568,13 @@ pub fn run_turn_with(
         let mut messages = Vec::with_capacity(history.len() + 1);
         messages.push(Message::system(cfg.system_prompt.clone()));
         messages.extend(history.iter().cloned());
-        let offered = offered_tools(tools.specs(), history, user, opts.max_tools_per_request);
+        let offered = offered_tools(
+            tools.specs(),
+            history,
+            user,
+            opts.max_tools_per_request,
+            &opts.pinned_tools,
+        );
         if let Some((budget, counter)) = &opts.budget {
             let tool_tokens = counter.count(&serde_json::to_string(&offered).unwrap_or_default());
             let inner = ContextBudget {
@@ -741,6 +748,10 @@ pub struct TurnOptions {
     pub max_tools_per_request: Option<usize>,
     /// Keep each request within this budget, counted with this counter.
     pub budget: Option<(ContextBudget, Arc<dyn TokenCounter>)>,
+    /// HUP-S3.2: tools offered on every request regardless of retrieval and outside
+    /// `max_tools_per_request` (e.g. `skill_load`, which only works if the model can always see it).
+    /// Names that are not in the registry are ignored.
+    pub pinned_tools: Vec<String>,
 }
 
 /// Chooses which tool schemas to offer for a query. Tool schemas are the largest fixed cost in a
@@ -812,19 +823,28 @@ fn offered_tools(
     history: &[Message],
     user: &str,
     k: Option<usize>,
+    pinned: &[String],
 ) -> Vec<ToolSpec> {
     let Some(k) = k else { return specs.to_vec() };
+    let is_pinned = |s: &ToolSpec| pinned.iter().any(|p| p == &s.name);
+    // Pinned tools first, then retrieval over the rest (so pinning never costs a retrieval slot).
+    let mut out: Vec<ToolSpec> = specs.iter().filter(|s| is_pinned(s)).cloned().collect();
+    let rest: Vec<ToolSpec> = specs.iter().filter(|s| !is_pinned(s)).cloned().collect();
+    let base = out.len();
+    let specs = rest.as_slice();
     let in_use: Vec<&str> = history
         .iter()
         .flat_map(|m| m.tool_calls.iter().map(|c| c.name.as_str()))
+        .filter(|n| !pinned.iter().any(|p| p == n))
         .collect();
-    let mut out: Vec<ToolSpec> = specs
-        .iter()
-        .filter(|s| in_use.contains(&s.name.as_str()))
-        .cloned()
-        .collect();
+    out.extend(
+        specs
+            .iter()
+            .filter(|s| in_use.contains(&s.name.as_str()))
+            .cloned(),
+    );
     for s in KeywordSelector.select(user, specs, k) {
-        if out.len() >= k.max(in_use.len()) {
+        if out.len() - base >= k.max(in_use.len()) {
             break;
         }
         if !out.iter().any(|o| o.name == s.name) {

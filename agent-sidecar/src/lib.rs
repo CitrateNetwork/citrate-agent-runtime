@@ -633,11 +633,57 @@ async fn close_session(
     Ok(Json(serde_json::json!({ "ok": true, "closed": true })))
 }
 
+/// HUP-S3.2: parse `CITRATE_HERMES_SKILLS` — a platform path list (`:` on unix, `;` on windows)
+/// of skill directories in precedence order (first wins). Empty entries are skipped.
+pub fn skill_sources_from_env(value: &str) -> Vec<citrate_agent_loop::skills::SkillSource> {
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    std::env::split_paths(value)
+        .filter(|p| !p.as_os_str().is_empty())
+        .enumerate()
+        .map(|(i, p)| {
+            let tail = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            citrate_agent_loop::skills::SkillSource::new(format!("{}:{tail}", i + 1), p)
+        })
+        .collect()
+}
+
+/// HUP-S3.2: load the skills library named by `CITRATE_HERMES_SKILLS` (default off → `None`).
+/// What was refused or shadowed is logged to stderr for the operator, never sent to the model.
+pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>> {
+    let value = std::env::var("CITRATE_HERMES_SKILLS").ok()?;
+    let sources = skill_sources_from_env(&value);
+    if sources.is_empty() {
+        return None;
+    }
+    let lib = citrate_agent_loop::skills::SkillLibrary::load(&sources);
+    for r in &lib.report().rejected {
+        eprintln!(
+            "citrate-agent-sidecar: skill refused: {}: {}",
+            r.path.display(),
+            r.reason
+        );
+    }
+    for s in &lib.report().shadowed {
+        eprintln!(
+            "citrate-agent-sidecar: skill '{}' from {} is shadowed by {}",
+            s.name, s.dropped_source, s.kept_source
+        );
+    }
+    eprintln!("citrate-agent-sidecar: {} instruction skills loaded", lib.len());
+    Some(Arc::new(lib))
+}
+
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
-/// deadlines (matching citrate-core's AI request bound).
+/// deadlines (matching citrate-core's AI request bound), plus the skills library when
+/// `CITRATE_HERMES_SKILLS` is set.
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     let timeout = std::time::Duration::from_secs(300);
-    Arc::new(sessions::SessionManager::new(
+    let mgr = sessions::SessionManager::new(
         Arc::new(move |ep: &sessions::LlmEndpoint| {
             Arc::new(llm_http::OpenAiCompatClient::new(
                 &ep.base_url,
@@ -646,7 +692,11 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
             )) as Arc<dyn citrate_agent_loop::LlmClient>
         }),
         timeout,
-    ))
+    );
+    Arc::new(match skills_from_env() {
+        Some(lib) => mgr.with_skills(lib),
+        None => mgr,
+    })
 }
 
 // ---- HUP-S1.4: tracks + briefs ----
@@ -750,3 +800,5 @@ async fn check_brief(
 mod sessions_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod skills_session_tests;
