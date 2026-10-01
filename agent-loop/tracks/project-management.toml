@@ -1,0 +1,30 @@
+id = "project-management"
+title = "Project management"
+summary = "Plans, sprints, checklists and status notes."
+persona = "Steward"
+skills = ["agentile-planset", "agentile-sprint", "journal"]
+workflow = "project-plan"
+workflow_available = false
+ships_in = "HUP-S3"
+gates = [
+  "You approve the plan before anything is written",
+  "Writes to outside services need your approval (HIC)",
+]
+
+[[questions]]
+id = "horizon"
+ask = "What time span?"
+choices = ["one week", "one sprint", "one quarter"]
+default = "one sprint"
+
+[[questions]]
+id = "method"
+ask = "Which method?"
+choices = ["Agentile (sprint file + gates)", "simple checklist"]
+default = "Agentile (sprint file + gates)"
+
+[[questions]]
+id = "where"
+ask = "Where should the plan live?"
+choices = ["local journal", "GitHub project"]
+default = "local journal"

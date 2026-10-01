@@ -49,3 +49,42 @@ fn session_ids_are_checked_before_they_reach_a_url() {
     assert!(check_session_id("../stop").is_err());
     assert!(check_session_id("").is_err());
 }
+
+// HUP-S1.4 — the terminal runs the same interview the app does.
+fn sample_track() -> Value {
+    json!({"id": "full-project", "questions": [
+        {"id": "name", "ask": "Project name?", "default": "Hello Mint", "choices": []},
+        {"id": "standard", "ask": "Which token standard?", "default": "ERC-721", "choices": ["ERC-721", "ERC-1155"]},
+        {"id": "supply", "ask": "Maximum supply?", "default": "500", "choices": []}
+    ]})
+}
+
+#[test]
+fn enter_takes_the_default_and_typed_answers_are_kept() {
+    let mut input = std::io::Cursor::new("Lemon Drops\n\n1000\n");
+    let mut prompts = Vec::new();
+    let a = ask_questions(&sample_track(), &mut input, &mut prompts).unwrap();
+    assert_eq!(a.get("name").map(String::as_str), Some("Lemon Drops"));
+    assert!(!a.contains_key("standard"), "blank line = default, left for the sidecar to fill");
+    assert_eq!(a.get("supply").map(String::as_str), Some("1000"));
+    let shown = String::from_utf8(prompts).unwrap();
+    assert!(shown.contains("[ERC-721]") && shown.contains("ERC-1155"), "{shown}");
+}
+
+#[test]
+fn a_choice_can_be_picked_by_number_and_a_bad_pick_is_asked_again() {
+    let mut input = std::io::Cursor::new("\n9\n2\n\n");
+    let mut prompts = Vec::new();
+    let a = ask_questions(&sample_track(), &mut input, &mut prompts).unwrap();
+    assert_eq!(a.get("standard").map(String::as_str), Some("ERC-1155"));
+    assert!(String::from_utf8(prompts).unwrap().contains("pick 1-2"));
+}
+
+#[test]
+fn the_brief_body_omits_the_track_when_none_is_given() {
+    let b = build_brief_body(None, "an NFT project", &BTreeMap::new());
+    assert!(b.get("track").is_none());
+    assert_eq!(b["goal"], "an NFT project");
+    let b = build_brief_body(Some("code"), "fix a test", &BTreeMap::new());
+    assert_eq!(b["track"], "code");
+}

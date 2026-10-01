@@ -1,0 +1,35 @@
+id = "creative"
+title = "Creative"
+summary = "Landing pages, posts, posters and copy."
+persona = "Maker"
+skills = ["frontend-design", "copywriting", "landing-pages"]
+workflow = "creative-project"
+workflow_available = false
+ships_in = "HUP-S3"
+gates = [
+  "You review the preview before anything is published",
+  "Nothing leaves this machine without your approval (HIC)",
+]
+
+[[questions]]
+id = "medium"
+ask = "What are we making?"
+choices = ["landing page", "social post", "poster", "short copy"]
+default = "landing page"
+
+[[questions]]
+id = "tone"
+ask = "What tone?"
+choices = ["playful", "calm", "bold"]
+default = "playful"
+
+[[questions]]
+id = "audience"
+ask = "Who is it for?"
+default = "builders new to Citrate"
+
+[[questions]]
+id = "length"
+ask = "How long?"
+choices = ["short", "medium", "long"]
+default = "short"

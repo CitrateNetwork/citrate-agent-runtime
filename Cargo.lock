@@ -63,6 +63,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
 ]
@@ -1134,6 +1135,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-guard"
+version = "0.4.0"
+dependencies = [
+ "tempfile",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "citrate-agent-legacy"
 version = "0.4.0"
 dependencies = [
@@ -1161,6 +1170,18 @@ version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "citrate-agent-shell"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
