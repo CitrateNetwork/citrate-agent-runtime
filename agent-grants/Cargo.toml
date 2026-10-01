@@ -1,0 +1,17 @@
+[package]
+name = "citrate-agent-grants"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Folder grants for agent filesystem access (HUP-S2.1): member-granted read or write access to a folder, a read-only 24 h full-access grant, expiry checked at use time, immediate revocation, and the central default-deny list (citrate-agent-guard) always winning. Keyless: nothing here signs."
+
+[dependencies]
+citrate-agent-guard = { path = "../agent-guard" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

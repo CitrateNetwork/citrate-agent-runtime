@@ -1,0 +1,20 @@
+[package]
+name = "citrate-agent-anchor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nightly anchor batch over citrate-agent-records (HUP-S7.3, runtime half): one UTC day's records as an RFC 6962 Merkle tree, a domain-separated day commitment, per-record inclusion proofs and a verifier, a local anchor ledger, and the unsigned AnchorRegistry.anchor(NightlyMerkle, root) calldata. Keyless: nothing here signs or sends."
+
+[dependencies]
+citrate-agent-records = { path = "../agent-records" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+sha3 = { workspace = true }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

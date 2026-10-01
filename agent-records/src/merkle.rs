@@ -5,7 +5,8 @@
 //! duplicated last leaf). A day is a UTC calendar day of record timestamps; because timestamps
 //! are clamped to be non-decreasing, a day is one contiguous run of `seq`.
 //!
-//! Nothing here anchors. HUP-S7.3 owns putting a root on chain.
+//! Nothing here anchors. HUP-S7.3 (`citrate-agent-anchor`) builds the nightly batch, its anchor
+//! commitment, and the anchor calldata on top of [`retained_leaves`] and these hash functions.
 
 use std::path::Path;
 
@@ -48,14 +49,16 @@ pub struct InclusionProof {
     pub root: String,
 }
 
-fn leaf_hash(data: &[u8; 32]) -> [u8; 32] {
+/// RFC 6962 leaf hash: `SHA-256(0x00 || data)`.
+pub fn leaf_hash(data: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update([0u8]);
     h.update(data);
     h.finalize().into()
 }
 
-fn node_hash(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+/// RFC 6962 interior node hash: `SHA-256(0x01 || left || right)`.
+pub fn node_hash(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update([1u8]);
     h.update(l);
@@ -153,25 +156,60 @@ pub fn verify_inclusion(p: &InclusionProof) -> bool {
     verify_path(&leaf, p.leaf_index, p.tree_size, &path, &root)
 }
 
-/// `(seq, day, record hash)` for every retained record, after verifying the chain. A torn tail
-/// or a lagging `HEAD` from an append in flight is tolerated; any real break is an error, because
-/// a root over a broken chain must never be produced.
-fn verified_leaves(dir: &Path) -> Result<Vec<(u64, u64, [u8; 32])>> {
+/// One retained record as a Merkle leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedLeaf {
+    pub seq: u64,
+    pub ts_ms: u64,
+    /// The record hash (the leaf data).
+    pub hash: [u8; 32],
+}
+
+/// Every retained record as a leaf, in `seq` order, plus where pruning stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedLeaves {
+    pub leaves: Vec<RetainedLeaf>,
+    /// Timestamp of the last pruned record, when older segments were pruned. Records of any day
+    /// at or before `utc_day(pruned_through_ms)` may be missing, so a root over that day would
+    /// not cover the whole day.
+    pub pruned_through_ms: Option<u64>,
+}
+
+/// Every retained record, after verifying the chain. A torn tail or a lagging `HEAD` from an
+/// append in flight is tolerated; any real break is an error, because a root over a broken chain
+/// must never be produced.
+pub fn retained_leaves(dir: &Path) -> Result<RetainedLeaves> {
     let mut out = Vec::new();
     let mut bad: Option<Error> = None;
-    walk(dir, Mode::Live, |r| {
+    let walked = walk(dir, Mode::Live, |r| {
         if bad.is_some() {
             return;
         }
         match r.hash_raw() {
-            Ok(h) => out.push((r.record.seq, utc_day(r.record.ts_ms), h)),
+            Ok(hash) => out.push(RetainedLeaf {
+                seq: r.record.seq,
+                ts_ms: r.record.ts_ms,
+                hash,
+            }),
             Err(e) => bad = Some(e),
         }
     })?;
     match bad {
         Some(e) => Err(e),
-        None => Ok(out),
+        None => Ok(RetainedLeaves {
+            leaves: out,
+            pruned_through_ms: walked.checkpoint.map(|cp| cp.ts_ms),
+        }),
     }
+}
+
+/// `(seq, day, record hash)` for every retained record, after verifying the chain.
+fn verified_leaves(dir: &Path) -> Result<Vec<(u64, u64, [u8; 32])>> {
+    Ok(retained_leaves(dir)?
+        .leaves
+        .into_iter()
+        .map(|l| (l.seq, utc_day(l.ts_ms), l.hash))
+        .collect())
 }
 
 /// The Merkle root of every retained record whose timestamp falls on UTC day `day`. `None` when
