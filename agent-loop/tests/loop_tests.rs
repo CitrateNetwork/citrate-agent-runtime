@@ -404,3 +404,69 @@ fn a_tool_without_a_registered_host_is_an_error_not_a_panic() {
     );
     assert_eq!(out, RunOutcome::Answered("k".into()));
 }
+
+/// A `tool_call` event names a host only when the loop will actually dispatch that call; calls it
+/// refuses (over the per-step cap, unparseable arguments, unknown tool) carry no host, so a remote
+/// host that acts on `host == core` events never runs a call the loop refused.
+#[test]
+fn only_dispatched_calls_announce_a_host() {
+    let mut calls = vec![
+        call("c0", "a", "{}"),
+        call("c1", "a", "{not json"),
+        call("c2", "nope", "{}"),
+        call("c3", "a", "{}"),
+    ];
+    calls.extend((4..7).map(|i| call(&format!("c{i}"), "a", "{}")));
+    let llm = ScriptLlm::new(vec![
+        Ok(AssistantTurn::tools(calls)),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let host = Arc::new(MockHost::new("core", ToolOutcome::Ok("ok".into())));
+    let tools =
+        ToolRegistry::new(vec![spec("a", HostKind::Core)]).with_host(HostKind::Core, host.clone());
+    let sink = Sink::default();
+    run_turn(
+        &cfg(6),
+        &llm,
+        &tools,
+        &sink,
+        &StopFlag::default(),
+        &mut vec![],
+        "x",
+    );
+    let announced: Vec<String> = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::ToolCall {
+                call,
+                host: Some(_),
+                ..
+            } => Some(call.id.clone()),
+            _ => None,
+        })
+        .collect();
+    let dispatched: Vec<String> = host
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    assert_eq!(
+        dispatched,
+        ["c0", "c3"],
+        "cap 4: c4..c6 skipped; c1 bad args; c2 unknown"
+    );
+    assert_eq!(
+        announced, dispatched,
+        "every host-named event is a real dispatch, and only those"
+    );
+    let all_calls = sink.kinds().iter().filter(|k| **k == "tool_call").count();
+    assert_eq!(
+        all_calls, 7,
+        "refused calls are still reported, just without a host"
+    );
+}

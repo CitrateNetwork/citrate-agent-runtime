@@ -617,9 +617,39 @@ pub fn run_turn_with(
             let spec = tools.spec(&call.name);
             let over_cap = i as u32 >= cfg.max_tool_calls_per_step;
             let host = spec.and_then(|s| tools.host(s.host));
+            // Decide refusal BEFORE announcing the call: a `tool_call` event names a host only when
+            // this loop will dispatch it, so a remote host acting on those events (core) never runs
+            // a call the loop refused.
+            let refusal: Option<String> = if over_cap {
+                Some(format!(
+                    "skipped: at most {} tool calls per step — call it again next step if still needed",
+                    cfg.max_tool_calls_per_step
+                ))
+            } else {
+                match spec {
+                    None => Some(format!("unknown tool '{}'", call.name)),
+                    Some(_) => {
+                        let args = if call.arguments.trim().is_empty() {
+                            "{}"
+                        } else {
+                            call.arguments.as_str()
+                        };
+                        if serde_json::from_str::<serde_json::Value>(args).is_err() {
+                            Some(
+                                "the arguments were not valid JSON; retry with a JSON object"
+                                    .into(),
+                            )
+                        } else if host.is_none() {
+                            Some(format!("'{}' is not available in this session", call.name))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
             // HUP-S2.7: after taint, an effectful call needs a member's explicit decision.
             let hic_reason = match spec {
-                Some(s) if !over_cap && s.annotations.is_effectful() => {
+                Some(s) if refusal.is_none() && s.annotations.is_effectful() => {
                     tools.taint().record().map(|r| {
                         format!(
                             "this session read untrusted content (from {}), so this action needs your explicit approval",
@@ -630,55 +660,35 @@ pub fn run_turn_with(
                 _ => None,
             };
             // Fail closed: a host that cannot put the call in front of a person never gets it.
-            let refused =
+            let refused_hic =
                 hic_reason.is_some() && host.is_some_and(|h| !h.honors_explicit_approval());
+            let dispatch = match (&refusal, spec, host) {
+                (None, Some(s), Some(h)) if !refused_hic => Some((s.host, h)),
+                _ => None,
+            };
             sink.emit(Event::ToolCall {
                 step,
                 call: call.clone(),
-                host: if refused { None } else { spec.map(|s| s.host) },
+                host: dispatch.as_ref().map(|(k, _)| *k),
                 hic: hic_reason.as_ref().map(|_| "required"),
                 hic_reason: hic_reason.clone(),
             });
             let mut ran = false;
-            let outcome = if over_cap {
-                ToolOutcome::Error(format!(
-                    "skipped: at most {} tool calls per step — call it again next step if still needed",
-                    cfg.max_tool_calls_per_step
-                ))
-            } else {
-                match spec {
-                    None => ToolOutcome::Error(format!("unknown tool '{}'", call.name)),
-                    Some(_)
-                        if serde_json::from_str::<serde_json::Value>(
-                            if call.arguments.trim().is_empty() {
-                                "{}"
-                            } else {
-                                &call.arguments
-                            },
-                        )
-                        .is_err() =>
-                    {
-                        ToolOutcome::Error(
-                            "the arguments were not valid JSON; retry with a JSON object".into(),
-                        )
+            let outcome = match (dispatch, refusal) {
+                (Some((_, h)), _) => {
+                    ran = true;
+                    match &hic_reason {
+                        Some(reason) => h.execute_with_explicit_approval(call, reason),
+                        None => h.execute(call),
                     }
-                    Some(_) if refused => ToolOutcome::Denied(
-                        "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
-                            .into(),
-                    ),
-                    Some(_) => match host {
-                        Some(h) => {
-                            ran = true;
-                            match &hic_reason {
-                                Some(reason) => h.execute_with_explicit_approval(call, reason),
-                                None => h.execute(call),
-                            }
-                        }
-                        None => ToolOutcome::Error(format!(
-                            "'{}' is not available in this session",
-                            call.name
-                        )),
-                    },
+                }
+                (None, Some(why)) => ToolOutcome::Error(why),
+                (None, None) if refused_hic => ToolOutcome::Denied(
+                    "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
+                        .into(),
+                ),
+                (None, None) => {
+                    ToolOutcome::Error(format!("'{}' is not available in this session", call.name))
                 }
             };
             let content = outcome.to_content();
