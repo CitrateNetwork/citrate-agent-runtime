@@ -25,8 +25,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod interview;
+pub mod personas;
 pub mod skills;
 pub mod verifiers_tooling;
+pub mod workflows;
 
 // ---------------------------------------------------------------------------------------------
 // Messages and tools

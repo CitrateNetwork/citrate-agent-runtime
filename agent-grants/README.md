@@ -28,10 +28,14 @@ grants.revoke(&id, now)?;
 
 ## Status
 
-Implemented and tested in this crate. **Not wired in yet:** the agent
-sessions (`agent-sidecar`), the file tools and capsule WASI preopens (S2.5)
-do not call it, and citrate-core has no Grants screen or store for it. Those
-are later work packages. Until then nothing in a member's experience changes.
+Implemented and tested in this crate. Capsule WASI preopens (S2.5,
+`citrate_agent_core::capsule::sandbox`) are scoped to these grants: a capsule
+mount opens only a folder covered by live whole-folder grants, after every
+entry below it passes `check`. **Not wired in yet:** the agent sessions
+(`agent-sidecar`) and the file tools do not call it, the sidecar passes no
+grants to its capsules (so they get no folder), and citrate-core has no Grants
+screen or store for it. Those are later work packages. Until then nothing in a
+member's experience changes.
 
 ## Model
 
