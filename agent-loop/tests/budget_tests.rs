@@ -118,6 +118,7 @@ fn the_loop_offers_at_most_k_tools_and_keeps_tools_already_in_use() {
     let opts = TurnOptions {
         max_tools_per_request: Some(3),
         budget: None,
+        ..Default::default()
     };
     let _ = &mut cfg;
     run_turn_with(
@@ -211,6 +212,7 @@ fn a_turn_whose_prompt_cannot_fit_fails_instead_of_overflowing() {
             },
             std::sync::Arc::new(CharTokenCounter),
         )),
+        ..Default::default()
     };
     let out = run_turn_with(
         &cfg,
