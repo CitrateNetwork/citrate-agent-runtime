@@ -18,7 +18,9 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod decide;
 pub mod llm_http;
+pub mod search;
 pub mod sessions;
 pub mod toolchain;
 
@@ -245,6 +247,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S5.2: search status (read-only). HUP-S5.3: the decide() slot + its metering.
+        .route("/search/status", get(search_status))
+        .route("/decide", post(decide))
+        .route("/decide/stats", get(decide_stats))
+        .route("/decide/outcomes", post(decide_outcome))
         .with_state(state)
 }
 
@@ -742,7 +749,8 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
-/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
+/// `CITRATE_HERMES_SKILLS` is set, the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`, the
+/// search tools when `CITRATE_HERMES_SEARCH=1`, and the decide() slot (Jev only when opted in).
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -770,6 +778,11 @@ pub fn production_sessions_with(
         Some(host) => mgr.with_toolchain(host),
         None => mgr,
     };
+    let mgr = match search::search_from_env() {
+        Some(host) => mgr.with_search(host),
+        None => mgr,
+    };
+    let mgr = mgr.with_decide(decide::DecideService::from_env());
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
@@ -801,6 +814,105 @@ pub fn toolchain_from_env() -> Option<Arc<toolchain::ToolchainHost>> {
 // ---- HUP-S1.4: tracks + briefs ----
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
+
+// ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
+
+/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+async fn search_status(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(host) = st.sessions.search() else {
+        return Ok(Json(serde_json::json!({
+            "enabled": false, "searxng": "off", "reader": "local"
+        })));
+    };
+    let reader = if host.third_party_reader() {
+        "jina"
+    } else {
+        "local"
+    };
+    let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
+        citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
+        citrate_agent_search::SearxngState::Idle => "idle",
+        citrate_agent_search::SearxngState::Running { .. } => "running",
+        citrate_agent_search::SearxngState::GaveUp(_) => "failed",
+    })
+    .await
+    .unwrap_or("failed");
+    Ok(Json(serde_json::json!({
+        "enabled": true, "searxng": searxng, "reader": reader
+    })))
+}
+
+fn decide_status_code(e: &citrate_agent_loop::decide::DecideError) -> StatusCode {
+    use citrate_agent_loop::decide::DecideError as E;
+    match e {
+        E::Invalid(_) => StatusCode::BAD_REQUEST,
+        E::NotPermitted(_) => StatusCode::FORBIDDEN,
+        E::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+        E::Backend(_) | E::BadAnswer(_) => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// `POST /decide`: one typed decision. The work runs on the blocking pool.
+async fn decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    let req: decide::DecideHttpReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad decide request: {e}")))?;
+    let svc = st.sessions.decide_service();
+    let out = tokio::task::spawn_blocking(move || svc.decide(&req))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "decide task failed"))?;
+    match out {
+        Ok(d) => Ok(Json(serde_json::to_value(d).unwrap_or_default())),
+        Err(e) => Err(json_err(decide_status_code(&e), &e.to_string())),
+    }
+}
+
+/// `GET /decide/stats`: per-backend decision metering (no content).
+async fn decide_stats(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<decide::DecideStatus>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(st.sessions.decide_service().status()))
+}
+
+/// `POST /decide/outcomes`: record one task's success for a backend.
+async fn decide_outcome(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let o: decide::OutcomeReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad outcome: {e}")))?;
+    st.sessions
+        .decide_service()
+        .record_outcome(&o)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 fn json_err(c: StatusCode, m: &str) -> JsonErr {
     (c, Json(serde_json::json!({ "error": m })))
@@ -905,3 +1017,7 @@ mod skills_session_tests;
 mod toolchain_tests;
 #[cfg(test)]
 mod mcp_session_tests;
+#[cfg(test)]
+mod search_session_tests;
+#[cfg(test)]
+mod decide_route_tests;

@@ -27,6 +27,9 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S5.2: when search is enabled (`CITRATE_HERMES_SEARCH=1`, default off), every session also
+//!   offers the sidecar-hosted `web_search` and `read_url` tools ([`crate::search`]). Their output is
+//!   untrusted, so a call taints the session. The two names are reserved while search is on.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,7 +47,9 @@ use citrate_agent_loop::{
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
 
+use crate::decide::DecideService;
 use crate::toolchain::ToolchainHost;
+use citrate_agent_search::SearchHost;
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -354,6 +359,7 @@ impl ToolHost for CapsuleHost {
 struct SidecarHost {
     skills: Option<SkillHost>,
     toolchain: Option<Arc<ToolchainHost>>,
+    search: Option<Arc<SearchHost>>,
     mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
 }
@@ -368,6 +374,11 @@ impl ToolHost for SidecarHost {
         if ToolchainHost::handles(&call.name) {
             if let Some(t) = &self.toolchain {
                 return t.execute(call);
+            }
+        }
+        if SearchHost::handles(&call.name) {
+            if let Some(s) = &self.search {
+                return s.execute(call);
             }
         }
         if let Some(m) = &self.mcp {
@@ -400,6 +411,8 @@ pub struct SessionManager {
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<Arc<McpHost>>,
+    search: Option<Arc<SearchHost>>,
+    decide: Arc<DecideService>,
 }
 
 impl SessionManager {
@@ -412,7 +425,31 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            search: None,
+            decide: Arc::new(DecideService::default()),
         }
+    }
+
+    /// HUP-S5.2: offer `web_search` and `read_url` to every new session.
+    pub fn with_search(mut self, host: Arc<SearchHost>) -> Self {
+        self.search = Some(host);
+        self
+    }
+
+    /// HUP-S5.2: the search host, when search is enabled.
+    pub fn search(&self) -> Option<Arc<SearchHost>> {
+        self.search.clone()
+    }
+
+    /// HUP-S5.3: the `decide()` slot and its metering (the default has Jev off).
+    pub fn with_decide(mut self, svc: Arc<DecideService>) -> Self {
+        self.decide = svc;
+        self
+    }
+
+    /// HUP-S5.3: the `decide()` service.
+    pub fn decide_service(&self) -> Arc<DecideService> {
+        self.decide.clone()
     }
 
     /// HUP-S6.3: offer the toolchain tools to every new session.
@@ -467,6 +504,15 @@ impl SessionManager {
                 )));
             }
             specs.extend(ToolchainHost::specs());
+        }
+        if self.search.is_some() {
+            if let Some(t) = specs.iter().find(|t| SearchHost::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while search is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(SearchHost::specs());
         }
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
@@ -571,6 +617,7 @@ impl SessionManager {
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
         let toolchain = session.toolchain.clone();
+        let search = self.search.clone();
         let mcp_host = self
             .mcp
             .clone()
@@ -578,6 +625,7 @@ impl SessionManager {
         if skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
+            || search.is_some()
             || mcp_host.is_some()
         {
             registry = registry.with_host(
@@ -585,6 +633,7 @@ impl SessionManager {
                 Arc::new(SidecarHost {
                     skills: skill_host,
                     toolchain,
+                    search,
                     mcp: mcp_host,
                     capsules: capsule_host,
                 }),

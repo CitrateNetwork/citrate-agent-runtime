@@ -1,0 +1,26 @@
+[package]
+name = "citrate-agent-search"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermes private search (HUP-S5.2): read_url (capped fetch, public-address-only, local readability to markdown; Jina Reader only as an explicit opt-in) and web_search over a supervised local SearXNG when one is installed. All output is untrusted. Keyless: never signs."
+
+[dependencies]
+citrate-agent-loop = { path = "../agent-loop" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+url = "2"
+dom_smoothie = "0.18"
+dom_query = { version = "0.28", default-features = false, features = ["markdown"] }
+
+# A real, tiny stand-in for searxng-run, used only by this crate's integration tests. It is not
+# installed or shipped (the workspace default member is agent/cli).
+[[bin]]
+name = "citrate-searxng-fixture"
+path = "fixtures/searxng_fixture.rs"
+test = false
+doc = false

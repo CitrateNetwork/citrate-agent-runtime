@@ -18,6 +18,8 @@ citrate-agent-loop = { path = "../agent-loop" }
 citrate-agent-shell = { path = "../agent-shell" }
 citrate-agent-guard = { path = "../agent-guard" }
 citrate-agent-mcp-host = { path = "../agent-mcp-host" }
+citrate-agent-search = { path = "../agent-search" }
+citrate-agent-metering = { path = "../agent-metering" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = { workspace = true }
 tokio = { workspace = true }

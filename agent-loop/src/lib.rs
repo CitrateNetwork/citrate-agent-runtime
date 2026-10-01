@@ -18,12 +18,16 @@
 //!   effectful tool call needs an explicit member decision (no auto-approval, no budget path) for
 //!   the rest of the session, unless a member clears it ([`TaintState`]; TLA+
 //!   `formal/TaintDowngrade.tla`).
+//! - **System-1 slot (HUP-S5.3):** [`decide`] makes one typed choice from a fixed option set, on
+//!   the local model by default (grammar-constrained), with the TypeSafe Jev backend only on the
+//!   member's per-origin opt-in (TLA+ `formal/DecideEgress.tla`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod decide;
 pub mod interview;
 pub mod skills;
 pub mod verifiers_tooling;

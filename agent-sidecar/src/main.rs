@@ -15,6 +15,17 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_SEARCH       HUP-S5.2: `1` offers web_search + read_url in every session (optional)
+//!   CITRATE_HERMES_SEARXNG      absolute path of searxng-run (or its virtualenv); unset = web_search
+//!                               reports "not installed" (optional)
+//!   CITRATE_HERMES_SEARXNG_DATA folder for SearXNG's generated settings + log (optional)
+//!   CITRATE_HERMES_READER       `jina` opts read_url in to the third-party Jina Reader; anything else
+//!                               = local readability (optional)
+//!   CITRATE_HERMES_JINA_ENDPOINT / CITRATE_HERMES_JINA_KEY_FILE  Jina Reader base URL / key file
+//!   CITRATE_HERMES_JEV          HUP-S5.3: `1` turns the opt-in Jev decide() backend on, still per
+//!                               origin (CITRATE_HERMES_JEV_ORIGINS, CITRATE_HERMES_JEV_NON_WEB) and
+//!                               only with CITRATE_HERMES_JEV_KEY_FILE (optional)
+//!   CITRATE_HERMES_DECIDE_LOG   JSONL file for decide() metering (optional)
 
 use std::sync::Arc;
 
