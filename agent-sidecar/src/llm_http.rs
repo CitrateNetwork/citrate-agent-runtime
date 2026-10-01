@@ -111,35 +111,33 @@ pub fn parse_turn(body: &str) -> Result<AssistantTurn, LlmError> {
     })
 }
 
-/// Blocking OpenAI-compatible client. Build once per session.
+/// Blocking OpenAI-compatible client. Holds only configuration: the `reqwest` blocking client (which
+/// owns an internal runtime) is built inside [`LlmClient::complete`], which always runs on the
+/// blocking pool. Building or dropping it inside an async handler panics and poisons shared locks.
 pub struct OpenAiCompatClient {
     url: String,
     bearer: String,
-    http: Option<reqwest::blocking::Client>,
+    timeout: Duration,
 }
 
 impl OpenAiCompatClient {
     /// `base_url` like `http://127.0.0.1:18080/v1`; `/chat/completions` is appended.
     pub fn new(base_url: &str, bearer: &str, timeout: Duration) -> Self {
-        let http = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(timeout)
-            .build()
-            .ok();
         OpenAiCompatClient {
             url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             bearer: bearer.to_string(),
-            http,
+            timeout,
         }
     }
 }
 
 impl LlmClient for OpenAiCompatClient {
     fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
-        let http = self
-            .http
-            .as_ref()
-            .ok_or_else(|| LlmError::Transport("HTTP client unavailable".into()))?;
+        let http = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(self.timeout)
+            .build()
+            .map_err(|_| LlmError::Transport("HTTP client unavailable".into()))?;
         let mut rb = http.post(&self.url).json(&to_wire_body(req));
         if !self.bearer.is_empty() {
             rb = rb.bearer_auth(&self.bearer);

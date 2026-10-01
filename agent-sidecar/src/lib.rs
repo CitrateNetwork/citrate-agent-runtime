@@ -37,6 +37,7 @@ use citrate_agent_core::capsule::dispatcher::ApprovalGate;
 use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
 use citrate_agent_core::hitl::ApprovalQueue;
 use citrate_agent_legacy::estop::EmergencyStop;
+use citrate_agent_loop::interview;
 
 /// One installed skill (a capsule), surfaced to the `AgentHarnessDomain::skills` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +238,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
+        // HUP-S1.4 — tracks + briefs (the interview every client shares).
+        .route("/tracks", get(tracks))
+        .route("/briefs", post(create_brief))
+        .route("/briefs/check", post(check_brief))
         .with_state(state)
 }
 
@@ -628,11 +633,57 @@ async fn close_session(
     Ok(Json(serde_json::json!({ "ok": true, "closed": true })))
 }
 
+/// HUP-S3.2: parse `CITRATE_HERMES_SKILLS` — a platform path list (`:` on unix, `;` on windows)
+/// of skill directories in precedence order (first wins). Empty entries are skipped.
+pub fn skill_sources_from_env(value: &str) -> Vec<citrate_agent_loop::skills::SkillSource> {
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    std::env::split_paths(value)
+        .filter(|p| !p.as_os_str().is_empty())
+        .enumerate()
+        .map(|(i, p)| {
+            let tail = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            citrate_agent_loop::skills::SkillSource::new(format!("{}:{tail}", i + 1), p)
+        })
+        .collect()
+}
+
+/// HUP-S3.2: load the skills library named by `CITRATE_HERMES_SKILLS` (default off → `None`).
+/// What was refused or shadowed is logged to stderr for the operator, never sent to the model.
+pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>> {
+    let value = std::env::var("CITRATE_HERMES_SKILLS").ok()?;
+    let sources = skill_sources_from_env(&value);
+    if sources.is_empty() {
+        return None;
+    }
+    let lib = citrate_agent_loop::skills::SkillLibrary::load(&sources);
+    for r in &lib.report().rejected {
+        eprintln!(
+            "citrate-agent-sidecar: skill refused: {}: {}",
+            r.path.display(),
+            r.reason
+        );
+    }
+    for s in &lib.report().shadowed {
+        eprintln!(
+            "citrate-agent-sidecar: skill '{}' from {} is shadowed by {}",
+            s.name, s.dropped_source, s.kept_source
+        );
+    }
+    eprintln!("citrate-agent-sidecar: {} instruction skills loaded", lib.len());
+    Some(Arc::new(lib))
+}
+
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
-/// deadlines (matching citrate-core's AI request bound).
+/// deadlines (matching citrate-core's AI request bound), plus the skills library when
+/// `CITRATE_HERMES_SKILLS` is set.
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     let timeout = std::time::Duration::from_secs(300);
-    Arc::new(sessions::SessionManager::new(
+    let mgr = sessions::SessionManager::new(
         Arc::new(move |ep: &sessions::LlmEndpoint| {
             Arc::new(llm_http::OpenAiCompatClient::new(
                 &ep.base_url,
@@ -641,6 +692,107 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
             )) as Arc<dyn citrate_agent_loop::LlmClient>
         }),
         timeout,
+    );
+    Arc::new(match skills_from_env() {
+        Some(lib) => mgr.with_skills(lib),
+        None => mgr,
+    })
+}
+
+// ---- HUP-S1.4: tracks + briefs ----
+
+type JsonErr = (StatusCode, Json<serde_json::Value>);
+
+fn json_err(c: StatusCode, m: &str) -> JsonErr {
+    (c, Json(serde_json::json!({ "error": m })))
+}
+
+fn bundled_tracks_or_500() -> Result<Vec<interview::Track>, JsonErr> {
+    interview::bundled_tracks().map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
+fn find_track(tracks: Vec<interview::Track>, id: &str) -> Result<interview::Track, JsonErr> {
+    tracks.into_iter().find(|t| t.id == id).ok_or_else(|| {
+        json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("no track {id:?}"),
+        )
+    })
+}
+
+async fn tracks(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<interview::Track>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(bundled_tracks_or_500()?))
+}
+
+#[derive(Deserialize)]
+struct BriefReq {
+    #[serde(default)]
+    track: Option<String>,
+    goal: String,
+    #[serde(default)]
+    answers: std::collections::BTreeMap<String, String>,
+}
+
+/// Answers → brief. Unanswered questions take their defaults; with no `track`, one is suggested
+/// from the goal (422 when nothing fits, so the client asks the member to pick).
+async fn create_brief(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: BriefReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad brief request: {e}")))?;
+    let id = match req.track.as_deref() {
+        Some(t) => t.to_string(),
+        None => interview::suggest_track(&req.goal)
+            .ok_or_else(|| {
+                json_err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "no track fits that goal; pick one from /tracks",
+                )
+            })?
+            .to_string(),
+    };
+    let track = find_track(bundled_tracks_or_500()?, &id)?;
+    let brief = interview::Brief::from_answers(&track, &req.goal, &req.answers)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    let markdown = brief.to_markdown();
+    Ok(Json(
+        serde_json::json!({ "brief": brief, "markdown": markdown }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CheckBriefReq {
+    brief: interview::Brief,
+}
+
+/// Validate a member-edited brief against its track (gates and workflow are not editable away).
+async fn check_brief(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: CheckBriefReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad brief: {e}")))?;
+    let track = find_track(bundled_tracks_or_500()?, &req.brief.track)?;
+    req.brief
+        .validate_edit(&track)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "markdown": req.brief.to_markdown() }),
     ))
 }
 
@@ -648,3 +800,5 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
 mod sessions_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod skills_session_tests;
