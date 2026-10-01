@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "next_id": 5,
+  "grants": [
+    {
+      "id": "g-1",
+      "kind": "folder",
+      "root": "/Users/member/work/app",
+      "access": "read",
+      "scope": "subtree",
+      "granted_at": 1790000000,
+      "expires_at": null,
+      "granted_by": "member",
+      "reason": "Granted in Settings",
+      "revoked_at": null
+    },
+    {
+      "id": "g-2",
+      "kind": "folder",
+      "root": "/Users/member/work/app",
+      "access": "write",
+      "scope": "subtree",
+      "granted_at": 1790000000,
+      "expires_at": null,
+      "granted_by": "member",
+      "reason": "Granted in Settings",
+      "revoked_at": null
+    },
+    {
+      "id": "g-3",
+      "kind": "folder",
+      "root": "/Users/member/Documents",
+      "access": "read",
+      "scope": "subtree",
+      "granted_at": 1790000000,
+      "expires_at": null,
+      "granted_by": "member",
+      "reason": "Granted in Settings",
+      "revoked_at": 1790000050
+    },
+    {
+      "id": "g-4",
+      "kind": "full_access",
+      "root": "/Users/member",
+      "access": "read",
+      "scope": "subtree",
+      "granted_at": 1790000000,
+      "expires_at": 1790086400,
+      "granted_by": "member",
+      "reason": "Read-only full access (24 h), confirmed in Settings",
+      "revoked_at": null
+    }
+  ]
+}

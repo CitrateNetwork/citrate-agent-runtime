@@ -474,6 +474,7 @@ mod tests {
                 filesystem: vec![],
                 chain_calls: vec![],
                 subagent_spawn: false,
+                network_allow: vec![],
             },
             data_class: DataClassDecl {
                 reads,

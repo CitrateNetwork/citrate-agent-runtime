@@ -51,8 +51,9 @@ async fn mcp_endpoint(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// A real MCP server on a background runtime; returns its URL.
-fn start_mcp_server() -> String {
+/// A real MCP server on a background runtime; returns its URL. Shared with the HUP-S4.4 probe
+/// tests.
+pub(super) fn start_mcp_server() -> String {
     let fx = Arc::new(Mutex::new(Fixture::new(None, false)));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
