@@ -14,6 +14,12 @@
 //! - HUP-S3.2: when a skills library is configured (`CITRATE_HERMES_SKILLS`, default off), every
 //!   session gets the skill description index in its system prompt and a pinned, sidecar-hosted
 //!   `skill_load` tool. Skills are instructions only; `skill_load` reads text and runs nothing.
+//! - HUP-S2.7 taint downgrade: tool specs carry `effect` / `trust` annotations (absent = effectful,
+//!   untrusted). Once a session has ingested untrusted content it stays tainted, and every
+//!   effectful call needs a member's explicit decision. A core-hosted call is only dispatched to
+//!   core in that state when the session was opened with `hicAware: true` (core's promise that a
+//!   `hic: "required"` call always goes to a person, with no auto or budget path); otherwise, and
+//!   for capsules, the sidecar declines the call itself.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,8 +31,8 @@ use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
-    LoopConfig, Message, StopFlag, ToolCall, ToolHost, ToolOutcome, ToolRegistry, ToolSpec,
-    TurnOptions,
+    LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
+    ToolSpec, TurnOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +122,11 @@ pub struct CreateSessionReq {
     /// HUP-S1.2: the model's context window in tokens; when given, every request is compacted to
     /// fit (or the turn fails honestly).
     pub context_tokens: Option<usize>,
+    /// HUP-S2.7: core confirms that a tool call marked `hic: "required"` always goes to a person
+    /// for an explicit decision (no auto-approval, no budget path). Absent = false: the sidecar then
+    /// declines tainted effectful core calls itself.
+    #[serde(default)]
+    pub hic_aware: bool,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -126,6 +137,11 @@ pub struct ToolResultReq {
     /// "ok" | "denied" | "error"
     pub status: String,
     pub content: String,
+    /// HUP-S2.7: "untrusted" marks this one result as untrusted content (e.g. a file outside the
+    /// granted folders), which taints the session; "trusted" or absent defers to the tool's
+    /// annotation.
+    #[serde(default)]
+    pub trust: Option<String>,
 }
 
 /// One event with its sequence number, as served by `GET …/events`.
@@ -156,6 +172,8 @@ pub struct Session {
     cfg: LoopConfig,
     opts: TurnOptions,
     specs: Vec<ToolSpec>,
+    hic_aware: bool,
+    taint: TaintState,
     llm: Arc<dyn LlmClient>,
     history: Mutex<Vec<Message>>,
     log: Mutex<EventLog>,
@@ -226,6 +244,11 @@ impl Session {
         }
     }
 
+    /// This session's taint (HUP-S2.7).
+    pub fn taint(&self) -> &TaintState {
+        &self.taint
+    }
+
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
     }
@@ -243,6 +266,8 @@ struct CoreHost {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     deadline: Duration,
     stop: StopFlag,
+    /// Core promised to route `hic: "required"` calls to a person (see `CreateSessionReq`).
+    hic_aware: bool,
 }
 
 impl ToolHost for CoreHost {
@@ -277,6 +302,16 @@ impl ToolHost for CoreHost {
             p.remove(&call.id);
         }
         outcome
+    }
+
+    fn honors_explicit_approval(&self) -> bool {
+        self.hic_aware
+    }
+
+    /// The requirement reaches core in the `tool_call` event (`hic: "required"` + reason); core
+    /// asks the member and posts the decision back like any other result.
+    fn execute_with_explicit_approval(&self, call: &ToolCall, _reason: &str) -> ToolOutcome {
+        self.execute(call)
     }
 }
 
@@ -418,6 +453,8 @@ impl SessionManager {
             cfg,
             opts,
             specs,
+            hic_aware: req.hic_aware,
+            taint: TaintState::default(),
             llm: (self.llm_factory)(&req.llm),
             history: Mutex::new(Vec::new()),
             log: Mutex::new(EventLog {
@@ -460,8 +497,11 @@ impl SessionManager {
             pending: session.pending.clone(),
             deadline: self.core_tool_deadline,
             stop: session.stop.clone(),
+            hic_aware: session.hic_aware,
         });
-        let mut registry = ToolRegistry::new(session.specs.clone()).with_host(HostKind::Core, core);
+        let mut registry = ToolRegistry::new(session.specs.clone())
+            .with_host(HostKind::Core, core)
+            .with_taint(session.taint.clone());
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
         if skill_host.is_some() || capsule_host.is_some() {
@@ -532,7 +572,17 @@ impl SessionManager {
 
 /// Parse a `tool_results` status into an outcome.
 pub fn outcome_from(req: ToolResultReq) -> Result<ToolOutcome, SessionError> {
+    let untrusted = match req.trust.as_deref() {
+        None | Some("trusted") => false,
+        Some("untrusted") => true,
+        Some(other) => {
+            return Err(SessionError::Invalid(format!(
+                "unknown trust {other:?} (trusted | untrusted)"
+            )))
+        }
+    };
     match req.status.as_str() {
+        "ok" if untrusted => Ok(ToolOutcome::Untrusted(req.content)),
         "ok" => Ok(ToolOutcome::Ok(req.content)),
         "denied" => Ok(ToolOutcome::Denied(req.content)),
         "error" => Ok(ToolOutcome::Error(req.content)),

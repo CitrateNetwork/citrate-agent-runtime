@@ -1041,11 +1041,15 @@ pub fn skill_load_spec() -> ToolSpec {
             "additionalProperties": false
         }),
         host: HostKind::Sidecar,
+        // Reads text and runs nothing, so it stays callable after taint; skill bodies can be
+        // third-party, so what it returns is untrusted and taints the session (HUP-S2.7).
         annotations: ToolAnnotations {
             read_only: true,
             destructive: false,
             idempotent: true,
             open_world: false,
+            effect: Some(crate::Effect::None),
+            trust: Some(crate::Trust::Untrusted),
         },
     }
 }

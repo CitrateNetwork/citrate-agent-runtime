@@ -708,3 +708,12 @@ fn a_listed_ref_swapped_for_an_escaping_symlink_after_load_is_refused() {
         "{out:?}"
     );
 }
+
+/// HUP-S2.7 × S3.2: skill_load reads text and runs nothing (callable after taint), and skill bodies
+/// can be third-party, so its output is untrusted.
+#[test]
+fn skill_load_is_not_effectful_and_its_output_is_untrusted() {
+    let spec = citrate_agent_loop::skills::skill_load_spec();
+    assert!(!spec.annotations.is_effectful());
+    assert!(spec.annotations.output_untrusted());
+}
