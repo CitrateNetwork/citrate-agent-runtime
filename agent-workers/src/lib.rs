@@ -94,6 +94,9 @@ pub struct RestartPolicy {
     pub shutdown_grace: Duration,
 }
 
+// The default values below are conservative placeholders, pending owner sign-off (HUP-S1.9):
+// 5 restarts per 60 s, 250 ms to 10 s backoff, ping every 5 s with a 2 s timeout, kill after 2
+// misses, 10 s for the first ping, 3 s shutdown grace.
 impl Default for RestartPolicy {
     fn default() -> Self {
         RestartPolicy {

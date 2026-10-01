@@ -24,7 +24,8 @@ citrate-core ── supervises ──> sidecar (agent loop; restarted by core's 
   (doubling from `backoff_base` to `backoff_max`) and starts a new child. More than
   `max_restarts` inside `window` and the worker is `failed` until the sidecar restarts.
   Defaults: 5 restarts per 60 s, 250 ms to 10 s backoff, ping every 5 s with a 2 s timeout,
-  10 s to answer the first ping, 3 s shutdown grace.
+  10 s to answer the first ping, 3 s shutdown grace. These values are conservative placeholders,
+  pending owner sign-off.
 - **Clean shutdown.** `shutdown` request, stdin closed, grace period, then kill. A worker also
   exits when its stdin closes, so it does not outlive a sidecar that died abruptly.
 - **Status.** `Worker::status()` (state, healthy, pid, restarts, last exit, last error), served
