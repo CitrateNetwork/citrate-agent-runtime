@@ -19,6 +19,7 @@
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
 pub mod llm_http;
+pub mod mcp_probe;
 pub mod sessions;
 pub mod toolchain;
 
@@ -245,6 +246,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S4.4: dry-run probe of a user-added server (validates, lists tools, registers nothing).
+        .route("/mcp/probe", post(mcp_probe_route))
         .with_state(state)
 }
 
@@ -295,6 +298,23 @@ async fn mcp_servers(
         None => serde_json::json!({ "configured": false, "servers": [] }),
     };
     Ok(Json(body))
+}
+
+/// HUP-S4.4: `POST /mcp/probe` with one server entry (the allowlist's `[[servers]]` shape, JSON).
+/// 422 `{errors: [{field, message}]}` for an invalid entry; 429 while another probe runs; else
+/// 200 with the probe report (`ok: false` + `error` when the server could not be reached).
+async fn mcp_probe_route(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Json(entry): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&headers, &st.bearer) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    mcp_probe::handle(entry).await
 }
 
 async fn skills(
@@ -905,3 +925,5 @@ mod skills_session_tests;
 mod toolchain_tests;
 #[cfg(test)]
 mod mcp_session_tests;
+#[cfg(test)]
+mod mcp_probe_tests;
