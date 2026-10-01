@@ -19,9 +19,16 @@
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
 pub mod grants;
+pub mod anchor;
+mod chain_routes;
 pub mod llm_http;
+pub mod metering;
+pub mod escalation;
+pub mod mcp_probe;
 pub mod sessions;
 pub mod toolchain;
+pub mod workers;
+pub mod trajectory;
 
 use std::sync::Arc;
 
@@ -40,6 +47,7 @@ use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
 use citrate_agent_core::hitl::ApprovalQueue;
 use citrate_agent_legacy::estop::EmergencyStop;
 use citrate_agent_loop::interview;
+use citrate_agent_loop::{personas, workflows};
 
 /// One installed skill (a capsule), surfaced to the `AgentHarnessDomain::skills` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -245,8 +253,31 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
         .route("/briefs/check", post(check_brief))
+        // HUP-S3.3 + S3.7 — personas (voice) and each track's workflow family.
+        .route("/personas", get(list_personas))
+        .route("/personas/check", post(check_persona))
+        .route("/workflows", get(list_workflows))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S1.9: the worker processes (toolchain, browser) and their health
+        .route("/workers", get(workers_status))
+        // HUP-S7.5: the daily metering report + opt-in BenchmarkRegistry calldata (built, never sent)
+        .route("/metering/daily", get(chain_routes::metering_daily))
+        .route(
+            "/metering/benchmark",
+            post(chain_routes::metering_benchmark),
+        )
+        // HUP-S7.3: nightly anchor batch (core signs with the anchor key; nothing is sent here)
+        .route("/anchor/status", get(chain_routes::anchor_status))
+        .route("/anchor/plan", post(chain_routes::anchor_plan))
+        .route("/anchor/confirm", post(chain_routes::anchor_confirm))
+        .route("/anchor/proof", get(chain_routes::anchor_proof))
+        // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
+        // key per request), and the registry route's status (disabled in this build).
+        .route("/escalations", post(escalation::escalate))
+        .route("/escalations/registry", get(escalation::registry_status))
+        // HUP-S4.4: dry-run probe of a user-added server (validates, lists tools, registers nothing).
+        .route("/mcp/probe", post(mcp_probe_route))
         .with_state(state)
 }
 
@@ -297,6 +328,36 @@ async fn mcp_servers(
         None => serde_json::json!({ "configured": false, "servers": [] }),
     };
     Ok(Json(body))
+}
+
+/// `GET /workers` — one entry per worker kind: state, health, pid, restarts, last exit. Bearer.
+async fn workers_status(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(
+        serde_json::json!({ "workers": st.sessions.workers_report() }),
+    ))
+}
+
+/// HUP-S4.4: `POST /mcp/probe` with one server entry (the allowlist's `[[servers]]` shape, JSON).
+/// 422 `{errors: [{field, message}]}` for an invalid entry; 429 while another probe runs; else
+/// 200 with the probe report (`ok: false` + `error` when the server could not be reached).
+async fn mcp_probe_route(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Json(entry): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&headers, &st.bearer) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    mcp_probe::handle(entry).await
 }
 
 async fn skills(
@@ -684,8 +745,17 @@ async fn close_session(
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    st.sessions.close(&id).map_err(|e| session_status(&e))?;
-    Ok(Json(serde_json::json!({ "ok": true, "closed": true })))
+    // A trajectory export at close writes files: keep it off the async workers.
+    let sessions = st.sessions.clone();
+    let exported = tokio::task::spawn_blocking(move || sessions.close(&id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| session_status(&e))?;
+    let mut body = serde_json::json!({ "ok": true, "closed": true });
+    if let Some(summary) = exported {
+        body["trajectory"] = serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
+    }
+    Ok(Json(body))
 }
 
 /// HUP-S3.2: parse `CITRATE_HERMES_SKILLS` — a platform path list (`:` on unix, `;` on windows)
@@ -782,7 +852,8 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
-/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
+/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1` (run in
+/// the supervised toolchain worker process, HUP-S1.9).
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -811,36 +882,52 @@ pub fn production_sessions_with(
         Some(lib) => mgr.with_skills(lib),
         None => mgr,
     };
-    let mgr = match toolchain_from_env() {
-        Some(host) => mgr.with_toolchain(host),
+    // HUP-S1.9: the toolchain runs in its own supervised worker process (this binary started
+    // with `--worker toolchain`), so a crash there never takes the loop down.
+    let mgr = match std::env::current_exe() {
+        Ok(exe) => match workers::toolchain_worker_from_env(exe) {
+            Some(worker) => mgr
+                .with_toolchain(Arc::new(workers::RemoteToolHost::new(
+                    worker.clone(),
+                    workers::TOOLCHAIN_CALL_TIMEOUT,
+                )))
+                .with_workers(Arc::new(workers::WorkerSet::with_toolchain(worker))),
+            None => mgr,
+        },
+        Err(e) => {
+            if toolchain::ToolchainConfig::from_env().is_some() {
+                eprintln!(
+                    "citrate-agent-sidecar: toolchain tools off: cannot locate this binary to start the worker: {e}"
+                );
+            }
+            mgr
+        }
+    };
+    let mgr = mgr.with_metering(metering::metering_from_env());
+    let mgr = match trajectory::TrajectoryConfig::from_env() {
+        Some(cfg) => {
+            eprintln!(
+                "citrate-agent-sidecar: trajectory recording on (verified turns only, redacted) into {}",
+                cfg.dir().display()
+            );
+            mgr.with_trajectories(cfg)
+        }
+        None => mgr,
+    };
+    let mgr = match anchor::AnchorPaths::from_env() {
+        Some(paths) => match anchor::AnchorService::from_paths(&paths) {
+            Ok(svc) => mgr.with_anchor(Arc::new(svc)),
+            Err(e) => {
+                eprintln!("citrate-agent-sidecar: anchor store unavailable: {e}");
+                mgr
+            }
+        },
         None => mgr,
     };
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
-}
-
-/// HUP-S6.3: the toolchain host when `CITRATE_HERMES_TOOLCHAIN=1` (default off → `None`). What it
-/// will use is logged to stderr for the operator.
-pub fn toolchain_from_env() -> Option<Arc<toolchain::ToolchainHost>> {
-    let cfg = toolchain::ToolchainConfig::from_env()?;
-    eprintln!(
-        "citrate-agent-sidecar: toolchain tools on: {} granted folder(s), solc {}",
-        cfg.roots.len(),
-        if cfg.solc.is_some() {
-            "configured"
-        } else {
-            "not found (builds will fail offline)"
-        }
-    );
-    match toolchain::ToolchainHost::new(cfg) {
-        Ok(h) => Some(Arc::new(h)),
-        Err(e) => {
-            eprintln!("citrate-agent-sidecar: toolchain tools off: {e}");
-            None
-        }
-    }
 }
 
 // ---- HUP-S1.4: tracks + briefs ----
@@ -940,10 +1027,64 @@ async fn check_brief(
     ))
 }
 
+// ---- HUP-S3.3 + S3.7: personas + track workflows ----
+
+/// The shipped personas, each with the prompt fragment a client appends when it is active.
+async fn list_personas(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<personas::PersonaView>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    personas::persona_views()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
+#[derive(Deserialize)]
+struct CheckPersonaReq {
+    persona: personas::CustomPersona,
+}
+
+/// Validate a member-defined persona and render its fragment (422 with the reason when refused).
+async fn check_persona(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<personas::PersonaView>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: CheckPersonaReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad persona: {e}")))?;
+    req.persona
+        .check()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))
+}
+
+/// Every track's workflow family (definitions; the verifiers are named, not run).
+async fn list_workflows(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<workflows::WorkflowView>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    workflows::workflow_views()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
 #[cfg(test)]
-mod grants_session_tests;
+mod anchor_route_tests;
 #[cfg(test)]
 mod mcp_session_tests;
+#[cfg(test)]
+mod metering_session_tests;
+#[cfg(test)]
+mod grants_session_tests;
 #[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
@@ -952,3 +1093,11 @@ mod skills_session_tests;
 mod tests;
 #[cfg(test)]
 mod toolchain_tests;
+#[cfg(test)]
+mod daemon_session_tests;
+#[cfg(test)]
+mod escalation_tests;
+#[cfg(test)]
+mod mcp_probe_tests;
+#[cfg(test)]
+mod personas_route_tests;

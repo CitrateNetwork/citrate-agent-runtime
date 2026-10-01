@@ -176,6 +176,21 @@ impl SessionGrants {
         Ok(read)
     }
 
+    /// The member's home these grants resolve against.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The grant set in use now, as a [`GrantState`] document (deny-location rows already set
+    /// aside). HUP-S1.9: sent with every toolchain call so the worker process checks the same set
+    /// again. A poisoned lock or an encoding failure yields `null`, which the worker refuses.
+    pub fn document(&self) -> serde_json::Value {
+        match self.inner.read() {
+            Ok(g) => serde_json::to_value(g.state()).unwrap_or(serde_json::Value::Null),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
     /// How many grants the session holds, and how many are live now.
     pub fn summary(&self) -> GrantSummary {
         match self.inner.read() {

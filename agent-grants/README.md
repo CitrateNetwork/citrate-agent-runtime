@@ -48,8 +48,17 @@ Implemented and tested in this crate, and wired into the agent sidecar
 - A session opened without a document is unchanged: no file tools, and the
   toolchain keeps its env roots.
 
-Not wired yet: capsule WASI preopens (S2.5), and the older `agent-legacy`
-path checks.
+Capsule WASI preopens (S2.5, `citrate_agent_core::capsule::sandbox`) are
+scoped to these grants: a capsule mount opens only a folder covered by live
+whole-folder grants, after every entry below it passes `check`. The sidecar
+does not yet pass a session's grants to its capsules (so they get no folder).
+
+With the toolchain in its worker process (HUP-S1.9), a grants session sends
+its current grant document with every toolchain call and the worker checks
+the project against it again.
+
+Not wired yet: grants for capsules in sidecar sessions, and the older
+`agent-legacy` path checks.
 
 ## Model
 

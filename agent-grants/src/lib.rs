@@ -53,8 +53,9 @@
 //! Implemented and tested in this crate. The agent sidecar's sessions use it
 //! for the grant-checked file tools and the toolchain project folder
 //! (`agent-sidecar/src/grants.rs`); citrate-core stores the persistence format
-//! ([`GrantState`]) and sends it to each session. Capsule preopens (S2.5) are
-//! later work.
+//! ([`GrantState`]) and sends it to each session. Capsule WASI preopens are
+//! scoped to these grants (`citrate_agent_core::capsule::sandbox`, HUP-S2.5);
+//! the sidecar does not pass session grants to capsules yet.
 
 use citrate_agent_guard::{check_path, Denied, GuardContext};
 use serde::{Deserialize, Serialize};
