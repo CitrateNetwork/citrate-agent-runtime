@@ -20,6 +20,7 @@
 
 pub mod escalation;
 pub mod llm_http;
+pub mod mcp_probe;
 pub mod sessions;
 pub mod toolchain;
 
@@ -40,6 +41,7 @@ use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
 use citrate_agent_core::hitl::ApprovalQueue;
 use citrate_agent_legacy::estop::EmergencyStop;
 use citrate_agent_loop::interview;
+use citrate_agent_loop::{personas, workflows};
 
 /// One installed skill (a capsule), surfaced to the `AgentHarnessDomain::skills` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -244,12 +246,18 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
         .route("/briefs/check", post(check_brief))
+        // HUP-S3.3 + S3.7 — personas (voice) and each track's workflow family.
+        .route("/personas", get(list_personas))
+        .route("/personas/check", post(check_persona))
+        .route("/workflows", get(list_workflows))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
         // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
         // key per request), and the registry route's status (disabled in this build).
         .route("/escalations", post(escalation::escalate))
         .route("/escalations/registry", get(escalation::registry_status))
+        // HUP-S4.4: dry-run probe of a user-added server (validates, lists tools, registers nothing).
+        .route("/mcp/probe", post(mcp_probe_route))
         .with_state(state)
 }
 
@@ -300,6 +308,23 @@ async fn mcp_servers(
         None => serde_json::json!({ "configured": false, "servers": [] }),
     };
     Ok(Json(body))
+}
+
+/// HUP-S4.4: `POST /mcp/probe` with one server entry (the allowlist's `[[servers]]` shape, JSON).
+/// 422 `{errors: [{field, message}]}` for an invalid entry; 429 while another probe runs; else
+/// 200 with the probe report (`ok: false` + `error` when the server could not be reached).
+async fn mcp_probe_route(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Json(entry): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&headers, &st.bearer) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    mcp_probe::handle(entry).await
 }
 
 async fn skills(
@@ -900,6 +925,56 @@ async fn check_brief(
     ))
 }
 
+// ---- HUP-S3.3 + S3.7: personas + track workflows ----
+
+/// The shipped personas, each with the prompt fragment a client appends when it is active.
+async fn list_personas(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<personas::PersonaView>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    personas::persona_views()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
+#[derive(Deserialize)]
+struct CheckPersonaReq {
+    persona: personas::CustomPersona,
+}
+
+/// Validate a member-defined persona and render its fragment (422 with the reason when refused).
+async fn check_persona(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<personas::PersonaView>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: CheckPersonaReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad persona: {e}")))?;
+    req.persona
+        .check()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))
+}
+
+/// Every track's workflow family (definitions; the verifiers are named, not run).
+async fn list_workflows(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<workflows::WorkflowView>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    workflows::workflow_views()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
 #[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
@@ -912,3 +987,7 @@ mod toolchain_tests;
 mod mcp_session_tests;
 #[cfg(test)]
 mod escalation_tests;
+#[cfg(test)]
+mod mcp_probe_tests;
+#[cfg(test)]
+mod personas_route_tests;

@@ -1,8 +1,8 @@
 ---
 created: 2026-10-01
-branch: hup/n3-mcp-host
+branch: hup/n3-mcp-host (S4.4 additions on hup/n4-user-mcp, 2026-10-01)
 author: Larry Klosowski + Claude Opus 5.5
-status: implemented and wired into sidecar sessions behind CITRATE_HERMES_MCP (default off); base protocol only
+status: implemented and wired into sidecar sessions behind CITRATE_HERMES_MCP (default off); base protocol only; S4.4 user-entry validation + dry-run probe implemented
 ---
 
 # citrate-agent-mcp-host
@@ -68,6 +68,37 @@ the environment, or the server's `instructions` text.
 - **Frozen tool list.** Tools are listed once at sidecar start. A server cannot add
   tools to a running session.
 
+## User-added servers (HUP-S4.4)
+
+citrate-core's Settings > MCP servers lets a person add their own servers. Two pieces
+live here:
+
+- **`user::validate_user_entry`** checks one entry (the `[[servers]]` shape, as JSON)
+  with stricter rules than the allowlist file, and reports every problem against its
+  field (`name`, `transport`, `command`, `args`, `cwd`, `url`, `env.<KEY>`, `entry`):
+  names of built-in servers are reserved (`RESERVED_SERVER_NAMES`); env names are plain
+  identifiers; env names that change which code a process loads (`LD_*`, `DYLD_*`,
+  `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV`, ...) are refused; env values are explicit, so
+  a value that refers to another variable (`$X`, `${X}`, `%X%`) is refused (nothing is
+  expanded, and nothing beyond the process basics in `BASE_ENV_ALLOWLIST` is inherited).
+  What passes is then read by the allowlist parser itself, so it is exactly what the
+  sidecar loads. Messages never contain an env value.
+- **`probe::probe`** (and the sidecar route `POST /mcp/probe`, bearer-gated) starts or
+  reaches the server, runs `initialize` and `tools/list`, and stops it. Nothing is
+  registered with sessions. The report lists every tool with the server's raw hints
+  (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `title`), the
+  effective annotations after the spec defaults, `trust: "untrusted"`, and whether a
+  session would be offered it (with the reason when not). It never carries the URL, the
+  environment, or the server's `instructions` text. The answer is bounded by
+  `PROBE_TIMEOUT` (20 s): past it the caller gets a failed report, while the probe's own
+  worker keeps going until the server stops answering within the per-request cap (also
+  20 s) or the listing ends, and only then stops the server. The sidecar runs one probe at a time (429 otherwise) and answers
+  422 `{errors: [{field, message}]}` for an invalid entry. The reserved names and the
+  loader env denylist are placeholders pending owner sign-off.
+
+The sidecar still reads only the allowlist file named by `CITRATE_HERMES_MCP` at start;
+core writes that file with the enabled, reviewed entries.
+
 ## Not implemented (honest scope)
 
 - The 2026-07-28 revision (stateless requests with `_meta`, `Mcp-Method`/`Mcp-Name`
@@ -80,8 +111,7 @@ the environment, or the server's `instructions` text.
   `Authorization` header is ever sent).
 - Automatic reconnect after a stdio server exits, re-initialising an expired HTTP
   session (a 404 is reported as an error), and acting on `tools/list_changed`.
-- A member-facing review screen for adding servers (HUP-S4.4) and the wiring of
-  mem-mcp and citratescan (HUP-S4.3).
+- The wiring of mem-mcp and citratescan (HUP-S4.3).
 
 ## Tests
 
@@ -92,6 +122,19 @@ against a real stdio MCP server (`fixtures/stdio_server.rs`, built as the
 server. `agent-sidecar` adds 7 session tests over a real HTTP MCP server (offered
 tools, untrusted result and taint, namespace reservation, decline after taint, stop
 cancels an in-flight call, the status route, config loading).
+
+HUP-S4.4 adds 4 unit tests (`user.rs`), 10 user-entry tests (`tests/user_entry.rs`),
+5 probe tests against the real stdio fixture and a stalled loopback endpoint
+(`tests/probe.rs`), and 5 sidecar route tests (`mcp_probe_tests.rs`: bearer, field
+errors, a probe that registers nothing, an unreachable server, the single probe slot).
+Mutation checks for S4.4 (each made a test fail, then was reverted): accepting env
+references, accepting loader env names, accepting reserved names, ignoring
+`allow_write_tools` in the shared offer decision, and reporting a tool as trusted.
+Two survivors, kept as defence in depth: dropping the probe's outer `recv_timeout`
+(the per-request deadline is also capped at the probe deadline, so the stall test
+still passes) and dropping the redaction of a base-rule message (no input reaches
+that path with an env value after the user rules pass; the function has its own
+unit test).
 
 Mutation checks (each mutant made a test fail, then was reverted): removing
 `env_clear()`, marking MCP output trusted, ignoring `allow_write_tools`, skipping the
