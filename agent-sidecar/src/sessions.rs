@@ -20,6 +20,9 @@
 //!   core in that state when the session was opened with `hicAware: true` (core's promise that a
 //!   `hic: "required"` call always goes to a person, with no auto or budget path); otherwise, and
 //!   for capsules, the sidecar declines the call itself.
+//! - HUP-S6.3: when the toolchain is enabled (`CITRATE_HERMES_TOOLCHAIN=1`, default off), every
+//!   session also offers the sidecar-hosted `forge_test`, `slither_scan`, `aderyn_scan` and
+//!   `medusa_fuzz` tools ([`crate::toolchain`]), whose results the toolchain verifiers judge.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,6 +38,8 @@ use citrate_agent_loop::{
     ToolSpec, TurnOptions,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::toolchain::ToolchainHost;
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -183,6 +188,8 @@ pub struct Session {
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
     skills: Option<Arc<SkillLibrary>>,
+    /// HUP-S6.3: present when this session was opened with the toolchain enabled.
+    toolchain: Option<Arc<ToolchainHost>>,
 }
 
 impl Session {
@@ -336,10 +343,12 @@ impl ToolHost for CapsuleHost {
     }
 }
 
-/// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, anything
-/// else to the capsule dispatch (when capsules are loaded).
+/// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, the
+/// toolchain tools to the toolchain host (when enabled), anything else to the capsule dispatch
+/// (when capsules are loaded).
 struct SidecarHost {
     skills: Option<SkillHost>,
+    toolchain: Option<Arc<ToolchainHost>>,
     capsules: Option<CapsuleHost>,
 }
 
@@ -348,6 +357,11 @@ impl ToolHost for SidecarHost {
         if call.name == SKILL_LOAD_TOOL {
             if let Some(h) = &self.skills {
                 return h.execute(call);
+            }
+        }
+        if ToolchainHost::handles(&call.name) {
+            if let Some(t) = &self.toolchain {
+                return t.execute(call);
             }
         }
         match &self.capsules {
@@ -373,6 +387,7 @@ pub struct SessionManager {
     core_tool_deadline: Duration,
     ids: AtomicU64,
     skills: Option<Arc<SkillLibrary>>,
+    toolchain: Option<Arc<ToolchainHost>>,
 }
 
 impl SessionManager {
@@ -383,7 +398,14 @@ impl SessionManager {
             core_tool_deadline,
             ids: AtomicU64::new(0),
             skills: None,
+            toolchain: None,
         }
+    }
+
+    /// HUP-S6.3: offer the toolchain tools to every new session.
+    pub fn with_toolchain(mut self, host: Arc<ToolchainHost>) -> Self {
+        self.toolchain = Some(host);
+        self
     }
 
     /// HUP-S3.2: offer this skills library to every new session. An empty library offers nothing.
@@ -411,6 +433,15 @@ impl SessionManager {
             }
             specs.push(skill_load_spec());
             pinned_tools.push(SKILL_LOAD_TOOL.to_string());
+        }
+        if self.toolchain.is_some() {
+            if let Some(t) = specs.iter().find(|t| ToolchainHost::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while the toolchain is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(ToolchainHost::specs());
         }
         let mut sessions = self
             .sessions
@@ -466,6 +497,7 @@ impl SessionManager {
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills: self.skills.clone(),
+            toolchain: self.toolchain.clone(),
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -504,11 +536,13 @@ impl SessionManager {
             .with_taint(session.taint.clone());
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
-        if skill_host.is_some() || capsule_host.is_some() {
+        let toolchain = session.toolchain.clone();
+        if skill_host.is_some() || capsule_host.is_some() || toolchain.is_some() {
             registry = registry.with_host(
                 HostKind::Sidecar,
                 Arc::new(SidecarHost {
                     skills: skill_host,
+                    toolchain,
                     capsules: capsule_host,
                 }),
             );

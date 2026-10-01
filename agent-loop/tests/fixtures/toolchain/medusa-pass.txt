@@ -1,0 +1,16 @@
+⇾ Reading the configuration file at: medusa.json
+⇾ Compiling targets with crytic-compile
+⇾ Finished compiling targets in 2s
+⇾ Initializing corpus...
+⇾ Number of assertion tests: 1
+⇾ Number of property tests: 2
+⇾ Fuzzing with 10 workers
+⇾ fuzz: elapsed:       0s, calls:          0 (     0/sec), seq/s:      0, branches:     12, corpus:     0, failures: 0/0, gas/s:            0
+⇾ fuzz: elapsed:       3s, calls:      24512 (  8170/sec), seq/s:     81, branches:     34, corpus:     6, failures: 0/245, gas/s:      1234567
+⇾ fuzz: elapsed:       6s, calls:      50113 (  8533/sec), seq/s:     85, branches:     35, corpus:     7, failures: 0/501, gas/s:      1301233
+⇾ Transaction test limit reached, halting now...
+⇾ Fuzzer stopped, test results follow below ...
+⇾ [PASSED] Assertion Test: CounterInvariants.check_increment(uint256)
+⇾ [PASSED] Property Test: CounterInvariants.property_supply_cap()
+⇾ [PASSED] Property Test: CounterInvariants.property_owner_fixed()
+⇾ Test summary: 3 test(s) passed, 0 test(s) failed
