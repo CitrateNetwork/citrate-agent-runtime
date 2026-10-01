@@ -15,6 +15,13 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
+//!                               the /checkpoints undo routes are served (optional)
+//!   CITRATE_HERMES_FILES        HUP-S2.9: `1` offers fs_write / fs_edit / fs_delete / fs_rename in
+//!                               every session; needs CITRATE_HERMES_GRANTS and the checkpoint
+//!                               store, else off (optional)
+//!   CITRATE_HERMES_GRANTS       absolute path of the folder-grants JSON core stores; read on every
+//!                               file-tool call (optional)
 
 use std::sync::Arc;
 

@@ -27,6 +27,11 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S2.9: when the file tools are enabled (`CITRATE_HERMES_FILES=1` with a grants file and a
+//!   checkpoint store, default off), every session also offers the sidecar-hosted `fs_write`,
+//!   `fs_edit`, `fs_delete` and `fs_rename` tools ([`crate::files`]). Each change is checked
+//!   against the folder grants and the default-deny list, then checkpointed under the session id,
+//!   so the member can undo it through the `/checkpoints` routes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,7 +49,9 @@ use citrate_agent_loop::{
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
 
+use crate::files::{FileTools, FileToolsHost};
 use crate::toolchain::ToolchainHost;
+use citrate_agent_checkpoints::CheckpointStore;
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
@@ -195,6 +202,8 @@ pub struct Session {
     skills: Option<Arc<SkillLibrary>>,
     /// HUP-S6.3: present when this session was opened with the toolchain enabled.
     toolchain: Option<Arc<ToolchainHost>>,
+    /// HUP-S2.9: present when this session was opened with the file tools enabled.
+    files: Option<Arc<FileTools>>,
 }
 
 impl Session {
@@ -354,6 +363,7 @@ impl ToolHost for CapsuleHost {
 struct SidecarHost {
     skills: Option<SkillHost>,
     toolchain: Option<Arc<ToolchainHost>>,
+    files: Option<FileToolsHost>,
     mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
 }
@@ -368,6 +378,11 @@ impl ToolHost for SidecarHost {
         if ToolchainHost::handles(&call.name) {
             if let Some(t) = &self.toolchain {
                 return t.execute(call);
+            }
+        }
+        if FileTools::handles(&call.name) {
+            if let Some(f) = &self.files {
+                return f.execute(call);
             }
         }
         if let Some(m) = &self.mcp {
@@ -400,6 +415,8 @@ pub struct SessionManager {
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<Arc<McpHost>>,
+    files: Option<Arc<FileTools>>,
+    checkpoints: Option<Arc<CheckpointStore>>,
 }
 
 impl SessionManager {
@@ -412,7 +429,31 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            files: None,
+            checkpoints: None,
         }
+    }
+
+    /// HUP-S2.9: serve the `/checkpoints` routes (list, undo a step, undo a session) from this
+    /// store. Independent of the file tools, so changes stay undoable after the tools are off.
+    pub fn with_checkpoints(mut self, store: Arc<CheckpointStore>) -> Self {
+        self.checkpoints = Some(store);
+        self
+    }
+
+    /// HUP-S2.9: offer the file tools to every new session. Their store also serves the
+    /// `/checkpoints` routes unless one was set with [`SessionManager::with_checkpoints`].
+    pub fn with_files(mut self, tools: Arc<FileTools>) -> Self {
+        if self.checkpoints.is_none() {
+            self.checkpoints = Some(tools.store().clone());
+        }
+        self.files = Some(tools);
+        self
+    }
+
+    /// HUP-S2.9: the undo checkpoint store (`None` when undo is not configured).
+    pub fn checkpoints(&self) -> Option<Arc<CheckpointStore>> {
+        self.checkpoints.clone()
     }
 
     /// HUP-S6.3: offer the toolchain tools to every new session.
@@ -467,6 +508,15 @@ impl SessionManager {
                 )));
             }
             specs.extend(ToolchainHost::specs());
+        }
+        if self.files.is_some() {
+            if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while the file tools are enabled",
+                    t.name
+                )));
+            }
+            specs.extend(FileTools::specs());
         }
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
@@ -532,6 +582,7 @@ impl SessionManager {
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills: self.skills.clone(),
             toolchain: self.toolchain.clone(),
+            files: self.files.clone(),
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -571,6 +622,10 @@ impl SessionManager {
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
         let toolchain = session.toolchain.clone();
+        let files = session
+            .files
+            .clone()
+            .and_then(|t| FileToolsHost::new(t, &session.id));
         let mcp_host = self
             .mcp
             .clone()
@@ -578,6 +633,7 @@ impl SessionManager {
         if skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
+            || files.is_some()
             || mcp_host.is_some()
         {
             registry = registry.with_host(
@@ -585,6 +641,7 @@ impl SessionManager {
                 Arc::new(SidecarHost {
                     skills: skill_host,
                     toolchain,
+                    files,
                     mcp: mcp_host,
                     capsules: capsule_host,
                 }),

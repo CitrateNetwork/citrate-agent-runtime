@@ -18,6 +18,8 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+mod checkpoint_routes;
+pub mod files;
 pub mod llm_http;
 pub mod sessions;
 pub mod toolchain;
@@ -245,6 +247,16 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S2.9: undo checkpoints for agent file changes (member actions, never tools).
+        .route("/checkpoints/:session", get(checkpoint_routes::list_steps))
+        .route(
+            "/checkpoints/:session/steps/:seq/undo",
+            post(checkpoint_routes::undo_step),
+        )
+        .route(
+            "/checkpoints/:session/undo",
+            post(checkpoint_routes::undo_session),
+        )
         .with_state(state)
 }
 
@@ -770,10 +782,51 @@ pub fn production_sessions_with(
         Some(host) => mgr.with_toolchain(host),
         None => mgr,
     };
+    let mgr = with_files_from_env(mgr);
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
+}
+
+/// HUP-S2.9: open the checkpoint store when `CITRATE_HERMES_CHECKPOINTS` names one (the undo
+/// routes then serve it), and offer the file tools when `CITRATE_HERMES_FILES=1` with a grants
+/// file. The file tools never run without a store: no change the member could not undo. What is
+/// on is logged to stderr for the operator.
+pub fn with_files_from_env(mgr: sessions::SessionManager) -> sessions::SessionManager {
+    let get = |k: &str| std::env::var(k).ok();
+    let files_cfg = files::FilesConfig::from_env_vars(get);
+    let Some(dir) = files::checkpoints_dir_from_env_vars(get) else {
+        if files_cfg.is_some() {
+            eprintln!(
+                "citrate-agent-sidecar: file tools off: no checkpoint store ({} is not set), so changes could not be undone",
+                files::CHECKPOINTS_ENV
+            );
+        }
+        return mgr;
+    };
+    let store = match citrate_agent_checkpoints::CheckpointStore::open(
+        &dir,
+        citrate_agent_checkpoints::Config::default(),
+    ) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("citrate-agent-sidecar: undo checkpoints off: {e}");
+            return mgr;
+        }
+    };
+    let mgr = mgr.with_checkpoints(store.clone());
+    match files_cfg {
+        Some(cfg) => {
+            eprintln!("citrate-agent-sidecar: file tools on (fs_write, fs_edit, fs_delete, fs_rename), with undo checkpoints");
+            mgr.with_files(Arc::new(files::FileTools::new(
+                store,
+                files::GrantSource::File(cfg.grants_file),
+                cfg.home,
+            )))
+        }
+        None => mgr,
+    }
 }
 
 /// HUP-S6.3: the toolchain host when `CITRATE_HERMES_TOOLCHAIN=1` (default off → `None`). What it
@@ -905,3 +958,5 @@ mod skills_session_tests;
 mod toolchain_tests;
 #[cfg(test)]
 mod mcp_session_tests;
+#[cfg(test)]
+mod files_tests;

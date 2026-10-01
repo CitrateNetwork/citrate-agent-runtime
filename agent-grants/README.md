@@ -28,10 +28,13 @@ grants.revoke(&id, now)?;
 
 ## Status
 
-Implemented and tested in this crate. **Not wired in yet:** the agent
-sessions (`agent-sidecar`), the file tools and capsule WASI preopens (S2.5)
-do not call it, and citrate-core has no Grants screen or store for it. Those
-are later work packages. Until then nothing in a member's experience changes.
+Implemented and tested in this crate. The sidecar file tools (`fs_write`,
+`fs_edit`, `fs_delete`, `fs_rename`, HUP-S2.9) check every write through
+[`FolderGrants::check`](src/lib.rs), reading the grants file named by
+`CITRATE_HERMES_GRANTS` on every call; they are off unless
+`CITRATE_HERMES_FILES=1`. **Not wired in yet:** capsule WASI preopens (S2.5)
+do not call it, and citrate-core has no Grants screen or store for it, so it
+writes no grants file. Until then nothing in a member's experience changes.
 
 ## Model
 
