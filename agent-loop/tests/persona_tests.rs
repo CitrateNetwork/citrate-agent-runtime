@@ -256,3 +256,28 @@ fn custom_text_is_flattened_to_one_line_per_field_in_the_fragment() {
     );
     assert!(v.prompt_fragment.contains("never change"));
 }
+
+#[test]
+fn a_shipped_persona_cannot_use_the_custom_id_prefix() {
+    // Reviewer mutation check: shipped and member ids must never collide.
+    let mut p = persona("builder");
+    p.id = "custom-builder".into();
+    let err = p
+        .validate()
+        .expect_err("a shipped id with the custom- prefix is refused");
+    assert!(err.contains("custom-"), "{err}");
+}
+
+#[test]
+fn a_persona_file_with_fewer_than_five_personas_is_refused() {
+    // Keep the header and the first four personas only (US-3.3 AC1 asks for at least five).
+    let parts: Vec<&str> = PERSONAS_SOURCE.split("[[personas]]").collect();
+    assert!(
+        parts.len() > 5,
+        "the bundled file has at least five personas"
+    );
+    let four = parts[..5].join("[[personas]]");
+    let err =
+        citrate_agent_loop::personas::parse_personas(&four).expect_err("four personas are refused");
+    assert!(err.contains("at least 5"), "{err}");
+}

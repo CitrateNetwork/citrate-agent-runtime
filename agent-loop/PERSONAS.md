@@ -45,7 +45,8 @@ nearest family (the hello-mint path as a learning checklist, and the status note
 owner call to confirm.
 
 No persona sets `tts_voice`. Unset means the system voice. A value is a voice id the platform's
-existing speech engine knows; personas add no speech engine.
+existing speech engine knows; personas add no speech engine. Nothing passes it to the speech
+engine yet, so clients show a set value as stored, not used.
 
 ## The fragment
 
