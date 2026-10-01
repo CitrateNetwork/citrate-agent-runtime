@@ -28,6 +28,7 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
 
 [dev-dependencies]
 citrate-agent-records = { path = "../agent-records" }

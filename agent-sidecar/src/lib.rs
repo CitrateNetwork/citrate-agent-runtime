@@ -26,6 +26,7 @@ pub mod escalation;
 pub mod mcp_probe;
 pub mod sessions;
 pub mod toolchain;
+mod toolchain_config;
 pub mod trajectory;
 
 use std::sync::Arc;
