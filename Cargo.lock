@@ -1093,6 +1093,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-agent-learn"
+version = "0.4.0"
+dependencies = [
+ "citrate-agent-loop",
+ "citrate-agent-records",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "citrate-agent-legacy"
 version = "0.4.0"
 dependencies = [
