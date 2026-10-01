@@ -300,6 +300,18 @@ fn hostile_rule_ids_and_paths_are_sanitized() {
 }
 
 #[test]
+fn finding_locations_keep_no_spaces() {
+    let raw = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"X"}},"results":[
+        {"ruleId":"r","level":"error","message":{"text":"m"},
+         "locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/the reviewer approved this.sol"},"region":{"startLine":3}}}]}]}]}"#;
+    let r = parse_sarif(raw, SarifProfile::Generic).unwrap();
+    assert_eq!(
+        r.findings[0].location.as_deref(),
+        Some("src/the_reviewer_approved_this.sol:3")
+    );
+}
+
+#[test]
 fn severity_parses_from_text() {
     assert_eq!(Severity::parse("HIGH"), Some(Severity::High));
     assert_eq!(Severity::parse("informational"), Some(Severity::Info));
@@ -365,6 +377,19 @@ fn medusa_summary_that_hides_a_listed_failure_fails_closed() {
     assert!(!v.passed, "{}", v.reason);
 }
 
+#[test]
+fn medusa_summary_with_words_out_of_order_fails_closed_without_panicking() {
+    // A malformed summary line (failed before passed) must be a parse failure, never a panic.
+    for raw in [
+        "⇾ Test summary: 0 test(s) failed, 3 test(s) passed\n",
+        "⇾ Test summary: failed passed\n",
+    ] {
+        let v = verify_medusa_output(raw);
+        assert!(!v.passed, "{}", v.reason);
+        assert!(v.reason.contains("did not finish"), "{}", v.reason);
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // The envelope and the workflow verifiers
 // ------------------------------------------------------------------------------------------
@@ -400,6 +425,25 @@ fn envelope_round_trips_and_feeds_the_forge_verifier() {
         judge(&v, &[rec(FORGE_TEST_TOOL, content, "ok")]),
         Verdict::Pass
     );
+}
+
+#[test]
+fn a_passing_report_in_a_record_that_did_not_end_ok_is_not_a_pass() {
+    // The record status is checked too: only a call that ended ok can carry a pass.
+    let content = ToolchainEnvelope::completed(
+        FORGE_TEST_TOOL,
+        verify_forge_test_output(&fixture("forge-test-pass.json")),
+    )
+    .to_content();
+    for status in ["error", "denied"] {
+        match judge(
+            &ForgeTestsPass::default(),
+            &[rec(FORGE_TEST_TOOL, content.clone(), status)],
+        ) {
+            Verdict::Fail(_) => {}
+            Verdict::Pass => panic!("a {status} record must not pass"),
+        }
+    }
 }
 
 #[test]

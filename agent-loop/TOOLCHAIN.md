@@ -64,7 +64,10 @@ While the toolchain is on, a session may not declare its own tool with one of th
   downloads a compiler.
 - Results reach the model as structure only: counts, sanitized test and rule identifiers, and
   `file:line` locations. Revert reasons, SARIF message text, medusa call sequences, and source
-  lines in compiler output are dropped. That is why the tools are annotated `trust: trusted`.
+  lines in compiler output are dropped. Quoted text in compiler error headers becomes
+  `(quoted)`, and locations keep no spaces. Identifiers are still project-authored, so this
+  narrows free text rather than removing it. That is why the tools are annotated
+  `trust: trusted`.
   They are annotated `effect: write` because builds write `out/` and `cache/`, so after a session
   is tainted they need a member's decision like every other effectful tool.
 - Not covered yet: there is no OS sandbox (US-2.2 AC1 is its own work item), and the programs
