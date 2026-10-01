@@ -15,6 +15,7 @@ use crate::capsule::dispatcher::{ApprovalGate, EthCallDispatcher, EthSendDispatc
 use crate::capsule::manifest::Manifest;
 use crate::capsule::wasm::EngineFactory;
 use crate::capsule::allowlist::FleetAllowlist;
+use crate::capsule::sandbox::{SandboxPlan, SandboxProvider};
 use crate::capsule::{archive, bundled_key, Capsule};
 use crate::error::AgentError;
 use std::collections::{HashMap, HashSet};
@@ -105,6 +106,10 @@ pub struct CapsuleDispatch {
     eth_call_dispatcher: Option<Arc<dyn EthCallDispatcher>>,
     eth_send_dispatcher: Option<Arc<dyn EthSendDispatcher>>,
     approval_gate: Option<Arc<dyn ApprovalGate>>,
+    /// HUP-S2.5: supplies each call's filesystem mounts and socket policy.
+    /// `None` = no preopens at all (the manifest's socket allowlist still
+    /// applies).
+    sandbox: Option<Arc<dyn SandboxProvider>>,
     // RM-E.2 / AGENT_RUNTIME-002: keeps the epoch ticker alive for the
     // dispatch's lifetime so the per-call `set_epoch_deadline` traps
     // runaway capsules. Dropped (stopping the thread) with the dispatch.
@@ -173,9 +178,26 @@ impl CapsuleDispatch {
                 .unwrap_or_default();
             let cps_path = path.join(format!("{dir_name}.cps"));
             if cps_path.exists() {
-                let file = std::fs::File::open(&cps_path)
-                    .map_err(|e| AgentError::Capsule(format!("open {cps_path:?}: {e}")))?;
-                let capsule = Capsule::from_archive_verified(file, &registry)?;
+                // HUP-S2.5: a signed archive that fails verification (unsigned,
+                // signed by another key, or a body that does not match its
+                // signed content_hash) is refused on its own, with the reason,
+                // and never falls back to the loose files beside it. The rest
+                // of the fleet still loads.
+                let verified = std::fs::File::open(&cps_path)
+                    .map_err(|e| AgentError::Capsule(format!("open {cps_path:?}: {e}")))
+                    .and_then(|file| Capsule::from_archive_verified(file, &registry));
+                let capsule = match verified {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let reason = format!(
+                            "failed signature or content-hash verification, so it will not \
+                             load: {e}"
+                        );
+                        eprintln!("[capsule-dispatch] refusing {cps_path:?}: {reason}");
+                        refused.insert(dir_name, reason);
+                        continue;
+                    }
+                };
                 // PBA-L6b-015: a valid signature is necessary, not sufficient.
                 // The (name, version, content_hash) must be allowlisted, so an
                 // older signed release or a signed test capsule cannot run.
@@ -223,8 +245,25 @@ impl CapsuleDispatch {
             eth_call_dispatcher,
             eth_send_dispatcher,
             approval_gate,
+            sandbox: None,
             _epoch_ticker,
         })
+    }
+
+    /// HUP-S2.5: resolve each call's sandbox (folder mounts scoped to the
+    /// member's live grants) through `provider`. Without one, capsules get
+    /// no preopened folder.
+    pub fn with_sandbox(mut self, provider: Arc<dyn SandboxProvider>) -> Self {
+        self.sandbox = Some(provider);
+        self
+    }
+
+    /// The sandbox plan a call to `capsule` runs under, resolved now.
+    fn sandbox_plan(&self, capsule: &Capsule) -> Result<SandboxPlan, AgentError> {
+        match &self.sandbox {
+            Some(p) => p.plan_for(&capsule.manifest),
+            None => SandboxPlan::without_grants(&capsule.manifest),
+        }
     }
 
     /// Names of every loaded capsule, alphabetized. Used by the
@@ -286,13 +325,18 @@ impl CapsuleDispatch {
             )));
         }
 
+        // HUP-S2.5: resolved per call, so a revoked or expired grant stops
+        // applying on the next call. A plan that cannot be satisfied refuses
+        // the call with the reason before any capsule code runs.
+        let plan = self.sandbox_plan(capsule)?;
         let linker = capsule.prepare_linker(&self.engine)?.into_linker();
-        let (mut store, instance) = capsule.instantiate_with_write_path(
+        let (mut store, instance) = capsule.instantiate_sandboxed(
             &self.engine,
             &linker,
             self.eth_call_dispatcher.clone(),
             self.eth_send_dispatcher.clone(),
             self.approval_gate.clone(),
+            &plan,
         )?;
         // REM-12 (wasmtime 26 → 45): `Instance::get_export` now returns
         // `(ComponentItem, ComponentExportIndex)`. The second `get_export`
@@ -683,6 +727,171 @@ mod tests {
                 "busy loop never returned within 5s — epoch ticker not wired (AGENT_RUNTIME-002)"
             ),
         }
+    }
+
+    // ── HUP-S2.5: every shipped capsule is verified before load ──
+
+    /// Re-tar `contents` exactly as given (no re-hash, no re-sign), the way
+    /// someone editing an archive by hand would.
+    fn write_cps(contents: &archive::ArchiveContents) -> Vec<u8> {
+        let mut entries: Vec<(String, Vec<u8>)> = vec![
+            ("manifest.toml".into(), contents.manifest.clone()),
+            ("capsule.wit".into(), contents.wit.clone()),
+            ("capsule.wasm".into(), contents.wasm.clone()),
+            ("procedure.md".into(), contents.procedure.clone()),
+        ];
+        for (p, b) in contents.gherkin.iter().chain(contents.specs.iter()) {
+            entries.push((p.clone(), b.clone()));
+        }
+        for (name, b) in &contents.signatures {
+            entries.push((format!("SIGNATURES/{name}"), b.clone()));
+        }
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, bytes) in &entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, bytes.as_slice())
+                    .expect("tar append");
+            }
+            builder.finish().expect("tar finish");
+        }
+        zstd::encode_all(&tar_buf[..], 3).expect("zstd")
+    }
+
+    /// A fleet dir with `hello` replaced by `hello_cps` and a good copy of
+    /// `echo-chain`.
+    fn fleet_with_hello(hello_cps: &[u8]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for name in ["hello", "echo-chain"] {
+            let src = capsules_root().join(name);
+            let dst = tmp.path().join(name);
+            std::fs::create_dir_all(&dst).expect("mkdir");
+            for f in ["manifest.toml", "capsule.wasm"] {
+                std::fs::copy(src.join(f), dst.join(f)).expect("copy");
+            }
+            let cps = format!("{name}.cps");
+            if name == "hello" {
+                std::fs::write(dst.join(&cps), hello_cps).expect("write");
+            } else {
+                std::fs::copy(src.join(&cps), dst.join(&cps)).expect("copy");
+            }
+        }
+        tmp
+    }
+
+    fn shipped_hello() -> archive::ArchiveContents {
+        let bytes = std::fs::read(capsules_root().join("hello").join("hello.cps")).expect("read");
+        archive::read_archive(&bytes[..]).expect("shipped hello reads")
+    }
+
+    fn assert_hello_refused(hello_cps: &[u8], why: &str) {
+        let tmp = fleet_with_hello(hello_cps);
+        let dispatch = CapsuleDispatch::load_from_dir(tmp.path(), None, None, None)
+            .expect("one bad archive does not take down the fleet");
+        assert!(
+            dispatch.has("echo-chain"),
+            "{why}: the good capsule still loads"
+        );
+        assert!(
+            !dispatch.has("hello"),
+            "{why}: no fallback to the loose files"
+        );
+        let reason = dispatch
+            .refused_capsules()
+            .get("hello")
+            .unwrap_or_else(|| panic!("{why}: hello must be listed as refused"));
+        assert!(reason.contains("verification"), "{why}: {reason}");
+        let err = dispatch
+            .call_raw("hello", "citrate:hello/greet@0.1.0", "greet", &[])
+            .expect_err("a refused capsule never runs");
+        assert!(err.to_string().contains("verification"), "{why}: {err}");
+    }
+
+    #[test]
+    fn shipped_capsules_load_verified_hup_s2_5() {
+        let tmp = fleet_with_hello(
+            &std::fs::read(capsules_root().join("hello").join("hello.cps")).expect("read"),
+        );
+        let dispatch = CapsuleDispatch::load_from_dir(tmp.path(), None, None, None).expect("loads");
+        assert!(dispatch.has("hello") && dispatch.has("echo-chain"));
+        assert!(dispatch.refused_capsules().is_empty());
+    }
+
+    #[test]
+    fn a_tampered_capsule_body_is_refused_hup_s2_5() {
+        let mut hello = shipped_hello();
+        hello.wasm.push(0); // body no longer matches the signed content_hash
+        assert_hello_refused(&write_cps(&hello), "tampered body");
+    }
+
+    #[test]
+    fn a_tampered_capsule_manifest_is_refused_hup_s2_5() {
+        let mut hello = shipped_hello();
+        let manifest = String::from_utf8(hello.manifest.clone()).expect("utf8");
+        hello.manifest = manifest.replace("0.1.0", "0.1.1").into_bytes();
+        assert_hello_refused(&write_cps(&hello), "tampered manifest");
+    }
+
+    #[test]
+    fn an_unsigned_capsule_is_refused_hup_s2_5() {
+        let mut hello = shipped_hello();
+        hello.signatures.clear();
+        assert_hello_refused(&write_cps(&hello), "unsigned");
+    }
+
+    #[test]
+    fn a_capsule_signed_by_another_key_is_refused_hup_s2_5() {
+        let hello = shipped_hello();
+        let source = crate::capsule::pack::CapsuleSource {
+            manifest_toml: String::from_utf8(hello.manifest.clone()).expect("utf8"),
+            wit: hello.wit.clone(),
+            wasm: hello.wasm.clone(),
+            procedure: hello.procedure.clone(),
+            gherkin: hello.gherkin.clone(),
+            specs: hello.specs.clone(),
+        };
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        let cps = crate::capsule::pack::pack(&source, &other_key).expect("pack");
+        assert_hello_refused(&cps, "foreign signer");
+    }
+
+    #[test]
+    fn a_corrupt_archive_is_refused_hup_s2_5() {
+        assert_hello_refused(b"not a capsule archive", "corrupt");
+    }
+
+    /// The sandbox provider is consulted on every call, before any capsule
+    /// code runs: a plan that cannot be satisfied refuses the call.
+    #[test]
+    fn call_raw_runs_under_the_sandbox_plan_hup_s2_5() {
+        struct Refuse;
+        impl SandboxProvider for Refuse {
+            fn plan_for(
+                &self,
+                manifest: &crate::capsule::manifest::Manifest,
+            ) -> Result<SandboxPlan, AgentError> {
+                Err(AgentError::Capsule(format!(
+                    "no grant covers the mount for {}",
+                    manifest.capsule.name
+                )))
+            }
+        }
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("loads")
+            .with_sandbox(Arc::new(Refuse));
+        let err = dispatch
+            .call_json("hello", &serde_json::json!({ "name": "member" }))
+            .expect_err("plan refused");
+        assert!(
+            err.to_string()
+                .contains("no grant covers the mount for hello"),
+            "{err}"
+        );
     }
 
     /// Loading the full BFR-INT-12 fleet from disk: all 7 capsules

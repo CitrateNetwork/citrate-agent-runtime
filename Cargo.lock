@@ -1071,6 +1071,7 @@ version = "0.4.0"
 dependencies = [
  "base64",
  "ciborium",
+ "citrate-agent-grants",
  "citrate-wallet-core",
  "ed25519-dalek",
  "hex",
@@ -1080,6 +1081,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tar",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
