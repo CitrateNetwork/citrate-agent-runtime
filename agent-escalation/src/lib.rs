@@ -24,7 +24,7 @@ mod registry;
 pub use endpoint::{
     parse_reply, run, settle, validate_base_url, wire_body, ApiKey, Charge, EscalationError,
     EscalationOutcome, EscalationRequest, HttpTransport, Transport, MAX_ESCALATION_TOKENS,
-    MAX_KEY_LEN, MAX_PROMPT_BYTES,
+    MAX_KEY_LEN, MAX_PROMPT_BYTES, MAX_REPLY_BYTES,
 };
 pub use price::{input_token_bound, Price, Usage, PER_MESSAGE_OVERHEAD_TOKENS};
 pub use registry::{

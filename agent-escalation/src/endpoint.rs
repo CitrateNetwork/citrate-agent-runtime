@@ -19,6 +19,9 @@ pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MAX_ESCALATION_TOKENS: u32 = 8192;
 /// The longest API key accepted.
 pub const MAX_KEY_LEN: usize = 512;
+/// The largest provider answer read, in bytes. An 8192-token completion is far below this; a
+/// longer body is refused instead of being buffered whole.
+pub const MAX_REPLY_BYTES: usize = 2 * 1024 * 1024;
 
 /// An escalation failure. No variant carries the endpoint URL, the key, or the provider's body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -316,9 +319,20 @@ impl Transport for HttpTransport {
                 })
             })?;
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .map_err(|_| EscalationError::Transport("answer could not be read".into()))?;
+        // Read at most one byte past the cap, so an oversized answer is refused, not buffered.
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(resp, MAX_REPLY_BYTES as u64 + 1),
+            &mut buf,
+        )
+        .map_err(|_| EscalationError::Transport("answer could not be read".into()))?;
+        if buf.len() > MAX_REPLY_BYTES {
+            return Err(EscalationError::BadResponse(
+                "the answer is too large".into(),
+            ));
+        }
+        let text = String::from_utf8(buf)
+            .map_err(|_| EscalationError::BadResponse("the answer is not UTF-8".into()))?;
         Ok((status, text))
     }
 }

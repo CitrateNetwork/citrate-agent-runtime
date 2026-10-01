@@ -442,6 +442,76 @@ fn http_transport_connect_failure_is_coarse() {
     assert!(!e.to_string().contains("127.0.0.1"));
 }
 
+/// A one-shot loopback server that drains the request and answers with `raw` (a full HTTP/1.1
+/// response, head and body).
+fn serve_raw(raw: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut reader = BufReader::new(sock.try_clone().expect("clone"));
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut buf = vec![0u8; len];
+            let _ = reader.read_exact(&mut buf);
+            let _ = sock.write_all(&raw);
+        }
+    });
+    format!("http://127.0.0.1:{}/v1", addr.port())
+}
+
+#[test]
+fn http_transport_refuses_an_answer_larger_than_the_reply_cap() {
+    // A valid completion whose text alone is past the cap: it is refused, not buffered whole.
+    let big = "x".repeat(citrate_agent_escalation::MAX_REPLY_BYTES + 1);
+    let body = json!({"choices": [{"message": {"content": big}}]}).to_string();
+    let mut raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body.as_bytes());
+    let base = serve_raw(raw);
+    let e = run(&request(&base), &HttpTransport, Duration::from_secs(10)).expect_err("too large");
+    assert!(
+        matches!(&e, EscalationError::BadResponse(m) if m.contains("too large")),
+        "{e:?}"
+    );
+    // The request did reach the provider, so core keeps the reservation charged.
+    assert!(e.may_have_reached_provider());
+}
+
+#[test]
+fn http_transport_does_not_follow_a_redirect() {
+    // The redirect target would answer with a completion; it must never be contacted.
+    let (target, seen) = serve_once(
+        200,
+        json!({"choices": [{"message": {"content": "redirected"}}]}).to_string(),
+    );
+    let raw = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let base = serve_raw(raw);
+    let e = run(&request(&base), &HttpTransport, Duration::from_secs(10)).expect_err("307");
+    assert!(matches!(e, EscalationError::Provider(307)), "{e:?}");
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "the key went to the redirect target"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Registry route: interface present, shipped disabled
 // ---------------------------------------------------------------------------
