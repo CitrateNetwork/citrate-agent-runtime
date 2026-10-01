@@ -379,6 +379,10 @@ fn the_tool_host_binds_a_stop_flag_and_refuses_unknown_names() {
     stop.stop();
     let out = th.execute(&call("mcp__fx__sleep", json!({"ms": 3000})));
     assert!(matches!(out, ToolOutcome::Error(_)), "{out:?}");
+    // A raised stop flag means the call is never sent: the server saw no request to cancel.
+    let state = host.call(&call("mcp__fx__state", json!({})), &StopFlag::default());
+    let body = text_of(&state);
+    assert!(body.contains("\"cancelled\":[]"), "{body}");
 }
 
 #[test]
@@ -395,4 +399,35 @@ fn non_object_arguments_are_refused_before_reaching_the_server() {
         &StopFlag::default(),
     );
     assert!(matches!(out, ToolOutcome::Error(_)), "{out:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn servers_are_connected_in_parallel_so_one_hung_server_does_not_add_up() {
+    // Two servers that never answer `initialize` (they do not read stdin) and one good one.
+    let hung = |name: &str| {
+        let mut c = ServerConfig::new(
+            name,
+            TransportConfig::Stdio {
+                command: "/bin/sleep".into(),
+                args: vec!["30".into()],
+                env: BTreeMap::new(),
+                cwd: None,
+            },
+        );
+        c.init_timeout = Duration::from_millis(1500);
+        c
+    };
+    let started = Instant::now();
+    let host = McpHost::connect(&McpConfig {
+        servers: vec![hung("h1"), hung("h2"), server("fx", &[])],
+    });
+    let took = started.elapsed();
+    let st = host.status();
+    assert_eq!(st[0].state, ServerState::Failed);
+    assert_eq!(st[1].state, ServerState::Failed);
+    assert_eq!(st[2].state, ServerState::Ready);
+    assert!(host.handles("mcp__fx__echo"));
+    // Serially this would take at least 3 s (two 1.5 s init deadlines back to back).
+    assert!(took < Duration::from_millis(2800), "connect took {took:?}");
 }

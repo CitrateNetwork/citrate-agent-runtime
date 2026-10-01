@@ -102,6 +102,11 @@ async fn mcp(State(s): State<Srv>, headers: HeaderMap, body: Bytes) -> Response 
     StatusCode::ACCEPTED.into_response()
 }
 
+/// Always answers with a redirect to the real endpoint (the host must not follow it).
+async fn moved() -> Response {
+    (StatusCode::TEMPORARY_REDIRECT, [("location", "/mcp")]).into_response()
+}
+
 /// Start the server on a background runtime; returns its URL.
 fn start(raw_override: Option<&'static str>) -> (String, Arc<Mutex<Seen>>, Arc<Mutex<Fixture>>) {
     let fx = Arc::new(Mutex::new(Fixture::new(None, false)));
@@ -124,7 +129,10 @@ fn start(raw_override: Option<&'static str>) -> (String, Arc<Mutex<Seen>>, Arc<M
                 .expect("bind");
             let addr = listener.local_addr().expect("addr");
             let _ = tx.send(addr);
-            let app = Router::new().route("/mcp", post(mcp)).with_state(srv);
+            let app = Router::new()
+                .route("/mcp", post(mcp))
+                .route("/moved", post(moved))
+                .with_state(srv);
             let _ = axum::serve(listener, app).await;
         });
     });
@@ -262,4 +270,31 @@ transport = "http"
 url = "http://203.0.113.9/mcp"
 "#;
     assert!(McpConfig::parse_toml(cfg).is_err());
+}
+
+#[test]
+fn an_oversized_sse_stream_is_refused_as_oversize() {
+    let (url, _, _) = start(None);
+    let mut cfg = http_server("web", &url);
+    cfg.max_response_bytes = 2048;
+    let client = McpClient::connect(&cfg).expect("connect");
+    let err = client
+        .call_tool(
+            "sse_echo",
+            json!({"text": "y".repeat(50_000)}),
+            &StopFlag::default(),
+        )
+        .expect_err("oversize");
+    assert!(matches!(err, McpError::Oversize(2048)), "{err:?}");
+}
+
+#[test]
+fn redirects_are_not_followed() {
+    let (url, _, _) = start(None);
+    let moved = url.replace("/mcp", "/moved");
+    let err = McpClient::connect(&http_server("web", &moved)).expect_err("redirect");
+    assert!(
+        matches!(&err, McpError::Transport(m) if m.contains("307")),
+        "{err:?}"
+    );
 }

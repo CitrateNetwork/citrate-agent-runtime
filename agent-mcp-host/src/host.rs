@@ -3,6 +3,7 @@
 
 use crate::client::McpClient;
 use crate::config::{McpConfig, ServerConfig};
+use crate::error::McpError;
 use crate::mapping::{fence, to_spec, TOOL_PREFIX};
 use citrate_agent_loop::{Effect, StopFlag, ToolCall, ToolHost, ToolOutcome, ToolSpec};
 use serde::Serialize;
@@ -62,12 +63,34 @@ pub struct McpHost {
 }
 
 impl McpHost {
-    /// Connect to every server in order. A server that fails is reported in [`McpHost::status`]
-    /// and offers no tools; the others are unaffected.
+    /// Connect to every server. Handshakes run in parallel (one thread per server), so a server
+    /// that never answers costs its own init deadline once, not once per server; tools are then
+    /// mapped in allowlist order. A server that fails is reported in [`McpHost::status`] and
+    /// offers no tools; the others are unaffected.
     pub fn connect(cfg: &McpConfig) -> Self {
+        type Connected = Result<(McpClient, Vec<crate::client::RemoteTool>), McpError>;
+        let results: Vec<Connected> = std::thread::scope(|scope| {
+            let handles: Vec<_> = cfg
+                .servers
+                .iter()
+                .map(|sc| {
+                    scope.spawn(move || {
+                        McpClient::connect(sc).and_then(|c| c.list_tools().map(|t| (c, t)))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(McpError::Spawn("the connect thread panicked".into()))
+                    })
+                })
+                .collect()
+        });
         let mut entries = Vec::with_capacity(cfg.servers.len());
         let mut routes = HashMap::new();
-        for (idx, sc) in cfg.servers.iter().enumerate() {
+        for ((idx, sc), connected) in cfg.servers.iter().enumerate().zip(results) {
             let mut e = Entry {
                 cfg: sc.clone(),
                 client: None,
@@ -75,7 +98,7 @@ impl McpHost {
                 specs: Vec::new(),
                 skipped: Vec::new(),
             };
-            match McpClient::connect(sc).and_then(|c| c.list_tools().map(|t| (c, t))) {
+            match connected {
                 Ok((client, tools)) => {
                     for t in tools {
                         match to_spec(&sc.name, &t) {

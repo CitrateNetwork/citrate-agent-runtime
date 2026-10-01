@@ -50,7 +50,7 @@ the environment, or the server's `instructions` text.
 |---|---|
 | stdio | Child process from an absolute path with `env_clear()`, then only the base allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, and the Windows process basics) plus the server's explicit `env`. Nothing else from the sidecar's environment reaches it. stderr is discarded so a chatty server can never block. Requests are written by a dedicated writer thread; responses are read by a bounded line reader. The child is killed when the host is dropped. |
 | HTTP | Streamable HTTP: one POST per message, `Accept: application/json, text/event-stream`, JSON or SSE answers (SSE parsed incrementally until the matching response). `Mcp-Session-Id` from `initialize` and `MCP-Protocol-Version` are sent on later requests. Redirects are refused; loopback requests bypass proxies. The blocking HTTP client always runs on its own thread, never on an async runtime thread. |
-| Lifecycle | `initialize` asks for `2025-06-18` and accepts `2025-06-18`, `2025-03-26` or `2024-11-05`; any other answer is refused. Capabilities, server name and version are recorded. Then `notifications/initialized`. |
+| Lifecycle | `initialize` asks for `2025-06-18` and accepts `2025-06-18`, `2025-03-26` or `2024-11-05`; any other answer is refused. Capabilities, server name and version are recorded. Then `notifications/initialized`. Servers are connected in parallel at start, so a server that never answers delays startup by its own init deadline once. |
 | Tools | `tools/list` only when the server declared `tools`; paginated (at most 32 pages, 256 tools). Each tool becomes an agent-loop `ToolSpec` with host `sidecar` and name `mcp__<server>__<tool>` (other characters mapped to `_`, at most 64 chars), so MCP tools cannot collide with core or sidecar tools. While MCP is configured the `mcp__` prefix is reserved: a session that offers its own tool in that namespace is refused. Descriptions are labelled, stripped of control characters and capped at 1024 chars; input schemas must be objects of at most 16 KiB. |
 | Annotations | Hints, mapped with the spec defaults: `readOnlyHint: true` gives effect `none`; anything else gives effect `write` (`destructiveHint` defaults true, `openWorldHint` defaults true, `idempotentHint` defaults false). Trust is always `untrusted`, whatever the server says. |
 | Calls | `tools/call` with the per-server deadline, the response cap, and cancellation: on timeout or when the session's stop flag rises (session stop or e-stop), the server is sent `notifications/cancelled` and the call ends at once. Arguments must be a JSON object. Text content is passed through; images and audio are described, never inlined; resource links are listed; embedded text resources are included; with no content blocks, `structuredContent` is shown as JSON. Output is fenced as untrusted data and truncated to `max_output_chars`. |
@@ -86,9 +86,9 @@ the environment, or the server's `instructions` text.
 ## Tests
 
 `cargo test -p citrate-agent-mcp-host`: 17 unit tests (config validation, env
-filtering, naming, annotation mapping, rendering, the bounded line reader), 21 tests
+filtering, naming, annotation mapping, rendering, the bounded line reader), 22 tests
 against a real stdio MCP server (`fixtures/stdio_server.rs`, built as the
-`citrate-mcp-fixture-server` test binary), and 7 against a real axum streamable-HTTP
+`citrate-mcp-fixture-server` test binary), and 9 against a real axum streamable-HTTP
 server. `agent-sidecar` adds 7 session tests over a real HTTP MCP server (offered
 tools, untrusted result and taint, namespace reservation, decline after taint, stop
 cancels an in-flight call, the status route, config loading).
