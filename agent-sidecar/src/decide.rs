@@ -39,7 +39,9 @@ pub const JEV_NON_WEB_ENV: &str = "CITRATE_HERMES_JEV_NON_WEB";
 pub const JEV_ENDPOINT_ENV: &str = "CITRATE_HERMES_JEV_ENDPOINT";
 pub const JEV_MODEL_ENV: &str = "CITRATE_HERMES_JEV_MODEL";
 pub const DECIDE_LOG_ENV: &str = "CITRATE_HERMES_DECIDE_LOG";
-/// TypeSafe's System One decisions endpoint (as used by the `system1-agents` adapter).
+/// TypeSafe's System One decisions endpoint (as used by the `system1-agents` adapter). This
+/// endpoint and the default model are taken from that adapter; the vendor and its terms are
+/// pending owner sign-off before any member opts in.
 pub const JEV_DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const JEV_DEFAULT_MODEL: &str = "jev-latest";
 /// Local decisions get the model's own budget; Jev answers in about a second when it is up.

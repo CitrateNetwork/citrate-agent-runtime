@@ -54,6 +54,17 @@ are refused as unsupported.
 - The tests use a small fixture program (`fixtures/searxng_fixture.rs`) that speaks the same
   settings file and HTTP surface, because SearXNG is not installed on CI or on the build machine.
 
+## Pending owner sign-off
+
+These are conservative placeholders, built so the defaults change nothing for members:
+
+- `read_url` caps (2 MiB body, 15 s, 5 redirects, 20k characters shown, 60k at most) and the
+  SearXNG limits (30 s start, 12 s query, 3 failed starts, `safe_search: 1`).
+- Jina and TypeSafe keys are member-chosen files passed by path; custody-vault storage is not built.
+- The Jev endpoint and model (`https://api.typesafe.ai/v1/systemone`, `jev-latest`) come from the
+  `system1-agents` adapter; the vendor and its terms need confirming before any member opts in.
+- Retention and rotation of the decision metering log (`CITRATE_HERMES_DECIDE_LOG`).
+
 ## Tests
 
 `cargo test -p citrate-agent-search`: unit tests for the address policy, extraction and the

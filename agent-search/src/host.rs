@@ -14,7 +14,7 @@ pub const READ_URL_TOOL: &str = "read_url";
 pub const TOOL_NAMES: [&str; 2] = [WEB_SEARCH_TOOL, READ_URL_TOOL];
 /// Longest query accepted.
 pub const MAX_QUERY_CHARS: usize = 400;
-/// Characters of page markdown shown by default and at most.
+/// Characters of page markdown shown by default and at most (placeholders, pending owner sign-off).
 pub const DEFAULT_READ_CHARS: usize = 20_000;
 pub const MAX_READ_CHARS: usize = 60_000;
 const DEFAULT_RESULTS: usize = 8;

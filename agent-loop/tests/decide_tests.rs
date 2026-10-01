@@ -1,5 +1,5 @@
 //! HUP-S5.3: the `decide()` System-1 slot. Offline tests over scripted transports; the real
-//! llama-server run lives in `decide_live_tests.rs` (ignored by default).
+//! llama-server run lives in `agent-sidecar/tests/decide_live.rs` (ignored by default).
 
 use citrate_agent_loop::decide::{
     build_jev_body, build_local_body, options_from_snapshot, parse_jev_answer, parse_local_answer,
@@ -503,4 +503,20 @@ fn every_subset_task_names_expected_refs_that_exist_in_its_snapshot() {
             assert!(opts.iter().any(|o| &o.id == e), "{}: {e} missing", t.id);
         }
     }
+}
+
+#[test]
+fn a_web_origin_must_state_its_cookie_and_attach_facts() {
+    // A caller that forgets the session-cookie or attach-mode fact must not be read as "no
+    // cookie, not attached" (that would open the Jev path); the request is refused instead.
+    let missing_both = serde_json::json!({"origin": "https://shop.example"});
+    assert!(serde_json::from_value::<DecisionOrigin>(missing_both).is_err());
+    let missing_attach =
+        serde_json::json!({"origin": "https://shop.example", "has_session_cookie": false});
+    assert!(serde_json::from_value::<DecisionOrigin>(missing_attach).is_err());
+    let full = serde_json::json!({
+        "origin": "https://shop.example", "has_session_cookie": false, "attach_mode": false
+    });
+    let o: DecisionOrigin = serde_json::from_value(full).expect("complete origin");
+    assert!(!o.has_session_cookie && !o.attach_mode);
 }

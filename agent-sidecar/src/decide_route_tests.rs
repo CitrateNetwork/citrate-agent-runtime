@@ -118,7 +118,8 @@ fn decide_body(base: &str, origin: Option<&str>, backend: &str) -> serde_json::V
         "context": "a page"
     });
     if let Some(o) = origin {
-        request["origin"] = serde_json::json!({"origin": o});
+        request["origin"] =
+            serde_json::json!({"origin": o, "has_session_cookie": false, "attach_mode": false});
     }
     serde_json::json!({
         "llm": {"baseUrl": format!("{base}/v1"), "bearer": ""},

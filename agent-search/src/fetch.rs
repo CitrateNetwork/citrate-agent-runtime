@@ -26,6 +26,8 @@ pub struct ReadUrlConfig {
     pub allow_private: Vec<IpAddr>,
 }
 
+// The caps below (2 MiB body, 15 s, 5 s connect, 5 redirects) are conservative placeholders,
+// pending owner sign-off.
 impl Default for ReadUrlConfig {
     fn default() -> Self {
         ReadUrlConfig {

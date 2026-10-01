@@ -66,13 +66,12 @@ pub struct DecideOption {
 }
 
 /// Where a web decision is being made. Taken by the caller from the top-level frame, never from
-/// page content or the model.
+/// page content or the model. Both facts are required on the wire: a caller that leaves one out
+/// is refused rather than read as "no cookie, not attached".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionOrigin {
     pub origin: String,
-    #[serde(default)]
     pub has_session_cookie: bool,
-    #[serde(default)]
     pub attach_mode: bool,
 }
 

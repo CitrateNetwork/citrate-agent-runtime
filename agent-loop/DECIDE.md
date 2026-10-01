@@ -40,7 +40,8 @@ real check.
 1. the member turned Jev on and a key file is configured;
 2. for a web decision: the origin (taken by the caller from the top-level frame) normalizes to an
    exact entry on the member's Jev allowlist, it has no session cookie, and the browser is not in
-   attach mode;
+   attach mode. A web origin must state `has_session_cookie` and `attach_mode` explicitly; a
+   request that leaves either out is rejected, never read as "no cookie, not attached";
 3. for a decision with no web origin: the separate non-web opt-in is on.
 
 `backend: "auto"` uses Jev when it is permitted and local otherwise. `backend: "jev"` is Jev or a
@@ -79,6 +80,17 @@ Live run, 2026-10-01, local backend, the bundled llama-server (build 10909) serv
 Reproduce with the command in `agent-sidecar/tests/decide_live.rs`. The next step is a harder
 subset with distractors and multi-step tasks once the managed browser (HUP-S5.1) produces real
 snapshots.
+
+## Pending owner sign-off
+
+These are conservative placeholders, built so the defaults change nothing for members:
+
+- `read_url` caps (2 MiB body, 15 s, 5 redirects, 20k characters shown, 60k at most) and the
+  SearXNG limits (30 s start, 12 s query, 3 failed starts, `safe_search: 1`).
+- Jina and TypeSafe keys are member-chosen files passed by path; custody-vault storage is not built.
+- The Jev endpoint and model (`https://api.typesafe.ai/v1/systemone`, `jev-latest`) come from the
+  `system1-agents` adapter; the vendor and its terms need confirming before any member opts in.
+- Retention and rotation of the decision metering log (`CITRATE_HERMES_DECIDE_LOG`).
 
 ## Not done here
 
