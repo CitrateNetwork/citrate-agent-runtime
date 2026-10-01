@@ -210,11 +210,18 @@ fn case_variants_resolve_to_the_on_disk_spelling_where_the_filesystem_folds_case
     let mut g = grants(&fx);
     g.grant(folder(&fx.proj, Access::Read), T0).expect("grant");
     let upper = fx.proj.join("SRC/MAIN.RS");
+    let folds_case = upper.exists();
     match g.check(s(&upper), Op::Read, T0) {
         // Case-insensitive volume (APFS default): the same file, reported
-        // with its real spelling.
+        // with its real spelling. Case-sensitive volume (Linux CI): an
+        // absent name under the grant, allowed as written.
         Decision::Allowed { canonical, .. } => {
-            assert_eq!(canonical.as_path(), fx.proj.join("src/main.rs"))
+            let want = if folds_case {
+                fx.proj.join("src/main.rs")
+            } else {
+                upper
+            };
+            assert_eq!(canonical.as_path(), want)
         }
         // Case-sensitive volume: a different (absent) name under the grant.
         // Allowed as written would also be fine; denied must not happen
