@@ -1,0 +1,10 @@
+[1;32m⇾[0m Fuzzing with 10 workers
+[1;32m⇾[0m [1mfuzz: [0melapsed: [1m      3s[0m, calls: [1m     31877 ( 10625/sec)[0m, seq/s: [1m   106[0m, branches: [1m    35[0m, corpus: [1m    6[0m, failures: [1m3/319[0m, gas/s: [1m  1404213[0m
+[1;32m⇾[0m Fuzzer stopped, test results follow below ...
+[1;32m⇾[0m [1;32m[PASSED] [1mAssertion Test: CounterInvariants.check_increment(uint256)[0m
+[1;32m⇾[0m [1;32m[PASSED] [1mProperty Test: CounterInvariants.property_owner_fixed()[0m
+[1;32m⇾[0m [1;31m[FAILED] [1mProperty Test: CounterInvariants.property_supply_cap()[0m
+Test for method "CounterInvariants.property_supply_cap()" failed after the following call sequence:
+[1m[Call Sequence][0m
+1) CounterInvariants.mint("[PASSED] Property Test: Fake.spoof()") (block=2, time=3, gas=12500000, gasprice=1, value=0, sender=0x10000)
+[1;32m⇾[0m Test summary: [1;32m2[0m test(s) passed, [1;31m1[0m test(s) failed

@@ -1,0 +1,171 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Slither",
+          "informationUri": "https://github.com/crytic/slither",
+          "version": "0.11.6",
+          "rules": [
+            {
+              "id": "0-1-reentrancy-eth",
+              "name": "reentrancy-eth",
+              "properties": {
+                "precision": "high",
+                "security-severity": "8.0"
+              },
+              "shortDescription": {
+                "text": "Reentrancy vulnerabilities"
+              },
+              "help": {
+                "text": "Apply the [`check-effects-interactions pattern`](http://solidity.readthedocs.io/en/v0.4.21/security-considerations.html#re-entrancy)."
+              }
+            },
+            {
+              "id": "0-0-suicidal",
+              "name": "suicidal",
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "8.0"
+              },
+              "shortDescription": {
+                "text": "Suicidal"
+              },
+              "help": {
+                "text": "Protect access to all sensitive functions."
+              }
+            },
+            {
+              "id": "3-0-solc-version",
+              "name": "solc-version",
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "0.0"
+              },
+              "shortDescription": {
+                "text": "Incorrect versions of Solidity"
+              },
+              "help": {
+                "text": "\nDeploy with a recent version of Solidity (at least 0.8.0) with no known severe issues.\n\nUse a simple pragma version that allows any of these versions.\nConsider using the latest version of Solidity for testing."
+              }
+            },
+            {
+              "id": "3-0-low-level-calls",
+              "name": "low-level-calls",
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "0.0"
+              },
+              "shortDescription": {
+                "text": "Low-level calls"
+              },
+              "help": {
+                "text": "Avoid low-level calls. Check the call success. If the call is meant for a contract, check for code existence."
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "0-1-reentrancy-eth",
+          "message": {
+            "text": "Reentrancy in Vault.withdraw() (src/Vault.sol#7-12):\n\tExternal calls:\n\t- (ok,None) = msg.sender.call{value: amount}() (src/Vault.sol#9)\n\tState variables written after the call(s):\n\t- balances[msg.sender] = 0 (src/Vault.sol#11)\n\tVault.balances (src/Vault.sol#5) can be used in cross function reentrancies:\n\t- Vault.balances (src/Vault.sol#5)\n\t- Vault.deposit() (src/Vault.sol#6)\n\t- Vault.withdraw() (src/Vault.sol#7-12)\n",
+            "markdown": "Reentrancy in [Vault.withdraw()](src/Vault.sol#L7-L12):\n\tExternal calls:\n\t- [(ok,None) = msg.sender.call{value: amount}()](src/Vault.sol#L9)\n\tState variables written after the call(s):\n\t- [balances[msg.sender] = 0](src/Vault.sol#L11)\n\t[Vault.balances](src/Vault.sol#L5) can be used in cross function reentrancies:\n\t- [Vault.balances](src/Vault.sol#L5)\n\t- [Vault.deposit()](src/Vault.sol#L6)\n\t- [Vault.withdraw()](src/Vault.sol#L7-L12)\n"
+          },
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/Vault.sol"
+                },
+                "region": {
+                  "startLine": 7,
+                  "endLine": 12
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "id": "ca03621978f842952d7cdc7476b64eb13f2689f4c4c510c2849e84827d42a4b4"
+          }
+        },
+        {
+          "ruleId": "0-0-suicidal",
+          "message": {
+            "text": "Vault.kill(address) (src/Vault.sol#13) allows anyone to destruct the contract\n",
+            "markdown": "[Vault.kill(address)](src/Vault.sol#L13) allows anyone to destruct the contract\n"
+          },
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/Vault.sol"
+                },
+                "region": {
+                  "startLine": 13,
+                  "endLine": 13
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "id": "62f7f19c9ae3e3b99025fbb22d3a4716a846d16828b5841026e64c915ea6618c"
+          }
+        },
+        {
+          "ruleId": "3-0-solc-version",
+          "message": {
+            "text": "Version constraint ^0.8.20 contains known severe issues (https://solidity.readthedocs.io/en/latest/bugs.html)\n\t- VerbatimInvalidDeduplication\n\t- FullInlinerNonExpressionSplitArgumentEvaluationOrder\n\t- MissingSideEffectsOnSelectorAccess.\nIt is used by:\n\t- ^0.8.20 (src/Counter.sol#2)\n\t- ^0.8.20 (src/Vault.sol#2)\n",
+            "markdown": "Version constraint ^0.8.20 contains known severe issues (https://solidity.readthedocs.io/en/latest/bugs.html)\n\t- VerbatimInvalidDeduplication\n\t- FullInlinerNonExpressionSplitArgumentEvaluationOrder\n\t- MissingSideEffectsOnSelectorAccess.\nIt is used by:\n\t- [^0.8.20](src/Counter.sol#L2)\n\t- [^0.8.20](src/Vault.sol#L2)\n"
+          },
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/Counter.sol"
+                },
+                "region": {
+                  "startLine": 2,
+                  "endLine": 2
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "id": "5af866de9a7b69af56256e6cd0e94c866b9246cd13c42a95487771ac2c5cddbc"
+          }
+        },
+        {
+          "ruleId": "3-0-low-level-calls",
+          "message": {
+            "text": "Low level call in Vault.withdraw() (src/Vault.sol#7-12):\n\t- (ok,None) = msg.sender.call{value: amount}() (src/Vault.sol#9)\n",
+            "markdown": "Low level call in [Vault.withdraw()](src/Vault.sol#L7-L12):\n\t- [(ok,None) = msg.sender.call{value: amount}()](src/Vault.sol#L9)\n"
+          },
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/Vault.sol"
+                },
+                "region": {
+                  "startLine": 7,
+                  "endLine": 12
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "id": "a42a5771647789bb49b118c4200a7d72e3c8ea3f756383fb4e3b2d9f56e10b95"
+          }
+        }
+      ]
+    }
+  ]
+}
