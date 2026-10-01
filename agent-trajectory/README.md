@@ -39,9 +39,9 @@ workflow, step, verifiers}}`. The system prompt and the session id are not expor
 
 | Category | Caught | Placeholder |
 |---|---|---|
-| secret | PEM private keys; 32-byte hex with or without `0x`; `sk-`, `ghp_`/`gho_`/..., `github_pat_`, `xox?-`, `AKIA`/`ASIA`, `AIza`, `sk_live_`/`rk_test_`, JWTs; values of `api_key=`, `password:`, `client_secret`, `token=`, `mnemonic:` and similar; secret URL query values | `[REDACTED:secret]` |
+| secret | PEM private keys; 32-byte hex with or without `0x`; `sk-`, `ghp_`/`gho_`/..., `github_pat_`, `xox?-`, `AKIA`/`ASIA`, `AIza`, `sk_live_`/`rk_test_`, `hf_`, JWTs; BIP-32 extended private keys (`xprv`, `tprv`, `zprv`, ...) and WIF private keys; values of `api_key=`, `password:`, `client_secret`, `token=`, `mnemonic:` and similar; secret URL query values | `[REDACTED:secret]` |
 | bearer_token | the credential after `Bearer` / `Basic` (when it looks like one, so "basic idea" survives) | `Bearer [REDACTED:bearer_token]` |
-| seed_phrase | 12 or more consecutive BIP-39 English words, across spaces, commas, newlines and list numbering | `[REDACTED:seed_phrase]` |
+| seed_phrase | 12 or more consecutive BIP-39 English words, across spaces, commas, newlines, list numbering, JSON arrays and `\n` escapes inside JSON strings | `[REDACTED:seed_phrase]` |
 | path | absolute Unix, `~/`, `file://` and Windows paths outside every granted root (after resolving `..`, matched by whole path components) | `[REDACTED:path]` |
 | address | `0x` + 40 hex, unless on the policy's allow list (case-insensitive) | `[REDACTED:address]` |
 | email | `local@domain.tld` | `[REDACTED:email]` |
@@ -54,6 +54,8 @@ Known trade-offs, chosen on the safe side:
 - Transaction hashes and other 32-byte digests are redacted as secrets (they look like private
   keys).
 - Redaction is pattern-based. The report says so and asks for a review before sharing.
+- A path token ends at whitespace, so an absolute path containing a space is only redacted up
+  to the space. The rest of that path (for example the second half of a folder name) stays.
 
 The BIP-39 wordlist is vendored at `src/bip39_english.txt`. A test pins its SHA-256 to the
 canonical English list.

@@ -289,3 +289,72 @@ fn the_bip39_wordlist_is_the_canonical_english_list() {
         "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review hardening: encodings tool arguments use, and key formats wallets use
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn file_urls_and_windows_paths_inside_a_root_are_relativised_once() {
+    let p = policy().with_granted_root("C:\\work\\app");
+    let (out, c) = Redactor::new(&p)
+        .unwrap()
+        .redact("file:///Users/member/work/app/src/a/b.rs and C:\\work\\app\\src\\main.rs");
+    assert_eq!(out, "[root:0]/src/a/b.rs and [root:1]/src/main.rs");
+    assert_eq!(c.get(Category::Path), 0);
+    assert_eq!(c.relativised, 2);
+}
+
+#[test]
+fn seed_phrases_inside_json_tool_arguments_are_redacted() {
+    let words: Vec<&str> = SEED12.split(' ').collect();
+    // A JSON array of words, as a tool call's arguments carry it.
+    let array = format!("{{\"words\":[\"{}\"]}}", words.join("\",\""));
+    let (out, c) = red(&array);
+    assert_eq!(c.get(Category::SeedPhrase), 1, "{out}");
+    assert!(!out.contains("sausage"), "{out}");
+    // One word per line inside a JSON string: the newlines are `\n` escapes.
+    let escaped = format!("{{\"note\":\"{}\"}}", words.join("\\n"));
+    let (out, c) = red(&escaped);
+    assert_eq!(c.get(Category::SeedPhrase), 1, "{out}");
+    assert!(!out.contains("sausage"), "{out}");
+    // Twelve words in a quoted list with single quotes and spaces.
+    let quoted = format!("['{}']", words.join("', '"));
+    assert_eq!(red(&quoted).1.get(Category::SeedPhrase), 1);
+}
+
+#[test]
+fn extended_private_keys_wif_keys_and_hugging_face_tokens_are_secrets() {
+    // Synthetic, assembled at run time so no key-shaped literal sits in the source.
+    let b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let body: String = b58.chars().cycle().take(107).collect();
+    let toks = [
+        ["xp", "rv"].concat() + &body,
+        ["tp", "rv"].concat() + &body,
+        ["zp", "rv"].concat() + &body,
+        "5H".to_string() + &b58[..49],
+        "K".to_string() + &b58[..51],
+        ["hf", "_"].concat() + "abcdefghijklmnopqrstuvwxyzABCDEFGH",
+    ];
+    for tok in &toks {
+        let (out, c) = red(&format!("use {tok} now"));
+        assert_eq!(out, "use [REDACTED:secret] now", "{tok}");
+        assert_eq!(c.total(), 1, "{tok}");
+    }
+    // Public extended keys are not secrets.
+    let xpub = ["xp", "ub"].concat() + &body;
+    assert_eq!(red(&xpub).0, xpub);
+}
+
+#[test]
+fn escaped_json_secret_assignments_lose_the_value() {
+    let (out, c) = red(r#"{\"password\":\"hunter2222\",\"user\":\"m\"}"#);
+    assert_eq!(
+        out,
+        r#"{\"password\":\"[REDACTED:secret]\",\"user\":\"m\"}"#
+    );
+    assert_eq!(c.get(Category::Secret), 1);
+    // A backslash inside a plain value does not cut the value short.
+    let (out, _) = red(r"password=ab\cd\ef9");
+    assert_eq!(out, "password=[REDACTED:secret]");
+}

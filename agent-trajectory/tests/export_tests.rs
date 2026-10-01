@@ -375,3 +375,15 @@ fn writing_never_overwrites_an_existing_file() {
     assert_eq!(body, ex.to_jsonl().unwrap());
     assert!(matches!(ex.write_jsonl(&path), Err(TrajectoryError::Io(_))));
 }
+
+#[cfg(unix)]
+#[test]
+fn the_written_training_set_is_readable_only_by_the_member() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("perm.jsonl");
+    let ex = export_verified(&[], &ExportPolicy::new()).unwrap();
+    ex.write_jsonl(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

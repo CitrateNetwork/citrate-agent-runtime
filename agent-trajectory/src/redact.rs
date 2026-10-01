@@ -151,6 +151,12 @@ impl Patterns {
                 r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
                 r"|AIza[0-9A-Za-z_\-]{35}",
                 r"|[sr]k_(?:live|test)_[A-Za-z0-9]{10,}",
+                r"|hf_[A-Za-z0-9]{30,}",
+                // BIP-32 extended private keys (any network/script prefix).
+                r"|[xtyzuv]prv[1-9A-HJ-NP-Za-km-z]{100,}",
+                // WIF private keys (uncompressed 51 chars, compressed 52 chars).
+                r"|5[HJK][1-9A-HJ-NP-Za-km-z]{49}\b",
+                r"|[KL][1-9A-HJ-NP-Za-km-z]{51}\b",
                 r"|eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})",
             ))?,
             hex32: compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b")?,
@@ -158,7 +164,7 @@ impl Patterns {
                 r#"(?i)([?&](?:access_token|refresh_token|id_token|token|api_key|apikey|key|secret|client_secret|password|sig|signature|auth)=)([^&\s#"'<>\[][^&\s#"'<>]*)"#,
             )?,
             kv: compile(
-                r#"(?i)\b(api[_-]?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|mnemonic)("?'?\s*[:=]\s*["']?)([^\s"',;}&\[<>][^\s"',;}&<>]{3,})"#,
+                r#"(?i)\b(api[_-]?key|client[_-]?secret|secret[_-]?key|secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|mnemonic)(\\?"?'?\s*[:=]\s*\\?["']?)((?:[^\s"',;}&\[<>\\]|\\[^\s"'])(?:[^\s"',;}&<>\\]|\\[^\s"']){3,})"#,
             )?,
             word: compile(r"[A-Za-z]+")?,
             email: compile(
@@ -314,9 +320,13 @@ impl Redactor {
                 }
             })
             .into_owned();
+        // Unix paths first: a `[root:N]/rest` produced by the Windows or file:// pass must not
+        // be scanned again as a Unix path. Neither later pass matches the Unix pass's output.
         let s = p
-            .file_url
-            .replace_all(&s, |cap: &Captures| self.path(&cap[1], &mut c))
+            .unix
+            .replace_all(&s, |cap: &Captures| {
+                format!("{}{}", &cap[1], self.path(&cap[2], &mut c))
+            })
             .into_owned();
         let s = p
             .windows
@@ -325,10 +335,8 @@ impl Redactor {
             })
             .into_owned();
         let s = p
-            .unix
-            .replace_all(&s, |cap: &Captures| {
-                format!("{}{}", &cap[1], self.path(&cap[2], &mut c))
-            })
+            .file_url
+            .replace_all(&s, |cap: &Captures| self.path(&cap[1], &mut c))
             .into_owned();
         (s, c)
     }
@@ -388,21 +396,38 @@ impl Redactor {
             }
         };
         for m in self.pats.word.find_iter(s) {
-            if !set.contains(m.as_str().to_lowercase().as_str()) {
+            let word = m.as_str().to_lowercase();
+            // Inside a JSON string a newline or tab is the escape `\n` / `\t`, which glues its
+            // letter to the next word ("\nability"). Try the word without that letter.
+            let start = if set.contains(word.as_str()) {
+                m.start()
+            } else if m.start() > 0
+                && s.as_bytes()[m.start() - 1] == b'\\'
+                && word.len() > 1
+                && word.starts_with(['n', 'r', 't'])
+                && set.contains(&word[1..])
+            {
+                m.start() + 1
+            } else {
                 flush(&mut run, &mut spans);
                 continue;
-            }
+            };
             let joins = match run {
                 Some((_, end, _)) => {
-                    // Words join across whitespace, commas, hyphens and list numbering ("2. ",
-                    // "3)"). A '.' or ':' without a number is a sentence break and ends the run.
-                    let gap = &s[end..m.start()];
+                    // Words join across whitespace, commas, hyphens, quotes and brackets (JSON
+                    // arrays), JSON escapes and list numbering ("2. ", "3)"). A '.' or ':'
+                    // without a number is a sentence break and ends the run.
+                    let raw = &s[end..start];
+                    let gap = raw
+                        .replace("\\n", " ")
+                        .replace("\\r", " ")
+                        .replace("\\t", " ");
                     let numbered = gap.chars().any(|ch| ch.is_ascii_digit());
-                    gap.len() <= 8
+                    raw.len() <= 8
                         && gap.chars().all(|ch| {
                             ch.is_whitespace()
                                 || ch.is_ascii_digit()
-                                || ",;()-".contains(ch)
+                                || ",;()-\"'[]\\".contains(ch)
                                 || (numbered && ".:".contains(ch))
                         })
                 }
@@ -412,7 +437,7 @@ impl Redactor {
                 (true, Some((a, _, n))) => Some((a, m.end(), n + 1)),
                 _ => {
                     flush(&mut run, &mut spans);
-                    Some((m.start(), m.end(), 1))
+                    Some((start, m.end(), 1))
                 }
             };
         }

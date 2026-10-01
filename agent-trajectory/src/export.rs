@@ -193,12 +193,18 @@ impl TrainingExport {
         Ok(out)
     }
 
-    /// Write the JSONL to a new file. Never overwrites an existing one.
+    /// Write the JSONL to a new file, readable only by its owner on Unix. Never overwrites an
+    /// existing one.
     pub fn write_jsonl(&self, path: &Path) -> Result<(), TrajectoryError> {
         let body = self.to_jsonl()?;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
             .open(path)
             .map_err(|e| TrajectoryError::Io(e.to_string()))?;
         f.write_all(body.as_bytes())
