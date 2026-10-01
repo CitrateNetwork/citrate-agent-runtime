@@ -252,10 +252,15 @@ impl TaintState {
     pub fn is_tainted(&self) -> bool {
         self.0.lock().map(|g| g.is_some()).unwrap_or(true)
     }
+    /// The taint record. Agrees with [`TaintState::is_tainted`]: a poisoned lock yields a record
+    /// even if none was written (fail closed), since `run_turn_with` gates on this.
     pub fn record(&self) -> Option<TaintRecord> {
         match self.0.lock() {
             Ok(g) => g.clone(),
-            Err(p) => p.into_inner().clone(),
+            Err(p) => Some(p.into_inner().clone().unwrap_or_else(|| TaintRecord {
+                source: "an unknown source".to_string(),
+                reason: "the session's taint state could not be read".to_string(),
+            })),
         }
     }
     /// Mark the session tainted. Returns true only when this call flipped it (the first source is
@@ -1204,5 +1209,36 @@ impl Planner for StaticPlanner {
             .iter()
             .find(|(keys, _)| keys.iter().any(|k| g.contains(&k.to_lowercase())))
             .map(|(_, w)| w)
+    }
+}
+
+#[cfg(test)]
+mod taint_state_tests {
+    use super::*;
+
+    fn poison(t: &TaintState) {
+        let inner = t.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = inner.lock().unwrap();
+            panic!("poison the taint lock");
+        })
+        .join();
+    }
+
+    #[test]
+    fn a_poisoned_untainted_state_reads_as_tainted_everywhere() {
+        let t = TaintState::default();
+        poison(&t);
+        assert!(t.is_tainted());
+        // run_turn_with gates on `record()`, so it must agree with `is_tainted()`.
+        assert!(t.record().is_some());
+    }
+
+    #[test]
+    fn a_poisoned_tainted_state_keeps_its_first_source() {
+        let t = TaintState::default();
+        assert!(t.taint("web_fetch", "untrusted"));
+        poison(&t);
+        assert_eq!(t.record().map(|r| r.source), Some("web_fetch".to_string()));
     }
 }
