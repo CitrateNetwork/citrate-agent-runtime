@@ -18,9 +18,11 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod learn;
 pub mod llm_http;
 pub mod sessions;
 pub mod toolchain;
+pub mod workflow_spec;
 
 use std::sync::Arc;
 
@@ -245,6 +247,15 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/briefs/check", post(check_brief))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S3.4: verified workflow runs and verified self-learning.
+        .route("/sessions/:id/workflows", post(start_workflow))
+        .route("/sessions/:id/workflows/:run", get(workflow_run))
+        .route("/learn/status", get(learn_status))
+        .route("/learn/proposals", post(learn_propose).get(learn_list))
+        .route("/learn/proposals/:pid", get(learn_get))
+        .route("/learn/proposals/:pid/accept", post(learn_accept))
+        .route("/learn/proposals/:pid/reject", post(learn_reject))
+        .route("/learn/proposals/:pid/publish", post(learn_publish))
         .with_state(state)
 }
 
@@ -692,7 +703,10 @@ pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>
             s.name, s.dropped_source, s.kept_source
         );
     }
-    eprintln!("citrate-agent-sidecar: {} instruction skills loaded", lib.len());
+    eprintln!(
+        "citrate-agent-sidecar: {} instruction skills loaded",
+        lib.len()
+    );
     Some(Arc::new(lib))
 }
 
@@ -742,7 +756,9 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
-/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
+/// `CITRATE_HERMES_SKILLS` is set, the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`, and
+/// verified self-learning when `CITRATE_HERMES_LEARN_DIR` and `CITRATE_HERMES_LEARN_SKILLS_DIR`
+/// are both set (HUP-S3.4).
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -768,6 +784,10 @@ pub fn production_sessions_with(
     };
     let mgr = match toolchain_from_env() {
         Some(host) => mgr.with_toolchain(host),
+        None => mgr,
+    };
+    let mgr = match learn::LearnService::from_env() {
+        Some(svc) => mgr.with_learn(svc),
         None => mgr,
     };
     Arc::new(match mcp {
@@ -896,12 +916,222 @@ async fn check_brief(
 }
 
 #[cfg(test)]
-mod sessions_tests;
+mod learn_session_tests;
 #[cfg(test)]
-mod tests;
+mod mcp_session_tests;
+#[cfg(test)]
+mod sessions_tests;
 #[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]
-mod toolchain_tests;
+mod tests;
 #[cfg(test)]
-mod mcp_session_tests;
+mod toolchain_tests;
+
+// ---- HUP-S3.4: verified workflow runs + verified self-learning ----
+
+async fn start_workflow(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    if st.sessions.get(&id).is_none() {
+        return Err(json_err(StatusCode::NOT_FOUND, "no such session"));
+    }
+    let spec: workflow_spec::WorkflowSpec = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad workflow: {e}")))?;
+    let wf = spec
+        .build()
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
+    let run_id = st
+        .sessions
+        .run_workflow(&id, wf, st.dispatch.clone())
+        .map_err(|e| json_err(session_status(&e), "the session refused the workflow"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id })),
+    ))
+}
+
+async fn workflow_run(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path((id, run)): Path<(String, String)>,
+) -> Result<Json<sessions::RunView>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    st.sessions
+        .run_view(&id, &run)
+        .map(Json)
+        .map_err(|e| json_err(session_status(&e), "no such session or run"))
+}
+
+fn refusal(r: learn::LearnRefusal) -> JsonErr {
+    match r {
+        learn::LearnRefusal::NotFound(m) => json_err(StatusCode::NOT_FOUND, &m),
+        learn::LearnRefusal::Invalid(m) => json_err(StatusCode::BAD_REQUEST, &m),
+        learn::LearnRefusal::Failed(m) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &m),
+        learn::LearnRefusal::Conflict { message, conflicts } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": message, "conflicts": conflicts })),
+        ),
+    }
+}
+
+/// The learn service, after the bearer check. With `write`, also refused while the e-stop is
+/// engaged.
+fn learn_guard(
+    headers: &HeaderMap,
+    st: &Arc<AppState>,
+    write: bool,
+) -> Result<Arc<learn::LearnService>, JsonErr> {
+    if !authorized(headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if write && st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    st.sessions.learn().cloned().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "learning is off (no learn folder configured)",
+        )
+    })
+}
+
+async fn learn_status(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(match st.sessions.learn() {
+        Some(svc) => svc.status(),
+        None => serde_json::json!({ "enabled": false }),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposeReq {
+    session_id: String,
+    run_id: String,
+    content: citrate_agent_learn::ProposalContent,
+    #[serde(default)]
+    known_memories: Vec<citrate_agent_learn::KnownMemory>,
+}
+
+async fn learn_propose(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<citrate_agent_learn::Proposal>), JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: ProposeReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad proposal: {e}")))?;
+    let session = st
+        .sessions
+        .get(&req.session_id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let p = svc
+        .propose(&session, &req.run_id, req.content, &req.known_memories)
+        .map_err(refusal)?;
+    Ok((StatusCode::CREATED, Json(p)))
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+async fn learn_list(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, false)?;
+    Ok(Json(serde_json::json!({ "proposals": svc.list(q.all) })))
+}
+
+async fn learn_get(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+) -> Result<Json<citrate_agent_learn::Proposal>, JsonErr> {
+    let svc = learn_guard(&headers, &st, false)?;
+    svc.get(&pid)
+        .map(Json)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such proposal"))
+}
+
+async fn learn_accept(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let decision: citrate_agent_learn::MemberAccept = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad accept: {e}")))?;
+    let out = svc.accept(&pid, decision).map_err(refusal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "persisted": out })))
+}
+
+#[derive(Deserialize)]
+struct RejectReq {
+    member: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn learn_reject(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: RejectReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad reject: {e}")))?;
+    svc.reject(&pid, &req.member, &req.reason)
+        .map_err(refusal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "rejected": true })))
+}
+
+#[derive(Deserialize)]
+struct PublishReq {
+    approval: citrate_agent_learn::PublishApproval,
+    params: citrate_agent_learn::PublishParams,
+}
+
+/// Build the SkillRegistry call for an accepted skill (HIC-1, recorded). Calldata only: core's
+/// SignatureCeremony signs, the member sends.
+async fn learn_publish(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<citrate_agent_learn::SkillPublishPayload>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: PublishReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad publish: {e}")))?;
+    svc.publish(&pid, req.approval, req.params)
+        .map(Json)
+        .map_err(refusal)
+}

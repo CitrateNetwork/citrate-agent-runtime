@@ -15,6 +15,11 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_LEARN_DIR    HUP-S3.4: learn data folder (decision log + proposals file);
+//!                               with CITRATE_HERMES_LEARN_SKILLS_DIR, turns on the learn routes
+//!                               and the `learn_propose` tool; unset = learning off (optional)
+//!   CITRATE_HERMES_LEARN_SKILLS_DIR  the member's skills folder, where an accepted skill is
+//!                               written as <name>/SKILL.md (optional, see above)
 
 use std::sync::Arc;
 

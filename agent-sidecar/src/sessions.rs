@@ -27,6 +27,12 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S3.4: a session can run a declarative workflow (`POST …/workflows`,
+//!   [`crate::workflow_spec`]) through `citrate_agent_learn::run_verified_workflow`; a run whose
+//!   verifiers all passed is kept (the last [`MAX_RUNS_KEPT`]) as the evidence a learn proposal
+//!   needs. When learning is configured (`CITRATE_HERMES_LEARN_DIR`, default off), every session is
+//!   also offered the sidecar-hosted `learn_propose` tool ([`crate::learn`]), which proposes from
+//!   the session's last verified run and never persists anything itself.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,11 +41,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
+use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
 use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
     LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
-    ToolSpec, TurnOptions,
+    ToolSpec, TurnOptions, Workflow,
 };
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use serde::{Deserialize, Serialize};
@@ -57,6 +64,73 @@ pub const MAX_TOKENS_CAP: u32 = 8192;
 pub const MAX_WAIT_MS: u64 = 25_000;
 /// Token budget for the skill description index in a session's system prompt.
 pub const SKILL_INDEX_TOKENS: usize = 1500;
+/// Workflow runs remembered per session (oldest dropped first).
+pub const MAX_RUNS_KEPT: usize = 16;
+
+/// Where a workflow run is.
+#[derive(Clone)]
+pub enum RunState {
+    Running {
+        workflow_id: String,
+    },
+    /// Every verifier of every step passed.
+    Verified(Box<VerifiedRun>),
+    /// It failed, was stopped, or its verdicts did not add up.
+    Unverified {
+        workflow_id: String,
+        reason: String,
+    },
+}
+
+/// `GET /sessions/:id/workflows/:run`.
+#[derive(Debug, Serialize)]
+pub struct RunView {
+    pub run_id: String,
+    pub workflow_id: String,
+    /// "running" | "verified" | "unverified"
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+    /// The model's final answers per step (shown to the member, never evidence).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl RunView {
+    fn of(run_id: &str, st: &RunState) -> Self {
+        match st {
+            RunState::Running { workflow_id } => RunView {
+                run_id: run_id.into(),
+                workflow_id: workflow_id.clone(),
+                state: "running",
+                evidence: None,
+                answers: vec![],
+                reason: None,
+            },
+            RunState::Verified(run) => RunView {
+                run_id: run_id.into(),
+                workflow_id: run.evidence().workflow_id.clone(),
+                state: "verified",
+                evidence: Some(run.evidence().clone()),
+                answers: run.answers().to_vec(),
+                reason: None,
+            },
+            RunState::Unverified {
+                workflow_id,
+                reason,
+            } => RunView {
+                run_id: run_id.into(),
+                workflow_id: workflow_id.clone(),
+                state: "unverified",
+                evidence: None,
+                answers: vec![],
+                reason: Some(reason.clone()),
+            },
+        }
+    }
+}
 
 /// Where the model lives and how to authenticate. Supplied by citrate-core, never by a webview.
 #[derive(Clone, Deserialize)]
@@ -195,6 +269,8 @@ pub struct Session {
     skills: Option<Arc<SkillLibrary>>,
     /// HUP-S6.3: present when this session was opened with the toolchain enabled.
     toolchain: Option<Arc<ToolchainHost>>,
+    /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
+    runs: Mutex<VecDeque<(String, RunState)>>,
 }
 
 impl Session {
@@ -263,6 +339,43 @@ impl Session {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// The model this session runs (recorded in a learn proposal's provenance).
+    pub fn model(&self) -> &str {
+        &self.cfg.model
+    }
+
+    fn set_run(&self, run_id: &str, state: RunState) {
+        if let Ok(mut runs) = self.runs.lock() {
+            if let Some(slot) = runs.iter_mut().find(|(id, _)| id == run_id) {
+                slot.1 = state;
+                return;
+            }
+            runs.push_back((run_id.to_string(), state));
+            while runs.len() > MAX_RUNS_KEPT {
+                runs.pop_front();
+            }
+        }
+    }
+
+    /// One workflow run, if this session still remembers it.
+    pub fn run(&self, run_id: &str) -> Option<RunState> {
+        self.runs.lock().ok().and_then(|r| {
+            r.iter()
+                .find(|(id, _)| id == run_id)
+                .map(|(_, st)| st.clone())
+        })
+    }
+
+    /// The session's most recent verified run, with its id.
+    pub fn last_verified(&self) -> Option<(String, VerifiedRun)> {
+        self.runs.lock().ok().and_then(|r| {
+            r.iter().rev().find_map(|(id, st)| match st {
+                RunState::Verified(v) => Some((id.clone(), (**v).clone())),
+                _ => None,
+            })
+        })
     }
 }
 
@@ -356,10 +469,16 @@ struct SidecarHost {
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<McpToolHost>,
     capsules: Option<CapsuleHost>,
+    learn: Option<crate::learn::LearnToolHost>,
 }
 
 impl ToolHost for SidecarHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name == crate::learn::LEARN_PROPOSE_TOOL {
+            if let Some(l) = &self.learn {
+                return l.execute(call);
+            }
+        }
         if call.name == SKILL_LOAD_TOOL {
             if let Some(h) = &self.skills {
                 return h.execute(call);
@@ -400,6 +519,8 @@ pub struct SessionManager {
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<ToolchainHost>>,
     mcp: Option<Arc<McpHost>>,
+    learn: Option<Arc<crate::learn::LearnService>>,
+    run_ids: AtomicU64,
 }
 
 impl SessionManager {
@@ -412,7 +533,20 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            learn: None,
+            run_ids: AtomicU64::new(0),
         }
+    }
+
+    /// HUP-S3.4: verified self-learning (the learn routes and the `learn_propose` tool).
+    pub fn with_learn(mut self, learn: Arc<crate::learn::LearnService>) -> Self {
+        self.learn = Some(learn);
+        self
+    }
+
+    /// HUP-S3.4: the learn service, when learning is configured.
+    pub fn learn(&self) -> Option<&Arc<crate::learn::LearnService>> {
+        self.learn.as_ref()
     }
 
     /// HUP-S6.3: offer the toolchain tools to every new session.
@@ -477,6 +611,18 @@ impl SessionManager {
             }
             specs.extend(mcp.specs());
         }
+        if self.learn.is_some() {
+            if specs
+                .iter()
+                .any(|t| t.name == crate::learn::LEARN_PROPOSE_TOOL)
+            {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while learning is on",
+                    crate::learn::LEARN_PROPOSE_TOOL
+                )));
+            }
+            specs.push(crate::learn::learn_propose_spec());
+        }
         let mut sessions = self
             .sessions
             .lock()
@@ -532,6 +678,7 @@ impl SessionManager {
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills: self.skills.clone(),
             toolchain: self.toolchain.clone(),
+            runs: Mutex::new(VecDeque::new()),
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -539,6 +686,120 @@ impl SessionManager {
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// The tools a turn or workflow in this session can call: core-hosted ones park on core, and
+    /// the sidecar-hosted ones (skills, toolchain, MCP, learn, capsules) run here.
+    fn registry_for(
+        &self,
+        session: &Arc<Session>,
+        capsules: Option<Arc<CapsuleDispatch>>,
+    ) -> ToolRegistry {
+        let core = Arc::new(CoreHost {
+            pending: session.pending.clone(),
+            deadline: self.core_tool_deadline,
+            stop: session.stop.clone(),
+            hic_aware: session.hic_aware,
+        });
+        let mut registry = ToolRegistry::new(session.specs.clone())
+            .with_host(HostKind::Core, core)
+            .with_taint(session.taint.clone());
+        let skill_host = session.skills.clone().map(SkillHost::new);
+        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
+        let toolchain = session.toolchain.clone();
+        let mcp_host = self
+            .mcp
+            .clone()
+            .map(|h| McpToolHost::new(h, session.stop.clone()));
+        let learn_host = self
+            .learn
+            .clone()
+            .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
+        if skill_host.is_some()
+            || capsule_host.is_some()
+            || toolchain.is_some()
+            || mcp_host.is_some()
+            || learn_host.is_some()
+        {
+            registry = registry.with_host(
+                HostKind::Sidecar,
+                Arc::new(SidecarHost {
+                    skills: skill_host,
+                    toolchain,
+                    mcp: mcp_host,
+                    capsules: capsule_host,
+                    learn: learn_host,
+                }),
+            );
+        }
+        registry
+    }
+
+    /// HUP-S3.4: run a workflow in this session on the blocking pool. Refuses while a turn or
+    /// another workflow is running. Returns the run id; read it with [`SessionManager::run_view`].
+    pub fn run_workflow(
+        &self,
+        id: &str,
+        wf: Workflow,
+        capsules: Option<Arc<CapsuleDispatch>>,
+    ) -> Result<String, SessionError> {
+        let session = self.get(id).ok_or(SessionError::NotFound)?;
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(SessionError::Busy);
+        }
+        let n = self.run_ids.fetch_add(1, Ordering::SeqCst) + 1;
+        let run_id = format!("wr-{n}");
+        session.set_run(
+            &run_id,
+            RunState::Running {
+                workflow_id: wf.id.clone(),
+            },
+        );
+        let registry = self.registry_for(&session, capsules);
+        let s = session.clone();
+        let rid = run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let sink = SessionSink(s.clone());
+            let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            let out = run_verified_workflow(
+                &s.id,
+                &s.cfg,
+                &s.opts,
+                s.llm.as_ref(),
+                &registry,
+                &sink,
+                &s.stop,
+                &mut history,
+                &wf,
+            );
+            if let Ok(mut h) = s.history.lock() {
+                *h = history;
+            }
+            s.set_run(
+                &rid,
+                match out {
+                    Ok(run) => RunState::Verified(Box::new(run)),
+                    Err(e) => RunState::Unverified {
+                        workflow_id: wf.id.clone(),
+                        reason: e.to_string(),
+                    },
+                },
+            );
+            s.busy.store(false, Ordering::SeqCst);
+            s.notify.notify_waiters();
+        });
+        Ok(run_id)
+    }
+
+    /// HUP-S3.4: one workflow run of this session.
+    pub fn run_view(&self, id: &str, run_id: &str) -> Result<RunView, SessionError> {
+        let session = self.get(id).ok_or(SessionError::NotFound)?;
+        let st = session.run(run_id).ok_or(SessionError::NotFound)?;
+        Ok(RunView::of(run_id, &st))
     }
 
     /// Start one user turn on the blocking pool. Refuses a second concurrent turn.
@@ -559,37 +820,7 @@ impl SessionManager {
         {
             return Err(SessionError::Busy);
         }
-        let core = Arc::new(CoreHost {
-            pending: session.pending.clone(),
-            deadline: self.core_tool_deadline,
-            stop: session.stop.clone(),
-            hic_aware: session.hic_aware,
-        });
-        let mut registry = ToolRegistry::new(session.specs.clone())
-            .with_host(HostKind::Core, core)
-            .with_taint(session.taint.clone());
-        let skill_host = session.skills.clone().map(SkillHost::new);
-        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
-        let toolchain = session.toolchain.clone();
-        let mcp_host = self
-            .mcp
-            .clone()
-            .map(|h| McpToolHost::new(h, session.stop.clone()));
-        if skill_host.is_some()
-            || capsule_host.is_some()
-            || toolchain.is_some()
-            || mcp_host.is_some()
-        {
-            registry = registry.with_host(
-                HostKind::Sidecar,
-                Arc::new(SidecarHost {
-                    skills: skill_host,
-                    toolchain,
-                    mcp: mcp_host,
-                    capsules: capsule_host,
-                }),
-            );
-        }
+        let registry = self.registry_for(&session, capsules);
         let s = session.clone();
         tokio::task::spawn_blocking(move || {
             let sink = SessionSink(s.clone());
