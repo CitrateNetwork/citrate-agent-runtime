@@ -687,6 +687,9 @@ fn env_rooted_host(fx: &Fx) -> ToolchainHost {
 
 async fn forge_in_session(fx: &Fx, doc: Option<serde_json::Value>) -> ToolchainEnvelope {
     fake_forge(fx);
+    // The fixture project holds a .env (for the file tool tests); the toolchain does not run
+    // beside env files, so these runs use the project without it.
+    let _ = std::fs::remove_file(fx.proj().join(".env"));
     let c = call(FORGE_TEST_TOOL, serde_json::json!({ "project": fx.proj() }));
     let (mgr, _) = manager(
         fx,
