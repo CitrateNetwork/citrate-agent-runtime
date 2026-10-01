@@ -449,43 +449,50 @@ pub fn run_turn_with(
                 return finish(sink, RunOutcome::Stopped);
             }
             let spec = tools.spec(&call.name);
-            sink.emit(Event::ToolCall {
-                step,
-                call: call.clone(),
-                host: spec.map(|s| s.host),
-            });
-            let outcome = if i as u32 >= cfg.max_tool_calls_per_step {
-                ToolOutcome::Error(format!(
+            // Decide refusal BEFORE announcing the call: a `tool_call` event names a host only when
+            // this loop will dispatch it, so a remote host acting on those events (core) never runs
+            // a call the loop refused.
+            let refusal: Option<String> = if i as u32 >= cfg.max_tool_calls_per_step {
+                Some(format!(
                     "skipped: at most {} tool calls per step — call it again next step if still needed",
                     cfg.max_tool_calls_per_step
                 ))
             } else {
                 match spec {
-                    None => ToolOutcome::Error(format!("unknown tool '{}'", call.name)),
+                    None => Some(format!("unknown tool '{}'", call.name)),
                     Some(s) => {
-                        if serde_json::from_str::<serde_json::Value>(
-                            if call.arguments.trim().is_empty() {
-                                "{}"
-                            } else {
-                                &call.arguments
-                            },
-                        )
-                        .is_err()
-                        {
-                            ToolOutcome::Error(
+                        let args = if call.arguments.trim().is_empty() {
+                            "{}"
+                        } else {
+                            call.arguments.as_str()
+                        };
+                        if serde_json::from_str::<serde_json::Value>(args).is_err() {
+                            Some(
                                 "the arguments were not valid JSON; retry with a JSON object"
                                     .into(),
                             )
+                        } else if tools.host(s.host).is_none() {
+                            Some(format!("'{}' is not available in this session", call.name))
                         } else {
-                            match tools.host(s.host) {
-                                Some(h) => h.execute(call),
-                                None => ToolOutcome::Error(format!(
-                                    "'{}' is not available in this session",
-                                    call.name
-                                )),
-                            }
+                            None
                         }
                     }
+                }
+            };
+            let dispatch = match (&refusal, spec) {
+                (None, Some(s)) => tools.host(s.host).map(|h| (s.host, h)),
+                _ => None,
+            };
+            sink.emit(Event::ToolCall {
+                step,
+                call: call.clone(),
+                host: dispatch.as_ref().map(|(k, _)| *k),
+            });
+            let outcome = match (dispatch, refusal) {
+                (Some((_, h)), _) => h.execute(call),
+                (None, Some(why)) => ToolOutcome::Error(why),
+                (None, None) => {
+                    ToolOutcome::Error(format!("'{}' is not available in this session", call.name))
                 }
             };
             let content = outcome.to_content();
