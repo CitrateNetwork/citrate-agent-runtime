@@ -248,6 +248,54 @@ impl HostCtx {
         }
     }
 
+    /// HUP-S2.5: rebuild the WASI context from a [`SandboxPlan`]: one
+    /// preopen per granted mount, a socket check that admits only the
+    /// plan's allowlisted remote addresses, and name lookup off. Everything
+    /// else keeps the empty defaults (closed stdio, no environment). Applied
+    /// before instantiation on every `Capsule::instantiate*` path.
+    ///
+    /// [`SandboxPlan`]: crate::capsule::sandbox::SandboxPlan
+    pub fn apply_sandbox(
+        &mut self,
+        plan: &crate::capsule::sandbox::SandboxPlan,
+    ) -> Result<(), AgentError> {
+        use crate::capsule::sandbox::{socket_permitted, MountPerms, NetworkPlan};
+        use wasmtime_wasi::FsPerms;
+        let mut b = WasiCtxBuilder::new();
+        b.allow_ip_name_lookup(false);
+        match plan.network() {
+            NetworkPlan::DenyAll => {
+                b.allow_tcp(false);
+                b.allow_udp(false);
+                b.socket_addr_check(|_, _| Box::pin(async { false }));
+            }
+            NetworkPlan::Allow(list) => {
+                let list = list.clone();
+                b.allow_tcp(true);
+                b.allow_udp(true);
+                b.socket_addr_check(move |addr, use_| {
+                    let ok = socket_permitted(&list, addr, use_);
+                    Box::pin(async move { ok })
+                });
+            }
+        }
+        for p in plan.preopens() {
+            let perms = match p.perms {
+                MountPerms::ReadOnly => FsPerms::ReadOnly,
+                MountPerms::ReadWrite => FsPerms::ReadWrite,
+            };
+            b.preopened_dir(&p.host, &p.guest, perms).map_err(|e| {
+                AgentError::Capsule(format!(
+                    "cannot open {} for the capsule at {:?}: {e}",
+                    p.host.display(),
+                    p.guest
+                ))
+            })?;
+        }
+        self.ctx = b.build();
+        Ok(())
+    }
+
     /// Build a host context with a read allow-list (eth-call only).
     /// Write path stays unconfigured — no eth_send calls will
     /// succeed because `approval_gate = None` rejects them all.
