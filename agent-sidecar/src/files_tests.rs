@@ -448,6 +448,43 @@ fn build_configuration_is_left_to_the_member_by_every_fs_tool() {
     assert_eq!(store.usage().unwrap().steps, 0, "nothing was snapshotted");
 }
 
+/// A hard link inside a granted folder can name a file kept elsewhere (a key, a token). No fs
+/// tool reads, snapshots, edits, moves or removes one: the edit search would otherwise answer
+/// questions about the linked file's text, and the checkpoint would copy it.
+#[cfg(unix)]
+#[test]
+fn hard_linked_files_are_left_to_the_member_by_every_fs_tool() {
+    let s = Scratch::new();
+    let (tools, store) = s.tools();
+    let host = FileToolsHost::new(tools, "s1-link").unwrap();
+    let secret = s.base.join("home/outside/secret.txt");
+    std::fs::write(&secret, "token-value").unwrap();
+    let link = s.proj().join("innocent.txt");
+    std::fs::hard_link(&secret, &link).unwrap();
+    for (tool, args) in [
+        (
+            FS_EDIT_TOOL,
+            serde_json::json!({"path": link, "old_text": "token", "new_text": "x"}),
+        ),
+        (
+            FS_WRITE_TOOL,
+            serde_json::json!({"path": link, "content": "x"}),
+        ),
+        (FS_DELETE_TOOL, serde_json::json!({"path": link})),
+        (
+            FS_RENAME_TOOL,
+            serde_json::json!({"from": link, "to": s.proj().join("moved.txt")}),
+        ),
+    ] {
+        let why = refused(&host, tool, args.clone());
+        assert!(why.contains("hard link"), "{tool} {args}: {why}");
+        assert!(!why.contains("token-value"));
+    }
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "token-value");
+    assert!(link.exists());
+    assert_eq!(store.usage().unwrap().steps, 0, "nothing was snapshotted");
+}
+
 #[test]
 fn paths_outside_a_write_grant_are_refused() {
     let s = Scratch::new();
