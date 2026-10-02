@@ -26,6 +26,8 @@ mod checkpoint_routes;
 pub mod files;
 pub mod decide;
 pub mod browser;
+pub mod signin_routes;
+pub mod web_signing_records;
 pub mod llm_http;
 pub mod metering;
 pub mod escalation;
@@ -277,6 +279,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/browser/detach", post(browser::detach))
         .route("/browser/origins", post(browser::origins))
         .route("/browser/actions/decide", post(browser::decide))
+        // HUP-S2.3: the managed browser's sign-in bridge, and web-signing decisions into the
+        // decision records the nightly anchor covers (both for citrate-core only).
+        .route("/browser/sign-in", get(signin_routes::list))
+        .route("/browser/sign-in/answer", post(signin_routes::answer))
+        .route("/records/web-signing", post(web_signing_records::write))
         // HUP-S5.2: search status (read-only). HUP-S5.3: the decide() slot + its metering.
         .route("/search/status", get(search_status))
         .route("/decide", post(decide))
@@ -1299,6 +1306,8 @@ mod tests;
 
 #[cfg(test)]
 mod browser_session_tests;
+#[cfg(test)]
+mod signin_route_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]

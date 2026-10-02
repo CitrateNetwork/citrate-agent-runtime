@@ -14,6 +14,8 @@
 //!   health origins excluded by default (`data/sensitive-origins.toml`).
 //! - [`approvals`]: after taint, each effectful browser action waits for the member's decision.
 //! - [`tools`]: the four `browser_*` tool specs and their host.
+//! - [`signin`]: HUP-S2.3, the managed browser's sign-in bridge (an EIP-1193 provider whose two
+//!   wallet methods wait for citrate-core; this crate never signs).
 //!
 //! Every page is untrusted: tool output is fenced as data and taints the session. The worker is
 //! keyless and never signs; nothing here touches a wallet. Off unless the sidecar is started with
@@ -25,6 +27,7 @@ pub mod chromium;
 pub mod frames;
 pub mod scope;
 pub mod service;
+pub mod signin;
 pub mod snapshot;
 pub mod tools;
 
