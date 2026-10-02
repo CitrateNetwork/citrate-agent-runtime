@@ -1303,6 +1303,7 @@ dependencies = [
 name = "citrate-agent-search"
 version = "0.4.0"
 dependencies = [
+ "citrate-agent-guard",
  "citrate-agent-loop",
  "dom_query",
  "dom_smoothie",
