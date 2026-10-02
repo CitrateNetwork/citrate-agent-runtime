@@ -712,7 +712,7 @@ tier = "bundled"
         let none = manifest(r#"network = "none""#, &[]);
         let broker = manifest(r#"network = "broker-only""#, &[]);
         let egress = manifest(
-            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\"]",
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\"]",
             &[],
         );
         assert_eq!(
@@ -723,7 +723,7 @@ tier = "bundled"
             SandboxPlan::without_grants(&broker).expect("p").network(),
             &NetworkPlan::DenyAll
         );
-        let allowed: SocketAddr = "203.0.113.7:443".parse().expect("addr");
+        let allowed: SocketAddr = "1.1.1.1:443".parse().expect("addr");
         assert_eq!(
             SandboxPlan::without_grants(&egress).expect("p").network(),
             &NetworkPlan::Allow(vec![allowed])
@@ -732,9 +732,9 @@ tier = "bundled"
 
     #[test]
     fn socket_rule_admits_only_allowlisted_remotes_and_implicit_binds() {
-        let ok: SocketAddr = "203.0.113.7:443".parse().expect("addr");
-        let other: SocketAddr = "203.0.113.8:443".parse().expect("addr");
-        let other_port: SocketAddr = "203.0.113.7:80".parse().expect("addr");
+        let ok: SocketAddr = "1.1.1.1:443".parse().expect("addr");
+        let other: SocketAddr = "1.0.0.1:443".parse().expect("addr");
+        let other_port: SocketAddr = "1.1.1.1:80".parse().expect("addr");
         let implicit: SocketAddr = "0.0.0.0:0".parse().expect("addr");
         let explicit_bind: SocketAddr = "0.0.0.0:8080".parse().expect("addr");
         let allow = [ok];
@@ -767,6 +767,23 @@ tier = "bundled"
         assert!(!deny.permits_socket(implicit, SocketAddrUse::TcpBind));
     }
 
+    /// Even a plan that lists a non-public address (built by hand, not from a manifest) never
+    /// lets a capsule reach it.
+    #[test]
+    fn socket_rule_never_admits_a_non_public_remote() {
+        for raw in ["127.0.0.1:8545", "169.254.169.254:80", "10.0.0.5:443", "[::1]:443"] {
+            let addr: SocketAddr = raw.parse().expect("addr");
+            let allow = [addr];
+            for use_ in [
+                SocketAddrUse::TcpConnect,
+                SocketAddrUse::UdpSend,
+                SocketAddrUse::UdpReceive,
+            ] {
+                assert!(!socket_permitted(&allow, addr, use_), "{raw} {use_:?}");
+            }
+        }
+    }
+
     /// The socket rule is what the WASI host consults: on the real
     /// `apply_sandbox` context an egress capsule cannot connect to an
     /// address outside its allowlist, bind an explicit local address, or
@@ -782,7 +799,7 @@ tier = "bundled"
         use wasmtime_wasi::sockets::WasiSocketsView;
 
         let m = manifest(
-            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\"]",
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\"]",
             &[],
         );
         let mut host = sandboxed_host(&SandboxPlan::without_grants(&m).expect("plan"));
