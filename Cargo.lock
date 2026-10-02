@@ -1128,6 +1128,7 @@ dependencies = [
  "base64",
  "ciborium",
  "citrate-agent-grants",
+ "citrate-agent-guard",
  "citrate-wallet-core",
  "ed25519-dalek",
  "hex",

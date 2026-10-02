@@ -39,7 +39,9 @@
 //!   applying on the next call.
 //! * **Network.** `none` and `broker-only` get no direct socket at all.
 //!   `egress-allowed` may connect or send only to the exact `network_allow`
-//!   addresses; binds are limited to the implicit ephemeral bind a connect
+//!   addresses, and only to public internet addresses (loopback, private,
+//!   link-local, shared and reserved ranges are refused at load and again
+//!   per socket use); binds are limited to the implicit ephemeral bind a connect
 //!   performs, listening and accepting are refused, and name lookup is off.
 //!
 //! ## Status
@@ -54,6 +56,7 @@ use crate::capsule::filesystem::{self, FilesystemAccess};
 use crate::capsule::manifest::{Manifest, NetworkPolicy};
 use crate::error::AgentError;
 use citrate_agent_grants::{Decision, DenialReason, FolderGrants, GrantKind, GrantScope, Op};
+use citrate_agent_guard::net::is_public_ip;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -317,7 +320,8 @@ fn network_plan(manifest: &Manifest) -> Result<NetworkPlan, AgentError> {
 }
 
 /// Parse `[capability].network_allow`: each entry an exact remote
-/// `ip:port` (`[v6]:port`), not an unspecified address, not port 0.
+/// `ip:port` (`[v6]:port`) on the public internet
+/// ([`citrate_agent_guard::net::is_public_ip`]), not port 0.
 pub fn parse_network_allow(entries: &[String]) -> Result<Vec<SocketAddr>, AgentError> {
     entries
         .iter()
@@ -333,6 +337,14 @@ pub fn parse_network_allow(entries: &[String]) -> Result<Vec<SocketAddr>, AgentE
                     "[capability].network_allow entry {s:?} must name one remote address and port"
                 )));
             }
+            // A manifest alone never reaches this machine, the local network or a metadata
+            // service: only public addresses can be allowlisted.
+            if !is_public_ip(addr.ip()) {
+                return Err(AgentError::Capsule(format!(
+                    "[capability].network_allow entry {s:?} is not a public internet address; \
+                     capsules may not reach loopback, private, link-local or reserved addresses"
+                )));
+            }
             Ok(addr)
         })
         .collect()
@@ -345,7 +357,7 @@ pub fn parse_network_allow(entries: &[String]) -> Result<Vec<SocketAddr>, AgentE
 pub fn socket_permitted(allow: &[SocketAddr], addr: SocketAddr, use_: SocketAddrUse) -> bool {
     match use_ {
         SocketAddrUse::TcpConnect | SocketAddrUse::UdpSend | SocketAddrUse::UdpReceive => {
-            allow.contains(&addr)
+            is_public_ip(addr.ip()) && allow.contains(&addr)
         }
         SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => {
             addr.ip().is_unspecified() && addr.port() == 0
