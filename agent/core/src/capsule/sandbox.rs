@@ -677,6 +677,21 @@ tier = "bundled"
         assert!(err.to_string().contains("off limits"), "{err}");
     }
 
+    /// A hard link inside the folder can name a file kept outside it (the deny list is
+    /// path-based, and WASI opens the inode), so a folder holding one is not mounted.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_file_inside_the_folder_refuses_the_mount() {
+        let w = world();
+        // `w.outside` is a file in the home folder, outside the grant.
+        std::fs::hard_link(&w.outside, w.project.join("linked-private.txt")).expect("link");
+        let m = manifest(r#"network = "none""#, &["read:/work"]);
+        let g = grants(&w, &[Access::Read]);
+        let err = SandboxPlan::resolve(&m, &[FsMount::new("/work", &w.project)], &g, NOW)
+            .expect_err("hard link refuses the mount");
+        assert!(err.to_string().contains("hard link"), "{err}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlink_to_an_ordinary_outside_file_is_tolerated() {
