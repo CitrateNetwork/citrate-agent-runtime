@@ -204,6 +204,28 @@ mod tests {
         assert!(is_public_ip("100.128.0.1".parse().unwrap()));
     }
 
+    /// 6to4 (2002::/16) and Teredo (2001::/32) carry an IPv4 address inside the IPv6 one; the
+    /// embedded address decides, so a tunnelled loopback or private address is not public.
+    #[test]
+    fn tunnelled_ipv4_addresses_are_judged_by_the_embedded_address() {
+        for n in [
+            "2002:7f00:1::1",            // 6to4 of 127.0.0.1
+            "2002:a00:1::",              // 6to4 of 10.0.0.1
+            "2002:c0a8:101::1",          // 6to4 of 192.168.1.1
+            "2002:a9fe:a9fe::1",         // 6to4 of 169.254.169.254
+            "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo, client 127.0.0.1
+            "2001:0:4136:e378:8000:63bf:f5ff:fffe", // Teredo, client 10.0.0.1
+            "2001:0:a00:1:8000:63bf:f7f7:f7f7",     // Teredo, server 10.0.0.1
+        ] {
+            assert!(!is_public_ip(n.parse().unwrap()), "{n}");
+        }
+        // Public on both ends stays public.
+        assert!(is_public_ip("2002:101:101::1".parse().unwrap())); // 6to4 of 1.1.1.1
+        assert!(is_public_ip(
+            "2001:0:4136:e378:8000:63bf:f7f7:f7f7".parse().unwrap() // client 8.8.8.8
+        ));
+    }
+
     #[test]
     fn local_names_are_refused_without_dns() {
         for h in [
