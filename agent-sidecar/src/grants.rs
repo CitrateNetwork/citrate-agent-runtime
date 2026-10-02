@@ -16,7 +16,10 @@
 //!   write grant; full access never writes. Reads and listings never follow a symbolic link at
 //!   the last component and leave out files with other hard links. Build configuration
 //!   (`foundry.toml`, env files and the rest of [`crate::toolchain_config::build_config_file`])
-//!   is the member's to edit: `file_write` refuses it.
+//!   is the member's to edit: `file_write` refuses it. HUP-S2.9: `file_write` is checkpointed
+//!   under the session id ([`crate::files::checked_whole_file_write`]) so the member can undo it;
+//!   without a checkpoint store it writes nothing. With a store the session also gets the
+//!   checkpointed `fs_write`, `fs_edit`, `fs_delete` and `fs_rename` on this same document.
 //! * **Toolchain project folder** (HUP-S6.3). When the session has a grant document it replaces
 //!   `CITRATE_HERMES_TOOLCHAIN_ROOTS`: the project must be covered by live read **and** write
 //!   folder grants (forge reads the sources and writes `out/` and `cache/`).
@@ -27,7 +30,7 @@
 //!
 //! Keyless: nothing here holds a key or signs (Rule 3).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -164,6 +167,32 @@ impl SessionGrants {
                     .map(|x| x.kind)
                     .unwrap_or(GrantKind::FullAccess);
                 Ok((canonical.into_path_buf(), kind))
+            }
+            Decision::Denied { reason } => Err(reason.to_string()),
+        }
+    }
+
+    /// HUP-S2.9: [`Self::check`] for a write that is about to be checkpointed: the resolved path
+    /// and the root of the folder grant that allows it (the checkpoint step is filed under that
+    /// root). Full access never writes, so the grant is always a folder grant.
+    pub fn check_write(&self, path: &Path) -> Result<(PathBuf, PathBuf), String> {
+        let g = self
+            .inner
+            .read()
+            .map_err(|_| "the grant set could not be read, so nothing is allowed".to_string())?;
+        match g.check(path, Op::Write, (self.clock)()) {
+            Decision::Allowed {
+                canonical,
+                grant_id,
+            } => {
+                let root = g
+                    .state()
+                    .grants
+                    .iter()
+                    .find(|x| x.id == grant_id)
+                    .map(|x| x.root.clone())
+                    .ok_or_else(|| "the grant that allowed this write is gone".to_string())?;
+                Ok((canonical.into_path_buf(), root))
             }
             Decision::Denied { reason } => Err(reason.to_string()),
         }
@@ -346,11 +375,19 @@ pub fn file_tool_specs() -> Vec<ToolSpec> {
 /// Runs the file tools for one session.
 pub struct FileToolHost {
     grants: std::sync::Arc<SessionGrants>,
+    /// HUP-S2.9: where `file_write` checkpoints. Without it `file_write` writes nothing.
+    undo: Option<crate::files::UndoScope>,
 }
 
 impl FileToolHost {
     pub fn new(grants: std::sync::Arc<SessionGrants>) -> Self {
-        FileToolHost { grants }
+        FileToolHost { grants, undo: None }
+    }
+
+    /// HUP-S2.9: checkpoint every `file_write` in `undo` (the member can undo it).
+    pub fn with_undo(mut self, undo: crate::files::UndoScope) -> Self {
+        self.undo = Some(undo);
+        self
     }
 
     fn args(call: &ToolCall) -> Result<serde_json::Map<String, serde_json::Value>, String> {
@@ -505,42 +542,29 @@ impl FileToolHost {
                 content.len()
             ));
         }
-        if let Some(name) = crate::toolchain_config::build_config_file(path) {
-            return ToolOutcome::Denied(crate::toolchain_config::build_config_refusal(&name));
-        }
-        let (file, _) = match self.grants.check(path, Op::Write) {
-            Ok(x) => x,
-            Err(e) => return ToolOutcome::Denied(e),
-        };
-        if let Some(name) = crate::toolchain_config::build_config_file(&file) {
-            return ToolOutcome::Denied(crate::toolchain_config::build_config_refusal(&name));
-        }
-        match std::fs::symlink_metadata(&file) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return ToolOutcome::Denied(format!("{} is a symbolic link", file.display()))
-            }
-            Ok(m) if !m.is_file() => {
-                return ToolOutcome::Error(format!("{} is not a regular file", file.display()))
-            }
-            Ok(m) if hard_linked(&m) => {
-                return ToolOutcome::Denied(format!(
-                    "{} has other hard links, so writing it could change a file outside the grant",
-                    file.display()
-                ))
-            }
-            _ => {}
-        }
-        let mut f = match open_nofollow(&file, true) {
-            Ok(f) => f,
-            Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
-        };
-        if let Err(e) = f.write_all(content.as_bytes()).and_then(|_| f.flush()) {
-            return ToolOutcome::Error(format!("cannot write {}: {e}", file.display()));
-        }
-        ToolOutcome::Ok(
-            serde_json::json!({ "path": file, "bytes": content.len(), "written": true })
+        // HUP-S2.9: the one checkpointed write path (grants and the deny list, build
+        // configuration, symlink leaves and hard links are all refused before any snapshot).
+        let checked = crate::files::checked_whole_file_write(
+            &self.grants,
+            self.undo.as_ref(),
+            path,
+            content.as_bytes(),
+            false,
+        );
+        match checked {
+            Ok(w) => ToolOutcome::Ok(
+                serde_json::json!({
+                    "path": w.path,
+                    "paths": [w.path],
+                    "bytes": content.len(),
+                    "written": true,
+                    "checkpoint": {"session": w.session, "seq": w.seq},
+                    "undo": crate::files::UNDO_NOTE,
+                })
                 .to_string(),
-        )
+            ),
+            Err(r) => r.into_outcome(),
+        }
     }
 }
 

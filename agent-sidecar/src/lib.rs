@@ -27,6 +27,7 @@ pub mod decide;
 pub mod escalation;
 pub mod files;
 pub mod grants;
+pub mod hic_records;
 pub mod learn;
 pub mod llm_http;
 pub mod mcp_probe;
@@ -305,6 +306,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/browser/sign-in", get(signin_routes::list))
         .route("/browser/sign-in/answer", post(signin_routes::answer))
         .route("/records/web-signing", post(web_signing_records::write))
+        // HUP-S2.6: core's other HIC events (grants, full access, escalation spend, approval
+        // cards) into the same decision records.
+        .route("/records/core", post(hic_records::write_core))
         // HUP-S5.2: search status (read-only). HUP-S5.3: the decide() slot + its metering.
         .route("/search/status", get(search_status))
         .route("/decide", post(decide))
@@ -531,16 +535,78 @@ fn resolve_body(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let id = requested_call_id(body).ok_or(StatusCode::BAD_REQUEST)?;
+    // HUP-S2.6: the member's decision on the reviewed head is recorded (write-ahead for an
+    // approval; fail closed when the record cannot be written). A resolve that does not match
+    // the head records nothing.
+    let head = st.queue.peek().filter(|p| p.id == id);
+    let log = st.sessions.records();
+    let pending_record = match (&log, &head) {
+        (Some(log), Some(p)) if approve => Some(
+            record_ceremony_decision(log, p, true).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+        ),
+        _ => None,
+    };
     let res = if approve {
         st.queue.approve_by_id(&id)
     } else {
         st.queue.reject_by_id(&id)
     };
     match res {
-        Ok(()) => Ok(Json(serde_json::json!({ "ok": true, "resolved": true }))),
+        Ok(()) => {
+            if let (Some(log), Some(p)) = (&log, &head) {
+                match pending_record {
+                    Some(seq) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Completed,
+                        "released to the capsule; a chain effect was signed and broadcast in core's ceremony first",
+                    ),
+                    None => {
+                        if let Err(e) = record_ceremony_decision(log, p, false) {
+                            eprintln!("citrate-agent-sidecar: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(Json(serde_json::json!({ "ok": true, "resolved": true })))
+        }
         // The head is not the call the operator reviewed, or its submitter is gone — refuse.
-        Err(_) => Err(StatusCode::CONFLICT),
+        Err(_) => {
+            if let (Some(log), Some(seq)) = (&log, pending_record) {
+                hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "the call was no longer waiting, so nothing was released",
+                );
+            }
+            Err(StatusCode::CONFLICT)
+        }
     }
+}
+
+/// HUP-S2.6: one ceremony-bridge decision on the reviewed call `p`.
+fn record_ceremony_decision(
+    log: &citrate_agent_records::DecisionLog,
+    p: &citrate_agent_core::hitl::PendingView,
+    allow: bool,
+) -> Result<u64, String> {
+    hic_records::record_member_decision(
+        log,
+        "ceremony.capsule_effect",
+        &format!("{}: {}", p.name, p.description),
+        allow,
+        if allow {
+            "the member approved this effect in core's ceremony"
+        } else {
+            "the member declined this effect"
+        },
+        vec![citrate_agent_records::EvidenceRef {
+            kind: "approval_call".to_string(),
+            uri: format!("sidecar:approval/{}", p.id),
+            digest: None,
+        }],
+    )
 }
 
 async fn run_skill(
@@ -1077,7 +1143,22 @@ pub fn production_sessions_with(
         None => mgr,
     };
     let mgr = mgr.with_decide(decide::DecideService::from_env());
-    let mgr = match learn::LearnService::from_env() {
+    // HUP-S2.6: one writer for the records directory the anchor batches, shared by every HIC
+    // event the sidecar records (and by learn, which then writes there instead of its own folder).
+    let records = web_signing_records::records_dir_from_env().and_then(|dir| {
+        match web_signing_records::shared_log(&dir) {
+            Ok(log) => Some(log),
+            Err(e) => {
+                eprintln!("citrate-agent-sidecar: decision records off: {e}");
+                None
+            }
+        }
+    });
+    let mgr = match &records {
+        Some(log) => mgr.with_records(log.clone()),
+        None => mgr,
+    };
+    let mgr = match learn::LearnService::from_env_with_records(records) {
         Some(svc) => mgr.with_learn(svc),
         None => mgr,
     };
@@ -1816,8 +1897,12 @@ mod escalation_tests;
 #[cfg(test)]
 mod files_tests;
 #[cfg(test)]
+mod hic_records_tests;
+#[cfg(test)]
 mod mcp_probe_tests;
 #[cfg(test)]
 mod personas_route_tests;
 #[cfg(test)]
 mod track_workflow_route_tests;
+#[cfg(test)]
+mod undo_writes_tests;

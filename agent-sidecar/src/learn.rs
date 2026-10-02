@@ -2,9 +2,10 @@
 //!
 //! Off unless both folders are configured:
 //!
-//! - `CITRATE_HERMES_LEARN_DIR`: the learn data folder. It holds the HIC decision log
-//!   (`decisions/`) and the proposals file (`proposals.json`), so undecided proposals survive a
-//!   restart.
+//! - `CITRATE_HERMES_LEARN_DIR`: the learn data folder. It holds the proposals file
+//!   (`proposals.json`), so undecided proposals survive a restart, and the HIC decision log
+//!   (`decisions/`) unless `CITRATE_HERMES_RECORDS_DIR` is set: then the decisions go to that one
+//!   records directory, which the nightly anchor batches (HUP-S2.6).
 //! - `CITRATE_HERMES_LEARN_SKILLS_DIR`: the member's skills folder, where an accepted skill is
 //!   written as `<name>/SKILL.md`. Skills named in `CITRATE_HERMES_SKILLS` (bundled, team) are
 //!   checked for name clashes.
@@ -116,6 +117,7 @@ pub enum AcceptedView {
 pub struct LearnService {
     learner: Mutex<Learner>,
     report: LoadReport,
+    log_dir: PathBuf,
 }
 
 impl LearnService {
@@ -129,19 +131,38 @@ impl LearnService {
         let (log, _recovery) =
             DecisionLog::open(&learn_dir.join("decisions"), LogConfig::default())
                 .map_err(|e| format!("decision log: {e}"))?;
+        Self::open_with_log(learn_dir, skills_dir, others, Arc::new(log))
+    }
+
+    /// HUP-S2.6: like [`Self::open`], but the HIC decisions go to `log` (the records directory the
+    /// nightly anchor batches) instead of the learn folder's own `decisions/`.
+    pub fn open_with_log(
+        learn_dir: &Path,
+        skills_dir: &Path,
+        others: Vec<SkillSource>,
+        log: Arc<DecisionLog>,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(learn_dir).map_err(|e| format!("learn folder: {e}"))?;
+        let log_dir = log.dir().to_path_buf();
         let (learner, report) = Learner::open(
             LearnConfig {
                 user_skills_dir: skills_dir.to_path_buf(),
                 other_skill_sources: others,
             },
-            Arc::new(log),
+            log,
             Arc::new(citrate_agent_records::SystemClock),
             &learn_dir.join("proposals.json"),
         );
         Ok(LearnService {
             learner: Mutex::new(learner),
             report,
+            log_dir,
         })
+    }
+
+    /// Where this service's HIC decisions are written.
+    pub fn decision_log_dir(&self) -> &Path {
+        &self.log_dir
     }
 
     /// The service from the two folder values and the `CITRATE_HERMES_SKILLS` path list. `None`
@@ -151,6 +172,17 @@ impl LearnService {
         skills_dir: Option<&str>,
         skill_sources: &str,
     ) -> Option<Self> {
+        Self::from_values_with_records(learn_dir, skills_dir, skill_sources, None)
+    }
+
+    /// HUP-S2.6: [`Self::from_values`], writing decisions to `records` when given (the records
+    /// directory the anchor batches), else to the learn folder's own `decisions/`.
+    pub fn from_values_with_records(
+        learn_dir: Option<&str>,
+        skills_dir: Option<&str>,
+        skill_sources: &str,
+        records: Option<Arc<DecisionLog>>,
+    ) -> Option<Self> {
         let learn_dir = learn_dir.map(str::trim).filter(|v| !v.is_empty())?;
         let skills_dir = skills_dir.map(str::trim).filter(|v| !v.is_empty())?;
         let skills_path = PathBuf::from(skills_dir);
@@ -158,7 +190,11 @@ impl LearnService {
             .into_iter()
             .filter(|s| s.root != skills_path)
             .collect();
-        match Self::open(Path::new(learn_dir), &skills_path, others) {
+        let opened = match records {
+            Some(log) => Self::open_with_log(Path::new(learn_dir), &skills_path, others, log),
+            None => Self::open(Path::new(learn_dir), &skills_path, others),
+        };
+        match opened {
             Ok(s) => {
                 let r = &s.report;
                 eprintln!(
@@ -185,10 +221,16 @@ impl LearnService {
 
     /// From the environment (default off).
     pub fn from_env() -> Option<Arc<Self>> {
+        Self::from_env_with_records(None)
+    }
+
+    /// HUP-S2.6: from the environment, writing decisions to `records` when given.
+    pub fn from_env_with_records(records: Option<Arc<DecisionLog>>) -> Option<Arc<Self>> {
         let dir = std::env::var(LEARN_DIR_ENV).ok();
         let skills = std::env::var(LEARN_SKILLS_DIR_ENV).ok();
         let sources = std::env::var("CITRATE_HERMES_SKILLS").unwrap_or_default();
-        Self::from_values(dir.as_deref(), skills.as_deref(), &sources).map(Arc::new)
+        Self::from_values_with_records(dir.as_deref(), skills.as_deref(), &sources, records)
+            .map(Arc::new)
     }
 
     fn lock(&self) -> MutexGuard<'_, Learner> {

@@ -28,11 +28,20 @@
 //! The tool result names the checkpoint (`session`, `seq`) so the app can offer Undo on the
 //! change. Undo itself is a member action through the `/checkpoints` routes, never a tool.
 //!
-//! **Configuration.** Off unless `CITRATE_HERMES_FILES=1`, a grants file
-//! (`CITRATE_HERMES_GRANTS`, the [`citrate_agent_grants::GrantState`] JSON core stores) and a
-//! checkpoint store (`CITRATE_HERMES_CHECKPOINTS`) are all configured: no write without a grant,
-//! and no write that could not be undone. The grants file is read on every call, so a revoke or
-//! an expiry applies to the next call. Paths must be absolute (or start with `~/`).
+//! **Configuration.** A session citrate-core opens with the member's grant document (HUP-S2.1)
+//! gets these tools whenever a checkpoint store is configured (`CITRATE_HERMES_CHECKPOINTS`, which
+//! core always sets): they check that session's document ([`GrantSource::Session`], core's grant
+//! store), read at every call, so a revoke or an expiry applies to the next call. Without a grant
+//! document, they are on only with `CITRATE_HERMES_FILES=1`, a grants file (`CITRATE_HERMES_GRANTS`)
+//! and a checkpoint store. Either way: no write without a grant, and no write that could not be
+//! undone. Paths must be absolute (or start with `~/`).
+//!
+//! **One write path.** The grant-session write tools (`file_write` in [`crate::grants`],
+//! `sheet_write` in [`crate::sheets`]) write through [`checked_whole_file_write`]: the same grant
+//! and deny-list check, then a refusal of build configuration, a symbolic link at the leaf (as
+//! given or as resolved) and a file with other hard links, all before any snapshot; then a
+//! checkpoint under the session id. Without a checkpoint store they write nothing. So every agent
+//! write a member can trigger can be undone through the `/checkpoints` routes.
 //!
 //! **Honest scope.** A file changed between the grant check and the write is caught by the
 //! checkpoint's own path checks (no write through a symbolic link, no path through a symlinked
@@ -108,10 +117,147 @@ pub fn checkpoints_dir_from_env_vars(get: impl Fn(&str) -> Option<String>) -> Op
 /// Where the grants come from.
 #[derive(Debug, Clone)]
 pub enum GrantSource {
-    /// Read and validated on every call (production). Missing or invalid = nothing granted.
+    /// Read and validated on every call (`CITRATE_HERMES_GRANTS`). Missing or invalid = nothing
+    /// granted.
     File(PathBuf),
     /// A fixed set (tests and embedders that manage grants themselves).
     Fixed(FolderGrants),
+    /// HUP-S2.9: the session's grant document, which citrate-core sends from its grant store when
+    /// it opens the session and after every change (production). Read at every call, so a revoke
+    /// reaches the next call.
+    Session(Arc<crate::grants::SessionGrants>),
+}
+
+/// What the tool results tell the model about undo.
+pub const UNDO_NOTE: &str = "The member can undo this change from the app.";
+
+/// HUP-S2.9: where one session's agent writes are checkpointed (the store and the session id).
+#[derive(Clone)]
+pub struct UndoScope {
+    store: Arc<CheckpointStore>,
+    session: SessionId,
+}
+
+impl std::fmt::Debug for UndoScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndoScope")
+            .field("session", &self.session.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl UndoScope {
+    /// `None` when `session` is not a valid checkpoint session id.
+    pub fn new(store: Arc<CheckpointStore>, session: &str) -> Option<Self> {
+        Some(UndoScope {
+            store,
+            session: SessionId::new(session).ok()?,
+        })
+    }
+
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// Checkpoint, then replace `file` (under the grant `root`) with `bytes`. Returns the step.
+    fn replace(&self, root: &Path, file: &Path, bytes: &[u8]) -> Result<u64, Refusal> {
+        let step = self
+            .store
+            .begin_step(&self.session, root, &[Change::write(file, bytes)])?;
+        let r = write_file(file, bytes);
+        finish(step, r)
+    }
+}
+
+/// A whole-file write that was made and checkpointed.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedWrite {
+    pub path: PathBuf,
+    pub session: String,
+    pub seq: u64,
+}
+
+/// HUP-S2.9: the one checkpointed whole-file write for the grant-session write tools
+/// (`file_write`, `sheet_write`). In order, and before anything is read or snapshotted:
+/// build configuration is refused (as given and as resolved), the path must pass the session's
+/// grants for a write (the agent-guard deny list first), the leaf must not be a symbolic link, a
+/// non-file, or a file with other hard links, and the parent folder must exist unless
+/// `create_parent`. Only then is the prior state snapshotted and the file replaced (temp sibling
+/// and rename). Without an undo store nothing is written: no agent write the member could not undo.
+pub(crate) fn checked_whole_file_write(
+    grants: &crate::grants::SessionGrants,
+    undo: Option<&UndoScope>,
+    path: &Path,
+    bytes: &[u8],
+    create_parent: bool,
+) -> Result<CheckedWrite, Refusal> {
+    if !path.is_absolute() {
+        return Err(Refusal::Failed("path must be absolute".into()));
+    }
+    if let Some(name) = crate::toolchain_config::build_config_file(path) {
+        return Err(Refusal::Policy(
+            crate::toolchain_config::build_config_refusal(&name),
+        ));
+    }
+    let (file, root) = grants.check_write(path).map_err(Refusal::Policy)?;
+    if let Some(name) = crate::toolchain_config::build_config_file(&file) {
+        return Err(Refusal::Policy(
+            crate::toolchain_config::build_config_refusal(&name),
+        ));
+    }
+    if let Some(r) = leaf_refusal(&[path, &file]) {
+        return Err(r);
+    }
+    if !create_parent && !file.parent().is_some_and(Path::is_dir) {
+        return Err(Refusal::Failed(format!(
+            "the folder of {} does not exist",
+            file.display()
+        )));
+    }
+    let Some(undo) = undo else {
+        return Err(Refusal::Policy(
+            "undo checkpoints are not configured, so no agent write is made (every agent write must be undoable)"
+                .into(),
+        ));
+    };
+    let seq = undo.replace(&root, &file, bytes)?;
+    Ok(CheckedWrite {
+        path: file,
+        session: undo.session.as_str().to_string(),
+        seq,
+    })
+}
+
+/// A refusal when a leaf in `paths` is a symbolic link, is not a regular file, or has other hard
+/// links (writing it could change a file outside the grant). A missing leaf is fine (a new file).
+/// The grant-session write tools pass the path as given and as resolved (they never follow a
+/// link at the leaf); `fs_write` and `fs_edit` resolve links before the grant check, so they pass
+/// the resolved path only.
+fn leaf_refusal(paths: &[&Path]) -> Option<Refusal> {
+    for p in paths.iter().copied() {
+        match fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Some(Refusal::Policy(format!(
+                    "{} is a symbolic link",
+                    p.display()
+                )))
+            }
+            Ok(m) if !m.is_file() => {
+                return Some(Refusal::Failed(format!(
+                    "{} is not a regular file",
+                    p.display()
+                )))
+            }
+            Ok(m) if crate::grants::hard_linked(&m) => {
+                return Some(Refusal::Policy(format!(
+                    "{} has other hard links, so writing it could change a file outside the grant",
+                    p.display()
+                )))
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The file tools shared by every session (one checkpoint store per process).
@@ -148,9 +294,18 @@ type Args = serde_json::Map<String, serde_json::Value>;
 
 /// Why a call did not change anything. `Policy` is a grant or deny-list refusal (the model sees
 /// "declined"); `Failed` is anything else.
-enum Refusal {
+pub(crate) enum Refusal {
     Policy(String),
     Failed(String),
+}
+
+impl Refusal {
+    pub(crate) fn into_outcome(self) -> ToolOutcome {
+        match self {
+            Refusal::Policy(m) => ToolOutcome::Denied(m),
+            Refusal::Failed(m) => ToolOutcome::Error(m),
+        }
+    }
 }
 
 impl From<citrate_agent_checkpoints::Error> for Refusal {
@@ -259,24 +414,30 @@ impl FileTools {
         ]
     }
 
-    fn load_grants(&self) -> Result<FolderGrants, Refusal> {
+    /// The grant set to check against now, and the time to check it at.
+    fn load_grants(&self) -> Result<(FolderGrants, u64), Refusal> {
         match &self.grants {
-            GrantSource::Fixed(g) => Ok(g.clone()),
+            GrantSource::Session(g) => g
+                .with_folder_grants(|fg, now| (fg.clone(), now))
+                .map_err(Refusal::Policy),
+            GrantSource::Fixed(g) => Ok((g.clone(), (self.clock)())),
             GrantSource::File(p) => {
                 let json = fs::read_to_string(p).map_err(|e| {
                     Refusal::Policy(format!(
                         "no folder grants are readable ({e}); ask the member to grant a folder"
                     ))
                 })?;
-                FolderGrants::from_json(&json, &self.home, &self.home).map_err(|e| {
-                    Refusal::Policy(format!("the folder grants could not be loaded: {e}"))
-                })
+                FolderGrants::from_json(&json, &self.home, &self.home)
+                    .map(|g| (g, (self.clock)()))
+                    .map_err(|e| {
+                        Refusal::Policy(format!("the folder grants could not be loaded: {e}"))
+                    })
             }
         }
     }
 
     /// Grant + deny-list check for a write to `raw`. Nothing is read or snapshotted before this.
-    fn allow(&self, grants: &FolderGrants, raw: &str) -> Result<Allowed, Refusal> {
+    fn allow(&self, grants: &FolderGrants, now: u64, raw: &str) -> Result<Allowed, Refusal> {
         let p = Path::new(raw);
         if !(p.is_absolute() || raw.starts_with("~/")) {
             return Err(Refusal::Failed(format!(
@@ -290,7 +451,7 @@ impl FileTools {
                 crate::toolchain_config::build_config_refusal(&name),
             ));
         }
-        match grants.check(p, Op::Write, (self.clock)()) {
+        match grants.check(p, Op::Write, now) {
             Decision::Allowed {
                 canonical,
                 grant_id,
@@ -319,7 +480,7 @@ impl FileTools {
 
     fn run(&self, session: &SessionId, call: &ToolCall) -> Result<serde_json::Value, Refusal> {
         let args = parse_args(&call.arguments).map_err(Refusal::Failed)?;
-        let grants = self.load_grants()?;
+        let (grants, now) = self.load_grants()?;
         let (paths, step) = match call.name.as_str() {
             FS_WRITE_TOOL => {
                 let path = str_arg(&args, "path")?;
@@ -330,7 +491,10 @@ impl FileTools {
                         content.len()
                     )));
                 }
-                let a = self.allow(&grants, path)?;
+                let a = self.allow(&grants, now, path)?;
+                if let Some(r) = leaf_refusal(&[&a.canonical]) {
+                    return Err(r);
+                }
                 let bytes = content.as_bytes();
                 let step = self.store.begin_step(
                     session,
@@ -354,7 +518,10 @@ impl FileTools {
                 if old_text.is_empty() {
                     return Err(Refusal::Failed("old_text is empty".into()));
                 }
-                let a = self.allow(&grants, path)?;
+                let a = self.allow(&grants, now, path)?;
+                if let Some(r) = leaf_refusal(&[&a.canonical]) {
+                    return Err(r);
+                }
                 let before = read_text(&a.canonical)?;
                 let n = before.matches(old_text).count();
                 if n == 0 {
@@ -389,7 +556,7 @@ impl FileTools {
             }
             FS_DELETE_TOOL => {
                 let path = str_arg(&args, "path")?;
-                let a = self.allow(&grants, path)?;
+                let a = self.allow(&grants, now, path)?;
                 let step =
                     self.store
                         .begin_step(session, &a.root, &[Change::delete(&a.canonical)])?;
@@ -399,8 +566,8 @@ impl FileTools {
             FS_RENAME_TOOL => {
                 let from_raw = str_arg(&args, "from")?;
                 let to_raw = str_arg(&args, "to")?;
-                let from = self.allow(&grants, from_raw)?;
-                let to = self.allow(&grants, to_raw)?;
+                let from = self.allow(&grants, now, from_raw)?;
+                let to = self.allow(&grants, now, to_raw)?;
                 if from.root != to.root {
                     return Err(Refusal::Failed(
                         "from and to must be inside the same granted folder".into(),
@@ -428,13 +595,13 @@ impl FileTools {
             "tool": call.name,
             "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
             "checkpoint": {"session": session.as_str(), "seq": step},
-            "undo": "The member can undo this change from the app."
+            "undo": UNDO_NOTE
         }))
     }
 }
 
 /// Commit after a change that happened, abort after one that failed. Returns the step's seq.
-fn finish(step: Step<'_>, change: Result<(), String>) -> Result<u64, Refusal> {
+pub(crate) fn finish(step: Step<'_>, change: Result<(), String>) -> Result<u64, Refusal> {
     let seq = step.seq();
     match change {
         Ok(()) => match step.commit() {
@@ -513,7 +680,7 @@ pub(crate) fn write_if_unchanged(path: &Path, expected: &str, bytes: &[u8]) -> R
 static TMP_N: AtomicU64 = AtomicU64::new(0);
 
 /// Write through a temp sibling and a rename, keeping an existing file's permissions.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the path has no parent folder".to_string())?;
@@ -570,8 +737,7 @@ impl ToolHost for FileToolsHost {
         }
         match self.tools.run(&self.session, call) {
             Ok(v) => ToolOutcome::Ok(v.to_string()),
-            Err(Refusal::Policy(m)) => ToolOutcome::Denied(m),
-            Err(Refusal::Failed(m)) => ToolOutcome::Error(m),
+            Err(r) => r.into_outcome(),
         }
     }
 }

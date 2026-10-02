@@ -239,8 +239,62 @@ pub async fn decide(
     let Ok(req) = serde_json::from_slice::<DecideReq>(&body) else {
         return err(StatusCode::BAD_REQUEST, "expected {id, allow}");
     };
+    // HUP-S2.6: the member's decision is recorded (write-ahead for an allow, which is refused
+    // when it cannot be recorded; a deny always takes effect).
+    let pending = b.pending_action().filter(|p| p.id == req.id);
+    let log = st.sessions.records();
+    let record = |allow: bool,
+                  p: &citrate_agent_browser::approvals::PendingAction,
+                  log: &citrate_agent_records::DecisionLog| {
+        crate::hic_records::record_member_decision(
+            log,
+            "browser.action",
+            &format!("{}: {}", p.tool, p.summary),
+            allow,
+            &p.reason,
+            vec![citrate_agent_records::EvidenceRef {
+                kind: "browser_action".to_string(),
+                uri: format!("sidecar:browser/action/{}", p.id),
+                digest: None,
+            }],
+        )
+    };
+    let allow_seq = match (&log, &pending) {
+        (Some(log), Some(p)) if req.allow => match record(true, p, log) {
+            Ok(seq) => Some(seq),
+            Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, e),
+        },
+        _ => None,
+    };
     match b.decide(&req.id, req.allow) {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err(StatusCode::CONFLICT, e),
+        Ok(()) => {
+            if let (Some(log), Some(p)) = (&log, &pending) {
+                match allow_seq {
+                    Some(seq) => crate::hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Completed,
+                        "released to the browser tool; the action's own result is in the session",
+                    ),
+                    None => {
+                        if let Err(e) = record(false, p, log) {
+                            eprintln!("citrate-agent-sidecar: {e}");
+                        }
+                    }
+                }
+            }
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => {
+            if let (Some(log), Some(seq)) = (&log, allow_seq) {
+                crate::hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "the action was no longer waiting, so nothing was released",
+                );
+            }
+            err(StatusCode::CONFLICT, e)
+        }
     }
 }

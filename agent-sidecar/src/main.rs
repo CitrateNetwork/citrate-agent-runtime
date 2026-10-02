@@ -24,10 +24,13 @@
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
 //!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
-//!                               the /checkpoints undo routes are served (optional)
-//!   CITRATE_HERMES_FILES        HUP-S2.9: `1` offers fs_write / fs_edit / fs_delete / fs_rename in
-//!                               every session; needs CITRATE_HERMES_GRANTS and the checkpoint
-//!                               store, else off (optional)
+//!                               the /checkpoints undo routes are served, and sessions opened with
+//!                               a grant document get checkpointed file_write / sheet_write plus
+//!                               fs_write / fs_edit / fs_delete / fs_rename on that document; unset
+//!                               = no agent file write at all (optional)
+//!   CITRATE_HERMES_FILES        HUP-S2.9: `1` also offers the fs_* tools in sessions opened
+//!                               without a grant document; needs CITRATE_HERMES_GRANTS and the
+//!                               checkpoint store, else off (optional)
 //!   CITRATE_HERMES_GRANTS       absolute path of the folder-grants JSON core stores; read on every
 //!                               file-tool call (optional)
 //!   CITRATE_HERMES_METERING_DIR HUP-S7.5: absolute folder for the metering log (metering.jsonl);
@@ -38,7 +41,11 @@
 //!   CITRATE_HERMES_ANCHOR_DIR   HUP-S7.3: absolute folder for the anchor ledger; both must be set
 //!                               for the /anchor/* routes, else they answer "not configured"
 //!                               (HUP-S2.3: POST /records/web-signing writes core's web-signing
-//!                               decisions into CITRATE_HERMES_RECORDS_DIR; unset, it answers 404)
+//!                               decisions into CITRATE_HERMES_RECORDS_DIR; unset, it answers 404.
+//!                               HUP-S2.6: set, the sidecar also records ceremony-bridge resolves,
+//!                               browser action decisions, learn decisions and POST /records/core
+//!                               (core's grant, full-access, escalation and approval-card events)
+//!                               there, through one writer)
 //!   CITRATE_HERMES_LEARN_DIR    HUP-S3.4: learn data folder (decision log + proposals file);
 //!                               with CITRATE_HERMES_LEARN_SKILLS_DIR, turns on the learn routes
 //!                               and the `learn_propose` tool; unset = learning off (optional)
