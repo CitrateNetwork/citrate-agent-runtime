@@ -37,25 +37,36 @@
 //! * **Time is checked at use.** The plan is resolved for every
 //!   instantiation (every capsule call), so a revoked or expired grant stops
 //!   applying on the next call.
-//! * **Network.** `none` and `broker-only` get no direct socket at all.
-//!   `egress-allowed` may connect or send only to the exact `network_allow`
-//!   addresses; binds are limited to the implicit ephemeral bind a connect
-//!   performs, listening and accepting are refused, and name lookup is off.
+//! * **No hard links.** A regular file with more than one name below the
+//!   folder is refused: its other name may be a deny-listed file, and the
+//!   deny list cannot see through a hard link.
+//! * **Network, ceiling and consent.** `none` and `broker-only` get no
+//!   direct socket at all. For `egress-allowed`, the signed `network_allow`
+//!   list is only the ceiling: a capsule may connect or send to an address
+//!   only when it is on that list AND the member consented to it for that
+//!   capsule ([`SandboxPlan::egress_only`], [`GrantsSandbox::egress`]).
+//!   Without consent the capsule reaches no address. Every listed address
+//!   must be public (globally routable unicast); a loopback, link-local,
+//!   private, shared, documentation, multicast or tunnelled-private address
+//!   refuses the capsule outright, when its manifest is parsed at load and
+//!   again at every call. Binds are
+//!   limited to the implicit ephemeral bind a connect performs, listening
+//!   and accepting are refused, and name lookup is off.
 //!
 //! ## Status
 //!
 //! Enforced on every `Capsule::instantiate*` path and in
-//! `CapsuleDispatch::call_raw`. Without a [`SandboxProvider`] (the default
-//! today), a capsule gets no preopens at all. Core does not yet pass the
-//! member's grants to the agent sidecar, so no shipped path mounts a folder
-//! yet; that wiring belongs with the Grants UI work package.
+//! `CapsuleDispatch::call_raw`. The agent sidecar passes each session's own
+//! provider per call (`CapsuleDispatch::call_json_sandboxed`), built from
+//! the member's live grants and the session's capsule bindings. With no
+//! bindings (the default) a capsule gets no preopens and no address.
 
 use crate::capsule::filesystem::{self, FilesystemAccess};
 use crate::capsule::manifest::{Manifest, NetworkPolicy};
 use crate::error::AgentError;
 use citrate_agent_grants::{Decision, DenialReason, FolderGrants, GrantKind, GrantScope, Op};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use wasmtime_wasi::sockets::SocketAddrUse;
@@ -125,12 +136,19 @@ impl SandboxPlan {
         }
     }
 
-    /// The plan when no member grants are supplied: no preopens, and the
-    /// manifest's signed socket allowlist.
+    /// The plan when no member grants or consent are supplied: no
+    /// preopens and no reachable address. A manifest whose egress list is
+    /// not admissible (see [`parse_network_allow`]) is still refused.
     pub fn without_grants(manifest: &Manifest) -> Result<Self, AgentError> {
+        Self::egress_only(manifest, &[])
+    }
+
+    /// No preopens; the network is the manifest's signed allowlist narrowed
+    /// to the addresses the member consented to for this capsule.
+    pub fn egress_only(manifest: &Manifest, consent: &[SocketAddr]) -> Result<Self, AgentError> {
         Ok(Self {
             preopens: Vec::new(),
-            network: network_plan(manifest)?,
+            network: network_plan(manifest, consent)?,
         })
     }
 
@@ -144,7 +162,26 @@ impl SandboxPlan {
         grants: &FolderGrants,
         now: u64,
     ) -> Result<Self, AgentError> {
-        Self::resolve_with_cap(manifest, mounts, grants, now, MAX_MOUNT_SCAN_ENTRIES)
+        Self::resolve_with_egress(manifest, mounts, grants, now, &[])
+    }
+
+    /// [`Self::resolve`] plus the member's egress consent for this capsule
+    /// (see [`Self::egress_only`]).
+    pub fn resolve_with_egress(
+        manifest: &Manifest,
+        mounts: &[FsMount],
+        grants: &FolderGrants,
+        now: u64,
+        consent: &[SocketAddr],
+    ) -> Result<Self, AgentError> {
+        Self::resolve_with_cap(
+            manifest,
+            mounts,
+            grants,
+            now,
+            MAX_MOUNT_SCAN_ENTRIES,
+            consent,
+        )
     }
 
     fn resolve_with_cap(
@@ -153,6 +190,7 @@ impl SandboxPlan {
         grants: &FolderGrants,
         now: u64,
         scan_cap: usize,
+        consent: &[SocketAddr],
     ) -> Result<Self, AgentError> {
         let name = &manifest.capsule.name;
         let declared = filesystem::parse_all(&manifest.capability.filesystem)?;
@@ -237,7 +275,7 @@ impl SandboxPlan {
         }
         Ok(Self {
             preopens,
-            network: network_plan(manifest)?,
+            network: network_plan(manifest, consent)?,
         })
     }
 
@@ -301,23 +339,130 @@ fn scan_mount(
             }
             if file_type.is_dir() {
                 stack.push(path);
+            } else if file_type.is_file() {
+                refuse_hard_link(&entry)?;
             }
         }
     }
     Ok(())
 }
 
-fn network_plan(manifest: &Manifest) -> Result<NetworkPlan, AgentError> {
+/// A regular file with another name elsewhere cannot be checked against
+/// the deny list by its path, so it refuses the mount.
+#[cfg(unix)]
+fn refuse_hard_link(entry: &std::fs::DirEntry) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = entry.path();
+    let meta = entry
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    if meta.nlink() > 1 {
+        return Err(format!(
+            "{} is a hard link (the same file has another name), which a capsule mount \
+             cannot check against the deny list",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn refuse_hard_link(_entry: &std::fs::DirEntry) -> Result<(), String> {
+    Ok(())
+}
+
+fn network_plan(manifest: &Manifest, consent: &[SocketAddr]) -> Result<NetworkPlan, AgentError> {
     Ok(match manifest.capability.network {
         NetworkPolicy::None | NetworkPolicy::BrokerOnly => NetworkPlan::DenyAll,
         NetworkPolicy::EgressAllowed => {
-            NetworkPlan::Allow(parse_network_allow(&manifest.capability.network_allow)?)
+            let ceiling = parse_network_allow(&manifest.capability.network_allow)?;
+            let allowed: Vec<SocketAddr> = ceiling
+                .into_iter()
+                .filter(|a| consent.contains(a))
+                .collect();
+            if allowed.is_empty() {
+                NetworkPlan::DenyAll
+            } else {
+                NetworkPlan::Allow(allowed)
+            }
         }
     })
 }
 
+/// Whether `ip` is a public (globally routable unicast) address a capsule
+/// may be allowed to reach. Everything else is refused: unspecified,
+/// loopback, private (RFC 1918, ULA), shared (100.64/10), link-local
+/// (including the 169.254.169.254 metadata address), benchmarking,
+/// documentation, the IETF and reserved blocks, broadcast and multicast,
+/// and IPv6 forms that carry an IPv4 address (mapped, compatible, NAT64,
+/// 6to4) unless the carried address is itself public. Teredo is refused
+/// outright.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4_public(v4),
+        IpAddr::V6(v6) => v6_public(v6),
+    }
+}
+
+fn v4_public(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    let blocked = a == 0 // "this network"
+        || a == 10 // RFC 1918
+        || a == 127 // loopback
+        || (a == 100 && (64..=127).contains(&b)) // shared address space
+        || (a == 169 && b == 254) // link-local, cloud metadata
+        || (a == 172 && (16..=31).contains(&b)) // RFC 1918
+        || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+        || (a == 192 && b == 0 && c == 2) // TEST-NET-1
+        || (a == 192 && b == 88 && c == 99) // 6to4 relay anycast
+        || (a == 192 && b == 168) // RFC 1918
+        || (a == 198 && (18..=19).contains(&b)) // benchmarking
+        || (a == 198 && b == 51 && c == 100) // TEST-NET-2
+        || (a == 203 && b == 0 && c == 113) // TEST-NET-3
+        || a >= 224; // multicast, reserved, broadcast
+    !blocked
+}
+
+fn v6_public(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return v4_public(v4);
+    }
+    // ::/96 (unspecified, loopback, IPv4-compatible): never public.
+    if seg[..6].iter().all(|s| *s == 0) {
+        return false;
+    }
+    // 64:ff9b::/96 NAT64: judge the embedded IPv4 address.
+    if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6].iter().all(|s| *s == 0) {
+        return v4_public(embedded_v4(seg[6], seg[7]));
+    }
+    // 2002::/16 6to4: judge the embedded IPv4 address.
+    if seg[0] == 0x2002 {
+        return v4_public(embedded_v4(seg[1], seg[2]));
+    }
+    // 2001::/32 Teredo: the real endpoint is obscured, refuse.
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        return false;
+    }
+    // 2001:db8::/32 documentation.
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return false;
+    }
+    // Only global unicast (2000::/3) is public; this excludes ULA
+    // (fc00::/7), link-local (fe80::/10), multicast (ff00::/8) and the
+    // reserved remainder.
+    (seg[0] & 0xe000) == 0x2000
+}
+
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    let [a, b] = hi.to_be_bytes();
+    let [c, d] = lo.to_be_bytes();
+    Ipv4Addr::new(a, b, c, d)
+}
+
 /// Parse `[capability].network_allow`: each entry an exact remote
-/// `ip:port` (`[v6]:port`), not an unspecified address, not port 0.
+/// `ip:port` (`[v6]:port`), not port 0, and a public address
+/// ([`is_public_ip`]).
 pub fn parse_network_allow(entries: &[String]) -> Result<Vec<SocketAddr>, AgentError> {
     entries
         .iter()
@@ -331,6 +476,12 @@ pub fn parse_network_allow(entries: &[String]) -> Result<Vec<SocketAddr>, AgentE
             if addr.ip().is_unspecified() || addr.port() == 0 {
                 return Err(AgentError::Capsule(format!(
                     "[capability].network_allow entry {s:?} must name one remote address and port"
+                )));
+            }
+            if !is_public_ip(addr.ip()) {
+                return Err(AgentError::Capsule(format!(
+                    "[capability].network_allow entry {s:?} is not a public address; a capsule \
+                     may not reach loopback, private, link-local or other local addresses"
                 )));
             }
             Ok(addr)
@@ -360,11 +511,12 @@ pub trait SandboxProvider: Send + Sync {
     fn plan_for(&self, manifest: &Manifest) -> Result<SandboxPlan, AgentError>;
 }
 
-/// A [`SandboxProvider`] over the member's folder grants and per-capsule
-/// mount bindings.
+/// A [`SandboxProvider`] over the member's folder grants, per-capsule
+/// mount bindings and per-capsule egress consent.
 pub struct GrantsSandbox {
     grants: Arc<RwLock<FolderGrants>>,
     mounts: HashMap<String, Vec<FsMount>>,
+    egress: HashMap<String, Vec<SocketAddr>>,
 }
 
 impl GrantsSandbox {
@@ -372,6 +524,7 @@ impl GrantsSandbox {
         Self {
             grants,
             mounts: HashMap::new(),
+            egress: HashMap::new(),
         }
     }
 
@@ -381,9 +534,21 @@ impl GrantsSandbox {
         self
     }
 
+    /// Record the member's consent for `capsule` to reach `addrs` (still
+    /// narrowed to the capsule's signed allowlist at every call).
+    pub fn egress(mut self, capsule: impl Into<String>, addrs: Vec<SocketAddr>) -> Self {
+        self.egress.entry(capsule.into()).or_default().extend(addrs);
+        self
+    }
+
     fn plan_at(&self, manifest: &Manifest, now: u64) -> Result<SandboxPlan, AgentError> {
         let mounts = self
             .mounts
+            .get(&manifest.capsule.name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let consent = self
+            .egress
             .get(&manifest.capsule.name)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
@@ -391,7 +556,7 @@ impl GrantsSandbox {
             .grants
             .read()
             .map_err(|_| AgentError::Capsule("folder grants are unavailable".into()))?;
-        SandboxPlan::resolve(manifest, mounts, &grants, now)
+        SandboxPlan::resolve_with_egress(manifest, mounts, &grants, now, consent)
     }
 }
 
@@ -421,12 +586,16 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn manifest(network: &str, filesystem: &[&str]) -> Manifest {
+        Manifest::parse(&manifest_src(network, filesystem)).expect("test manifest parses")
+    }
+
+    fn manifest_src(network: &str, filesystem: &[&str]) -> String {
         let fs = filesystem
             .iter()
             .map(|s| format!("{s:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        Manifest::parse(&format!(
+        format!(
             r#"
 [capsule]
 name = "sandbox-test"
@@ -463,8 +632,7 @@ tla_spec = ""
 tier = "bundled"
 "#,
             zeros = "0".repeat(64),
-        ))
-        .expect("test manifest parses")
+        )
     }
 
     /// A member home, a granted project folder with one file, and a secret
@@ -683,9 +851,15 @@ tier = "bundled"
         let w = world();
         let m = manifest(r#"network = "none""#, &["read:/work"]);
         let g = grants(&w, &[Access::Read]);
-        let err =
-            SandboxPlan::resolve_with_cap(&m, &[FsMount::new("/work", &w.project)], &g, NOW, 2)
-                .expect_err("over the cap");
+        let err = SandboxPlan::resolve_with_cap(
+            &m,
+            &[FsMount::new("/work", &w.project)],
+            &g,
+            NOW,
+            2,
+            &[],
+        )
+        .expect_err("over the cap");
         assert!(err.to_string().contains("more than 2 entries"), "{err}");
     }
 
@@ -708,13 +882,14 @@ tier = "bundled"
     // ── network ──────────────────────────────────────────────────
 
     #[test]
-    fn network_plan_follows_the_manifest() {
+    fn network_plan_follows_the_manifest_and_the_members_consent() {
         let none = manifest(r#"network = "none""#, &[]);
         let broker = manifest(r#"network = "broker-only""#, &[]);
         let egress = manifest(
-            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\"]",
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\", \"9.9.9.9:443\"]",
             &[],
         );
+        let allowed: SocketAddr = "1.1.1.1:443".parse().expect("addr");
         assert_eq!(
             SandboxPlan::without_grants(&none).expect("p").network(),
             &NetworkPlan::DenyAll
@@ -723,11 +898,144 @@ tier = "bundled"
             SandboxPlan::without_grants(&broker).expect("p").network(),
             &NetworkPlan::DenyAll
         );
-        let allowed: SocketAddr = "203.0.113.7:443".parse().expect("addr");
+        // M-6: the signed manifest is the ceiling, never the grant. With no
+        // member consent an egress capsule reaches nothing.
         assert_eq!(
             SandboxPlan::without_grants(&egress).expect("p").network(),
+            &NetworkPlan::DenyAll
+        );
+        assert_eq!(
+            SandboxPlan::egress_only(&egress, &[allowed])
+                .expect("p")
+                .network(),
             &NetworkPlan::Allow(vec![allowed])
         );
+        // Consent never reaches past the manifest, nor gives a none or
+        // broker-only capsule a socket.
+        let unlisted: SocketAddr = "8.8.8.8:53".parse().expect("addr");
+        assert_eq!(
+            SandboxPlan::egress_only(&egress, &[unlisted])
+                .expect("p")
+                .network(),
+            &NetworkPlan::DenyAll
+        );
+        assert_eq!(
+            SandboxPlan::egress_only(&none, &[allowed])
+                .expect("p")
+                .network(),
+            &NetworkPlan::DenyAll
+        );
+        assert_eq!(
+            SandboxPlan::egress_only(&broker, &[allowed])
+                .expect("p")
+                .network(),
+            &NetworkPlan::DenyAll
+        );
+    }
+
+    #[test]
+    fn egress_to_a_non_global_address_is_refused() {
+        for bad in [
+            "127.0.0.1:80",
+            "10.0.0.1:443",
+            "172.16.0.1:443",
+            "192.168.1.1:443",
+            "169.254.169.254:80",
+            "100.64.0.1:443",
+            "0.1.2.3:443",
+            "192.0.0.8:443",
+            "192.0.2.1:443",
+            "198.18.0.1:443",
+            "198.51.100.1:443",
+            "203.0.113.7:443",
+            "224.0.0.1:443",
+            "240.0.0.1:443",
+            "255.255.255.255:443",
+            "[::1]:443",
+            "[fe80::1]:443",
+            "[fc00::1]:443",
+            "[fd12:3456::1]:443",
+            "[ff02::1]:443",
+            "[2001:db8::1]:443",
+            "[::ffff:127.0.0.1]:443",
+            "[::ffff:10.0.0.1]:443",
+            "[::127.0.0.1]:443",
+            "[64:ff9b::7f00:1]:443",
+            "[2002:7f00:1::]:443",
+            "[2002:a9fe:a9fe::]:443",
+            "[2001:0:4136:e378:8000:63bf:80ff:fffe]:443",
+        ] {
+            let err = parse_network_allow(&[bad.to_string()])
+                .expect_err(&format!("{bad} must be refused"));
+            assert!(
+                err.to_string().contains("not a public address"),
+                "{bad}: {err}"
+            );
+        }
+        for good in [
+            "1.1.1.1:443",
+            "8.8.8.8:53",
+            "[2606:4700:4700::1111]:443",
+            "[::ffff:1.1.1.1]:443",
+            "[2002:101:101::]:443",
+        ] {
+            parse_network_allow(&[good.to_string()])
+                .unwrap_or_else(|e| panic!("{good} is public: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_manifest_naming_a_private_address_cannot_run_even_with_consent() {
+        // Refused when the manifest is parsed (at load) ...
+        let text = "network = \"egress-allowed\"\nnetwork_allow = [\"169.254.169.254:80\"]";
+        let err = Manifest::parse(&manifest_src(text, &[])).expect_err("must not parse");
+        assert!(err.to_string().contains("not a public address"), "{err}");
+        // ... and again at every call, should a manifest be built in code.
+        let mut m = manifest(
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\"]",
+            &[],
+        );
+        m.capability.network_allow = vec!["169.254.169.254:80".to_string()];
+        let metadata: SocketAddr = "169.254.169.254:80".parse().expect("addr");
+        let err = SandboxPlan::egress_only(&m, &[metadata]).expect_err("refused");
+        assert!(err.to_string().contains("not a public address"), "{err}");
+        SandboxPlan::without_grants(&m).expect_err("refused without consent too");
+    }
+
+    #[test]
+    fn grants_sandbox_applies_the_members_egress_consent_per_capsule() {
+        let m = manifest(
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\"]",
+            &[],
+        );
+        let ok: SocketAddr = "1.1.1.1:443".parse().expect("addr");
+        let w = world();
+        let g = Arc::new(RwLock::new(grants(&w, &[])));
+        let consenting = GrantsSandbox::new(Arc::clone(&g)).egress("sandbox-test", vec![ok]);
+        assert_eq!(
+            consenting.plan_at(&m, NOW).expect("plan").network(),
+            &NetworkPlan::Allow(vec![ok])
+        );
+        let other = GrantsSandbox::new(Arc::clone(&g)).egress("another-capsule", vec![ok]);
+        assert_eq!(
+            other.plan_at(&m, NOW).expect("plan").network(),
+            &NetworkPlan::DenyAll
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_inside_the_folder_refuses_the_mount() {
+        // A second name for a file elsewhere (for example a deny-listed
+        // key) would expose it through the preopen; the deny list cannot
+        // see through hard links, so the mount is refused.
+        let w = world();
+        std::fs::hard_link(&w.outside, w.project.join("linked.txt")).expect("hard link");
+        let m = manifest(r#"network = "none""#, &["read:/work"]);
+        let g = grants(&w, &[Access::Read]);
+        let err = SandboxPlan::resolve(&m, &[FsMount::new("/work", &w.project)], &g, NOW)
+            .expect_err("hard link refused");
+        assert!(err.to_string().contains("hard link"), "{err}");
     }
 
     #[test]
@@ -782,10 +1090,11 @@ tier = "bundled"
         use wasmtime_wasi::sockets::WasiSocketsView;
 
         let m = manifest(
-            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\"]",
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\"]",
             &[],
         );
-        let mut host = sandboxed_host(&SandboxPlan::without_grants(&m).expect("plan"));
+        let consent: SocketAddr = "1.1.1.1:443".parse().expect("addr");
+        let mut host = sandboxed_host(&SandboxPlan::egress_only(&m, &[consent]).expect("plan"));
         let code = |e: wasmtime_wasi::p2::SocketError| -> NetErr {
             e.downcast().expect("a socket error code, not a trap")
         };
@@ -971,3 +1280,7 @@ tier = "bundled"
         assert_eq!(err, ErrorCode::NotPermitted);
     }
 }
+
+#[cfg(test)]
+#[path = "sandbox_guest_tests.rs"]
+mod guest_tests;

@@ -118,12 +118,9 @@ async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
     // The dispatch carries the QueuedApprovalGate over `queue`, so a skill's chain effect surfaces on
     // the same queue /approvals + /status read.
     let dispatch = load_dispatch(capsule_path, queue.clone());
-    // PBA-L6b-015: list only skills the dispatch will actually run (a refused or unverified
-    // capsule is not a skill).
-    let skills: Vec<_> = match &dispatch {
-        Some(d) => skills.into_iter().filter(|s| d.has(&s.name)).collect(),
-        None => skills,
-    };
+    // PBA-L6b-015 / HUP-S2.5: list only skills the dispatch will actually run (a refused or
+    // unverified capsule is not a skill; with no dispatch nothing runs).
+    let skills = agent_sidecar::runnable_skills(skills, dispatch.as_deref());
 
     // MCP servers are started and handshaken off the async runtime (blocking I/O).
     let mcp = tokio::task::spawn_blocking(agent_sidecar::mcp_from_env)

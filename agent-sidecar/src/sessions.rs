@@ -274,6 +274,10 @@ pub struct CreateSessionReq {
     /// no file tools, and the toolchain keeps its env roots.
     #[serde(default)]
     pub grants: Option<serde_json::Value>,
+    /// HUP-S2.5: capsule folder mounts (resolved against `grants` at every call) and the member's
+    /// egress consent. Absent = capsules get no folder and no address.
+    #[serde(default)]
+    pub capsule_sandbox: Option<crate::capsule_sandbox::CapsuleSandboxDoc>,
     /// HUP-S10.3: a scheduled daemon run nobody is watching. The session starts tainted (source
     /// [`UNATTENDED_TAINT_SOURCE`]), so every effectful call needs a member's explicit decision
     /// from the first step, or is declined here when core is not `hic_aware`. Read-only calls run
@@ -360,6 +364,8 @@ pub struct Session {
     trajectory: Option<(Arc<TrajectoryRecorder>, Arc<TrajectoryConfig>)>,
     /// HUP-S2.1: present when this session was opened with a grant document.
     grants: Option<Arc<SessionGrants>>,
+    /// HUP-S2.5: what this session's capsule calls may mount and reach.
+    capsule_sandbox: Arc<crate::capsule_sandbox::SessionSandbox>,
     /// HUP-S2.9: present when this session was opened with the file tools enabled.
     files: Option<Arc<FileTools>>,
     /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
@@ -548,6 +554,8 @@ impl ToolHost for CoreHost {
 /// effects still park on the approval queue for a human).
 pub(crate) struct CapsuleHost {
     dispatch: Arc<CapsuleDispatch>,
+    /// HUP-S2.5: the session's sandbox, resolved at every call.
+    sandbox: Arc<crate::capsule_sandbox::SessionSandbox>,
 }
 
 impl ToolHost for CapsuleHost {
@@ -558,7 +566,10 @@ impl ToolHost for CapsuleHost {
             &call.arguments
         })
         .unwrap_or(serde_json::Value::Object(Default::default()));
-        match self.dispatch.call_json(&call.name, &args) {
+        match self
+            .dispatch
+            .call_json_sandboxed(&call.name, &args, self.sandbox.as_ref())
+        {
             Ok(v) => ToolOutcome::Ok(v.to_string()),
             Err(e) => ToolOutcome::Error(e.to_string()),
         }
@@ -967,6 +978,10 @@ impl SessionManager {
                 Some(Arc::new(g))
             }
         };
+        let capsule_sandbox = Arc::new(
+            crate::capsule_sandbox::SessionSandbox::new(req.capsule_sandbox, grants.clone())
+                .map_err(|e| SessionError::Invalid(format!("capsuleSandbox was refused: {e}")))?,
+        );
         let toolchain: Option<Arc<dyn ToolHost>> = match (&self.toolchain, &grants) {
             (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
@@ -1050,6 +1065,7 @@ impl SessionManager {
             skills: self.skills.clone(),
             toolchain,
             grants,
+            capsule_sandbox,
             metering,
             metering_store: self.metering.clone(),
             trajectory,
@@ -1081,7 +1097,10 @@ impl SessionManager {
             .with_host(HostKind::Core, core)
             .with_taint(session.taint.clone());
         let skill_host = session.skills.clone().map(SkillHost::new);
-        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
+        let capsule_host = capsules.map(|d| CapsuleHost {
+            dispatch: d,
+            sandbox: session.capsule_sandbox.clone(),
+        });
         let toolchain = session.toolchain.clone();
         let files = session
             .files
