@@ -144,10 +144,10 @@ impl VerifierSpec {
                     return Err(format!("unknown severity {threshold:?}"));
                 }
             }
-            VerifierSpec::ScanReportRead { tool } => {
-                if tool != SLITHER_SCAN_TOOL && tool != ADERYN_SCAN_TOOL {
-                    return Err(format!("{tool:?} is not a SARIF scanner"));
-                }
+            VerifierSpec::ScanReportRead { tool }
+                if tool != SLITHER_SCAN_TOOL && tool != ADERYN_SCAN_TOOL =>
+            {
+                return Err(format!("{tool:?} is not a SARIF scanner"));
             }
             _ => {}
         }
