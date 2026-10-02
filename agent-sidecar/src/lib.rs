@@ -265,6 +265,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/skills", get(skills))
+        // HUP-S3.2: the SKILL.md instruction skills sessions are offered, and a reload after the
+        // member saves one.
+        .route("/instruction-skills", get(instruction_skills))
+        .route(
+            "/instruction-skills/reload",
+            post(reload_instruction_skills),
+        )
         .route("/approvals", get(approvals))
         .route("/approvals/approve", post(approve_head))
         .route("/approvals/reject", post(reject_head))
@@ -437,6 +444,70 @@ async fn skills(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(st.skills.clone()))
+}
+
+/// HUP-S3.2: the instruction skills new sessions are offered (before any persona allowlist), with
+/// provenance for reviewed third-party ones, the ranking method and how many surface per turn.
+async fn instruction_skills(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let lib = st.sessions.skills();
+    let mut skills = Vec::new();
+    let mut refused = 0usize;
+    if let Some(lib) = &lib {
+        refused = lib.report().rejected.len();
+        for name in lib.names() {
+            let Some(s) = lib.get(name) else { continue };
+            let provenance = s.provenance.as_ref().map(|p| {
+                serde_json::json!({
+                    "source": p.source,
+                    "upstream": p.upstream,
+                    "commit": p.commit,
+                    "license": p.license,
+                    "path": p.path,
+                    "verdict": p.verdict,
+                    "skill_md_sha256": p.skill_md_sha256,
+                    "intake_rewrite": p.intake_rewrite,
+                })
+            });
+            skills.push(serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "source": s.source,
+                "provenance": provenance,
+            }));
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "ranker": citrate_agent_loop::skills::SkillRanker::method(&citrate_agent_loop::skills::Bm25Ranker),
+        "per_turn": citrate_agent_loop::skills::SKILLS_PER_TURN,
+        "skills": skills,
+        "refused": refused,
+    })))
+}
+
+/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). Sessions already
+/// open keep their skills; the next session gets the new library.
+async fn reload_instruction_skills(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let sessions = st.sessions.clone();
+    let reloaded = tokio::task::spawn_blocking(move || sessions.reload_skills())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut body = serde_json::json!({ "ok": true, "reloaded": reloaded.is_some() });
+    if let Some(n) = reloaded {
+        body["skills_offered"] = serde_json::json!(n);
+    }
+    Ok(Json(body))
 }
 
 async fn approvals(
@@ -1553,6 +1624,8 @@ mod learn_more_session_tests;
 mod sessions_tests;
 #[cfg(test)]
 mod sheets_session_tests;
+#[cfg(test)]
+mod instruction_skills_route_tests;
 #[cfg(test)]
 mod skills_lock_env_tests;
 #[cfg(test)]
