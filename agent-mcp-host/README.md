@@ -111,7 +111,16 @@ core writes that file with the enabled, reviewed entries.
   `Authorization` header is ever sent).
 - Automatic reconnect after a stdio server exits, re-initialising an expired HTTP
   session (a 404 is reported as an error), and acting on `tools/list_changed`.
-- The wiring of mem-mcp and citratescan (HUP-S4.3).
+
+## Servers citrate-core configures (HUP-S4.3)
+
+citrate-core writes this file (`hermes/mcp.json`, JSON) from the member's settings and sets
+`CITRATE_HERMES_MCP` only while it exists; both entries default off. `mem` is a stdio entry
+naming the citrate-core executable with `--citrate-mem-mcp-stdio <socket>`, a read-only bridge
+to the local mem-mcp daemon that lists only its read tools, annotated `readOnlyHint: true`.
+`scan` is CitrateScan's HTTP endpoint, whose tools carry the same annotation. A server whose
+tools are not annotated read-only offers nothing here unless `allow_write_tools` is set, which
+core never sets.
 
 ## Tests
 

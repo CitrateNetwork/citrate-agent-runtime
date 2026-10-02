@@ -45,6 +45,10 @@
 //!                               origin (CITRATE_HERMES_JEV_ORIGINS, CITRATE_HERMES_JEV_NON_WEB) and
 //!                               only with CITRATE_HERMES_JEV_KEY_FILE (optional)
 //!   CITRATE_HERMES_DECIDE_LOG   JSONL file for decide() metering (optional)
+//!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
+//!                               serves the /browser control routes; anything else = off (optional)
+//!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
+//!                               updater); unset = a system Chromium if one exists (optional)
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it

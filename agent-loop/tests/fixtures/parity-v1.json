@@ -43,7 +43,10 @@
     { "name": "skill_run", "host": "core", "read_only": true },
     { "name": "widget_create", "host": "core", "read_only": false },
     { "name": "models_list", "host": "core", "read_only": true },
-    { "name": "contract_deploy", "host": "core", "read_only": false }
+    { "name": "contract_deploy", "host": "core", "read_only": false },
+    { "name": "get_verified_source", "host": "core", "read_only": true },
+    { "name": "fl_round_plan", "host": "core", "read_only": true },
+    { "name": "fl_round_start", "host": "core", "read_only": false }
   ],
   "config_divergences": [
     {

@@ -25,6 +25,7 @@ mod chain_routes;
 mod checkpoint_routes;
 pub mod files;
 pub mod decide;
+pub mod browser;
 pub mod llm_http;
 pub mod metering;
 pub mod escalation;
@@ -267,6 +268,15 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/workflows", get(list_workflows))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S5.1 + S5.6: the browser (member controls for the Browser pop-out).
+        .route("/browser/status", get(browser::status))
+        .route("/browser/frame", get(browser::frame))
+        .route("/browser/stop", post(browser::stop))
+        .route("/browser/resume", post(browser::resume))
+        .route("/browser/attach", post(browser::attach))
+        .route("/browser/detach", post(browser::detach))
+        .route("/browser/origins", post(browser::origins))
+        .route("/browser/actions/decide", post(browser::decide))
         // HUP-S5.2: search status (read-only). HUP-S5.3: the decide() slot + its metering.
         .route("/search/status", get(search_status))
         .route("/decide", post(decide))
@@ -581,6 +591,10 @@ async fn stop(
     st.estop.trigger();
     // HUP-S1.1b: the kill switch halts every agent session too.
     st.sessions.stop_all();
+    // HUP-S5.1: and the browser (closes it, denies any waiting browser action, latches).
+    if let Some(b) = st.sessions.browser().cloned() {
+        let _ = tokio::task::spawn_blocking(move || b.stop()).await;
+    }
     // PBA-L6b-010: freeze + drain the approval queue so nothing parked before the stop can be
     // released after it, and running skills cannot queue new effects.
     let drained = st.queue.freeze_and_drain();
@@ -948,6 +962,10 @@ pub fn production_sessions_with(
         }
         None => mgr,
     };
+    let mgr = match browser::from_env() {
+        Some(b) => mgr.with_browser(b),
+        None => mgr,
+    };
     let mgr = match search::search_from_env() {
         Some(host) => mgr.with_search(host),
         None => mgr,
@@ -1278,6 +1296,9 @@ mod sheets_session_tests;
 mod skills_session_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod browser_session_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]

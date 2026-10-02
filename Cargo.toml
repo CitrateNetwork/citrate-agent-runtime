@@ -28,6 +28,7 @@ members = [
     "agent-office",
     "agent-workers",
     "agent-escalation",
+    "agent-browser",
 ]
 default-members = ["agent/cli"]
 resolver = "2"
