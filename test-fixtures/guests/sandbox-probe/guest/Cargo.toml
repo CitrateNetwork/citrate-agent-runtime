@@ -1,0 +1,26 @@
+# HUP-S2.5 test guest (wasm32-wasip2 component). Not part of the runtime
+# workspace and never shipped: its compiled output is the committed
+# `../capsule.wasm` fixture. Rebuild with `./build.sh` in this folder.
+[package]
+name = "sandbox-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "=0.51.0", default-features = false, features = ["macros", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+debug = false
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Standalone: keep it out of the parent workspace.
+[workspace]

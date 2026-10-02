@@ -1,0 +1,15 @@
+package citrate:sandbox-probe@0.1.0;
+
+/// HUP-S2.5 test guest: tries one filesystem or network operation from
+/// inside a capsule and reports what the host allowed. Test fixture only;
+/// never shipped, never signed.
+interface probe {
+    /// `op` is one of `read`, `write`, `list` or `connect`. `target` is a
+    /// guest path (read, write, list) or an `ip:port` (connect). Returns
+    /// `ok:<detail>` or `err:<error kind>`.
+    run: func(op: string, target: string) -> string;
+}
+
+world sandbox-probe {
+    export probe;
+}

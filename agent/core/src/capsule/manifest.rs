@@ -457,7 +457,7 @@ tier = "bundled"
     fn egress_allowed_with_exact_socket_addresses_loads() {
         let ok = WORKED_EXAMPLE.replace(
             r#"network = "none""#,
-            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\", \"[2001:db8::1]:8443\"]",
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\", \"[2606:4700:4700::1111]:8443\"]",
         );
         let m = Manifest::parse(&ok).expect("egress with an allowlist loads");
         assert_eq!(m.capability.network, NetworkPolicy::EgressAllowed);

@@ -169,6 +169,19 @@ impl SessionGrants {
         }
     }
 
+    /// HUP-S2.5: run `f` over the grant set in use now and the current time (unix seconds), for
+    /// checks that need the whole set (a capsule's folder mounts). A poisoned lock allows nothing.
+    pub fn with_folder_grants<R>(
+        &self,
+        f: impl FnOnce(&FolderGrants, u64) -> R,
+    ) -> Result<R, String> {
+        let g = self
+            .inner
+            .read()
+            .map_err(|_| "the grant set could not be read, so nothing is allowed".to_string())?;
+        Ok(f(&g, (self.clock)()))
+    }
+
     /// The toolchain project check: live read and write folder grants must both cover `dir`.
     pub fn check_project(&self, dir: &Path) -> Result<PathBuf, String> {
         let (read, rk) = self.check(dir, Op::Read)?;

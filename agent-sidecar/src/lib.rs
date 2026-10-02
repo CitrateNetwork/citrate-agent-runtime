@@ -20,6 +20,7 @@
 
 pub mod learn;
 pub mod grants;
+pub mod capsule_sandbox;
 pub mod anchor;
 mod chain_routes;
 mod checkpoint_routes;
@@ -156,6 +157,23 @@ pub fn load_skills(capsule_dir: &std::path::Path) -> Vec<SkillView> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// HUP-S2.5: the skills to list, out of `skills` (every capsule dir with a manifest): only the
+/// ones `dispatch` will actually run. A capsule refused at load (bad signature, content hash or
+/// manifest, or not allowlisted) or loaded unsigned for listing only is not a skill, and with no
+/// dispatch nothing can run, so nothing is listed.
+pub fn runnable_skills(
+    skills: Vec<SkillView>,
+    dispatch: Option<&CapsuleDispatch>,
+) -> Vec<SkillView> {
+    match dispatch {
+        Some(d) => skills
+            .into_iter()
+            .filter(|s| d.is_runnable(&s.name))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Extract a `key = "value"` string from a manifest without a TOML dep (the fields we read are flat
@@ -1284,6 +1302,8 @@ mod anchor_route_tests;
 mod mcp_session_tests;
 #[cfg(test)]
 mod metering_session_tests;
+#[cfg(test)]
+mod capsule_sandbox_tests;
 #[cfg(test)]
 mod grants_session_tests;
 #[cfg(test)]
