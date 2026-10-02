@@ -283,6 +283,37 @@ pub struct CreateSessionReq {
     /// as usual. Absent = false: nothing changes. The taint is never cleared for such a session.
     #[serde(default)]
     pub unattended: bool,
+    /// HUP-S3.3: the persona for this session. The sidecar checks it (a custom persona with the
+    /// same rules as `POST /personas/check`) and appends the fragment it renders to the system
+    /// prompt, so a fragment never has to come from app state. Absent = nothing is appended.
+    #[serde(default)]
+    pub persona: Option<SessionPersona>,
+}
+
+/// A session's persona: exactly one of a shipped persona `id` or a `custom` persona.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPersona {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub custom: Option<citrate_agent_loop::personas::CustomPersona>,
+}
+
+impl SessionPersona {
+    /// The checked persona's prompt fragment, or why it was refused.
+    pub fn fragment(&self) -> Result<String, String> {
+        use citrate_agent_loop::personas;
+        match (&self.id, &self.custom) {
+            (Some(id), None) => personas::persona_views()?
+                .into_iter()
+                .find(|v| &v.persona.id == id)
+                .map(|v| v.prompt_fragment)
+                .ok_or_else(|| "no shipped persona has that id".to_string()),
+            (None, Some(c)) => c.check().map(|v| v.prompt_fragment),
+            _ => Err("a persona is either a shipped id or a custom persona".to_string()),
+        }
+    }
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -911,6 +942,12 @@ impl SessionManager {
         }
         let mut specs = req.tools;
         let mut system_prompt = req.system_prompt;
+        if let Some(p) = &req.persona {
+            let fragment = p
+                .fragment()
+                .map_err(|e| SessionError::Invalid(format!("the persona was refused: {e}")))?;
+            system_prompt = format!("{system_prompt}\n\n{fragment}");
+        }
         let mut pinned_tools = Vec::new();
         if let Some(lib) = &self.skills {
             if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
