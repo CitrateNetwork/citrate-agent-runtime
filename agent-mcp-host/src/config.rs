@@ -443,6 +443,31 @@ url = "https://scan.example/api/mcp"
         }
     }
 
+    /// The allowlist file is checked with the same env rules as a user entry when it is loaded,
+    /// so whoever can write the file still cannot make a server load other code or inherit a
+    /// secret by reference.
+    #[test]
+    fn the_allowlist_refuses_loader_env_and_env_references_at_load() {
+        for env in [
+            "{\"LD_PRELOAD\": \"/tmp/x.so\"}",
+            "{\"DYLD_INSERT_LIBRARIES\": \"/tmp/x.dylib\"}",
+            "{\"ld_library_path\": \"/tmp\"}",
+            "{\"NODE_OPTIONS\": \"--require /tmp/x.js\"}",
+            "{\"PYTHONPATH\": \"/tmp\"}",
+            "{\"TOKEN\": \"${GITHUB_TOKEN}\"}",
+            "{\"TOKEN\": \"$OPENAI_API_KEY\"}",
+            "{\"TOKEN\": \"%APPDATA%\"}",
+            "{\"1BAD\": \"x\"}",
+        ] {
+            let json = format!(
+                "{{\"servers\": [{{\"name\": \"a\", \"transport\": \"stdio\", \"command\": \"/bin/x\", \"env\": {env}}}]}}"
+            );
+            assert!(McpConfig::parse_json(&json).is_err(), "accepted: {env}");
+        }
+        let ok = r#"{"servers": [{"name": "a", "transport": "stdio", "command": "/bin/x", "env": {"MEM_TENANT": "personal", "PRICE": "pa$$word"}}]}"#;
+        assert!(McpConfig::parse_json(ok).is_ok());
+    }
+
     #[test]
     fn loopback_http_is_allowed() {
         for u in [
