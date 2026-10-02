@@ -18,13 +18,19 @@ citrate-agent-loop = { path = "../agent-loop" }
 citrate-agent-shell = { path = "../agent-shell" }
 citrate-agent-guard = { path = "../agent-guard" }
 citrate-agent-mcp-host = { path = "../agent-mcp-host" }
+citrate-agent-learn = { path = "../agent-learn" }
+citrate-agent-records = { path = "../agent-records" }
 citrate-agent-grants = { path = "../agent-grants" }
+citrate-agent-checkpoints = { path = "../agent-checkpoints" }
+citrate-agent-office = { path = "../agent-office" }
 citrate-agent-workers = { path = "../agent-workers" }
 citrate-agent-metering = { path = "../agent-metering" }
 citrate-agent-trajectory = { path = "../agent-trajectory" }
 citrate-agent-anchor = { path = "../agent-anchor" }
 hex = "0.4"
 citrate-agent-escalation = { path = "../agent-escalation" }
+citrate-agent-search = { path = "../agent-search" }
+citrate-agent-browser = { path = "../agent-browser" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = { workspace = true }
 tokio = { workspace = true }

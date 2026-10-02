@@ -22,13 +22,15 @@
 //! and content, re-reads the saved file, and builds calldata only ([`registry`]). Nothing in this
 //! crate holds a key, signs, or sends (Rule 3); core's SignatureCeremony does the signing.
 //!
-//! The state machine is model-checked in `formal/SkillPersistence.tla`.
-//!
-//! Not wired yet: no sidecar route calls this crate today (see `README.md`).
+//! The state machine is model-checked in `formal/SkillPersistence.tla`. [`Learner::open`] keeps
+//! proposals in a file across restarts and reconciles it with the decision log
+//! (`formal/LearnRestart.tla`). The sidecar wires this crate to its learn routes and the
+//! `learn_propose` tool (see `README.md`).
 
 mod evidence;
 mod learner;
 pub mod registry;
+mod store;
 
 pub use evidence::{
     run_verified_workflow, sha256_hex, trajectory_digest, Evidence, TrajectoryRef, Unverified,
@@ -40,3 +42,4 @@ pub use learner::{
     PublishApproval, PublishParams, SkillPublishPayload, MAX_MEMORY_KEY_LEN, MAX_MEMORY_VALUE_LEN,
     MAX_PENDING, MAX_USER_TAGS, MEMORY_SCHEMA,
 };
+pub use store::{LoadReport, MAX_KEPT_DECIDED, STORE_SCHEMA};

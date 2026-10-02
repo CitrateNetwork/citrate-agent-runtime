@@ -63,6 +63,13 @@ With the toolchain in its worker process (HUP-S1.9), a grants session sends
 its current grant document with every toolchain call and the worker checks
 the project against it again.
 
+The checkpointed sidecar file tools (`fs_write`, `fs_edit`, `fs_delete`,
+`fs_rename`, HUP-S2.9) also check every write through `FolderGrants::check`,
+reading the grants file named by `CITRATE_HERMES_GRANTS` on every call; they
+are off unless `CITRATE_HERMES_FILES=1` and a checkpoint store is configured.
+Core does not yet point `CITRATE_HERMES_GRANTS` at its grant store, so for
+members these tools stay off.
+
 Not wired yet: grants for capsules in sidecar sessions, and the older
 `agent-legacy` path checks.
 
