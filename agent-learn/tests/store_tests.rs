@@ -564,3 +564,183 @@ fn a_consistent_file_needs_no_reconciling() {
     let (_, report) = env.open();
     assert_eq!(report.reconciled, 0);
 }
+
+#[test]
+fn a_resolution_whose_save_was_lost_is_still_applied_after_a_restart() {
+    let env = Env::new();
+    let run = verified_run("s1");
+    let (a, b) = {
+        let (mut l, _) = env.open();
+        let a = l
+            .propose(&run, memory("k", "one"), prov("s1"), &[])
+            .unwrap();
+        l.accept(&a.id, accept()).unwrap();
+        let b = l
+            .propose(&run, memory("k", "two"), prov("s1"), &[])
+            .unwrap();
+        l.accept(
+            &b.id,
+            MemberAccept {
+                member: "member-1".into(),
+                acknowledged_conflicts: vec![format!("proposal:{}", a.id)],
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(env.store()).unwrap();
+        l.resolve(MemberResolve {
+            member: "member-1".into(),
+            keep: a.id.clone(),
+            retract: b.id.clone(),
+        })
+        .unwrap();
+        drop(l);
+        restore_file(&env.store(), &before);
+        (a, b)
+    };
+    let (l, report) = env.open();
+    assert_eq!(report.reconciled, 1, "{report:?}");
+    match l.get(&b.id).map(|p| &p.state) {
+        Some(ProposalState::Retracted { by, kept }) => {
+            assert_eq!(by, "member-1");
+            assert_eq!(kept, &a.id);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        l.get(&a.id).map(|p| &p.state),
+        Some(ProposalState::Persisted)
+    ));
+}
+
+#[test]
+fn a_retracted_proposal_is_restored_from_the_file() {
+    let env = Env::new();
+    let run = verified_run("s1");
+    let b = {
+        let (mut l, _) = env.open();
+        let a = l
+            .propose(&run, memory("k", "one"), prov("s1"), &[])
+            .unwrap();
+        l.accept(&a.id, accept()).unwrap();
+        let b = l
+            .propose(&run, memory("k", "two"), prov("s1"), &[])
+            .unwrap();
+        l.accept(
+            &b.id,
+            MemberAccept {
+                member: "member-1".into(),
+                acknowledged_conflicts: vec![format!("proposal:{}", a.id)],
+            },
+        )
+        .unwrap();
+        l.resolve(MemberResolve {
+            member: "member-1".into(),
+            keep: a.id.clone(),
+            retract: b.id.clone(),
+        })
+        .unwrap();
+        b
+    };
+    let (l, report) = env.open();
+    assert_eq!(report.reconciled, 0, "{report:?}");
+    assert!(report.dropped.is_empty(), "{report:?}");
+    assert!(matches!(
+        l.get(&b.id).map(|p| &p.state),
+        Some(ProposalState::Retracted { .. })
+    ));
+}
+
+#[test]
+fn a_resolution_is_applied_even_when_the_accept_before_it_was_lost_too() {
+    // Found by formal/ContradictionResolve.tla: the file lost both the accept and the resolve of
+    // the retracted memory. The log has both; the memory must come back retracted, not offered
+    // for accepting again (which would bring back what the member set aside).
+    let env = Env::new();
+    let run = verified_run("s1");
+    let (a, b) = {
+        let (mut l, _) = env.open();
+        let a = l
+            .propose(&run, memory("k", "one"), prov("s1"), &[])
+            .unwrap();
+        l.accept(&a.id, accept()).unwrap();
+        let b = l
+            .propose(&run, memory("k", "two"), prov("s1"), &[])
+            .unwrap();
+        let before = std::fs::read(env.store()).unwrap();
+        l.accept(
+            &b.id,
+            MemberAccept {
+                member: "member-1".into(),
+                acknowledged_conflicts: vec![format!("proposal:{}", a.id)],
+            },
+        )
+        .unwrap();
+        l.resolve(MemberResolve {
+            member: "member-1".into(),
+            keep: a.id.clone(),
+            retract: b.id.clone(),
+        })
+        .unwrap();
+        drop(l);
+        restore_file(&env.store(), &before);
+        (a, b)
+    };
+    let (mut l, report) = env.open();
+    assert_eq!(report.reconciled, 1, "{report:?}");
+    match l.get(&b.id).map(|p| &p.state) {
+        Some(ProposalState::Retracted { kept, .. }) => assert_eq!(kept, &a.id),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        l.accept(&b.id, accept()),
+        Err(LearnError::WrongState { .. })
+    ));
+}
+
+#[test]
+fn a_memory_offered_again_after_a_lost_save_still_counts_as_accepted_for_contradictions() {
+    // Found by formal/ContradictionResolve.tla: the accept of `a` was recorded and core may hold
+    // its record, but the file lost it, so `a` is offered again. A later memory that disagrees
+    // must be a contradiction (stored as `both`), not a plain pending clash stored as `true`.
+    let env = Env::new();
+    let run = verified_run("s1");
+    let a = {
+        let (mut l, _) = env.open();
+        let a = l
+            .propose(&run, memory("k", "one"), prov("s1"), &[])
+            .unwrap();
+        let before = std::fs::read(env.store()).unwrap();
+        l.accept(&a.id, accept()).unwrap();
+        drop(l);
+        restore_file(&env.store(), &before);
+        a
+    };
+    let (mut l, _) = env.open();
+    assert!(matches!(
+        l.get(&a.id).map(|p| &p.state),
+        Some(ProposalState::PersistFailed { .. })
+    ));
+    let b = l
+        .propose(&run, memory("k", "two"), prov("s1"), &[])
+        .unwrap();
+    let a_ref = format!("proposal:{}", a.id);
+    assert_eq!(b.conflicts.len(), 1, "{:?}", b.conflicts);
+    assert_eq!(b.conflicts[0].kind, ConflictKind::Contradiction);
+    assert_eq!(b.conflicts[0].existing_id, a_ref);
+    let rec = l
+        .accept(
+            &b.id,
+            MemberAccept {
+                member: "member-1".into(),
+                acknowledged_conflicts: vec![a_ref.clone()],
+            },
+        )
+        .unwrap();
+    match rec {
+        Persisted::Memory(m) => {
+            assert_eq!(m.belnap, Belnap::Both);
+            assert_eq!(m.contradicts, vec![a_ref]);
+        }
+        other => panic!("{other:?}"),
+    }
+}

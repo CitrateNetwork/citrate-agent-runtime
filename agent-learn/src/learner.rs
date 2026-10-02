@@ -27,6 +27,10 @@ pub const MAX_PENDING: usize = 256;
 pub const MAX_USER_TAGS: usize = 8;
 /// The schema tag of a [`MemoryRecord`].
 pub const MEMORY_SCHEMA: &str = "citrate.learn.memory.v1";
+/// The schema tag of a [`Resolution`].
+pub const RESOLUTION_SCHEMA: &str = "citrate.learn.resolve.v1";
+/// The decision-log kind of a contradiction resolution.
+const RESOLVE_KIND: &str = "learn.memory.resolve";
 /// Longest reject reason kept, in characters (in the proposal and in the decision log).
 const MAX_REASON_CHARS: usize = 1000;
 /// Tag added to every publish so readers can tell learned skills apart.
@@ -112,6 +116,13 @@ pub enum ProposalState {
     Persisted,
     /// A publish payload was built for the ceremony. Nothing was sent.
     PublishPrepared,
+    /// An accepted memory the member set aside when resolving a contradiction: `kept` is the
+    /// proposal whose value they chose instead. Kept for the record (Belnap `false`), never
+    /// deleted, and no longer counted as known.
+    Retracted {
+        by: String,
+        kept: String,
+    },
 }
 
 impl ProposalState {
@@ -122,6 +133,7 @@ impl ProposalState {
             ProposalState::PersistFailed { .. } => "persist_failed",
             ProposalState::Persisted => "persisted",
             ProposalState::PublishPrepared => "publish_prepared",
+            ProposalState::Retracted { .. } => "retracted",
         }
     }
     fn awaiting_decision(&self) -> bool {
@@ -199,6 +211,34 @@ pub enum Persisted {
         content_sha256: String,
     },
     Memory(Box<MemoryRecord>),
+}
+
+/// The member resolves a contradiction between two accepted memories: keep one, retract the
+/// other. Both must be persisted memories on the same key (case and spacing ignored) with
+/// different values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberResolve {
+    pub member: String,
+    /// The proposal whose value the member keeps.
+    pub keep: String,
+    /// The proposal the member retracts.
+    pub retract: String,
+}
+
+/// A resolved contradiction, for core to apply to its ledger and memory graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    pub schema: String,
+    pub kept: String,
+    pub retracted: String,
+    pub key: String,
+    pub kept_value: String,
+    pub retracted_value: String,
+    pub decided_by: String,
+    pub decided_at_ms: u64,
+    /// `seq` of the HIC-1 decision record in the local decision log.
+    pub decision_seq: u64,
 }
 
 /// The member's explicit approval to prepare a publish of this exact proposal and content.
@@ -294,6 +334,8 @@ pub enum LearnError {
     InvalidPublish(String),
     #[error("could not save the proposals file: {0}")]
     Store(String),
+    #[error("not a contradiction: {0}")]
+    NotAContradiction(String),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -519,7 +561,8 @@ impl Learner {
     /// a recorded reject is final; a recorded, completed skill accept whose file is on disk is
     /// persisted; a recorded publish is prepared. A recorded memory accept is offered again
     /// (`persist_failed`): its record may never have reached core, and core keys records by
-    /// proposal id, so accepting again is safe. Returns how many proposals moved.
+    /// proposal id, so accepting again is safe. A recorded resolution retracts the memory it set
+    /// aside (`formal/ContradictionResolve.tla`). Returns how many proposals moved.
     fn reconcile_with_log(&mut self) -> Result<usize, String> {
         use citrate_agent_records::Entry;
         let mut records =
@@ -533,15 +576,16 @@ impl Learner {
                 outcomes.insert(o.decision_seq, o.outcome);
             }
         }
-        // proposal id -> latest (seq, kind, decision, actor, reason)
-        let mut latest: BTreeMap<String, (u64, String, Decision, String, String)> = BTreeMap::new();
+        // proposal id -> latest (seq, kind, decision, actor, reason, kept)
+        type Latest = (u64, String, Decision, String, String, Option<String>);
+        let mut latest: BTreeMap<String, Latest> = BTreeMap::new();
         for r in &records {
             let Entry::Decision(d) = &r.record.entry else {
                 continue;
             };
             if !matches!(
                 d.kind.as_str(),
-                "learn.skill" | "learn.memory" | "skill.publish"
+                "learn.skill" | "learn.memory" | "skill.publish" | RESOLVE_KIND
             ) {
                 continue;
             }
@@ -552,6 +596,11 @@ impl Learner {
             else {
                 continue;
             };
+            let kept = d
+                .evidence
+                .iter()
+                .find_map(|e| e.uri.strip_prefix("learn:kept/"))
+                .map(str::to_string);
             latest.insert(
                 id.to_string(),
                 (
@@ -560,13 +609,14 @@ impl Learner {
                     d.decision,
                     r.record.actor.id.clone(),
                     d.reason.clone(),
+                    kept,
                 ),
             );
         }
         let mut moved = 0;
         let ids: Vec<String> = self.proposals.keys().cloned().collect();
         for id in ids {
-            let Some((seq, kind, decision, actor, reason)) = latest.get(&id).cloned() else {
+            let Some((seq, kind, decision, actor, reason, kept)) = latest.get(&id).cloned() else {
                 continue;
             };
             let Some(p) = self.proposals.get(&id) else {
@@ -600,6 +650,18 @@ impl Learner {
                 }
                 (ProposalState::Persisted, "skill.publish", Decision::Approved) => {
                     Some(ProposalState::PublishPrepared)
+                }
+                // A recorded resolution retracts the memory whatever the file says: the resolve
+                // needed a completed accept, so a file that also lost that accept (proposed or
+                // persist_failed) must not offer the memory for accepting again.
+                (
+                    ProposalState::Proposed
+                    | ProposalState::PersistFailed { .. }
+                    | ProposalState::Persisted,
+                    RESOLVE_KIND,
+                    Decision::Approved,
+                ) if p.kind == ProposalKind::Memory => {
+                    kept.map(|kept| ProposalState::Retracted { by: actor, kept })
                 }
                 _ => None,
             };
@@ -785,7 +847,12 @@ impl Learner {
             }
             // A memory accepted from this learner is a known memory too, even before core
             // passes it back in `known`: a later proposal that disagrees is a contradiction.
-            let accepted = matches!(p.state, ProposalState::Persisted);
+            // A memory in `persist_failed` was accepted too: a memory's persist only fails when
+            // a restart found its accept recorded but not saved, and core may already hold it
+            // (formal/ContradictionResolve.tla). A retracted memory is no longer known.
+            let accepted = matches!(p.state, ProposalState::Persisted)
+                || (p.kind == ProposalKind::Memory
+                    && matches!(p.state, ProposalState::PersistFailed { .. }));
             if !accepted && !p.state.awaiting_decision() {
                 continue;
             }
@@ -1190,6 +1257,105 @@ impl Learner {
             name,
             path,
             content_sha256: p.content_sha256.clone(),
+        })
+    }
+
+    /// The member resolves a contradiction between two accepted memories: `keep` stays, `retract`
+    /// is retracted (kept for the record, no longer known). The HIC-1 decision is written to the
+    /// log first; the retracted proposal changes state only after it is recorded. Returns the
+    /// [`Resolution`] core applies to its ledger and memory graph.
+    pub fn resolve(&mut self, r: MemberResolve) -> Result<Resolution, LearnError> {
+        if r.member.trim().is_empty() {
+            return Err(LearnError::MemberRequired);
+        }
+        let keep = self.lookup(&r.keep)?.clone();
+        let drop = self.lookup(&r.retract)?.clone();
+        if keep.id == drop.id {
+            return Err(LearnError::NotAContradiction(
+                "a memory cannot be kept and retracted at once".into(),
+            ));
+        }
+        let (
+            ProposalContent::Memory { key: kk, value: kv },
+            ProposalContent::Memory { key: dk, value: dv },
+        ) = (&keep.content, &drop.content)
+        else {
+            return Err(LearnError::NotAContradiction(
+                "only two memories can be resolved".into(),
+            ));
+        };
+        for p in [&keep, &drop] {
+            if !matches!(p.state, ProposalState::Persisted) {
+                return Err(Self::wrong_state(p));
+            }
+        }
+        if norm_key(kk) != norm_key(dk) {
+            return Err(LearnError::NotAContradiction(
+                "the two memories are about different keys".into(),
+            ));
+        }
+        if collapse(kv) == collapse(dv) {
+            return Err(LearnError::NotAContradiction(
+                "the two memories say the same thing".into(),
+            ));
+        }
+        let mut evidence = Self::evidence_refs(&drop);
+        evidence.truncate(MAX_EVIDENCE.saturating_sub(1));
+        evidence.insert(
+            1,
+            EvidenceRef {
+                kind: "kept".into(),
+                uri: format!("learn:kept/{}", keep.id),
+                digest: Some(keep.content_sha256.clone()),
+            },
+        );
+        evidence.truncate(MAX_EVIDENCE);
+        let key: String = collapse(kk).chars().take(200).collect();
+        let actor = Actor::member(r.member.as_str());
+        let receipt = self
+            .log
+            .record_decision(
+                actor.clone(),
+                DecisionEvent {
+                    tier: HicTier::Hic1,
+                    kind: RESOLVE_KIND.into(),
+                    subject: format!(
+                        "resolve memory {key}: keep {}, retract {}",
+                        keep.id, drop.id
+                    ),
+                    decision: Decision::Approved,
+                    reason: "member resolved a contradiction between two learned memories".into(),
+                    evidence,
+                },
+            )
+            .map_err(|e| LearnError::Record(e.to_string()))?;
+        if let Some(stored) = self.proposals.get_mut(&drop.id) {
+            stored.state = ProposalState::Retracted {
+                by: r.member.clone(),
+                kept: keep.id.clone(),
+            };
+        }
+        self.save_after_decision();
+        self.log
+            .record_outcome(
+                actor,
+                OutcomeEvent {
+                    decision_seq: receipt.seq,
+                    outcome: Outcome::Completed,
+                    detail: format!("{} retracted in favour of {}", drop.id, keep.id),
+                },
+            )
+            .map_err(|e| LearnError::Record(e.to_string()))?;
+        Ok(Resolution {
+            schema: RESOLUTION_SCHEMA.into(),
+            kept: keep.id,
+            retracted: drop.id,
+            key: kk.clone(),
+            kept_value: kv.clone(),
+            retracted_value: dv.clone(),
+            decided_by: r.member,
+            decided_at_ms: receipt.ts_ms,
+            decision_seq: receipt.seq,
         })
     }
 

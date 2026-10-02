@@ -12,8 +12,11 @@
 //! What it serves:
 //!
 //! - The learn routes (`/learn/...`, in `lib.rs`): propose from a verified workflow run of a
-//!   session, list, accept, reject, and build the SkillRegistry publish payload. A memory accept
-//!   returns the typed memory record for core to store; the sidecar stores no memories.
+//!   session, list, accept, reject, resolve a contradiction between two accepted memories (keep
+//!   one, retract the other), and build the SkillRegistry publish payload. A memory accept
+//!   returns the typed memory record for core to store; the sidecar stores no memories. A skill
+//!   accept reloads the skills library, so the skill is offered to the next session without a
+//!   restart.
 //! - The `learn_propose` tool, offered to every session while learning is on. Hermes calls it to
 //!   propose a skill or memory from the session's last verified workflow run. It only proposes:
 //!   the member decides in the app, and nothing is persisted by the tool.
@@ -27,8 +30,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use citrate_agent_learn::{
-    KnownMemory, LearnConfig, LearnError, Learner, LoadReport, MemberAccept, Persisted, Proposal,
-    ProposalContent, Provenance, PublishApproval, PublishParams, SkillPublishPayload,
+    KnownMemory, LearnConfig, LearnError, Learner, LoadReport, MemberAccept, MemberResolve,
+    Persisted, Proposal, ProposalContent, Provenance, PublishApproval, PublishParams, Resolution,
+    SkillPublishPayload,
 };
 use citrate_agent_loop::skills::SkillSource;
 use citrate_agent_loop::{
@@ -87,7 +91,8 @@ impl From<LearnError> for LearnRefusal {
             | LearnError::TooManyPending
             | LearnError::NotASkill
             | LearnError::ApprovalMismatch
-            | LearnError::ContentChanged => LearnRefusal::conflict(message),
+            | LearnError::ContentChanged
+            | LearnError::NotAContradiction(_) => LearnRefusal::conflict(message),
             LearnError::Record(_) | LearnError::Persist(_) | LearnError::Store(_) => {
                 LearnRefusal::Failed(message)
             }
@@ -285,6 +290,11 @@ impl LearnService {
 
     pub fn reject(&self, id: &str, member: &str, reason: &str) -> Result<(), LearnRefusal> {
         Ok(self.lock().reject(id, member, reason)?)
+    }
+
+    /// The member keeps one of two contradicting learned memories and retracts the other.
+    pub fn resolve(&self, r: MemberResolve) -> Result<Resolution, LearnRefusal> {
+        Ok(self.lock().resolve(r)?)
     }
 
     pub fn publish(

@@ -291,6 +291,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/learn/proposals/:pid/accept", post(learn_accept))
         .route("/learn/proposals/:pid/reject", post(learn_reject))
         .route("/learn/proposals/:pid/publish", post(learn_publish))
+        .route("/learn/memories/resolve", post(learn_resolve))
         // HUP-S2.9: undo checkpoints for agent file changes (member actions, never tools).
         .route("/checkpoints/:session", get(checkpoint_routes::list_steps))
         .route(
@@ -832,6 +833,12 @@ pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>
         return None;
     }
     let lib = citrate_agent_loop::skills::SkillLibrary::load(&sources);
+    log_skill_report(&lib);
+    Some(Arc::new(lib))
+}
+
+/// What the skills loader refused or shadowed, for the operator (stderr), never the model.
+fn log_skill_report(lib: &citrate_agent_loop::skills::SkillLibrary) {
     for r in &lib.report().rejected {
         eprintln!(
             "citrate-agent-sidecar: skill refused: {}: {}",
@@ -849,7 +856,6 @@ pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>
         "citrate-agent-sidecar: {} instruction skills loaded",
         lib.len()
     );
-    Some(Arc::new(lib))
 }
 
 /// HUP-S4.1: read and validate an MCP allowlist file and connect to its servers. `Ok(None)` for
@@ -926,9 +932,19 @@ pub fn production_sessions_with(
         Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
         None => mgr,
     };
-    let mgr = match skills_from_env() {
-        Some(lib) => mgr.with_skills(lib),
-        None => mgr,
+    // HUP-S3.2: the skills library. HUP-S3.4: kept with its sources, so a learned skill the
+    // member accepts is offered to the next session without a restart.
+    let sources =
+        skill_sources_from_env(&std::env::var("CITRATE_HERMES_SKILLS").unwrap_or_default());
+    let mgr = if sources.is_empty() {
+        mgr
+    } else {
+        let mgr = mgr.with_skill_sources(sources);
+        match mgr.skills() {
+            Some(lib) => log_skill_report(&lib),
+            None => eprintln!("citrate-agent-sidecar: 0 instruction skills loaded"),
+        }
+        mgr
     };
     // HUP-S1.9: the toolchain runs in its own supervised worker process (this binary started
     // with `--worker toolchain`), so a crash there never takes the loop down.
@@ -1289,6 +1305,8 @@ mod grants_session_tests;
 #[cfg(test)]
 mod learn_session_tests;
 #[cfg(test)]
+mod learn_more_session_tests;
+#[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
 mod sheets_session_tests;
@@ -1468,7 +1486,30 @@ async fn learn_accept(
     let decision: citrate_agent_learn::MemberAccept = serde_json::from_slice(&body)
         .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad accept: {e}")))?;
     let out = svc.accept(&pid, decision).map_err(refusal)?;
-    Ok(Json(serde_json::json!({ "ok": true, "persisted": out })))
+    let mut body = serde_json::json!({ "ok": true, "persisted": out });
+    if matches!(out, learn::AcceptedView::Skill { .. }) {
+        // HUP-S3.4: offer the saved skill to the next session without a restart.
+        let reloaded = st.sessions.reload_skills();
+        body["skills_reloaded"] = serde_json::Value::Bool(reloaded.is_some());
+        if let Some(n) = reloaded {
+            body["skills_offered"] = serde_json::json!(n);
+        }
+    }
+    Ok(Json(body))
+}
+
+/// The member resolves a contradiction between two learned memories (HIC-1, recorded first):
+/// keep one, retract the other. Returns the resolution for core's ledger and memory graph.
+async fn learn_resolve(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: citrate_agent_learn::MemberResolve = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad resolve: {e}")))?;
+    let r = svc.resolve(req).map_err(refusal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "resolution": r })))
 }
 
 #[derive(Deserialize)]
