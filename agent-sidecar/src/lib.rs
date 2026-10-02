@@ -284,6 +284,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/decide/outcomes", post(decide_outcome))
         // HUP-S3.4: verified workflow runs and verified self-learning.
         .route("/sessions/:id/workflows", post(start_workflow))
+        .route("/sessions/:id/track_workflows", post(start_track_workflow))
         .route("/sessions/:id/workflows/:run", get(workflow_run))
         .route("/learn/status", get(learn_status))
         .route("/learn/proposals", post(learn_propose).get(learn_list))
@@ -652,7 +653,15 @@ async fn create_session(
         )
     })?;
     match st.sessions.create(req) {
-        Ok(id) => Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id })))),
+        Ok(id) => {
+            // HUP-S3.3: say what the persona did (offered skills, missing ones, pinned tools).
+            let persona = st.sessions.get(&id).and_then(|s| s.persona().cloned());
+            let body = match persona {
+                Some(p) => serde_json::json!({ "id": id, "persona": p }),
+                None => serde_json::json!({ "id": id }),
+            };
+            Ok((StatusCode::CREATED, Json(body)))
+        }
         Err(e) => {
             let msg = match &e {
                 sessions::SessionError::Invalid(m) => m.clone(),
@@ -1230,17 +1239,42 @@ async fn check_brief(
 
 // ---- HUP-S3.3 + S3.7: personas + track workflows ----
 
+/// A shipped persona as `GET /personas` serves it: the view plus which of its allowlisted skills
+/// this sidecar has installed.
+#[derive(Serialize)]
+struct PersonaListing {
+    #[serde(flatten)]
+    view: personas::PersonaView,
+    /// Allowlisted skills in this sidecar's library (what a session with this persona offers).
+    skills_installed: Vec<String>,
+}
+
 /// The shipped personas, each with the prompt fragment a client appends when it is active.
 async fn list_personas(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
-) -> Result<Json<Vec<personas::PersonaView>>, JsonErr> {
+) -> Result<Json<Vec<PersonaListing>>, JsonErr> {
     if !authorized(&headers, &st.bearer) {
         return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
-    personas::persona_views()
-        .map(Json)
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+    let views =
+        personas::persona_views().map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    let lib = st.sessions.skills_library();
+    Ok(Json(
+        views
+            .into_iter()
+            .map(|view| PersonaListing {
+                skills_installed: view
+                    .persona
+                    .skills
+                    .iter()
+                    .filter(|k| lib.is_some_and(|l| l.get(k).is_some()))
+                    .cloned()
+                    .collect(),
+                view,
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1265,17 +1299,135 @@ async fn check_persona(
         .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))
 }
 
-/// Every track's workflow family (definitions; the verifiers are named, not run).
+/// A workflow as `GET /workflows` serves it: the view plus, when this sidecar cannot host a tool
+/// the workflow needs, why it cannot run here.
+#[derive(Serialize)]
+struct WorkflowListing {
+    #[serde(flatten)]
+    view: workflows::WorkflowView,
+    /// `None` = this sidecar hosts every sidecar tool the workflow needs. Core-hosted tools
+    /// (journal_read, ...) depend on the session's own tool list and are checked at start.
+    unavailable: Option<String>,
+}
+
+/// Why this sidecar cannot run a workflow needing `needs`, if it cannot.
+fn sidecar_unavailable(st: &AppState, needs: &[String]) -> Option<String> {
+    if st.sessions.toolchain_enabled() {
+        return None;
+    }
+    let missing: Vec<&str> = needs
+        .iter()
+        .map(String::as_str)
+        .filter(|t| toolchain::ToolchainHost::handles(t))
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "needs the contract toolchain ({}), which is off in this app",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Every track's workflow family (definitions; the verifiers are named, not run). A session runs
+/// one with `POST /sessions/:id/track_workflows`.
 async fn list_workflows(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
-) -> Result<Json<Vec<workflows::WorkflowView>>, JsonErr> {
+) -> Result<Json<Vec<WorkflowListing>>, JsonErr> {
     if !authorized(&headers, &st.bearer) {
         return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
-    workflows::workflow_views()
-        .map(Json)
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+    let views =
+        workflows::workflow_views().map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(
+        views
+            .into_iter()
+            .map(|view| WorkflowListing {
+                unavailable: sidecar_unavailable(&st, &view.needs_tools),
+                view,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackWorkflowReq {
+    workflow: String,
+}
+
+/// HUP-S3.3 (US-3.3 AC2): run a track's catalog workflow in a session, by id. The steps and
+/// verifiers are the bundled catalog's, never the client's. Refused (422, naming the tools) when
+/// the session does not offer a tool a pass needs, so a workflow never starts that cannot finish.
+async fn start_track_workflow(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    let Some(session) = st.sessions.get(&id) else {
+        return Err(json_err(StatusCode::NOT_FOUND, "no such session"));
+    };
+    let req: TrackWorkflowReq = serde_json::from_slice(&body).map_err(|e| {
+        json_err(
+            StatusCode::BAD_REQUEST,
+            &format!("bad track workflow request: {e}"),
+        )
+    })?;
+    let spec = workflows::find_workflow(&req.workflow)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))?
+        .ok_or_else(|| {
+            json_err(
+                StatusCode::NOT_FOUND,
+                "no such track workflow; see GET /workflows",
+            )
+        })?;
+    let offered = session.tool_names();
+    let missing: Vec<String> = spec
+        .required_tools()
+        .into_iter()
+        .filter(|t| !offered.contains(t))
+        .collect();
+    if !missing.is_empty() {
+        let mut reason = format!(
+            "this workflow needs {}, which this conversation does not offer",
+            missing.join(", ")
+        );
+        if let Some(why) = sidecar_unavailable(&st, &missing) {
+            reason = format!("this workflow {why}");
+        }
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": reason, "missing_tools": missing })),
+        ));
+    }
+    let wf = spec
+        .build()
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    let run_id = st
+        .sessions
+        .run_workflow(&id, wf, st.dispatch.clone())
+        .map_err(|e| json_err(session_status(&e), "the session refused the workflow"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "run_id": run_id,
+            "workflow_id": spec.id,
+            "track": spec.track,
+            "evidence": spec.evidence(),
+        })),
+    ))
 }
 
 #[cfg(test)]
@@ -1523,3 +1675,5 @@ mod escalation_tests;
 mod mcp_probe_tests;
 #[cfg(test)]
 mod personas_route_tests;
+#[cfg(test)]
+mod track_workflow_route_tests;

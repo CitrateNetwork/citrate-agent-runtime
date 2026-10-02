@@ -4,7 +4,7 @@ summary = "Landing pages, posts, posters and copy."
 persona = "Maker"
 skills = ["frontend-design", "copywriting", "landing-pages"]
 workflow = "creative-project"
-workflow_available = false
+workflow_available = true
 ships_in = "HUP-S3"
 gates = [
   "You review the preview before anything is published",

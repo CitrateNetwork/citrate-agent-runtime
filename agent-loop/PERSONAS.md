@@ -3,6 +3,7 @@ created: 2026-10-01
 branch: hup/n4-personas
 author: Larry Klosowski + Claude Opus 5.5
 status: active (persona names pending owner sign-off)
+updated: 2026-10-01 (hup/n5-personas-rest: sessions apply the persona, track workflows run from a session)
 ---
 
 # Personas, tracks and track workflows (HUP-S3.3 + S3.7)
@@ -11,8 +12,9 @@ Code: [`src/personas.rs`](src/personas.rs), [`src/workflows.rs`](src/workflows.r
 [`src/interview.rs`](src/interview.rs) (tracks). Data: [`personas/personas.toml`](personas/personas.toml),
 [`tracks/workflows.toml`](tracks/workflows.toml), `tracks/*.toml`. Tests:
 [`tests/persona_tests.rs`](tests/persona_tests.rs),
-[`tests/track_workflow_bdd_tests.rs`](tests/track_workflow_bdd_tests.rs) and
-`agent-sidecar/src/personas_route_tests.rs`. Planset: citrate-core
+[`tests/track_workflow_bdd_tests.rs`](tests/track_workflow_bdd_tests.rs),
+[`tests/persona_session_tests.rs`](tests/persona_session_tests.rs),
+`agent-sidecar/src/personas_route_tests.rs` and `agent-sidecar/src/track_workflow_route_tests.rs`. Planset: citrate-core
 `.agentile/planset/2026-09-30-hermes-upskill/` (US-3.3 in `04_FEATURES_BDD.md`, D-9 and D-10 in
 `00_OVERVIEW.md`, names in `09_PERSONAS_DRAFT.md`).
 
@@ -44,9 +46,10 @@ Guide and Operator have no dedicated track among the five launch tracks; they de
 nearest family (the hello-mint path as a learning checklist, and the status note). This is an
 owner call to confirm.
 
-No persona sets `tts_voice`. Unset means the system voice. A value is a voice id the platform's
-existing speech engine knows; personas add no speech engine. Nothing passes it to the speech
-engine yet, so clients show a set value as stored, not used.
+No persona sets `tts_voice` (an owner decision; unset means the system voice). A value is a voice
+id the platform's existing speech engine knows; personas add no speech engine. citrate-core's
+"Read replies aloud" option (off by default) passes it to the app's speech engine, falling back to
+the system voice when the id is not installed.
 
 ## The fragment
 
@@ -64,13 +67,36 @@ identifier-shaped tool names and slug skill names. Its default workflow is its t
 The sidecar exposes it as `POST /personas/check`; citrate-core stores the accepted persona with the
 member's local settings.
 
+## A persona in a session
+
+`POST /sessions` takes `persona` (a shipped id) or `customPersona` (checked with the same rules as
+`POST /personas/check`), never both. The client still composes the prompt fragment. The session
+applies the rest of the bundle (`SessionPersona`):
+
+- **Skill allowlist.** The session offers only the allowlisted skills that are installed
+  (`SkillLibrary::restricted_to`): only they are listed in the skill index and only they load with
+  `skill_load`. An allowlist with nothing installed offers no skills and no `skill_load`, never
+  other skills. A persona with an empty allowlist (a custom persona that names none) leaves the
+  skills unchanged.
+- **Tool emphasis.** Up to four emphasised tools that the session already offers are pinned into
+  every request (`SessionPersona::pinned_tools`), so retrieval cannot drop them. A tool the session
+  does not offer is ignored: a persona never grants a tool.
+
+The answer carries `persona`: `skills_offered`, `skills_missing`, `skills_restricted` and
+`pinned_tools`, so the app can say what the persona changed. With no persona, nothing changes.
+
+Shipped allowlists name skills from the reviewed corpus (citrate-core `skills.lock`, verdict
+`include-*`) and the app's bundled `citrate-*` skills. Which of them are installed depends on the
+corpus the app ships (HUP-S3.1); `GET /personas` reports it per persona as `skills_installed`.
+
 ## Sidecar routes (bearer-gated)
 
 | Route | Returns |
 |---|---|
-| `GET /personas` | every shipped persona, its `prompt_fragment`, `name_pending_sign_off` |
+| `GET /personas` | every shipped persona, its `prompt_fragment`, `name_pending_sign_off`, `skills_installed` |
 | `POST /personas/check` `{persona}` | the custom persona's view with its fragment, or 422 with the reason |
-| `GET /workflows` | every track's workflows: steps, verifier names, tools, `evidence`, `is_default` |
+| `GET /workflows` | every track's workflows: steps, verifier names, tools, `needs_tools`, `evidence`, `is_default`, and `unavailable` (why this sidecar cannot run it, e.g. the toolchain is off) |
+| `POST /sessions/:id/track_workflows` `{workflow}` | 202 `{run_id, workflow_id, track, evidence}`; 404 for an unknown workflow; 422 `{error, missing_tools}` when the session does not offer a tool a pass needs. Read the run with `GET /sessions/:id/workflows/:run` |
 
 ## Track workflows
 
@@ -85,8 +111,13 @@ member's local settings.
 `tool-report` workflows are judged by the toolchain's own reports (forge, slither, aderyn, medusa)
 or a tool's result. `answer-shape` workflows check the answer's structure and guard tools that
 must not run (no deploy, no journal write before approval); they are weaker by design, and the app
-labels them. No session route runs workflows yet, so each track keeps `workflow_available = false`.
-The hello-mint anvil-fork dry run and deploy belong to the deploy gate (HUP-S6.4), not this list.
+labels them. A session runs a catalog workflow by id (`POST /sessions/:id/track_workflows`); the
+steps and verifiers always come from the bundled catalog, never from the client. Every track says
+`workflow_available = true`. The contract and hello-mint workflows need the contract toolchain
+(`CITRATE_HERMES_TOOLCHAIN`, off by default), so on a default install they are refused with that
+reason. The code track's default workflow stays answer-shape until a general test-runner tool
+ships. The hello-mint anvil-fork dry run and deploy belong to the deploy gate (HUP-S6.4), not this
+list.
 
 ## BDD, one scenario group per track
 
@@ -141,6 +172,9 @@ Feature: Personas and tracks (US-3.3)
 ```
 
 Each scenario maps to a test in `tests/track_workflow_bdd_tests.rs` (`track_<id>_...`) or
-`tests/persona_tests.rs`. The satisfying run is generated from the workflow's own verifiers, so a
+`tests/persona_tests.rs`, and again through the session route in
+`agent-sidecar/src/track_workflow_route_tests.rs` (`track_<id>_...`: every workflow of every
+family, a satisfying model verified and a claiming model not, the toolchain judged by real reports,
+core calls answered as core would). The satisfying run is generated from the workflow's own verifiers, so a
 new workflow is covered by `every_secondary_workflow_also_finishes_on_a_satisfying_run` as soon as
 it is added to the catalog.

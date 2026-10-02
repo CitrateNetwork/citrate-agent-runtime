@@ -769,6 +769,33 @@ impl SkillLibrary {
         SkillLibrary::default()
     }
 
+    /// HUP-S3.3: this library cut down to a persona's skill allowlist. Returns the skills that are
+    /// both loaded and allowed, plus the allowlisted names that are not loaded (in allowlist
+    /// order), so a client can say which are missing. The load report is kept as is.
+    pub fn restricted_to(&self, allow: &[String]) -> (SkillLibrary, Vec<String>) {
+        let mut skills = BTreeMap::new();
+        let mut missing = Vec::new();
+        for name in allow {
+            match self.skills.get(name) {
+                Some(s) => {
+                    skills.insert(name.clone(), s.clone());
+                }
+                None => {
+                    if !missing.contains(name) {
+                        missing.push(name.clone());
+                    }
+                }
+            }
+        }
+        (
+            SkillLibrary {
+                skills,
+                report: self.report.clone(),
+            },
+            missing,
+        )
+    }
+
     /// Load every source, in precedence order (first wins). Never fails: anything refused is in
     /// [`SkillLibrary::report`].
     pub fn load(sources: &[SkillSource]) -> Self {
