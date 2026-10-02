@@ -278,7 +278,7 @@ fn in_the_loop_reading_a_page_taints_and_the_next_click_waits_for_the_member() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     let stop = StopFlag::default();
     let registry = ToolRegistry::new(tools::specs()).with_host(
         HostKind::Sidecar,
@@ -382,7 +382,7 @@ fn an_approval_is_bound_to_the_snapshot_the_member_was_shown() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     let login = format!("{base}/login");
     svc.navigate(&login).expect("navigates");
     svc.snapshot().expect("snapshot");
@@ -421,7 +421,7 @@ fn an_approval_is_void_when_the_page_moves_on_by_itself() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     svc.navigate(&format!("{base}/spa")).expect("navigates");
     let (_, snap) = svc.snapshot().expect("snapshot");
     assert!(

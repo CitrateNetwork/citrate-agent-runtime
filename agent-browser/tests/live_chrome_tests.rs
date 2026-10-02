@@ -112,7 +112,7 @@ fn managed_browser_navigates_snapshots_types_clicks_and_streams_frames() {
         return;
     };
     let base = common::serve();
-    let svc = BrowserService::new(common::config(exe));
+    let svc = BrowserService::new(common::config_allowing(exe, &base));
     assert_eq!(svc.status().mode, "off");
 
     let page = svc.navigate(&format!("{base}/login")).expect("navigates");
@@ -198,7 +198,7 @@ fn stop_latches_until_resume_and_denies_waiting_actions() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     svc.navigate(&format!("{base}/login")).expect("navigates");
 
     // An action waiting for the member is denied by Stop.
@@ -231,7 +231,7 @@ fn attach_needs_consent_per_session_and_per_origin() {
     let Some(exe) = common::chromium() else {
         return;
     };
-    let base = common::serve();
+    let (base, log) = common::serve_logged();
     // Stand-in for the member's own Chrome, started with remote debugging on a known port.
     let port = common::free_port();
     let mut members_chrome = MembersChrome::start(&exe, port);
@@ -294,13 +294,21 @@ fn attach_needs_consent_per_session_and_per_origin() {
     );
 
     // A consented origin that redirects to one without consent: the landing page is refused.
-    let redirector = common::serve_redirect(format!("{base}/login"));
+    // The redirected request is stopped before it is sent, so the member's cookies for the
+    // target never leave the browser.
+    let redirector = common::serve_redirect(format!("{base}/login?via=redirect"));
     svc.allow_origin(&redirector, false)
         .expect("consents to the redirector only");
     match svc.navigate(&format!("{redirector}/go")) {
         Err(BrowserError::NeedsConsent { origin }) => assert_eq!(origin, base),
         other => panic!("expected NeedsConsent for the redirect target, got {other:?}"),
     }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        common::hits(&log, "/login?via=redirect"),
+        0,
+        "the origin without consent never received the redirected request"
+    );
     assert!(matches!(
         svc.snapshot(),
         Err(BrowserError::NeedsConsent { .. })
@@ -357,4 +365,65 @@ impl Drop for MembersChrome {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.profile);
     }
+}
+
+#[test]
+fn managed_browser_opens_local_addresses_only_when_a_developer_allows_them() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let (base, log) = common::serve_logged();
+    let svc = BrowserService::new(common::config(exe.clone()));
+    match svc.navigate(&format!("{base}/login")) {
+        Err(BrowserError::NotWeb(why)) => assert!(why.contains("public"), "{why}"),
+        other => panic!("expected a refusal for a local address, got {other:?}"),
+    }
+    for local in ["http://localhost:9/", "http://169.254.169.254/latest/meta-data/"] {
+        assert!(
+            matches!(svc.navigate(local), Err(BrowserError::NotWeb(_))),
+            "{local}"
+        );
+    }
+    assert_eq!(common::hits(&log, "/"), 0, "nothing reached the local server");
+
+    let allowed = BrowserService::new(common::config_allowing(exe, &base));
+    let page = allowed
+        .navigate(&format!("{base}/login"))
+        .expect("an allowed origin opens");
+    assert_eq!(page.title, "Example login");
+}
+
+#[test]
+fn a_page_cannot_make_the_managed_browser_reach_another_local_service() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let base = common::serve();
+    let (other, other_log) = common::serve_logged();
+    let svc = BrowserService::new(common::config_allowing(exe, &base));
+    // The allowed page fetches from another local origin on its own.
+    svc.navigate(&format!("{base}/fetcher?u={other}/secret"))
+        .expect("the allowed page opens");
+    let done = wait_for(
+        || {
+            svc.snapshot()
+                .ok()
+                .map(|(_, s)| s.text)
+                .filter(|t| !t.contains("waiting"))
+        },
+        10,
+    )
+    .expect("the page's request settles");
+    assert!(done.contains("failed"), "{done}");
+    assert_eq!(
+        common::hits(&other_log, "/secret"),
+        0,
+        "the other local service never received the request"
+    );
+    // A click or script navigation to a local address is stopped too.
+    match svc.navigate(&format!("{other}/secret")) {
+        Err(BrowserError::NotWeb(_)) => {}
+        other_result => panic!("expected a refusal, got {other_result:?}"),
+    }
+    assert_eq!(common::hits(&other_log, "/secret"), 0);
 }

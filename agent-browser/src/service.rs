@@ -1048,6 +1048,107 @@ mod tests {
         assert_eq!(s.url(), "https://a.example/#x");
     }
 
+    fn paused(url: &str, resource: &str, frame: &str) -> CdpEvent {
+        // Shape of `Fetch.requestPaused` (flat session), as Chrome sends it.
+        CdpEvent {
+            method: "Fetch.requestPaused".to_string(),
+            params: json!({
+                "requestId": "interception-job-7.0",
+                "request": {"url": url, "method": "GET", "headers": {}},
+                "frameId": frame,
+                "resourceType": resource,
+            }),
+            session_id: Some("S1".to_string()),
+        }
+    }
+
+    fn verdict(reply: Option<Reply>) -> (String, Value) {
+        let r = reply.expect("every paused request is answered");
+        assert_eq!(r.session_id.as_deref(), Some("S1"));
+        assert_eq!(r.params["requestId"], "interception-job-7.0");
+        (r.method, r.params)
+    }
+
+    #[test]
+    fn managed_mode_fails_requests_to_local_addresses_before_they_are_sent() {
+        let s = shared_attached("https://example.com/");
+        s.attached.store(false, Ordering::SeqCst);
+        *lock(&s.target) = Some("T1".to_string());
+        for (url, kind) in [
+            ("http://127.0.0.1:8545/", "XHR"),
+            ("http://169.254.169.254/latest/meta-data/", "Fetch"),
+            ("http://localhost:11434/api/tags", "Document"),
+            ("http://192.168.1.1/", "Image"),
+        ] {
+            let (method, params) = verdict(s.on_event(&paused(url, kind, "T1")));
+            assert_eq!(method, "Fetch.failRequest", "{url}");
+            assert_eq!(params["errorReason"], "BlockedByClient");
+        }
+        let (method, _) = verdict(s.on_event(&paused("https://1.1.1.1/x.js", "Script", "T1")));
+        assert_eq!(method, "Fetch.continueRequest");
+    }
+
+    #[test]
+    fn a_page_load_on_a_named_host_with_no_connection_to_resolve_on_fails_closed() {
+        let s = shared_attached("https://example.com/");
+        s.attached.store(false, Ordering::SeqCst);
+        *lock(&s.target) = Some("T1".to_string());
+        let (method, _) = verdict(s.on_event(&paused("https://example.com/", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+    }
+
+    #[test]
+    fn a_developer_allowed_local_origin_continues_in_managed_mode() {
+        let mut s = shared_attached("about:blank");
+        s.attached.store(false, Ordering::SeqCst);
+        s.allow_private = crate::gate::parse_allow_private("http://127.0.0.1:8545").expect("allow");
+        let (method, _) = verdict(s.on_event(&paused("http://127.0.0.1:8545/", "Document", "T1")));
+        assert_eq!(method, "Fetch.continueRequest");
+        let (method, _) = verdict(s.on_event(&paused("http://127.0.0.1:8546/", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+    }
+
+    #[test]
+    fn attach_mode_stops_a_page_load_to_an_origin_without_consent_before_it_is_sent() {
+        let s = shared_attached("https://consented.example/");
+        *lock(&s.target) = Some("T1".to_string());
+        if let Some(sc) = lock(&s.scope).as_mut() {
+            sc.allow("https://consented.example", false).expect("consent");
+        }
+        // A redirect or click from the consented origin to one without consent.
+        let (method, params) = verdict(s.on_event(&paused(
+            "https://other.example/account",
+            "Document",
+            "T1",
+        )));
+        assert_eq!(method, "Fetch.failRequest");
+        assert_eq!(params["errorReason"], "BlockedByClient");
+        assert_eq!(
+            lock(&s.consent_needed).as_ref().map(|c| c.origin.clone()),
+            Some("https://other.example".to_string())
+        );
+        // Sensitive origins are stopped the same way.
+        let (method, _) = verdict(s.on_event(&paused("https://www.chase.com/", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+        // The consented origin, a sub-frame and a sub-resource continue.
+        for (url, kind, frame) in [
+            ("https://consented.example/next", "Document", "T1"),
+            ("https://ads.example/frame", "Document", "F2"),
+            ("https://cdn.example/app.js", "Script", "T1"),
+        ] {
+            let (method, _) = verdict(s.on_event(&paused(url, kind, frame)));
+            assert_eq!(method, "Fetch.continueRequest", "{url}");
+        }
+    }
+
+    #[test]
+    fn paused_requests_of_other_sessions_are_not_answered() {
+        let s = shared_attached("https://example.com/");
+        let mut ev = paused("http://127.0.0.1/", "Document", "T1");
+        ev.session_id = Some("OTHER".to_string());
+        assert!(s.on_event(&ev).is_none());
+    }
+
     #[test]
     fn attach_without_consent_contacts_nothing() {
         let svc = BrowserService::new(BrowserConfig {
