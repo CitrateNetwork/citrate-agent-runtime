@@ -320,3 +320,38 @@ fn a_skill_whose_source_is_not_declared_in_the_lock_is_refused() {
     assert!(lib.is_empty());
     assert!(lib.report().rejected[0].reason.contains("not declared"));
 }
+
+/// The real release bundle, staged by citrate-core `scripts/stage-skills-bundle.mjs build`, loads
+/// with no refusal and ranks at most five per request. Run with
+/// `CITRATE_TEST_SKILLS_BUNDLE=<staged dir> cargo test -p citrate-agent-loop --test
+/// skills_lock_tests -- --ignored`.
+#[test]
+#[ignore = "needs a staged skills bundle (CITRATE_TEST_SKILLS_BUNDLE)"]
+fn the_staged_release_bundle_loads_every_admitted_skill() {
+    let Some(dir) = std::env::var_os("CITRATE_TEST_SKILLS_BUNDLE") else {
+        panic!("set CITRATE_TEST_SKILLS_BUNDLE");
+    };
+    let root = PathBuf::from(dir);
+    let text = std::fs::read_to_string(root.join("skills.lock")).unwrap();
+    let lock = SkillLock::from_toml(&text).unwrap();
+    let admitted = lock.admitted().count();
+    let lib = load(&root, &text);
+    for r in &lib.report().rejected {
+        eprintln!("refused: {} {}", r.path.display(), r.reason);
+    }
+    assert!(lib.report().rejected.is_empty());
+    assert_eq!(lib.len(), admitted);
+    for q in [
+        "audit this solidity contract for reentrancy",
+        "write semgrep rules for this pattern",
+        "polish the typography of my landing page",
+        "search arxiv for papers on federated learning",
+    ] {
+        let picked = lib.select(q, citrate_agent_loop::skills::SKILLS_PER_TURN);
+        assert!(picked.len() <= 5);
+        eprintln!(
+            "{q:?} -> {:?}",
+            picked.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+}

@@ -1285,6 +1285,10 @@ impl ToolHost for SkillHost {
 // ---------------------------------------------------------------------------------------------
 
 /// The lock verdicts that ship a skill's text. Anything else but `exclude` is refused.
+/// Largest pinned file hashed at load. A ref over [`MAX_REF_BYTES`] is still checked and listed
+/// (as in an unlocked source); `skill_load` refuses to read it.
+const MAX_LOCKED_FILE_BYTES: usize = 16 * 1024 * 1024;
+
 const SHIPPING_VERDICTS: &[&str] = &[
     "include-as-is",
     "include-with-scripts-stripped",
@@ -1490,7 +1494,7 @@ fn load_locked_one(
                 ))
             }
         }
-        read_pinned(&p, &r.sha256, MAX_REF_BYTES)
+        read_pinned(&p, &r.sha256, MAX_LOCKED_FILE_BYTES)
             .map_err(|e| reject(p.clone(), format!("ref '{}' {e}", r.path)))?;
         refs.push(r.path.clone());
         ref_sha256.insert(r.path.clone(), r.sha256.clone());
