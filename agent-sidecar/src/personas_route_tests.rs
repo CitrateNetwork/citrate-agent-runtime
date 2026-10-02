@@ -174,3 +174,129 @@ async fn get_workflows_lists_every_track_family_with_verifier_names() {
             .any(|x| x.as_str().unwrap_or("").contains("forge_test")))
         .unwrap_or(false));
 }
+
+/// A recorder for the system prompt each model request carries.
+struct Seen(std::sync::Mutex<Vec<String>>);
+impl citrate_agent_loop::LlmClient for Seen {
+    fn complete(
+        &self,
+        r: &citrate_agent_loop::CompletionRequest,
+    ) -> Result<citrate_agent_loop::AssistantTurn, citrate_agent_loop::LlmError> {
+        let system: String = r
+            .messages
+            .iter()
+            .filter(|m| m.role == citrate_agent_loop::Role::System)
+            .map(|m| m.content.clone())
+            .collect();
+        if let Ok(mut s) = self.0.lock() {
+            s.push(system);
+        }
+        Ok(citrate_agent_loop::AssistantTurn::text("(idle)"))
+    }
+}
+
+fn session_body(persona: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "model": "gemma-4",
+        "systemPrompt": "You are Hermes.",
+        "llm": {"baseUrl": "http://127.0.0.1:18080/v1", "bearer": "k"},
+        "persona": persona,
+    })
+}
+
+/// A session can name its persona instead of carrying a prompt fragment the app built: the
+/// sidecar checks a custom persona itself and appends the fragment it renders.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_persona_is_checked_and_rendered_by_the_sidecar() {
+    let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+    let llm: Arc<dyn citrate_agent_loop::LlmClient> = seen.clone();
+    let sessions = Arc::new(sessions::SessionManager::new(
+        Arc::new(move |_ep: &sessions::LlmEndpoint| llm.clone()),
+        Duration::from_secs(1),
+    ));
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue: Arc::new(ApprovalQueue::new()),
+        skills: vec![],
+        dispatch: None,
+        bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions,
+    });
+    let expected = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/personas/check",
+            serde_json::json!({"persona": custom()}),
+            true,
+        ))
+        .await
+        .unwrap();
+    let fragment = json(expected).await["prompt_fragment"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!fragment.is_empty());
+
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/sessions",
+            session_body(serde_json::json!({"custom": custom()})),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let id = json(r).await["id"].as_str().unwrap_or_default().to_string();
+    app(st.clone())
+        .oneshot(req(
+            "POST",
+            &format!("/sessions/{id}/messages"),
+            serde_json::json!({"text": "hi"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    let mut system = String::new();
+    for _ in 0..50 {
+        if let Some(s) = seen.0.lock().ok().and_then(|g| g.first().cloned()) {
+            system = s;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(system.starts_with("You are Hermes."), "{system}");
+    assert!(system.contains(&fragment), "{system}");
+
+    // A shipped persona by id.
+    let shipped = personas::persona_views().expect("personas");
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/sessions",
+            session_body(serde_json::json!({"id": shipped[0].persona.id})),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_session_persona_that_fails_the_checks_is_refused() {
+    let mut bad = custom();
+    bad["style_rules"] = serde_json::json!([]);
+    for persona in [
+        serde_json::json!({"custom": bad}),
+        serde_json::json!({"id": "no-such-persona"}),
+        serde_json::json!({"id": "x", "custom": custom()}),
+        serde_json::json!({}),
+    ] {
+        let r = app(state())
+            .oneshot(req("POST", "/sessions", session_body(persona.clone()), true))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{persona}");
+    }
+}
