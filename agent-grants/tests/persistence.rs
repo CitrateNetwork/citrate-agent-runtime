@@ -243,3 +243,31 @@ fn a_stored_grant_is_inert_before_its_granted_at() {
     assert!(is_allowed(&back.check(&file, Op::Read, later)));
     assert!(!is_allowed(&back.check(&home_file, Op::Read, later + 3600)));
 }
+
+/// HUP-S2.1 wiring: the document citrate-core writes (its `agent_grants` store) is the contract
+/// fixture `tests/fixtures/core-grant-state-v1.json`; citrate-core's tests pin its serializer to
+/// the same bytes. It must load here unchanged and decide as its rows say.
+#[test]
+fn the_core_written_document_loads_and_decides() {
+    let text = include_str!("fixtures/core-grant-state-v1.json");
+    let home = PathBuf::from("/Users/member");
+    let g = FolderGrants::from_json(text, &home, &home).expect("core's document must load");
+    let views = g.list(1_790_000_100);
+    let status: Vec<GrantStatus> = views.iter().map(|v| v.status).collect();
+    assert_eq!(
+        status,
+        vec![
+            GrantStatus::Active,
+            GrantStatus::Active,
+            GrantStatus::Revoked,
+            GrantStatus::Active
+        ]
+    );
+    // The full-access row's countdown.
+    assert_eq!(views[3].remaining_secs, Some(86_300));
+    assert_eq!(g.state().next_id, 5);
+    // Re-serializing yields the same document (field names and order core relies on).
+    let again: serde_json::Value = serde_json::from_str(&g.to_json().expect("json")).expect("v");
+    let orig: serde_json::Value = serde_json::from_str(text).expect("v");
+    assert_eq!(again, orig);
+}

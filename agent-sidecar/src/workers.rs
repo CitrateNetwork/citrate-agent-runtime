@@ -26,6 +26,7 @@ use citrate_agent_workers::{RestartPolicy, Worker, WorkerError, WorkerKind, Work
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::grants::SessionGrants;
 use crate::toolchain::{ToolchainConfig, ToolchainHost};
 
 /// The argument that starts the binary as a worker instead of the control plane.
@@ -105,13 +106,10 @@ impl RemoteToolHost {
     }
 }
 
-impl ToolHost for RemoteToolHost {
-    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+impl RemoteToolHost {
+    /// Send one call to the worker and map every failure to an honest tool error.
+    fn send(&self, params: Value) -> ToolOutcome {
         let kind = self.worker.kind().as_str();
-        let params = match serde_json::to_value(call) {
-            Ok(v) => serde_json::json!({ "call": v }),
-            Err(e) => return ToolOutcome::Error(format!("could not encode the call: {e}")),
-        };
         match self.worker.call(params, self.call_timeout) {
             Ok(v) => match serde_json::from_value::<WireOutcome>(v) {
                 Ok(o) => o.into(),
@@ -134,6 +132,47 @@ impl ToolHost for RemoteToolHost {
             Err(WorkerError::Remote(e)) => {
                 ToolOutcome::Error(format!("the {kind} worker could not run the call: {e}"))
             }
+        }
+    }
+}
+
+impl ToolHost for RemoteToolHost {
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        match serde_json::to_value(call) {
+            Ok(v) => self.send(serde_json::json!({ "call": v })),
+            Err(e) => ToolOutcome::Error(format!("could not encode the call: {e}")),
+        }
+    }
+}
+
+impl crate::sessions::ToolchainBackend for RemoteToolHost {
+    fn scoped_to(&self, grants: Arc<SessionGrants>) -> Result<Arc<dyn ToolHost>, String> {
+        Ok(Arc::new(GrantScopedRemote {
+            remote: RemoteToolHost::new(self.worker.clone(), self.call_timeout),
+            grants,
+        }))
+    }
+}
+
+/// HUP-S2.1 in the worker process: a session opened with folder grants sends its grant set as it
+/// is at the moment of each call (so a revocation applies to the next call), and the worker
+/// checks the project against it instead of `CITRATE_HERMES_TOOLCHAIN_ROOTS`.
+struct GrantScopedRemote {
+    remote: RemoteToolHost,
+    grants: Arc<SessionGrants>,
+}
+
+impl ToolHost for GrantScopedRemote {
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        match serde_json::to_value(call) {
+            Ok(v) => self.remote.send(serde_json::json!({
+                "call": v,
+                "grants": {
+                    "home": self.grants.home(),
+                    "document": self.grants.document(),
+                },
+            })),
+            Err(e) => ToolOutcome::Error(format!("could not encode the call: {e}")),
         }
     }
 }
@@ -205,6 +244,15 @@ struct ToolchainHandler(ToolchainHost);
 #[derive(Deserialize)]
 struct CallParams {
     call: ToolCall,
+    /// HUP-S2.1: present when the session was opened with folder grants.
+    #[serde(default)]
+    grants: Option<CallGrants>,
+}
+
+#[derive(Deserialize)]
+struct CallGrants {
+    home: PathBuf,
+    document: Value,
 }
 
 impl Handler for ToolchainHandler {
@@ -217,7 +265,18 @@ impl Handler for ToolchainHandler {
                 p.call.name.chars().take(64).collect::<String>()
             ));
         }
-        let out: WireOutcome = self.0.execute(&p.call).into();
+        let out: WireOutcome = match p.grants {
+            None => self.0.execute(&p.call).into(),
+            Some(g) => {
+                if !g.home.is_absolute() {
+                    return Err("the grants home must be an absolute path".into());
+                }
+                let set = SessionGrants::empty(&g.home);
+                set.replace(&g.document)
+                    .map_err(|e| format!("the session's grant set was refused: {e}"))?;
+                self.0.for_grants(Arc::new(set))?.execute(&p.call).into()
+            }
+        };
         serde_json::to_value(out).map_err(|e| format!("could not encode the outcome: {e}"))
     }
 }
