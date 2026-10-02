@@ -11,6 +11,8 @@
 //!   error text or model-invented tool names.
 //! - [`MeteringLog`] is a local append-only JSONL file of records.
 //! - [`DailyReport`] aggregates one UTC day into JSON and markdown.
+//! - [`DecisionLog`] / [`DecisionReport`] (HUP-S5.3): the `decide()` slot's content-free decision
+//!   records and task outcomes, reported per backend (local, jev) with task success rates.
 //! - [`build_benchmark_payload`] turns a report into calldata for
 //!   `BenchmarkRegistry.record(uint256,bytes32,bytes32,uint256)`, only for a member who opted in
 //!   ([`BenchmarkOptIn`]). It builds calldata and nothing else: no key, no signing, no network
@@ -27,6 +29,7 @@ use thiserror::Error;
 mod benchmark;
 mod clock;
 mod day;
+mod decisions;
 mod log;
 mod record;
 mod report;
@@ -39,6 +42,9 @@ pub use benchmark::{
 };
 pub use clock::{Clock, SystemClock};
 pub use day::{utc_day_bounds_ms, utc_day_of_ms};
+pub use decisions::{
+    BackendStats, DecisionLine, DecisionLog, DecisionReport, TaskRecord, DECISION_REPORT_SCHEMA,
+};
 pub use log::MeteringLog;
 pub use record::{ToolTally, TurnOutcome, TurnRecord, Verification, VerifierOutcome};
 pub use report::{

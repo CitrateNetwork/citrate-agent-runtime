@@ -9,6 +9,7 @@ status: active
 
 | Module | Models | Invariants | WP |
 |---|---|---|---|
+| `LearnRestart.tla` | One skill proposal across sidecar crashes and restarts: the proposals file, the write-ahead decision log, lost saves, log crash recovery, and reconciling the file with the log on open (HUP-S3.4 wiring) | `AtMostOneWrite`, `WriteImpliesRecorded`, `RejectFinal`, `AckedNotLost`, `PersistedIsTrue` (plus `TypeOK`) | HUP-S3.4 wiring |
 | `SkillPersistence.tla` | Proposal, verifiers, member accept or reject, conflicts, the write (which can fail), publish approval, the publish build, and outside edits to the saved file, for independent proposals | `NothingProposedWithoutVerifiers`, `PersistImpliesVerifiedAndAccepted`, `NoSilentMerge`, `RejectRecordedAndFinal`, `PublishImpliesHIC1` (plus `TypeOK`) | HUP-S3.4 |
 
 The planset (03_TLA_SPECS) names two invariants for this module, `PersistImpliesVerifiedAndAccepted`
@@ -68,3 +69,31 @@ ignored, approval not matched, publish before persist, publish without re-readin
 reject recorded as an approval, a contradiction stored as `true`, accept from any state,
 provenance unchecked, persisted skill not validated by the loader) each fail at least one test
 in `agent-learn/tests/learn_tests.rs` or the unit tests in `src/evidence.rs`.
+
+## LearnRestart (2026-10-01, branch hup/n4-learn-e2e)
+
+Rust counterpart: `Learner::open` (load the proposals file, then `reconcile_with_log`),
+`Learner::propose` (save, or roll back and refuse), and the record, write, close order of
+`Learner::accept`. Any save may be lost before a crash (`Save` is a separate, optional step).
+
+```sh
+cd agent-learn/formal
+"$(brew --prefix openjdk)/bin/java" -XX:+UseParallelGC -cp ~/.tla/tla2tools.jar tlc2.TLC \
+  -workers auto LearnRestart.tla -config LearnRestart.cfg
+```
+
+| Config | States generated | Distinct | Depth | Result |
+|---|---|---|---|---|
+| `MaxCrashes = 3` (checked in) | 287 | 183 | 13 | no error (under 1 s) |
+| `MaxCrashes = 8` | 757 | 473 | 25 | no error (under 1 s) |
+
+Mutation check (each a single edit, then restored):
+
+| Mutant | Caught by |
+|---|---|
+| restart loads the file and ignores the log | `RejectFinal` |
+| propose reports success without saving the file | `AckedNotLost` |
+| the accept guard ignores the skill folder already on disk | `AtMostOneWrite` |
+| reconcile treats any recorded accept as persisted | `PersistedIsTrue` |
+| the accept is not recorded before the write | `WriteImpliesRecorded` |
+| the reject is not written to the log | `RejectFinal` |
