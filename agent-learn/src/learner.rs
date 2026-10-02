@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::evidence::{sha256_hex, Evidence, VerifiedRun};
 use crate::registry;
+use crate::store::{self, LoadReport, StoreFile, MAX_KEPT_DECIDED, MAX_RECONCILE_RECORDS};
 
 /// Longest memory key, in bytes.
 pub const MAX_MEMORY_KEY_LEN: usize = 256;
@@ -132,7 +133,10 @@ impl ProposalState {
 }
 
 /// A skill or memory Hermes proposes to keep, with the evidence that justifies it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// It deserializes only so the learner can restore its own proposals file
+/// ([`Learner::open`]); a loaded proposal is re-checked before it is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
     pub id: String,
     pub kind: ProposalKind,
@@ -288,6 +292,8 @@ pub enum LearnError {
     ContentChanged,
     #[error("invalid publish parameters: {0}")]
     InvalidPublish(String),
+    #[error("could not save the proposals file: {0}")]
+    Store(String),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -385,6 +391,66 @@ pub struct Learner {
     clock: Arc<dyn Clock>,
     proposals: BTreeMap<String, Proposal>,
     counter: u64,
+    /// The proposals file, when the learner was opened with one ([`Learner::open`]).
+    store: Option<PathBuf>,
+    /// Why the last save failed, until a save succeeds.
+    store_error: Option<String>,
+}
+
+/// Why a stored proposal is not restored, or `None` when it is consistent.
+fn stored_problem(p: &Proposal) -> Option<String> {
+    let id_ok = p.id.len() == 27
+        && p.id.starts_with("lp-")
+        && p.id[3..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !id_ok {
+        return Some("malformed id".into());
+    }
+    let sha = match &p.content {
+        ProposalContent::Skill { skill_md } => {
+            if p.kind != ProposalKind::Skill {
+                return Some("kind does not match the content".into());
+            }
+            if let Err(e) = validate_skill(skill_md) {
+                return Some(e.to_string());
+            }
+            sha256_hex(skill_md.as_bytes())
+        }
+        ProposalContent::Memory { key, value } => {
+            if p.kind != ProposalKind::Memory {
+                return Some("kind does not match the content".into());
+            }
+            if let Err(e) = validate_memory(key, value) {
+                return Some(e.to_string());
+            }
+            if key.trim() != key || value.trim() != value {
+                return Some("memory key or value is not trimmed".into());
+            }
+            memory_sha(key, value)
+        }
+    };
+    if sha != p.content_sha256 {
+        return Some("content does not match its hash".into());
+    }
+    let ev = &p.evidence;
+    if ev.trajectory.session_id != p.provenance.session_id {
+        return Some("evidence is from another session".into());
+    }
+    if ev.verdicts.is_empty() || ev.verdicts.iter().any(|v| !v.passed) {
+        return Some("evidence does not show every verifier passing".into());
+    }
+    if ev
+        .verdicts
+        .iter()
+        .any(|v| !ev.steps.iter().any(|s| s == &v.step))
+    {
+        return Some("evidence names a step that is not in the workflow".into());
+    }
+    if ev.trajectory.sha256.len() != 64 {
+        return Some("malformed trajectory digest".into());
+    }
+    None
 }
 
 impl Learner {
@@ -399,7 +465,204 @@ impl Learner {
             clock,
             proposals: BTreeMap::new(),
             counter: 0,
+            store: None,
+            store_error: None,
         }
+    }
+
+    /// A learner whose proposals survive a restart: they are restored from `store_path` (if it
+    /// exists) and the file is rewritten after every change. Never fails: inconsistent proposals
+    /// are dropped and an unreadable file is moved aside, as the [`LoadReport`] says.
+    pub fn open(
+        cfg: LearnConfig,
+        log: Arc<DecisionLog>,
+        clock: Arc<dyn Clock>,
+        store_path: &Path,
+    ) -> (Self, LoadReport) {
+        let mut l = Self::with_clock(cfg, log, clock);
+        l.store = Some(store_path.to_path_buf());
+        let mut report = LoadReport::default();
+        match store::read_file(store_path) {
+            Ok(None) => {}
+            Ok(Some(file)) => {
+                l.counter = file.counter;
+                for p in file.proposals {
+                    if l.proposals.contains_key(&p.id) {
+                        report.dropped.push((p.id, "duplicate id".into()));
+                        continue;
+                    }
+                    if let Some(why) = stored_problem(&p) {
+                        report.dropped.push((p.id, why));
+                        continue;
+                    }
+                    l.proposals.insert(p.id.clone(), p);
+                }
+                report.loaded = l.proposals.len();
+            }
+            Err(_) => {
+                report.moved_aside = store::move_aside(store_path, l.clock.now_ms());
+            }
+        }
+        match l.reconcile_with_log() {
+            Ok(0) => {}
+            Ok(n) => {
+                report.reconciled = n;
+                l.save_after_decision();
+            }
+            Err(e) => report.log_error = Some(e),
+        }
+        (l, report)
+    }
+
+    /// The decision log is written before every effect, the proposals file after it, so a crash
+    /// or a failed save can leave the file one decision behind. Move such proposals forward:
+    /// a recorded reject is final; a recorded, completed skill accept whose file is on disk is
+    /// persisted; a recorded publish is prepared. A recorded memory accept is offered again
+    /// (`persist_failed`): its record may never have reached core, and core keys records by
+    /// proposal id, so accepting again is safe. Returns how many proposals moved.
+    fn reconcile_with_log(&mut self) -> Result<usize, String> {
+        use citrate_agent_records::Entry;
+        let mut records =
+            citrate_agent_records::read::page(self.log.dir(), None, MAX_RECONCILE_RECORDS)
+                .map_err(|e| e.to_string())?;
+        records.sort_by_key(|r| r.record.seq);
+        // decision seq -> outcome
+        let mut outcomes: BTreeMap<u64, Outcome> = BTreeMap::new();
+        for r in &records {
+            if let Entry::Outcome(o) = &r.record.entry {
+                outcomes.insert(o.decision_seq, o.outcome);
+            }
+        }
+        // proposal id -> latest (seq, kind, decision, actor, reason)
+        let mut latest: BTreeMap<String, (u64, String, Decision, String, String)> = BTreeMap::new();
+        for r in &records {
+            let Entry::Decision(d) = &r.record.entry else {
+                continue;
+            };
+            if !matches!(
+                d.kind.as_str(),
+                "learn.skill" | "learn.memory" | "skill.publish"
+            ) {
+                continue;
+            }
+            let Some(id) = d
+                .evidence
+                .iter()
+                .find_map(|e| e.uri.strip_prefix("learn:proposal/"))
+            else {
+                continue;
+            };
+            latest.insert(
+                id.to_string(),
+                (
+                    r.record.seq,
+                    d.kind.clone(),
+                    d.decision,
+                    r.record.actor.id.clone(),
+                    d.reason.clone(),
+                ),
+            );
+        }
+        let mut moved = 0;
+        let ids: Vec<String> = self.proposals.keys().cloned().collect();
+        for id in ids {
+            let Some((seq, kind, decision, actor, reason)) = latest.get(&id).cloned() else {
+                continue;
+            };
+            let Some(p) = self.proposals.get(&id) else {
+                continue;
+            };
+            let completed = matches!(outcomes.get(&seq), Some(Outcome::Completed));
+            let next = match (&p.state, kind.as_str(), &decision) {
+                (s, "learn.skill" | "learn.memory", Decision::Denied) if s.awaiting_decision() => {
+                    Some(ProposalState::Rejected { by: actor, reason })
+                }
+                (ProposalState::Proposed, "learn.skill", Decision::Approved) => {
+                    let on_disk = skill_name(p)
+                        .map(|n| self.skill_dir(&n).join("SKILL.md"))
+                        .and_then(|f| file_sha(&f))
+                        .is_some_and(|sha| sha == p.content_sha256);
+                    Some(if completed && on_disk {
+                        ProposalState::Persisted
+                    } else {
+                        ProposalState::PersistFailed {
+                            reason: "an accept was recorded but did not complete before a restart"
+                                .into(),
+                        }
+                    })
+                }
+                (ProposalState::Proposed, "learn.memory", Decision::Approved) => {
+                    Some(ProposalState::PersistFailed {
+                        reason:
+                            "accepted before a restart; accept again so the app receives the memory"
+                                .into(),
+                    })
+                }
+                (ProposalState::Persisted, "skill.publish", Decision::Approved) => {
+                    Some(ProposalState::PublishPrepared)
+                }
+                _ => None,
+            };
+            if let (Some(next), Some(p)) = (next, self.proposals.get_mut(&id)) {
+                p.state = next;
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Why the proposals file could not be saved, if the last save failed. Decisions already
+    /// made are in the decision log; a restart would show stale proposal states until a later
+    /// save succeeds.
+    pub fn store_error(&self) -> Option<&str> {
+        self.store_error.as_deref()
+    }
+
+    /// Every proposal the learner holds (undecided and recent decided ones), oldest first.
+    pub fn all(&self) -> Vec<&Proposal> {
+        let mut v: Vec<&Proposal> = self.proposals.values().collect();
+        v.sort_by(|a, b| (a.created_at_ms, &a.id).cmp(&(b.created_at_ms, &b.id)));
+        v
+    }
+
+    /// Drop the oldest decided proposals beyond [`MAX_KEPT_DECIDED`].
+    fn prune(&mut self) {
+        let mut decided: Vec<(u64, String)> = self
+            .proposals
+            .values()
+            .filter(|p| !p.state.awaiting_decision())
+            .map(|p| (p.created_at_ms, p.id.clone()))
+            .collect();
+        if decided.len() <= MAX_KEPT_DECIDED {
+            return;
+        }
+        decided.sort();
+        let excess = decided.len() - MAX_KEPT_DECIDED;
+        for (_, id) in decided.into_iter().take(excess) {
+            self.proposals.remove(&id);
+        }
+    }
+
+    /// Rewrite the proposals file (no-op without a store).
+    fn save(&mut self) -> Result<(), String> {
+        let Some(path) = self.store.clone() else {
+            return Ok(());
+        };
+        self.prune();
+        let file = StoreFile {
+            schema: store::STORE_SCHEMA.into(),
+            counter: self.counter,
+            proposals: self.all().into_iter().cloned().collect(),
+        };
+        let res = store::write_file(&path, &file);
+        self.store_error = res.as_ref().err().cloned();
+        res
+    }
+
+    /// Save after a decision: the decision stands (it is in the decision log) even when the
+    /// save fails; the failure is kept for [`Learner::store_error`].
+    fn save_after_decision(&mut self) {
+        let _ = self.save();
     }
 
     pub fn get(&self, id: &str) -> Option<&Proposal> {
@@ -623,7 +886,12 @@ impl Learner {
             conflicts,
             state: ProposalState::Proposed,
         };
-        self.proposals.insert(id, p.clone());
+        self.proposals.insert(id.clone(), p.clone());
+        if let Err(e) = self.save() {
+            // Nothing was decided yet: keep memory and file in step by forgetting it.
+            self.proposals.remove(&id);
+            return Err(LearnError::Store(e));
+        }
         Ok(p)
     }
 
@@ -717,6 +985,7 @@ impl Learner {
                 reason,
             };
         }
+        self.save_after_decision();
         Ok(())
     }
 
@@ -859,6 +1128,7 @@ impl Learner {
                 },
             };
         }
+        self.save_after_decision();
         let persisted = result?;
         // The skill is on disk even if closing the record failed; the log's recovery marks the
         // decision outcome_unknown on next open, which is the honest state.
@@ -1048,6 +1318,7 @@ impl Learner {
         if let Some(stored) = self.proposals.get_mut(id) {
             stored.state = ProposalState::PublishPrepared;
         }
+        self.save_after_decision();
         self.log
             .record_outcome(
                 actor,
@@ -1059,5 +1330,101 @@ impl Learner {
             )
             .map_err(|e| LearnError::Record(e.to_string()))?;
         Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evidence::TrajectoryRef;
+    use citrate_agent_records::LogConfig;
+
+    fn proposal(n: u64, state: ProposalState) -> Proposal {
+        let (key, value) = (format!("k{n}"), "v".to_string());
+        Proposal {
+            id: format!("lp-{n:024x}"),
+            kind: ProposalKind::Memory,
+            content_sha256: memory_sha(&key, &value),
+            content: ProposalContent::Memory { key, value },
+            evidence: Evidence {
+                workflow_id: "w".into(),
+                steps: vec!["s".into()],
+                verdicts: vec![crate::evidence::VerifierVerdict {
+                    step: "s".into(),
+                    name: "v".into(),
+                    passed: true,
+                    detail: String::new(),
+                }],
+                attempts: 1,
+                trajectory: TrajectoryRef {
+                    session_id: "x".into(),
+                    workflow_id: "w".into(),
+                    messages: 1,
+                    sha256: "0".repeat(64),
+                },
+            },
+            provenance: Provenance {
+                session_id: "x".into(),
+                agent: "hermes".into(),
+                model: "m".into(),
+            },
+            created_at_ms: n,
+            conflicts: vec![],
+            state,
+        }
+    }
+
+    #[test]
+    fn saving_keeps_every_undecided_proposal_and_only_the_newest_decided_ones() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let log = Arc::new(
+            DecisionLog::open(&dir.path().join("r"), LogConfig::default())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .0,
+        );
+        let (mut l, _) = Learner::open(
+            LearnConfig {
+                user_skills_dir: dir.path().join("u"),
+                other_skill_sources: vec![],
+            },
+            log,
+            Arc::new(SystemClock),
+            &dir.path().join("p.json"),
+        );
+        let n = MAX_KEPT_DECIDED as u64 + 3;
+        for i in 0..n {
+            let p = proposal(i, ProposalState::Persisted);
+            assert!(stored_problem(&p).is_none(), "{:?}", stored_problem(&p));
+            l.proposals.insert(p.id.clone(), p);
+        }
+        // An old undecided one is never dropped.
+        let old = proposal(n + 10, ProposalState::Proposed);
+        let old_id = old.id.clone();
+        let mut old = old;
+        old.created_at_ms = 0;
+        l.proposals.insert(old_id.clone(), old);
+        l.save().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(l.proposals.len(), MAX_KEPT_DECIDED + 1);
+        assert!(l.proposals.contains_key(&old_id));
+        for i in 0..3 {
+            assert!(
+                !l.proposals.contains_key(&format!("lp-{i:024x}")),
+                "the oldest decided ones went first"
+            );
+        }
+        assert!(l.proposals.contains_key(&format!("lp-{:024x}", n - 1)));
+    }
+
+    #[test]
+    fn a_stored_proposal_with_a_bad_id_or_kind_is_a_problem() {
+        let mut p = proposal(1, ProposalState::Proposed);
+        p.id = "lp-ZZ".into();
+        assert!(stored_problem(&p).is_some());
+        let mut p = proposal(1, ProposalState::Proposed);
+        p.kind = ProposalKind::Skill;
+        assert!(stored_problem(&p).is_some());
+        let mut p = proposal(1, ProposalState::Proposed);
+        p.evidence.verdicts[0].step = "elsewhere".into();
+        assert!(stored_problem(&p).is_some());
     }
 }

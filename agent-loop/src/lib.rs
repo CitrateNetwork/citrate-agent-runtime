@@ -18,12 +18,16 @@
 //!   effectful tool call needs an explicit member decision (no auto-approval, no budget path) for
 //!   the rest of the session, unless a member clears it ([`TaintState`]; TLA+
 //!   `formal/TaintDowngrade.tla`).
+//! - **System-1 slot (HUP-S5.3):** [`decide`] makes one typed choice from a fixed option set, on
+//!   the local model by default (grammar-constrained), with the TypeSafe Jev backend only on the
+//!   member's per-origin opt-in (TLA+ `formal/DecideEgress.tla`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod decide;
 pub mod interview;
 pub mod personas;
 pub mod skills;
@@ -391,6 +395,23 @@ impl std::fmt::Display for LlmError {
 /// configured gateway; tests: a script).
 pub trait LlmClient: Send + Sync {
     fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError>;
+
+    /// HUP-S7.5: [`LlmClient::complete`] plus the token usage the provider reported for this
+    /// call. The default reports none: a client that cannot see usage says "unknown", never zero.
+    fn complete_with_usage(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        self.complete(req).map(|t| (t, None))
+    }
+}
+
+/// Token usage one model call reported (HUP-S7.5 metering). Taken from the provider's own
+/// response; nothing here is estimated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------------------------

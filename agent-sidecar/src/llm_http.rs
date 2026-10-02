@@ -4,7 +4,9 @@
 //!
 //! Errors are coarse on purpose: they never carry the endpoint, the bearer, or a request body.
 
-use citrate_agent_loop::{AssistantTurn, CompletionRequest, LlmClient, LlmError, Role, ToolCall};
+use citrate_agent_loop::{
+    AssistantTurn, CompletionRequest, LlmClient, LlmError, Role, TokenUsage, ToolCall,
+};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -111,6 +113,18 @@ pub fn parse_turn(body: &str) -> Result<AssistantTurn, LlmError> {
     })
 }
 
+/// HUP-S7.5: the `usage` block of an OpenAI-compatible response (llama-server and gateways report
+/// it). Both `prompt_tokens` and `completion_tokens` must be non-negative integers; anything else
+/// is unknown (`None`), never zero.
+pub fn parse_usage(body: &str) -> Option<TokenUsage> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let u = v.get("usage")?;
+    Some(TokenUsage {
+        prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
+        completion_tokens: u.get("completion_tokens")?.as_u64()?,
+    })
+}
+
 /// Blocking OpenAI-compatible client. Holds only configuration: the `reqwest` blocking client (which
 /// owns an internal runtime) is built inside [`LlmClient::complete`], which always runs on the
 /// blocking pool. Building or dropping it inside an async handler panics and poisons shared locks.
@@ -133,6 +147,13 @@ impl OpenAiCompatClient {
 
 impl LlmClient for OpenAiCompatClient {
     fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
+        self.complete_with_usage(req).map(|(t, _)| t)
+    }
+
+    fn complete_with_usage(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(self.timeout)
@@ -158,6 +179,7 @@ impl LlmClient for OpenAiCompatClient {
         if !status.is_success() {
             return Err(LlmError::Provider(format!("HTTP {}", status.as_u16())));
         }
-        parse_turn(&text)
+        let turn = parse_turn(&text)?;
+        Ok((turn, parse_usage(&text)))
     }
 }

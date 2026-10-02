@@ -1,0 +1,74 @@
+[
+  {
+    "id": "search-engine-query-box",
+    "goal": "Search the web for 'citrate blockdag'. Which element should be typed into first?",
+    "snapshot": "- [e1] link \"About\"\n- [e2] link \"Images\"\n- [e3] combobox \"Search\"\n- [e4] button \"Search by voice\"\n- [e5] button \"I'm Feeling Lucky\"\n- [e6] link \"Privacy\"\n- [e7] link \"Settings\"",
+    "expected": ["e3"]
+  },
+  {
+    "id": "shop-add-to-cart",
+    "goal": "Add this pair of running shoes (size already selected) to the shopping cart.",
+    "snapshot": "- [e1] link \"Men\"\n- [e2] link \"Women\"\n- [e3] heading \"Trail Runner 4\"\n- [e4] radio \"Size 10\" checked\n- [e5] button \"Add to wishlist\"\n- [e6] button \"Add to cart\"\n- [e7] link \"Size guide\"\n- [e8] link \"Write a review\"",
+    "expected": ["e6"]
+  },
+  {
+    "id": "repo-star",
+    "goal": "Star this code repository.",
+    "snapshot": "- [e1] link \"Code\"\n- [e2] link \"Issues 12\"\n- [e3] link \"Pull requests 3\"\n- [e4] button \"Watch 8\"\n- [e5] button \"Fork 21\"\n- [e6] button \"Star 340\"\n- [e7] link \"README.md\"",
+    "expected": ["e6"]
+  },
+  {
+    "id": "flight-departure-date",
+    "goal": "Book a flight: set the departure date next.",
+    "snapshot": "- [e1] radio \"Round trip\" checked\n- [e2] radio \"One way\"\n- [e3] textbox \"From\" value=\"EWR\"\n- [e4] textbox \"To\" value=\"SFO\"\n- [e5] textbox \"Depart\"\n- [e6] textbox \"Return\"\n- [e7] button \"Search flights\"\n- [e8] link \"Manage booking\"",
+    "expected": ["e5"]
+  },
+  {
+    "id": "wiki-random-article",
+    "goal": "Open a random encyclopedia article.",
+    "snapshot": "- [e1] link \"Main page\"\n- [e2] link \"Contents\"\n- [e3] link \"Current events\"\n- [e4] link \"Random article\"\n- [e5] link \"About\"\n- [e6] searchbox \"Search the encyclopedia\"\n- [e7] button \"Search\"",
+    "expected": ["e4"]
+  },
+  {
+    "id": "cookie-banner-reject",
+    "goal": "Dismiss the cookie banner while refusing optional cookies.",
+    "snapshot": "- [e1] dialog \"We value your privacy\"\n- [e2] button \"Accept all\"\n- [e3] button \"Reject optional cookies\"\n- [e4] link \"Cookie policy\"\n- [e5] button \"Customize\"\n- [e6] link \"Home\"",
+    "expected": ["e3"]
+  },
+  {
+    "id": "news-next-page",
+    "goal": "Go to the next page of search results.",
+    "snapshot": "- [e1] link \"Result: Markets rally on rate news\"\n- [e2] link \"Result: Storm season outlook\"\n- [e3] link \"Previous\"\n- [e4] link \"1\"\n- [e5] link \"2\"\n- [e6] link \"3\"\n- [e7] link \"Next\"",
+    "expected": ["e7", "e5"]
+  },
+  {
+    "id": "docs-version-picker",
+    "goal": "Switch the documentation to a different version.",
+    "snapshot": "- [e1] link \"Guides\"\n- [e2] link \"API reference\"\n- [e3] combobox \"Version v2.4\"\n- [e4] button \"Copy code\"\n- [e5] link \"Edit this page\"\n- [e6] searchbox \"Search docs\"",
+    "expected": ["e3"]
+  },
+  {
+    "id": "maps-directions",
+    "goal": "Get driving directions to the displayed place.",
+    "snapshot": "- [e1] heading \"Liberty State Park\"\n- [e2] button \"Directions\"\n- [e3] button \"Save\"\n- [e4] button \"Nearby\"\n- [e5] button \"Share\"\n- [e6] link \"Website\"\n- [e7] button \"Photos\"",
+    "expected": ["e2"]
+  },
+  {
+    "id": "recipe-vegetarian-filter",
+    "goal": "Show only vegetarian recipes.",
+    "snapshot": "- [e1] checkbox \"Quick (under 30 min)\"\n- [e2] checkbox \"Vegetarian\"\n- [e3] checkbox \"Gluten free\"\n- [e4] combobox \"Sort by\"\n- [e5] link \"Lemon pasta\"\n- [e6] link \"Mushroom risotto\"\n- [e7] button \"Clear filters\"",
+    "expected": ["e2"]
+  },
+  {
+    "id": "forum-sign-in",
+    "goal": "Sign in to an existing account on this forum.",
+    "snapshot": "- [e1] link \"Latest\"\n- [e2] link \"Top\"\n- [e3] link \"Categories\"\n- [e4] button \"Sign up\"\n- [e5] button \"Log in\"\n- [e6] searchbox \"Search topics\"",
+    "expected": ["e5"]
+  },
+  {
+    "id": "video-captions",
+    "goal": "Turn on captions for this video.",
+    "snapshot": "- [e1] button \"Play (k)\"\n- [e2] slider \"Volume\"\n- [e3] button \"Subtitles/closed captions (c)\"\n- [e4] button \"Settings\"\n- [e5] button \"Full screen (f)\"\n- [e6] button \"Like\"\n- [e7] button \"Subscribe\"",
+    "expected": ["e3"]
+  }
+]
