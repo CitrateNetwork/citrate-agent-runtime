@@ -2,9 +2,9 @@
 //!
 //! A skill is **instructions only** (planset 02_ARCHITECTURE, "Skill" row): an agentskills.io
 //! `SKILL.md` — YAML frontmatter with `name` + `description`, then a markdown body — plus optional
-//! bundled files (`references/`, `assets/`, `scripts/`). Hermes keeps every skill's name and
-//! description in context (one short line each, token-bounded) and loads a body only when the model
-//! asks for it with the `skill_load` tool.
+//! bundled files (`references/`, `assets/`, `scripts/`). For each turn Hermes ranks the skill
+//! descriptions against the request and puts at most [`SKILLS_PER_TURN`] of them in context (one
+//! short line each); a body loads only when the model asks for it with the `skill_load` tool.
 //!
 //! What this module guarantees:
 //! - **Strict, bounded parsing.** The frontmatter is a small, explicit YAML subset (plain/quoted
@@ -20,7 +20,10 @@
 //!   they exist; they cannot be run or loaded through this module. Anything side-effecting is a tool
 //!   or a capsule, never a skill.
 
-use crate::{HostKind, TokenCounter, ToolAnnotations, ToolCall, ToolHost, ToolOutcome, ToolSpec};
+use crate::{
+    HostKind, Message, Role, TokenCounter, ToolAnnotations, ToolCall, ToolHost, ToolOutcome,
+    ToolSpec, TurnContext,
+};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +54,8 @@ pub const MAX_FILES_LISTED: usize = 64;
 pub const MAX_RESOURCE_DEPTH: usize = 4;
 /// A skill description is cut to this many characters in the index (about 30 tokens).
 pub const INDEX_DESC_CHARS: usize = 120;
+/// US-3.2 AC1: the most skills surfaced in the system prompt for one turn.
+pub const SKILLS_PER_TURN: usize = 5;
 
 /// Keys from the agentskills.io specification.
 const SPEC_KEYS: &[&str] = &[
@@ -952,25 +957,69 @@ impl SkillLibrary {
         }
     }
 
-    /// The system-prompt section that introduces the skills (or `None` with no skills).
-    pub fn prompt_section(
-        &self,
-        budget_tokens: usize,
-        counter: &dyn TokenCounter,
-    ) -> Option<String> {
+    /// US-3.2 AC1: the at most `k` skills that best match `query`, ranked by BM25 over each
+    /// skill's name and description. A query that matches no skill surfaces none.
+    pub fn select(&self, query: &str, k: usize) -> Vec<&Skill> {
+        self.select_with(&Bm25Ranker, query, k)
+    }
+
+    /// [`SkillLibrary::select`] with another ranker (for example an embedding ranker). The result
+    /// is capped at `k` whatever the ranker returns.
+    pub fn select_with(&self, ranker: &dyn SkillRanker, query: &str, k: usize) -> Vec<&Skill> {
+        let skills: Vec<&Skill> = self.skills.values().collect();
+        let docs: Vec<(&str, &str)> = skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str()))
+            .collect();
+        let mut out: Vec<&Skill> = Vec::new();
+        for i in ranker.rank(query, &docs, k) {
+            if out.len() >= k {
+                break;
+            }
+            if let Some(s) = skills.get(i) {
+                if !out.iter().any(|o| o.name == s.name) {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// The system-prompt section for one turn: the skills that match `query` (at most `k`, best
+    /// first) and how many are installed in all. `None` when no skill is installed.
+    pub fn turn_section(&self, query: &str, k: usize) -> Option<String> {
         if self.is_empty() {
             return None;
         }
-        let idx = self.index(budget_tokens, counter);
-        if idx.text.is_empty() {
-            return None;
+        let total = self.len();
+        let installed = if total == 1 {
+            "1 skill is installed".to_string()
+        } else {
+            format!("{total} skills are installed")
+        };
+        let picked = self.select(query, k);
+        if picked.is_empty() {
+            return Some(format!(
+                "## Skills\n{installed}; none matches this request. If the member asks for one by \
+                 name, call `{SKILL_LOAD_TOOL}` with that exact name."
+            ));
         }
+        let lines: Vec<String> = picked
+            .iter()
+            .map(|s| {
+                format!(
+                    "- {}: {}",
+                    s.name,
+                    one_line(&s.description, INDEX_DESC_CHARS)
+                )
+            })
+            .collect();
         Some(format!(
-            "## Skills\nSkills are instructions, not actions. Before a task one of these covers, \
-             call `{SKILL_LOAD_TOOL}` with its exact name to read it; it may list files you can \
-             read the same way. Follow it using your tools; every effect still goes through \
-             their approval gates.\n{}",
-            idx.text
+            "## Skills\nSkills are instructions, not actions. {installed}; these match this \
+             request best. Before a task one of these covers, call `{SKILL_LOAD_TOOL}` with its \
+             exact name to read it; it may list files you can read the same way. Follow it using \
+             your tools; every effect still goes through their approval gates.\n{}",
+            lines.join("\n")
         ))
     }
 
@@ -1123,5 +1172,113 @@ impl ToolHost for SkillHost {
             Ok(s) => ToolOutcome::Ok(s),
             Err(e) => ToolOutcome::Error(e),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-turn skill retrieval (US-3.2 AC1)
+// ---------------------------------------------------------------------------------------------
+
+/// Ranks skill descriptions against a request. `docs` are `(name, description)` pairs; the result
+/// is indices into `docs`, best first, at most `k`.
+pub trait SkillRanker: Send + Sync {
+    /// Which method ran, for the operator log and tests (for example `bm25-lexical`).
+    fn method(&self) -> &'static str;
+    fn rank(&self, query: &str, docs: &[(&str, &str)], k: usize) -> Vec<usize>;
+}
+
+/// Okapi BM25 over each skill's name (counted three times) and description. Deterministic: equal
+/// scores break by position, which is name order in a [`SkillLibrary`]. Only skills that share a
+/// term with the query are returned. The sidecar has no embedding model in process, so this
+/// lexical ranker is the one that runs; an embedding ranker can implement [`SkillRanker`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Bm25Ranker;
+
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+const NAME_WEIGHT: usize = 3;
+
+impl SkillRanker for Bm25Ranker {
+    fn method(&self) -> &'static str {
+        "bm25-lexical"
+    }
+
+    fn rank(&self, query: &str, docs: &[(&str, &str)], k: usize) -> Vec<usize> {
+        let mut q = crate::words(query);
+        q.sort();
+        q.dedup();
+        if q.is_empty() || docs.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let terms: Vec<Vec<String>> = docs
+            .iter()
+            .map(|(name, desc)| {
+                let mut t = Vec::new();
+                for _ in 0..NAME_WEIGHT {
+                    t.extend(crate::words(name));
+                }
+                t.extend(crate::words(desc));
+                t
+            })
+            .collect();
+        let n = terms.len() as f64;
+        let avg_len = terms.iter().map(Vec::len).sum::<usize>() as f64 / n;
+        let mut scored: Vec<(usize, f64)> = Vec::new();
+        for (i, doc) in terms.iter().enumerate() {
+            let len = doc.len() as f64;
+            let mut score = 0.0;
+            for w in &q {
+                let tf = doc.iter().filter(|t| *t == w).count() as f64;
+                if tf == 0.0 {
+                    continue;
+                }
+                let df = terms.iter().filter(|d| d.contains(w)).count() as f64;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let norm = if avg_len > 0.0 {
+                    1.0 - BM25_B + BM25_B * len / avg_len
+                } else {
+                    1.0
+                };
+                score += idf * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm);
+            }
+            if score > 0.0 {
+                scored.push((i, score));
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+}
+
+/// The per-turn skill index: a [`TurnContext`] that puts the at most `k` skills matching the
+/// turn's request in the system prompt. A follow-up with no signal of its own ("ok, go ahead") is
+/// ranked with the member's previous message instead.
+#[derive(Clone)]
+pub struct SkillTurnIndex {
+    lib: Arc<SkillLibrary>,
+    k: usize,
+}
+
+impl SkillTurnIndex {
+    pub fn new(lib: Arc<SkillLibrary>, k: usize) -> Self {
+        SkillTurnIndex { lib, k }
+    }
+
+    /// The method that ranks the skills (see [`Bm25Ranker`]).
+    pub fn method(&self) -> &'static str {
+        Bm25Ranker.method()
+    }
+}
+
+impl TurnContext for SkillTurnIndex {
+    fn section(&self, user: &str, history: &[Message]) -> Option<String> {
+        if self.lib.select(user, self.k).is_empty() {
+            if let Some(prev) = history.iter().rev().find(|m| m.role == Role::User) {
+                if !self.lib.select(&prev.content, self.k).is_empty() {
+                    return self.lib.turn_section(&prev.content, self.k);
+                }
+            }
+        }
+        self.lib.turn_section(user, self.k)
     }
 }
