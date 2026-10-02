@@ -64,14 +64,19 @@ fn managed_mode_lets_public_addresses_through() {
         }
     );
     // Not a network request the gate judges.
-    for url in ["data:text/plain,hi", "about:blank", "blob:https://example.com/x"] {
+    for url in [
+        "data:text/plain,hi",
+        "about:blank",
+        "blob:https://example.com/x",
+    ] {
         assert_eq!(managed_verdict(url, &[], true), Verdict::Continue, "{url}");
     }
 }
 
 #[test]
 fn a_developer_allowed_origin_is_reachable_and_nothing_else_on_that_host() {
-    let allow = parse_allow_private("http://127.0.0.1:8545, http://localhost:3000").expect("parses");
+    let allow =
+        parse_allow_private("http://127.0.0.1:8545, http://localhost:3000").expect("parses");
     assert_eq!(allow.len(), 2);
     assert_eq!(
         managed_verdict("http://127.0.0.1:8545/rpc", &allow, true),
@@ -89,7 +94,10 @@ fn a_developer_allowed_origin_is_reachable_and_nothing_else_on_that_host() {
         managed_verdict("https://127.0.0.1:8545/", &allow, true),
         Verdict::Block(_)
     ));
-    assert_eq!(parse_allow_private("").expect("empty"), Vec::<Origin>::new());
+    assert_eq!(
+        parse_allow_private("").expect("empty"),
+        Vec::<Origin>::new()
+    );
     assert!(parse_allow_private("file:///etc").is_err());
     assert_eq!(allow[0], origin("http://127.0.0.1:8545"));
 }

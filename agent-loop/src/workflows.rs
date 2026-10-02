@@ -16,8 +16,7 @@
 use crate::interview::bundled_tracks;
 use crate::verifiers_tooling::{
     ForgeTestsPass, MedusaNoFailures, SarifBelowThreshold, ScanReportRead, Severity,
-    ADERYN_SCAN_TOOL,
-    FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
+    ADERYN_SCAN_TOOL, FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
 };
 use crate::{
     AnswerContains, JsonFieldEquals, Step, ToolNotCalled, ToolSucceeded, Verifier, Workflow,

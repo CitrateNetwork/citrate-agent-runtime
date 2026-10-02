@@ -28,9 +28,9 @@ use serde_json::{json, Value};
 
 use crate::approvals::{ActionApprovals, Decision, PendingAction};
 use crate::cdp::{Cdp, CdpEvent, EventHandler, Reply};
-use crate::gate::{self, Verdict};
 use crate::chromium::{self, ChromiumStatus, ManagedChrome};
 use crate::frames::{FrameBuffer, FrameView, Highlight};
+use crate::gate::{self, Verdict};
 use crate::scope::{Denylist, Origin, OriginScope, ScopeDecision};
 use crate::snapshot::{build_snapshot, Snapshot, SnapshotLimits};
 
@@ -304,7 +304,9 @@ impl Shared {
                         match spawned {
                             // Answered by the resolver thread.
                             Ok(_) => return None,
-                            Err(_) => Verdict::Block("the host name could not be checked".to_string()),
+                            Err(_) => {
+                                Verdict::Block("the host name could not be checked".to_string())
+                            }
                         }
                     }
                     None => Verdict::Block("the host name could not be checked".to_string()),
@@ -330,12 +332,13 @@ impl Shared {
 
     /// Attach mode: a top-level page load needs the member's consent for its origin.
     fn attached_verdict(&self, url: &str) -> Verdict {
-        let decision = lock(&self.scope)
-            .as_ref()
-            .map(|s| s.check(url))
-            .unwrap_or(ScopeDecision::NotWeb {
-                reason: "internal: no origin scope".to_string(),
-            });
+        let decision =
+            lock(&self.scope)
+                .as_ref()
+                .map(|s| s.check(url))
+                .unwrap_or(ScopeDecision::NotWeb {
+                    reason: "internal: no origin scope".to_string(),
+                });
         let err = match decision {
             ScopeDecision::Allowed => return Verdict::Continue,
             ScopeDecision::NeedsConsent { origin } => {
@@ -1291,14 +1294,12 @@ mod tests {
         let s = shared_attached("https://consented.example/");
         *lock(&s.target) = Some("T1".to_string());
         if let Some(sc) = lock(&s.scope).as_mut() {
-            sc.allow("https://consented.example", false).expect("consent");
+            sc.allow("https://consented.example", false)
+                .expect("consent");
         }
         // A redirect or click from the consented origin to one without consent.
-        let (method, params) = verdict(s.on_event(&paused(
-            "https://other.example/account",
-            "Document",
-            "T1",
-        )));
+        let (method, params) =
+            verdict(s.on_event(&paused("https://other.example/account", "Document", "T1")));
         assert_eq!(method, "Fetch.failRequest");
         assert_eq!(params["errorReason"], "BlockedByClient");
         assert_eq!(

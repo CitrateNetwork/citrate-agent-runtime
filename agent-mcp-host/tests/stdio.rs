@@ -444,11 +444,7 @@ fn shutdown_stops_every_stdio_server_now() {
     host.shutdown();
     let t0 = Instant::now();
     while !host.status().iter().all(|s| s.state == ServerState::Exited) {
-        assert!(
-            t0.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            host.status()
-        );
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", host.status());
         std::thread::sleep(Duration::from_millis(20));
     }
     let name = host.specs()[0].name.clone();

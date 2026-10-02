@@ -379,13 +379,20 @@ fn managed_browser_opens_local_addresses_only_when_a_developer_allows_them() {
         Err(BrowserError::NotWeb(why)) => assert!(why.contains("public"), "{why}"),
         other => panic!("expected a refusal for a local address, got {other:?}"),
     }
-    for local in ["http://localhost:9/", "http://169.254.169.254/latest/meta-data/"] {
+    for local in [
+        "http://localhost:9/",
+        "http://169.254.169.254/latest/meta-data/",
+    ] {
         assert!(
             matches!(svc.navigate(local), Err(BrowserError::NotWeb(_))),
             "{local}"
         );
     }
-    assert_eq!(common::hits(&log, "/"), 0, "nothing reached the local server");
+    assert_eq!(
+        common::hits(&log, "/"),
+        0,
+        "nothing reached the local server"
+    );
 
     let allowed = BrowserService::new(common::config_allowing(exe, &base));
     let page = allowed

@@ -813,7 +813,12 @@ tier = "bundled"
     /// lets a capsule reach it.
     #[test]
     fn socket_rule_never_admits_a_non_public_remote() {
-        for raw in ["127.0.0.1:8545", "169.254.169.254:80", "10.0.0.5:443", "[::1]:443"] {
+        for raw in [
+            "127.0.0.1:8545",
+            "169.254.169.254:80",
+            "10.0.0.5:443",
+            "[::1]:443",
+        ] {
             let addr: SocketAddr = raw.parse().expect("addr");
             let allow = [addr];
             for use_ in [

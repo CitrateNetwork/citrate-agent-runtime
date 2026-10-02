@@ -156,10 +156,10 @@ mod tests {
     #[test]
     fn tunnelled_ipv4_addresses_are_judged_by_the_embedded_address() {
         for n in [
-            "2002:7f00:1::1",            // 6to4 of 127.0.0.1
-            "2002:a00:1::",              // 6to4 of 10.0.0.1
-            "2002:c0a8:101::1",          // 6to4 of 192.168.1.1
-            "2002:a9fe:a9fe::1",         // 6to4 of 169.254.169.254
+            "2002:7f00:1::1",                       // 6to4 of 127.0.0.1
+            "2002:a00:1::",                         // 6to4 of 10.0.0.1
+            "2002:c0a8:101::1",                     // 6to4 of 192.168.1.1
+            "2002:a9fe:a9fe::1",                    // 6to4 of 169.254.169.254
             "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo, client 127.0.0.1
             "2001:0:4136:e378:8000:63bf:f5ff:fffe", // Teredo, client 10.0.0.1
             "2001:0:a00:1:8000:63bf:f7f7:f7f7",     // Teredo, server 10.0.0.1

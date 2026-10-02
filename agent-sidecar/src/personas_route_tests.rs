@@ -294,7 +294,12 @@ async fn a_session_persona_that_fails_the_checks_is_refused() {
         serde_json::json!({}),
     ] {
         let r = app(state())
-            .oneshot(req("POST", "/sessions", session_body(persona.clone()), true))
+            .oneshot(req(
+                "POST",
+                "/sessions",
+                session_body(persona.clone()),
+                true,
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{persona}");
