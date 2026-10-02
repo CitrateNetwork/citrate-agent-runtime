@@ -1,6 +1,7 @@
 //! Target policy: which URLs `read_url` may fetch and which addresses it may connect to.
 
 use crate::SearchError;
+use citrate_agent_guard::net::is_local_name as local_name;
 use reqwest::Url;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
@@ -42,17 +43,6 @@ fn literal_ip(url: &Url) -> Option<IpAddr> {
 
 fn allowed(ip: IpAddr, allow_private: &[IpAddr]) -> bool {
     is_public_ip(ip) || allow_private.contains(&ip)
-}
-
-/// Names that never denote a public host, whatever DNS says.
-fn local_name(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "localhost"
-        || h.ends_with(".localhost")
-        || h.ends_with(".local")
-        || h.ends_with(".internal")
-        || h.ends_with(".home.arpa")
-        || !h.contains('.')
 }
 
 /// Check a target without resolving it: literal addresses and local names only. Used for a target

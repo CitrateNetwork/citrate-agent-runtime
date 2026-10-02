@@ -10,6 +10,8 @@
 //! - [`snapshot`]: ref-indexed accessibility snapshots (`[e3] button "Continue"`).
 //! - [`service`]: the worker: navigate, snapshot, act by ref, screenshot, a screencast for the
 //!   Browser pop-out ([`frames`]), Stop, and attach-to-Chrome.
+//! - [`gate`]: requests are judged before they are sent: public addresses only in managed mode,
+//!   consented origins only for attach-mode page loads.
 //! - [`scope`]: attach-mode origin scoping: per-origin, per-session consent; banking, email and
 //!   health origins excluded by default (`data/sensitive-origins.toml`).
 //! - [`approvals`]: after taint, each effectful browser action waits for the member's decision.
@@ -23,6 +25,7 @@ pub mod approvals;
 pub mod cdp;
 pub mod chromium;
 pub mod frames;
+pub mod gate;
 pub mod scope;
 pub mod service;
 pub mod snapshot;

@@ -49,6 +49,9 @@
 //!                               serves the /browser control routes; anything else = off (optional)
 //!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
 //!                               updater); unset = a system Chromium if one exists (optional)
+//!   CITRATE_BROWSER_ALLOW_PRIVATE  developer use: local origins the managed browser may open
+//!                               (comma separated, e.g. http://127.0.0.1:8545); unset = public
+//!                               web addresses only (optional)
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it

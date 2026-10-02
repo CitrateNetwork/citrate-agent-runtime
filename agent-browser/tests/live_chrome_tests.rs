@@ -309,9 +309,10 @@ fn attach_needs_consent_per_session_and_per_origin() {
         0,
         "the origin without consent never received the redirected request"
     );
+    // The tab is left on the browser's own error page, which is never read either.
     assert!(matches!(
         svc.snapshot(),
-        Err(BrowserError::NeedsConsent { .. })
+        Err(BrowserError::NeedsConsent { .. }) | Err(BrowserError::NotWeb(_))
     ));
 
     // Detach forgets consent and leaves the member's Chrome running.

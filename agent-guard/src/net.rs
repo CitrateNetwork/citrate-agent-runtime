@@ -66,6 +66,18 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Host names that never denote a public host, whatever DNS says: `localhost` and its
+/// subdomains, `.local` (mDNS), `.internal`, `.home.arpa`, and single-label names.
+pub fn is_local_name(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+        || h.ends_with(".home.arpa")
+        || !h.contains('.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
