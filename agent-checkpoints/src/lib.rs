@@ -55,8 +55,9 @@
 //!
 //! # Not here
 //!
-//! Keyless: nothing signs (Rule 3). Not wired into any tool yet; the file tools adopt it in a
-//! later WP, and the app (citrate-core) owns the app-data directory and the undo UI.
+//! Keyless: nothing signs (Rule 3). The sidecar file tools (`agent-sidecar` `files` module,
+//! HUP-S2.9) take a step around every change and serve the undo routes; the app (citrate-core)
+//! owns the app-data directory and the undo UI.
 
 mod blobs;
 mod error;
