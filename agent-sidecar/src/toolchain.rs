@@ -34,10 +34,17 @@
 //! reading inside the project, names a compiler by path, or holds env files or other build
 //! front-end configs is refused with the reason, and nothing runs.
 //!
+//! **OS sandbox (US-2.2 AC1).** When the machine has a working OS sandbox (macOS Seatbelt, Linux
+//! bubblewrap) every run goes through it: no network, writes only in the project folder and the
+//! scratch HOME, reads limited to those, the system and the toolchain directories. Without one
+//! the runs behave as before and the run facts say `sandbox.enforced: false`.
+//! `CITRATE_HERMES_SHELL_SANDBOX` = `preferred` (default), `required` (refuse when no sandbox
+//! works here) or `off`; any other value is treated as `required`.
+//!
 //! **Honest scope.** These are fixed argv templates, but the programs execute project code by
-//! design (forge tests in the EVM, compilation). There is
-//! no OS sandbox yet (US-2.2 AC1 is a separate work item), and a session stop or the e-stop does
-//! not interrupt a run in progress; the wall-clock timeout bounds it. aderyn and medusa are
+//! design (forge tests in the EVM, compilation); the OS sandbox bounds what that code can reach.
+//! A session stop or the e-stop does not interrupt a run in progress; the wall-clock timeout
+//! bounds it. aderyn and medusa are
 //! often not installed: the tools then say so and their verifiers fail, never pass. This module
 //! never holds a key and never signs (Rule 3).
 
@@ -55,6 +62,7 @@ use citrate_agent_loop::verifiers_tooling::{
 use citrate_agent_loop::{
     Effect, HostKind, ToolAnnotations, ToolCall, ToolHost, ToolOutcome, ToolSpec, Trust,
 };
+use citrate_agent_shell::sandbox::{SandboxMode, SandboxPolicy};
 use citrate_agent_shell::{
     Allowlist, ArgPolicy, RunReport, RunRequest, ShellError, ShellPolicy, ShellRunner,
 };
@@ -68,6 +76,9 @@ pub const TOOLCHAIN_ROOTS_ENV: &str = "CITRATE_HERMES_TOOLCHAIN_ROOTS";
 pub const TOOLCHAIN_PATH_ENV: &str = "CITRATE_HERMES_TOOLCHAIN_PATH";
 /// Absolute path of the solc binary forge should use (`FOUNDRY_SOLC`).
 pub const SOLC_ENV: &str = "CITRATE_HERMES_SOLC";
+/// The OS sandbox mode for the toolchain (and any other agent-shell run the sidecar makes):
+/// `preferred` (default), `required`, or `off`. Anything else is `required` (fail closed).
+pub const SANDBOX_ENV: &str = "CITRATE_HERMES_SHELL_SANDBOX";
 /// The chain's pinned compiler version (looked up in the per-user svm dir by default).
 pub const PINNED_SOLC: &str = "0.8.36";
 
@@ -106,6 +117,19 @@ pub struct ToolchainConfig {
     pub solc: Option<PathBuf>,
     /// The member's home (for the default-deny list).
     pub home: PathBuf,
+    /// Whether runs go through the OS sandbox.
+    pub sandbox: SandboxMode,
+}
+
+/// [`SANDBOX_ENV`] read with `get`: unset or empty is `default`, junk is `Required`.
+pub fn sandbox_mode_from(
+    get: &impl Fn(&str) -> Option<String>,
+    default: SandboxMode,
+) -> SandboxMode {
+    match get(SANDBOX_ENV) {
+        Some(v) if !v.trim().is_empty() => SandboxMode::parse(&v).unwrap_or(SandboxMode::Required),
+        _ => default,
+    }
 }
 
 fn split_abs(value: &str) -> Vec<PathBuf> {
@@ -152,11 +176,13 @@ impl ToolchainConfig {
             .map(|d| d.join(PINNED_SOLC).join(format!("solc-{PINNED_SOLC}")))
             .find(|p| p.is_file()),
         };
+        let sandbox = sandbox_mode_from(&get, SandboxMode::Preferred);
         Some(ToolchainConfig {
             roots,
             search_path,
             solc,
             home,
+            sandbox,
         })
     }
 
@@ -210,7 +236,15 @@ fn build_runner(
         .with_request_env_allow(&["FOUNDRY_OFFLINE", "FOUNDRY_SOLC"])
         .with_default_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .with_max_timeout(Duration::from_secs(MAX_TIMEOUT_SECS + MEDUSA_GRACE_SECS))
-        .with_output_caps(stdout_cap, STDERR_CAP);
+        .with_output_caps(stdout_cap, STDERR_CAP)
+        .with_sandbox(
+            SandboxPolicy::new(cfg.sandbox).with_extra_read_roots(
+                cfg.solc
+                    .iter()
+                    .filter_map(|p| p.parent().map(Path::to_path_buf))
+                    .collect(),
+            ),
+        );
     if let Some(g) = grants {
         return Ok(ShellRunner::new(policy, move |cwd: &Path| {
             g.check_project(cwd).map(|_| ())
@@ -566,6 +600,7 @@ fn run_facts(r: &RunReport) -> serde_json::Value {
         "stderr_bytes": r.stderr_bytes,
         "stdout_truncated": r.stdout_truncated,
         "output_incomplete": r.output_incomplete,
+        "sandbox": r.sandbox,
     })
 }
 

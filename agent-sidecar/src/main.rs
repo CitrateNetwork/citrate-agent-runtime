@@ -13,6 +13,14 @@
 //!   CITRATE_HERMES_TOOLCHAIN_PATH   toolchain search path override, a path list (optional)
 //!   CITRATE_HERMES_SOLC         absolute path of the solc forge should use; default: the pinned
 //!                               0.8.36 in the per-user svm dir when present (optional)
+//!   CITRATE_HERMES_SHELL_SANDBOX  US-2.2 AC1: `preferred` (default) runs the toolchain inside
+//!                               the OS sandbox (macOS Seatbelt, Linux bubblewrap) when one works
+//!                               here; `required` refuses runs without one; `off` never wraps;
+//!                               any other value counts as `required` (optional)
+//!   CITRATE_HERMES_SHELL_RUN    US-2.2 AC2: `1` offers shell_run (an exact command the member
+//!                               approves, run in the OS sandbox, never without it) in every
+//!                               session opened with folder grants; anything else = off (optional)
+//!   CITRATE_HERMES_SHELL_PATH   shell_run search path override, a path list (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
 //!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
