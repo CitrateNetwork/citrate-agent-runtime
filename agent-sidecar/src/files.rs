@@ -41,7 +41,7 @@
 //! holds a key and never signs (Rule 3).
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -503,7 +503,20 @@ fn read_text(path: &Path) -> Result<String, Refusal> {
             meta.len()
         )));
     }
-    let bytes = fs::read(path).map_err(|e| Refusal::Failed(format!("{shown}: {e}")))?;
+    // Read through a confirmed open of the checked path (see `grants::open_checked`).
+    let mut bytes = Vec::new();
+    crate::grants::open_checked(path, false)
+        .and_then(|f| {
+            f.take(MAX_CONTENT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| ())
+        })
+        .map_err(|e| Refusal::Failed(format!("{shown}: {e}")))?;
+    if bytes.len() > MAX_CONTENT_BYTES {
+        return Err(Refusal::Failed(format!(
+            "{shown} grew past the {MAX_CONTENT_BYTES}-byte edit limit while it was read"
+        )));
+    }
     String::from_utf8(bytes).map_err(|_| Refusal::Failed(format!("{shown} is not UTF-8 text")))
 }
 
@@ -537,10 +550,9 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         TMP_N.fetch_add(1, Ordering::SeqCst)
     ));
     let res = (|| -> std::io::Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        // A new temp file, confirmed to be where it was asked for (a folder on the way swapped
+        // for a link after the grant check is refused, see `grants::open_checked`).
+        let mut f = crate::grants::open_checked(&tmp, true)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         if let Ok(meta) = fs::metadata(path) {

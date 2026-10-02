@@ -26,7 +26,7 @@ use citrate_agent_loop::{
 };
 use citrate_agent_office::{format_for, read_sheet, write_sheet, Cell, Limits, SheetFormat};
 
-use crate::grants::{hard_linked, open_nofollow, SessionGrants};
+use crate::grants::{hard_linked, open_checked, SessionGrants};
 
 pub const SHEET_READ_TOOL: &str = "sheet_read";
 pub const SHEET_WRITE_TOOL: &str = "sheet_write";
@@ -179,7 +179,7 @@ impl SheetToolHost {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
         };
-        let mut f = match open_nofollow(&file, false) {
+        let mut f = match open_checked(&file, false) {
             Ok(f) => f,
             Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
         };
@@ -259,7 +259,7 @@ impl SheetToolHost {
             }
             _ => {}
         }
-        let mut f = match open_nofollow(&file, true) {
+        let mut f = match open_checked(&file, true) {
             Ok(f) => f,
             Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
         };
