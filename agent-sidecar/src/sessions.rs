@@ -286,6 +286,30 @@ pub struct CreateSessionReq {
     /// as usual. Absent = false: nothing changes. The taint is never cleared for such a session.
     #[serde(default)]
     pub unattended: bool,
+    /// HUP-S3.3: a shipped persona id. Its skill allowlist decides which skills the session
+    /// offers, and its tool emphasis pins up to four of the session's own tools into every request.
+    /// The persona's prompt fragment is composed by the client. Absent = no persona: nothing
+    /// changes.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// HUP-S3.3 (US-3.3 AC3): a member-defined persona instead of `persona` (checked here with
+    /// the same rules as `POST /personas/check`). Never both.
+    #[serde(default)]
+    pub custom_persona: Option<citrate_agent_loop::personas::CustomPersona>,
+}
+
+/// HUP-S3.3: what a session did with its persona (`POST /sessions` answers it as `persona`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonaReport {
+    pub id: String,
+    /// Allowlisted skills this session offers (empty when the sidecar has no skills library).
+    pub skills_offered: Vec<String>,
+    /// Allowlisted skills that are not installed, so not offered.
+    pub skills_missing: Vec<String>,
+    /// False when the persona names no skills (a custom persona): the skills are then unchanged.
+    pub skills_restricted: bool,
+    /// The session's own tools pinned into every request, in emphasis order.
+    pub pinned_tools: Vec<String>,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -372,6 +396,8 @@ pub struct Session {
     files: Option<Arc<FileTools>>,
     /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
     runs: Mutex<VecDeque<(String, RunState)>>,
+    /// HUP-S3.3: present when this session was opened with a persona.
+    persona: Option<PersonaReport>,
 }
 
 impl Session {
@@ -480,6 +506,16 @@ impl Session {
     }
 
     /// HUP-S2.1: this session's folder grants (`None` when it was opened without a document).
+    /// HUP-S3.3: what this session did with its persona, if it has one.
+    pub fn persona(&self) -> Option<&PersonaReport> {
+        self.persona.as_ref()
+    }
+
+    /// The names of every tool this session offers (core-hosted and sidecar-hosted).
+    pub fn tool_names(&self) -> Vec<String> {
+        self.specs.iter().map(|t| t.name.clone()).collect()
+    }
+
     pub fn grants(&self) -> Option<&Arc<SessionGrants>> {
         self.grants.as_ref()
     }
@@ -876,6 +912,17 @@ impl SessionManager {
         self.mcp.as_ref().map(|h| h.status())
     }
 
+    /// HUP-S3.3: the skills library new sessions start from (before a persona's allowlist).
+    /// A snapshot: HUP-S3.4 reloads the library when the member accepts a learned skill.
+    pub fn skills_library(&self) -> Option<Arc<SkillLibrary>> {
+        self.skills()
+    }
+
+    /// HUP-S3.3: whether the toolchain tools (forge, slither, aderyn, medusa) are offered.
+    pub fn toolchain_enabled(&self) -> bool {
+        self.toolchain.is_some()
+    }
+
     /// HUP-S3.2: offer this skills library to every new session. An empty library offers nothing.
     /// A library given this way is fixed: [`SessionManager::reload_skills`] has no sources to
     /// read again.
@@ -932,11 +979,45 @@ impl SessionManager {
         if req.model.trim().is_empty() {
             return Err(SessionError::Invalid("model is required".into()));
         }
+        let persona = citrate_agent_loop::personas::session_persona(
+            req.persona.as_deref(),
+            req.custom_persona.as_ref(),
+        )
+        .map_err(SessionError::Invalid)?;
+        // HUP-S3.3: the persona's skill allowlist decides which skills this session offers. An
+        // allowlist with nothing installed offers no skills (and no `skill_load`), never others.
+        // One snapshot of the (reloadable) library for the allowlist, the prompt section and
+        // the session's `skill_load` host.
+        let base_skills = self.skills();
+        let (skills, persona_skills) = match (&persona, &base_skills) {
+            (Some(p), Some(lib)) if p.restricts_skills() => {
+                let (only, missing) = lib.restricted_to(&p.skills);
+                let offered: Vec<String> = only.names().into_iter().map(String::from).collect();
+                let lib = if only.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(only))
+                };
+                (lib, Some((offered, missing, true)))
+            }
+            (Some(p), None) if p.restricts_skills() => {
+                (None, Some((Vec::new(), p.skills.clone(), true)))
+            }
+            (Some(_), lib) => (
+                lib.clone(),
+                Some((
+                    lib.as_ref()
+                        .map(|l| l.names().into_iter().map(String::from).collect())
+                        .unwrap_or_default(),
+                    Vec::new(),
+                    false,
+                )),
+            ),
+            (None, lib) => (lib.clone(), None),
+        };
         let mut specs = req.tools;
         let mut system_prompt = req.system_prompt;
         let mut pinned_tools = Vec::new();
-        // One snapshot for the prompt section and the session's `skill_load` host.
-        let skills = self.skills();
         if let Some(lib) = &skills {
             if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
                 return Err(SessionError::Invalid(format!(
@@ -1036,6 +1117,25 @@ impl SessionManager {
             crate::capsule_sandbox::SessionSandbox::new(req.capsule_sandbox, grants.clone())
                 .map_err(|e| SessionError::Invalid(format!("capsuleSandbox was refused: {e}")))?,
         );
+        // HUP-S3.3: the persona's tool emphasis pins the session's own tools (never adds one).
+        let persona = persona.map(|p| {
+            let offered: Vec<String> = specs.iter().map(|t| t.name.clone()).collect();
+            let pinned = p.pinned_tools(&offered);
+            for t in &pinned {
+                if !pinned_tools.contains(t) {
+                    pinned_tools.push(t.clone());
+                }
+            }
+            let (skills_offered, skills_missing, skills_restricted) =
+                persona_skills.clone().unwrap_or_default();
+            PersonaReport {
+                id: p.id,
+                skills_offered,
+                skills_missing,
+                skills_restricted,
+                pinned_tools: pinned,
+            }
+        });
         let toolchain: Option<Arc<dyn ToolHost>> = match (&self.toolchain, &grants) {
             (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
@@ -1125,6 +1225,7 @@ impl SessionManager {
             trajectory,
             files: self.files.clone(),
             runs: Mutex::new(VecDeque::new()),
+            persona,
         });
         sessions.insert(id.clone(), session);
         Ok(id)

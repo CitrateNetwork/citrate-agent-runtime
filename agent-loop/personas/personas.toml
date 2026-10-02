@@ -9,6 +9,12 @@
 # persona, change its one `name = "..."` line; the `id` is stable and is what members' settings
 # store. When the owner signs off, also change that persona's `name_status` to "owner-approved".
 #
+# skills is the persona's skill allowlist: names of skills in the reviewed corpus (citrate-core
+# skills.lock, verdict include-*) or the app's bundled citrate-* skills. A session opened with this
+# persona offers only these skills (GET /personas reports which are installed); names that are not
+# installed are skipped, never invented. tool_emphasis names tools a session pins into every
+# request (at most four, and only tools the session already offers).
+#
 # tts_voice is optional. Unset means the system voice. Set it to a voice id the platform's
 # existing speech engine knows (a plain slug); no TTS engine ships with personas.
 #
@@ -32,7 +38,7 @@ style_rules = [
 default_track = "full-project"
 default_workflow = "hello-mint"
 tool_emphasis = ["forge_test", "slither_scan", "skill_load", "contract_deploy"]
-skills = ["solidity", "foundry", "openzeppelin", "solady", "frontend-design", "agentile-red-green", "toolchain"]
+skills = ["red-green", "refactor-mutate", "test-plan", "secure-workflow-guide", "guidelines-advisor", "token-integration-analyzer", "property-based-testing", "frontend-design", "tailwind", "vercel-react-best-practices", "citrate-precompiles"]
 
 [[personas]]
 id = "auditor"
@@ -51,7 +57,7 @@ style_rules = [
 default_track = "smart-contract"
 default_workflow = "audit-a-contract"
 tool_emphasis = ["slither_scan", "aderyn_scan", "medusa_fuzz", "forge_test"]
-skills = ["trailofbits-audit", "audit-context", "spec-compliance", "toolchain"]
+skills = ["audit-context-building", "audit-prep-assistant", "entry-point-analyzer", "spec-to-code-compliance", "secure-workflow-guide", "guidelines-advisor", "token-integration-analyzer", "code-maturity-assessor", "differential-review", "variant-analysis", "insecure-defaults", "sharp-edges", "property-based-testing", "sarif-parsing", "semgrep", "fp-check"]
 
 [[personas]]
 id = "maker"
@@ -70,7 +76,7 @@ style_rules = [
 default_track = "creative"
 default_workflow = "creative-project"
 tool_emphasis = ["skill_load", "memory_search"]
-skills = ["frontend-design", "copywriting", "landing-pages"]
+skills = ["frontend-design", "impeccable", "copywriting", "copy-editing", "content-strategy", "page-cro", "web-design-guidelines", "stop-slop", "tailwind", "gsap", "three", "css-animations", "animejs", "lottie"]
 
 [[personas]]
 id = "steward"
@@ -89,7 +95,7 @@ style_rules = [
 default_track = "project-management"
 default_workflow = "project-plan"
 tool_emphasis = ["journal_read", "journal_append", "skills_list"]
-skills = ["agentile-planset", "agentile-sprint", "journal"]
+skills = ["agentile", "planset", "feature-spec", "test-plan", "retro", "journal", "document-pass", "case-study", "essay", "projects"]
 
 [[personas]]
 id = "guide"
@@ -108,7 +114,7 @@ style_rules = [
 default_track = "full-project"
 default_workflow = "launch-checklist"
 tool_emphasis = ["memory_search", "memory_recall", "app_navigate"]
-skills = ["citrate-docs", "paraconsensus-literacy", "wallet-basics"]
+skills = ["citrate-paraconsensus", "citrate-precompiles", "citrate-belnap-aggregate", "citrate-sidecar-consensus", "navigate", "agentile", "ask-questions-if-underspecified"]
 
 [[personas]]
 id = "operator"
@@ -126,4 +132,4 @@ style_rules = [
 default_track = "project-management"
 default_workflow = "status-note"
 tool_emphasis = ["node_status", "staking_status", "models_list"]
-skills = ["cluster", "sizeup", "fl-rounds"]
+skills = ["citrate-sidecar-consensus", "citrate-paraconsensus", "citrate-belnap-aggregate", "citrate-precompiles", "projects"]
