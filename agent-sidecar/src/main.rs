@@ -15,6 +15,9 @@
 //!                               0.8.36 in the per-user svm dir when present (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_MCP_REGISTRY HUP-S4.4: core's owner-only saved MCP server list
+//!                               (mcp-servers.json); POST /mcp/probe starts only entries saved
+//!                               there exactly as sent; unset = every probe is refused (optional)
 //!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
 //!                               the /checkpoints undo routes are served (optional)
 //!   CITRATE_HERMES_FILES        HUP-S2.9: `1` offers fs_write / fs_edit / fs_delete / fs_rename in

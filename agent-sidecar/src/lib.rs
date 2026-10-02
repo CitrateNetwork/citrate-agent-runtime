@@ -386,8 +386,10 @@ async fn workers_status(
 }
 
 /// HUP-S4.4: `POST /mcp/probe` with one server entry (the allowlist's `[[servers]]` shape, JSON).
-/// 422 `{errors: [{field, message}]}` for an invalid entry; 429 while another probe runs; else
-/// 200 with the probe report (`ok: false` + `error` when the server could not be reached).
+/// 422 `{errors: [{field, message}]}` for an invalid entry; 503 when the sidecar was not given
+/// core's saved server list; 403 when the entry is not saved there exactly as sent (nothing is
+/// started); 429 while another probe runs; else 200 with the probe report (`ok: false` + `error`
+/// when the server could not be reached).
 async fn mcp_probe_route(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -399,7 +401,7 @@ async fn mcp_probe_route(
             Json(serde_json::json!({ "error": "unauthorized" })),
         ));
     }
-    mcp_probe::handle(entry).await
+    mcp_probe::handle(entry, st.sessions.mcp_registry()).await
 }
 
 async fn skills(
@@ -924,6 +926,11 @@ pub fn production_sessions_with(
     // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
     let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
+        None => mgr,
+    };
+    // HUP-S4.4: the MCP probe starts only entries core saved in this list.
+    let mgr = match std::env::var_os(mcp_probe::MCP_REGISTRY_ENV).filter(|p| !p.is_empty()) {
+        Some(p) => mgr.with_mcp_registry(std::path::PathBuf::from(p)),
         None => mgr,
     };
     let mgr = match skills_from_env() {

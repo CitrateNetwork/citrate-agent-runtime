@@ -693,6 +693,8 @@ pub struct SessionManager {
     metering: Arc<MeteringStore>,
     trajectories: Option<Arc<TrajectoryConfig>>,
     anchor: Option<Arc<AnchorService>>,
+    /// HUP-S4.4: core's saved MCP server list; the probe starts only entries saved there.
+    mcp_registry: Option<std::path::PathBuf>,
 }
 
 impl SessionManager {
@@ -717,7 +719,19 @@ impl SessionManager {
             metering: Arc::new(MeteringStore::in_memory()),
             trajectories: None,
             anchor: None,
+            mcp_registry: None,
         }
+    }
+
+    /// HUP-S4.4: core's saved MCP server list (`mcp_probe::MCP_REGISTRY_ENV`).
+    pub fn with_mcp_registry(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.mcp_registry = Some(path.into());
+        self
+    }
+
+    /// HUP-S4.4: the saved MCP server list the probe checks against, if configured.
+    pub fn mcp_registry(&self) -> Option<&std::path::Path> {
+        self.mcp_registry.as_deref()
     }
 
     /// HUP-S7.5: where finished metering records go (default: in memory for this process).
