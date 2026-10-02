@@ -301,6 +301,15 @@ impl FileTools {
                         crate::toolchain_config::build_config_refusal(&name),
                     ));
                 }
+                // A hard link can name a file kept outside the grant (the deny list is
+                // path-based): no fs tool reads, snapshots, edits, moves or removes one.
+                if let Ok(meta) = fs::symlink_metadata(canonical.as_path()) {
+                    if meta.is_file() && crate::grants::hard_linked(&meta) {
+                        return Err(Refusal::Policy(format!(
+                            "{raw} has another hard link, so it may be a file kept elsewhere; the member handles it"
+                        )));
+                    }
+                }
                 let root = grants
                     .state()
                     .grants
