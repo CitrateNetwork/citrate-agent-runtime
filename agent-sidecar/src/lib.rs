@@ -930,13 +930,68 @@ async fn shell_decide(
         .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
     let req: ShellDecideReq = serde_json::from_slice(&body)
         .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {id, allow, argv, cwd}"))?;
+    // HUP-S2.6: the member's decision on the exact command is recorded in the log the nightly
+    // anchor batches (write-ahead for an allow, which is refused when it cannot be recorded; a
+    // deny always takes effect and is recorded after).
+    let log = st.sessions.records();
+    let subject = format!("{} (in {})", req.argv.join(" "), req.cwd);
+    let record = |allow: bool, log: &citrate_agent_records::DecisionLog| {
+        hic_records::record_member_decision(
+            log,
+            "shell.run",
+            &subject,
+            allow,
+            "the member decided on the exact command and folder shown",
+            vec![citrate_agent_records::EvidenceRef {
+                kind: "shell_run".to_string(),
+                uri: format!("sidecar:sessions/{id}/shell/{}", req.id),
+                digest: None,
+            }],
+        )
+    };
+    let allow_seq = match &log {
+        Some(log) if req.allow => match record(true, log) {
+            Ok(seq) => Some(seq),
+            Err(e) => return Err(json_err(StatusCode::SERVICE_UNAVAILABLE, &e)),
+        },
+        _ => None,
+    };
     match session.shell_decide(&req.id, req.allow, &req.argv, &req.cwd) {
-        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
-        Err(sessions::SessionError::Invalid(m)) => Err(json_err(StatusCode::CONFLICT, &m)),
-        Err(_) => Err(json_err(
-            StatusCode::CONFLICT,
-            "this session does not run commands",
-        )),
+        Ok(()) => {
+            if let Some(log) = &log {
+                match allow_seq {
+                    Some(seq) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Completed,
+                        "released to the sandboxed runner; the run's own result is in the session",
+                    ),
+                    None => {
+                        if let Err(e) = record(false, log) {
+                            eprintln!("citrate-agent-sidecar: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) => {
+            if let (Some(log), Some(seq)) = (&log, allow_seq) {
+                hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "the command was not released (no longer waiting, or argv/folder differed)",
+                );
+            }
+            match e {
+                sessions::SessionError::Invalid(m) => Err(json_err(StatusCode::CONFLICT, &m)),
+                _ => Err(json_err(
+                    StatusCode::CONFLICT,
+                    "this session does not run commands",
+                )),
+            }
+        }
     }
 }
 

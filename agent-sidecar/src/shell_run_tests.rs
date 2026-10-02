@@ -897,3 +897,101 @@ async fn an_unattended_session_never_offers_a_run() {
     assert!(s.shell_pending().unwrap_or_default().is_empty());
     assert!(!marker.exists());
 }
+
+/// HUP-S2.6: every member decision on a `shell_run` command lands in the decision log the nightly
+/// anchor batches: a refused (mismatched) allow closes as failed, the real allow as completed, and
+/// a deny is recorded as denied. (One command per session: after a run the session is tainted.)
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_run_decisions_are_recorded_for_the_anchor() {
+    use citrate_agent_records::{Decision, DecisionLog, Entry, LogConfig, Outcome};
+    let fx = Fx::new();
+    let records_dir = fx.home().join("records");
+    let (log, _) = DecisionLog::open(&records_dir, LogConfig::default()).unwrap();
+    let log = Arc::new(log);
+    let mgr_for = |cmd: &str| {
+        let c = call("call_0", &["sh", "-c", cmd], &fx.proj());
+        let script = Arc::new(Script(Mutex::new(vec![
+            AssistantTurn::tools(vec![c]),
+            AssistantTurn::text("Done."),
+        ])));
+        Arc::new(
+            sessions::SessionManager::new(
+                Arc::new(move |_ep: &sessions::LlmEndpoint| script.clone() as Arc<dyn LlmClient>),
+                Duration::from_secs(5),
+            )
+            .with_grants_home(fx.home())
+            .with_shell_run(Arc::new(cfg_open()))
+            .with_records(log.clone()),
+        )
+    };
+    async fn pending_of(app: &axum::Router, id: &str) -> serde_json::Value {
+        for _ in 0..300 {
+            let (_, body) = send(app, "GET", &format!("/sessions/{id}/shell/pending"), None).await;
+            if body["pending"].as_array().is_some_and(|a| !a.is_empty()) {
+                return body["pending"][0].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no pending shell_run");
+    }
+    // Session A: a mismatched allow (409), then the real allow.
+    let a = mgr_for("echo one");
+    let a_id = a.create(create_req(Some(fx.rw_doc()), false)).unwrap();
+    let a_app = app_for(a.clone());
+    a.send(&a_id, "build it".into(), None).unwrap();
+    let p = pending_of(&a_app, &a_id).await;
+    let url = format!("/sessions/{a_id}/shell/decide");
+    let (st, _) = send(
+        &a_app,
+        "POST",
+        &url,
+        Some(serde_json::json!({"id": p["id"], "allow": true, "argv": ["sh"], "cwd": p["cwd"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = send(
+        &a_app,
+        "POST",
+        &url,
+        Some(serde_json::json!({"id": p["id"], "allow": true, "argv": p["argv"], "cwd": p["cwd"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // Session B: a deny.
+    let b = mgr_for("echo two");
+    let b_id = b.create(create_req(Some(fx.rw_doc()), false)).unwrap();
+    let b_app = app_for(b.clone());
+    b.send(&b_id, "build it".into(), None).unwrap();
+    let p = pending_of(&b_app, &b_id).await;
+    let (st, _) = send(
+        &b_app,
+        "POST",
+        &format!("/sessions/{b_id}/shell/decide"),
+        Some(
+            serde_json::json!({"id": p["id"], "allow": false, "argv": p["argv"], "cwd": p["cwd"]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut recs = citrate_agent_records::read::page(&records_dir, None, 10_000).unwrap();
+    recs.sort_by_key(|r| r.record.seq);
+    let decisions: Vec<(u64, Decision)> = recs
+        .iter()
+        .filter_map(|r| match &r.record.entry {
+            Entry::Decision(d) if d.kind == "shell.run" => Some((r.record.seq, d.decision)),
+            _ => None,
+        })
+        .collect();
+    let outcome = |seq: u64| {
+        recs.iter().find_map(|r| match &r.record.entry {
+            Entry::Outcome(o) if o.decision_seq == seq => Some(o.outcome),
+            _ => None,
+        })
+    };
+    assert_eq!(decisions.len(), 3, "{decisions:?}");
+    assert_eq!(decisions[0].1, Decision::Approved);
+    assert_eq!(outcome(decisions[0].0), Some(Outcome::Failed));
+    assert_eq!(decisions[1].1, Decision::Approved);
+    assert_eq!(outcome(decisions[1].0), Some(Outcome::Completed));
+    assert_eq!(decisions[2].1, Decision::Denied);
+}
