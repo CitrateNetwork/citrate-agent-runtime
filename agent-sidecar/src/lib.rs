@@ -18,29 +18,29 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
-pub mod learn;
-pub mod grants;
-pub mod capsule_sandbox;
 pub mod anchor;
+pub mod browser;
+pub mod capsule_sandbox;
 mod chain_routes;
 mod checkpoint_routes;
-pub mod files;
 pub mod decide;
-pub mod browser;
-pub mod signin_routes;
-pub mod web_signing_records;
-pub mod llm_http;
-pub mod metering;
 pub mod escalation;
+pub mod files;
+pub mod grants;
+pub mod learn;
+pub mod llm_http;
 pub mod mcp_probe;
+pub mod metering;
 pub mod search;
 pub mod sessions;
 pub mod sheets;
+pub mod signin_routes;
 pub mod toolchain;
 mod toolchain_config;
-pub mod workflow_spec;
-pub mod workers;
 pub mod trajectory;
+pub mod web_signing_records;
+pub mod workers;
+pub mod workflow_spec;
 
 use std::sync::Arc;
 
@@ -1474,17 +1474,17 @@ async fn start_track_workflow(
 #[cfg(test)]
 mod anchor_route_tests;
 #[cfg(test)]
-mod mcp_session_tests;
-#[cfg(test)]
-mod metering_session_tests;
-#[cfg(test)]
 mod capsule_sandbox_tests;
 #[cfg(test)]
 mod grants_session_tests;
 #[cfg(test)]
+mod learn_more_session_tests;
+#[cfg(test)]
 mod learn_session_tests;
 #[cfg(test)]
-mod learn_more_session_tests;
+mod mcp_session_tests;
+#[cfg(test)]
+mod metering_session_tests;
 #[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
@@ -1497,11 +1497,11 @@ mod tests;
 #[cfg(test)]
 mod browser_session_tests;
 #[cfg(test)]
-mod signin_route_tests;
+mod decide_route_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]
-mod decide_route_tests;
+mod signin_route_tests;
 #[cfg(test)]
 mod toolchain_tests;
 
@@ -1736,14 +1736,16 @@ async fn learn_publish(
         .map_err(refusal)
 }
 #[cfg(test)]
-mod files_tests;
-#[cfg(test)]
 mod daemon_session_tests;
 #[cfg(test)]
 mod escalation_tests;
+#[cfg(test)]
+mod files_tests;
 #[cfg(test)]
 mod mcp_probe_tests;
 #[cfg(test)]
 mod personas_route_tests;
 #[cfg(test)]
 mod track_workflow_route_tests;
+#[cfg(test)]
+mod undo_writes_tests;

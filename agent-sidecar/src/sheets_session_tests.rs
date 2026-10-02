@@ -38,6 +38,8 @@ fn now() -> u64 {
 /// `base/home/books` (granted), `base/home/other` (not granted), `base/home/.ssh`.
 struct Fx {
     base: PathBuf,
+    /// HUP-S2.9: the undo store (one open per directory).
+    store: std::sync::OnceLock<Arc<citrate_agent_checkpoints::CheckpointStore>>,
 }
 impl Fx {
     fn new() -> Self {
@@ -54,7 +56,10 @@ impl Fx {
         std::fs::write(base.join("home/books/q3.csv"), "item,cost\npaper,4.5\n").unwrap();
         std::fs::write(base.join("home/other/secret.csv"), "a,b\n1,2\n").unwrap();
         std::fs::write(base.join("home/.ssh/keys.csv"), "k\nv\n").unwrap();
-        Fx { base }
+        Fx {
+            base,
+            store: std::sync::OnceLock::new(),
+        }
     }
     fn home(&self) -> PathBuf {
         self.base.join("home")
@@ -73,7 +78,22 @@ impl Fx {
     fn host(&self, doc: &serde_json::Value) -> SheetToolHost {
         let g = SessionGrants::empty(self.home());
         g.replace(doc).unwrap();
+        // HUP-S2.9: writes are checkpointed (at `base/ckpt`, outside the home).
         SheetToolHost::new(Arc::new(g))
+            .with_undo(crate::files::UndoScope::new(self.store(), "s1-sheets").unwrap())
+    }
+    fn store(&self) -> Arc<citrate_agent_checkpoints::CheckpointStore> {
+        self.store
+            .get_or_init(|| {
+                Arc::new(
+                    citrate_agent_checkpoints::CheckpointStore::open(
+                        &self.base.join("ckpt"),
+                        citrate_agent_checkpoints::Config::default(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .clone()
     }
 }
 impl Drop for Fx {
@@ -340,7 +360,8 @@ fn manager(fx: &Fx, turns: Vec<AssistantTurn>) -> (Arc<sessions::SessionManager>
         Arc::new(move |_ep: &sessions::LlmEndpoint| r2.clone() as Arc<dyn LlmClient>),
         Duration::from_secs(5),
     )
-    .with_grants_home(fx.home());
+    .with_grants_home(fx.home())
+    .with_checkpoints(fx.store());
     (Arc::new(mgr), rec)
 }
 

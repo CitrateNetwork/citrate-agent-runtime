@@ -54,11 +54,13 @@
 //! - HUP-S9.3: when trajectory recording is configured (`CITRATE_HERMES_TRAJECTORIES`, default
 //!   off), a session also carries a `TrajectoryRecorder`, exported (verified turns only, redacted)
 //!   when the session closes ([`crate::trajectory`]).
-//! - HUP-S2.9: when the file tools are enabled (`CITRATE_HERMES_FILES=1` with a grants file and a
-//!   checkpoint store, default off), every session also offers the sidecar-hosted `fs_write`,
-//!   `fs_edit`, `fs_delete` and `fs_rename` tools ([`crate::files`]). Each change is checked
-//!   against the folder grants and the default-deny list, then checkpointed under the session id,
-//!   so the member can undo it through the `/checkpoints` routes.
+//! - HUP-S2.9: a session opened with a grant document, when a checkpoint store is configured, also
+//!   offers the sidecar-hosted `fs_write`, `fs_edit`, `fs_delete` and `fs_rename` tools
+//!   ([`crate::files`]) on that document, and its `file_write` and `sheet_write` are checkpointed
+//!   too (without a store they write nothing). A session without a grant document gets the `fs_*`
+//!   tools only with `CITRATE_HERMES_FILES=1` and a grants file. Each change is checked against
+//!   the folder grants and the default-deny list, then checkpointed under the session id, so the
+//!   member can undo it through the `/checkpoints` routes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1104,12 +1106,26 @@ impl SessionManager {
                         t.name
                     )));
                 }
+                // HUP-S2.9: with an undo store, a grant session also gets the checkpointed fs_*
+                // tools, checked against this same grant document.
+                let fs_on_grants = self.checkpoints.is_some() && self.files.is_none();
+                if fs_on_grants {
+                    if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
+                        return Err(SessionError::Invalid(format!(
+                            "the tool name '{}' is reserved by the sidecar while folder grants are given",
+                            t.name
+                        )));
+                    }
+                }
                 let g = SessionGrants::empty(home);
                 g.replace(&doc).map_err(|e| {
                     SessionError::Invalid(format!("the grant document was refused: {e}"))
                 })?;
                 specs.extend(crate::grants::file_tool_specs());
                 specs.extend(crate::sheets::sheet_tool_specs());
+                if fs_on_grants {
+                    specs.extend(FileTools::specs());
+                }
                 Some(Arc::new(g))
             }
         };
@@ -1140,6 +1156,16 @@ impl SessionManager {
             (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
             (None, _) => None,
+        };
+        // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
+        // grant store), not a grants file.
+        let files = match (&grants, &self.checkpoints) {
+            (Some(g), Some(store)) => Some(Arc::new(FileTools::new(
+                store.clone(),
+                crate::files::GrantSource::Session(g.clone()),
+                g.home(),
+            ))),
+            _ => self.files.clone(),
         };
         let mut sessions = self
             .sessions
@@ -1223,7 +1249,7 @@ impl SessionManager {
             metering,
             metering_store: self.metering.clone(),
             trajectory,
-            files: self.files.clone(),
+            files,
             runs: Mutex::new(VecDeque::new()),
             persona,
         });
@@ -1275,8 +1301,26 @@ impl SessionManager {
             .files
             .clone()
             .and_then(|t| FileToolsHost::new(t, &session.id));
-        let file_host = session.grants.clone().map(FileToolHost::new);
-        let sheet_host = session.grants.clone().map(SheetToolHost::new);
+        // HUP-S2.9: file_write and sheet_write checkpoint under the session id; without an undo
+        // store they write nothing.
+        let undo = self
+            .checkpoints
+            .clone()
+            .and_then(|st| crate::files::UndoScope::new(st, &session.id));
+        let file_host = session.grants.clone().map(|g| {
+            let h = FileToolHost::new(g);
+            match &undo {
+                Some(u) => h.with_undo(u.clone()),
+                None => h,
+            }
+        });
+        let sheet_host = session.grants.clone().map(|g| {
+            let h = SheetToolHost::new(g);
+            match &undo {
+                Some(u) => h.with_undo(u.clone()),
+                None => h,
+            }
+        });
         let search = self.search.clone();
         let mcp_host = self
             .mcp
