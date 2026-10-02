@@ -265,7 +265,7 @@ impl SandboxPlan {
 /// the same grant check the file tools use, for every operation the mount
 /// allows. A symlink whose target is merely outside the grant is tolerated
 /// (WASI refuses to follow it out of the preopen); a deny-listed target is
-/// not.
+/// not. A regular file with another hard link refuses the mount (Unix).
 fn scan_mount(
     root: &Path,
     ops: &[Op],
@@ -300,6 +300,21 @@ fn scan_mount(
                     Decision::Denied { reason } => {
                         return Err(format!("{} is off limits: {reason}", path.display()))
                     }
+                }
+            }
+            // A hard link can name a file kept outside the grant (the deny list is
+            // path-based and WASI opens the inode), so a folder holding one is not mounted.
+            #[cfg(unix)]
+            if file_type.is_file() {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::symlink_metadata(&path)
+                    .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+                if meta.nlink() > 1 {
+                    return Err(format!(
+                        "{} has another hard link, so it may be a file kept elsewhere; \
+                         grant a folder without hard-linked files",
+                        path.display()
+                    ));
                 }
             }
             if file_type.is_dir() {
