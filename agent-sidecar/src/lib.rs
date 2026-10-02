@@ -18,29 +18,30 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
-pub mod learn;
-pub mod grants;
-pub mod capsule_sandbox;
 pub mod anchor;
+pub mod browser;
+pub mod capsule_sandbox;
 mod chain_routes;
 mod checkpoint_routes;
-pub mod files;
 pub mod decide;
-pub mod browser;
-pub mod signin_routes;
-pub mod web_signing_records;
-pub mod llm_http;
-pub mod metering;
 pub mod escalation;
+pub mod files;
+pub mod grants;
+pub mod learn;
+pub mod llm_http;
 pub mod mcp_probe;
+pub mod metering;
 pub mod search;
 pub mod sessions;
 pub mod sheets;
+pub mod shell_run;
+pub mod signin_routes;
 pub mod toolchain;
 mod toolchain_config;
-pub mod workflow_spec;
-pub mod workers;
 pub mod trajectory;
+pub mod web_signing_records;
+pub mod workers;
+pub mod workflow_spec;
 
 use std::sync::Arc;
 
@@ -278,6 +279,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
         .route("/sessions/:id/grants", post(replace_grants))
+        .route("/sessions/:id/shell/pending", get(shell_pending))
+        .route("/sessions/:id/shell/decide", post(shell_decide))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -818,6 +821,59 @@ async fn replace_grants(
     }
 }
 
+/// US-2.2 AC2: `GET /sessions/:id/shell/pending` — the commands waiting for the member, with
+/// everything the approval card shows. A session without `shell_run` has none.
+async fn shell_pending(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let pending = session.shell_pending().unwrap_or_default();
+    Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
+#[derive(Deserialize)]
+struct ShellDecideReq {
+    id: String,
+    allow: bool,
+    argv: Vec<String>,
+    cwd: String,
+}
+
+/// US-2.2 AC2: `POST /sessions/:id/shell/decide {id, allow, argv, cwd}` — the member's decision.
+/// The argv and cwd must be the ones that were shown; otherwise 409 and nothing is decided.
+async fn shell_decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let req: ShellDecideReq = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {id, allow, argv, cwd}"))?;
+    match session.shell_decide(&req.id, req.allow, &req.argv, &req.cwd) {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(sessions::SessionError::Invalid(m)) => Err(json_err(StatusCode::CONFLICT, &m)),
+        Err(_) => Err(json_err(
+            StatusCode::CONFLICT,
+            "this session does not run commands",
+        )),
+    }
+}
+
 async fn close_session(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1036,6 +1092,22 @@ pub fn production_sessions_with(
         None => mgr,
     };
     let mgr = with_files_from_env(mgr);
+    // US-2.2 AC2: shell_run (off by default; always inside the OS sandbox).
+    let mgr = match shell_run::ShellRunConfig::from_env() {
+        Some(cfg) => {
+            match cfg.sandbox.backend() {
+                Ok(b) => eprintln!(
+                    "citrate-agent-sidecar: shell_run on for sessions with folder grants; every command needs the member's approval and runs in the {} sandbox",
+                    b.name()
+                ),
+                Err(why) => eprintln!(
+                    "citrate-agent-sidecar: shell_run on, but every command will be refused: no OS sandbox ({why})"
+                ),
+            }
+            mgr.with_shell_run(Arc::new(cfg))
+        }
+        None => mgr,
+    };
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
@@ -1474,17 +1546,17 @@ async fn start_track_workflow(
 #[cfg(test)]
 mod anchor_route_tests;
 #[cfg(test)]
-mod mcp_session_tests;
-#[cfg(test)]
-mod metering_session_tests;
-#[cfg(test)]
 mod capsule_sandbox_tests;
 #[cfg(test)]
 mod grants_session_tests;
 #[cfg(test)]
+mod learn_more_session_tests;
+#[cfg(test)]
 mod learn_session_tests;
 #[cfg(test)]
-mod learn_more_session_tests;
+mod mcp_session_tests;
+#[cfg(test)]
+mod metering_session_tests;
 #[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
@@ -1497,11 +1569,13 @@ mod tests;
 #[cfg(test)]
 mod browser_session_tests;
 #[cfg(test)]
-mod signin_route_tests;
+mod decide_route_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]
-mod decide_route_tests;
+mod shell_run_tests;
+#[cfg(test)]
+mod signin_route_tests;
 #[cfg(test)]
 mod toolchain_tests;
 
@@ -1736,11 +1810,11 @@ async fn learn_publish(
         .map_err(refusal)
 }
 #[cfg(test)]
-mod files_tests;
-#[cfg(test)]
 mod daemon_session_tests;
 #[cfg(test)]
 mod escalation_tests;
+#[cfg(test)]
+mod files_tests;
 #[cfg(test)]
 mod mcp_probe_tests;
 #[cfg(test)]

@@ -59,6 +59,10 @@
 //!   `fs_edit`, `fs_delete` and `fs_rename` tools ([`crate::files`]). Each change is checked
 //!   against the folder grants and the default-deny list, then checkpointed under the session id,
 //!   so the member can undo it through the `/checkpoints` routes.
+//! - US-2.2 AC2: when `shell_run` is enabled (`CITRATE_HERMES_SHELL_RUN=1`, default off), every
+//!   session opened with folder grants also offers the sidecar-hosted `shell_run` tool
+//!   ([`crate::shell_run`]): each command waits for the member's decision on the session's
+//!   `/shell` routes and runs only in the OS sandbox. The name is reserved while it is on.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,6 +93,9 @@ use crate::files::{FileTools, FileToolsHost};
 use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
 use crate::metering::{MeteredLlm, MeteringStore, TeeSink};
 use crate::sheets::SheetToolHost;
+use crate::shell_run::{
+    shell_run_spec, ShellPending, ShellRunConfig, ShellRunHost, ShellRunSession, SHELL_RUN_TOOL,
+};
 use crate::toolchain::ToolchainHost;
 use crate::trajectory::{export_session, ExportSummary, TrajectoryConfig};
 use crate::workers::WorkerSet;
@@ -398,9 +405,32 @@ pub struct Session {
     runs: Mutex<VecDeque<(String, RunState)>>,
     /// HUP-S3.3: present when this session was opened with a persona.
     persona: Option<PersonaReport>,
+    /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
+    shell: Option<Arc<ShellRunSession>>,
 }
 
 impl Session {
+    /// US-2.2 AC2: the commands waiting for the member (`None` when the session has no
+    /// `shell_run`).
+    pub fn shell_pending(&self) -> Option<Vec<ShellPending>> {
+        self.shell.as_ref().map(|s| s.approvals().pending())
+    }
+
+    /// US-2.2 AC2: the member's decision on a waiting command; it must carry the argv and cwd
+    /// that were shown.
+    pub fn shell_decide(
+        &self,
+        id: &str,
+        allow: bool,
+        argv: &[String],
+        cwd: &str,
+    ) -> Result<(), SessionError> {
+        let s = self.shell.as_ref().ok_or(SessionError::NotFound)?;
+        s.approvals()
+            .decide(id, allow, argv, cwd)
+            .map_err(SessionError::Invalid)
+    }
+
     fn push(&self, event: Event) {
         if let Ok(mut log) = self.log.lock() {
             log.next_seq += 1;
@@ -633,10 +663,17 @@ pub(crate) struct SidecarHost {
     pub(crate) capsules: Option<CapsuleHost>,
     pub(crate) learn: Option<crate::learn::LearnToolHost>,
     pub(crate) browser: Option<BrowserToolHost>,
+    /// US-2.2 AC2: `shell_run`, when on and the session has grants.
+    pub(crate) shell: Option<ShellRunHost>,
 }
 
 impl ToolHost for SidecarHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name == SHELL_RUN_TOOL {
+            if let Some(s) = &self.shell {
+                return s.execute(call);
+            }
+        }
         if browser_tools::handles(&call.name) {
             if let Some(b) = &self.browser {
                 return b.execute(call);
@@ -746,6 +783,8 @@ pub struct SessionManager {
     metering: Arc<MeteringStore>,
     trajectories: Option<Arc<TrajectoryConfig>>,
     anchor: Option<Arc<AnchorService>>,
+    /// US-2.2 AC2: `shell_run` for sessions opened with folder grants (default off).
+    shell_run: Option<Arc<ShellRunConfig>>,
 }
 
 impl SessionManager {
@@ -771,7 +810,19 @@ impl SessionManager {
             metering: Arc::new(MeteringStore::in_memory()),
             trajectories: None,
             anchor: None,
+            shell_run: None,
         }
+    }
+
+    /// US-2.2 AC2: offer `shell_run` to every new session opened with folder grants.
+    pub fn with_shell_run(mut self, cfg: Arc<ShellRunConfig>) -> Self {
+        self.shell_run = Some(cfg);
+        self
+    }
+
+    /// Whether `shell_run` is on.
+    pub fn shell_run_enabled(&self) -> bool {
+        self.shell_run.is_some()
     }
 
     /// HUP-S7.5: where finished metering records go (default: in memory for this process).
@@ -1087,6 +1138,11 @@ impl SessionManager {
             }
             specs.push(crate::learn::learn_propose_spec());
         }
+        if self.shell_run.is_some() && specs.iter().any(|t| t.name == SHELL_RUN_TOOL) {
+            return Err(SessionError::Invalid(format!(
+                "the tool name '{SHELL_RUN_TOOL}' is reserved by the sidecar while shell_run is on"
+            )));
+        }
         let grants = match req.grants {
             None => None,
             Some(doc) => {
@@ -1112,6 +1168,15 @@ impl SessionManager {
                 specs.extend(crate::sheets::sheet_tool_specs());
                 Some(Arc::new(g))
             }
+        };
+        let shell = match (&self.shell_run, &grants) {
+            (Some(cfg), Some(g)) => {
+                specs.push(shell_run_spec());
+                Some(Arc::new(
+                    ShellRunSession::new(cfg, g.clone()).map_err(SessionError::Invalid)?,
+                ))
+            }
+            _ => None,
         };
         let capsule_sandbox = Arc::new(
             crate::capsule_sandbox::SessionSandbox::new(req.capsule_sandbox, grants.clone())
@@ -1226,6 +1291,7 @@ impl SessionManager {
             files: self.files.clone(),
             runs: Mutex::new(VecDeque::new()),
             persona,
+            shell,
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -1290,7 +1356,12 @@ impl SessionManager {
             .browser
             .clone()
             .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        let shell_host = session
+            .shell
+            .as_ref()
+            .map(|s| s.host(session.taint.clone(), session.stop.clone()));
         if file_host.is_some()
+            || shell_host.is_some()
             || skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
@@ -1313,6 +1384,7 @@ impl SessionManager {
                     capsules: capsule_host,
                     learn: learn_host,
                     browser: browser_host,
+                    shell: shell_host,
                 }),
             );
         }

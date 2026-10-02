@@ -779,6 +779,7 @@ fn env_rooted_host(fx: &Fx) -> ToolchainHost {
         search_path: vec![fx.base.join("bin")],
         solc: None,
         home: fx.home(),
+        sandbox: citrate_agent_shell::sandbox::SandboxMode::Off,
     })
     .unwrap()
 }

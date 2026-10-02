@@ -192,6 +192,57 @@ impl SessionGrants {
         Ok(read)
     }
 
+    /// US-2.2 AC2 (`shell_run`): the folder a command run in `dir` may write. `dir` must be
+    /// covered by live read and write grants from the same folder grant, reaching its whole
+    /// subtree (a shallow grant does not cover what a command may create below it). Returns the
+    /// canonical `dir` and that grant's canonical root.
+    pub fn shell_scope(&self, dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+        self.with_folder_grants(|g, now| {
+            let write = match g.check(dir, Op::Write, now) {
+                Decision::Allowed {
+                    canonical,
+                    grant_id,
+                } => (canonical.into_path_buf(), grant_id),
+                Decision::Denied { reason } => return Err(reason.to_string()),
+            };
+            let find = |id: &str| {
+                g.state()
+                    .grants
+                    .iter()
+                    .find(|x| x.id == id)
+                    .ok_or_else(|| "the covering grant could not be found".to_string())
+            };
+            let subtree_folder = |x: &citrate_agent_grants::Grant| -> Result<(), String> {
+                if x.kind != GrantKind::Folder {
+                    return Err(
+                        "commands run only in a folder grant, never under full access".into(),
+                    );
+                }
+                if x.scope != citrate_agent_grants::GrantScope::Subtree {
+                    return Err(
+                        "commands need folder grants that cover everything below them, not only their direct entries"
+                            .into(),
+                    );
+                }
+                Ok(())
+            };
+            let grant = find(&write.1)?;
+            subtree_folder(grant)?;
+            // The sandbox lets the command read its whole writable folder, so a read grant
+            // must cover all of it as well.
+            match g.check(&grant.root, Op::Read, now) {
+                Decision::Allowed { grant_id, .. } => subtree_folder(find(&grant_id)?)?,
+                Decision::Denied { reason } => {
+                    return Err(format!(
+                        "the whole folder {} needs a read grant too: {reason}",
+                        grant.root.display()
+                    ))
+                }
+            }
+            Ok((write.0, grant.root.clone()))
+        })?
+    }
+
     /// The member's home these grants resolve against.
     pub fn home(&self) -> &Path {
         &self.home

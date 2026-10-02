@@ -346,6 +346,7 @@ mod tests {
             search_path: vec![PathBuf::from("/usr/bin")],
             solc: None,
             home: std::env::temp_dir(),
+            sandbox: citrate_agent_shell::sandbox::SandboxMode::Off,
         };
         let h = ToolchainHandler(ToolchainHost::new(cfg).unwrap());
         let err = h
