@@ -59,7 +59,8 @@
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it
 //! reads the same `CITRATE_HERMES_TOOLCHAIN*` variables). On SIGTERM or Ctrl-C the control plane
-//! stops accepting requests and shuts its workers down cleanly before exiting.
+//! stops accepting requests and stops its child processes (workers, browser, SearXNG, MCP
+//! servers) before exiting.
 
 use std::sync::Arc;
 
@@ -162,19 +163,20 @@ async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the worker processes first (each gets a shutdown
-    // request and a grace period, well inside core's 5 s stop grace), then let the server drain.
-    // Off the async runtime: it joins the supervisor threads.
+    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the child processes first (workers get a shutdown
+    // request and a grace period, well inside core's 5 s stop grace; the browser, SearXNG and MCP
+    // servers are stopped explicitly), then let the server drain. Off the async runtime: it joins
+    // the supervisor threads.
     let sessions = state.sessions.clone();
     let served = axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_children()).await;
         })
         .await;
     // Idempotent: covers a server that ended without a signal.
     let sessions = state.sessions.clone();
-    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_children()).await;
     served?;
     Ok(())
 }

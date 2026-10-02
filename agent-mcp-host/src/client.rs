@@ -215,6 +215,11 @@ impl McpClient {
 
     /// The server announced a changed tool list. Recorded only: the offered tools are fixed when
     /// the sidecar starts, so a server cannot add tools to a running session.
+    /// Stop the server now (a stdio child is killed). Idempotent.
+    pub fn close(&self) {
+        self.transport.close();
+    }
+
     pub fn tools_changed(&self) -> bool {
         self.transport.tools_changed()
     }

@@ -158,6 +158,16 @@ impl McpHost {
         name.starts_with(TOOL_PREFIX)
     }
 
+    /// Stop every server now (sidecar shutdown): stdio children are killed rather than left to
+    /// the host being dropped. Idempotent; later calls report the server as gone.
+    pub fn shutdown(&self) {
+        for e in &self.entries {
+            if let Some(c) = &e.client {
+                c.close();
+            }
+        }
+    }
+
     pub fn status(&self) -> Vec<ServerStatus> {
         self.entries
             .iter()

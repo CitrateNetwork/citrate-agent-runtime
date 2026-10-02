@@ -860,6 +860,23 @@ impl SessionManager {
         self.workers.shutdown();
     }
 
+    /// Sidecar shutdown: stop every child process explicitly, not only by drop at exit (core
+    /// kills the sidecar after its grace period, and a killed process runs no destructors): the
+    /// workers, the browser (stopped and latched), SearXNG and the MCP servers. Idempotent.
+    pub fn shutdown_children(&self) {
+        self.stop_all();
+        self.workers.shutdown();
+        if let Some(b) = &self.browser {
+            b.stop();
+        }
+        if let Some(s) = &self.search {
+            s.shutdown();
+        }
+        if let Some(m) = &self.mcp {
+            m.shutdown();
+        }
+    }
+
     /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers
     /// nothing and reserves nothing.
     pub fn with_mcp(mut self, host: Arc<McpHost>) -> Self {
