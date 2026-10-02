@@ -18,9 +18,26 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod learn;
+pub mod grants;
+pub mod anchor;
+mod chain_routes;
+mod checkpoint_routes;
+pub mod files;
+pub mod decide;
+pub mod browser;
 pub mod llm_http;
+pub mod metering;
+pub mod escalation;
+pub mod mcp_probe;
+pub mod search;
 pub mod sessions;
+pub mod sheets;
 pub mod toolchain;
+mod toolchain_config;
+pub mod workflow_spec;
+pub mod workers;
+pub mod trajectory;
 
 use std::sync::Arc;
 
@@ -39,6 +56,7 @@ use citrate_agent_core::capsule::prod_impls::QueuedApprovalGate;
 use citrate_agent_core::hitl::ApprovalQueue;
 use citrate_agent_legacy::estop::EmergencyStop;
 use citrate_agent_loop::interview;
+use citrate_agent_loop::{personas, workflows};
 
 /// One installed skill (a capsule), surfaced to the `AgentHarnessDomain::skills` shape.
 #[derive(Debug, Clone, Serialize)]
@@ -239,12 +257,69 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
+        .route("/sessions/:id/grants", post(replace_grants))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
         .route("/briefs/check", post(check_brief))
+        // HUP-S3.3 + S3.7 — personas (voice) and each track's workflow family.
+        .route("/personas", get(list_personas))
+        .route("/personas/check", post(check_persona))
+        .route("/workflows", get(list_workflows))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S5.1 + S5.6: the browser (member controls for the Browser pop-out).
+        .route("/browser/status", get(browser::status))
+        .route("/browser/frame", get(browser::frame))
+        .route("/browser/stop", post(browser::stop))
+        .route("/browser/resume", post(browser::resume))
+        .route("/browser/attach", post(browser::attach))
+        .route("/browser/detach", post(browser::detach))
+        .route("/browser/origins", post(browser::origins))
+        .route("/browser/actions/decide", post(browser::decide))
+        // HUP-S5.2: search status (read-only). HUP-S5.3: the decide() slot + its metering.
+        .route("/search/status", get(search_status))
+        .route("/decide", post(decide))
+        .route("/decide/stats", get(decide_stats))
+        .route("/decide/outcomes", post(decide_outcome))
+        // HUP-S3.4: verified workflow runs and verified self-learning.
+        .route("/sessions/:id/workflows", post(start_workflow))
+        .route("/sessions/:id/workflows/:run", get(workflow_run))
+        .route("/learn/status", get(learn_status))
+        .route("/learn/proposals", post(learn_propose).get(learn_list))
+        .route("/learn/proposals/:pid", get(learn_get))
+        .route("/learn/proposals/:pid/accept", post(learn_accept))
+        .route("/learn/proposals/:pid/reject", post(learn_reject))
+        .route("/learn/proposals/:pid/publish", post(learn_publish))
+        // HUP-S2.9: undo checkpoints for agent file changes (member actions, never tools).
+        .route("/checkpoints/:session", get(checkpoint_routes::list_steps))
+        .route(
+            "/checkpoints/:session/steps/:seq/undo",
+            post(checkpoint_routes::undo_step),
+        )
+        .route(
+            "/checkpoints/:session/undo",
+            post(checkpoint_routes::undo_session),
+        )
+        // HUP-S1.9: the worker processes (toolchain, browser) and their health
+        .route("/workers", get(workers_status))
+        // HUP-S7.5: the daily metering report + opt-in BenchmarkRegistry calldata (built, never sent)
+        .route("/metering/daily", get(chain_routes::metering_daily))
+        .route(
+            "/metering/benchmark",
+            post(chain_routes::metering_benchmark),
+        )
+        // HUP-S7.3: nightly anchor batch (core signs with the anchor key; nothing is sent here)
+        .route("/anchor/status", get(chain_routes::anchor_status))
+        .route("/anchor/plan", post(chain_routes::anchor_plan))
+        .route("/anchor/confirm", post(chain_routes::anchor_confirm))
+        .route("/anchor/proof", get(chain_routes::anchor_proof))
+        // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
+        // key per request), and the registry route's status (disabled in this build).
+        .route("/escalations", post(escalation::escalate))
+        .route("/escalations/registry", get(escalation::registry_status))
+        // HUP-S4.4: dry-run probe of a user-added server (validates, lists tools, registers nothing).
+        .route("/mcp/probe", post(mcp_probe_route))
         .with_state(state)
 }
 
@@ -295,6 +370,36 @@ async fn mcp_servers(
         None => serde_json::json!({ "configured": false, "servers": [] }),
     };
     Ok(Json(body))
+}
+
+/// `GET /workers` — one entry per worker kind: state, health, pid, restarts, last exit. Bearer.
+async fn workers_status(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(
+        serde_json::json!({ "workers": st.sessions.workers_report() }),
+    ))
+}
+
+/// HUP-S4.4: `POST /mcp/probe` with one server entry (the allowlist's `[[servers]]` shape, JSON).
+/// 422 `{errors: [{field, message}]}` for an invalid entry; 429 while another probe runs; else
+/// 200 with the probe report (`ok: false` + `error` when the server could not be reached).
+async fn mcp_probe_route(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Json(entry): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !authorized(&headers, &st.bearer) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+    mcp_probe::handle(entry).await
 }
 
 async fn skills(
@@ -486,6 +591,10 @@ async fn stop(
     st.estop.trigger();
     // HUP-S1.1b: the kill switch halts every agent session too.
     st.sessions.stop_all();
+    // HUP-S5.1: and the browser (closes it, denies any waiting browser action, latches).
+    if let Some(b) = st.sessions.browser().cloned() {
+        let _ = tokio::task::spawn_blocking(move || b.stop()).await;
+    }
     // PBA-L6b-010: freeze + drain the approval queue so nothing parked before the stop can be
     // released after it, and running skills cannot queue new effects.
     let drained = st.queue.freeze_and_drain();
@@ -517,6 +626,7 @@ fn session_status(e: &sessions::SessionError) -> StatusCode {
         sessions::SessionError::Busy => StatusCode::CONFLICT,
         sessions::SessionError::TooMany => StatusCode::TOO_MANY_REQUESTS,
         sessions::SessionError::Invalid(_) => StatusCode::BAD_REQUEST,
+        sessions::SessionError::NoGrants => StatusCode::CONFLICT,
     }
 }
 
@@ -639,6 +749,40 @@ async fn stop_session(
     Ok(Json(serde_json::json!({ "ok": true, "stopped": true })))
 }
 
+/// HUP-S2.1: replace a session's folder grants with the member's current grant document (sent by
+/// citrate-core whenever the member grants, revokes, or a full-access window is turned on). A
+/// refused document answers 400 and leaves the session with no grants; a session opened without a
+/// document answers 409.
+async fn replace_grants(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let doc: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "the body must be a grant document"))?;
+    match session.replace_grants(&doc) {
+        Ok(summary) => Ok(Json(serde_json::json!({ "ok": true, "grants": summary }))),
+        Err(e) => {
+            let msg = match &e {
+                sessions::SessionError::Invalid(m) => m.clone(),
+                sessions::SessionError::NoGrants => {
+                    "this session was opened without folder grants".into()
+                }
+                _ => "refused".into(),
+            };
+            Err(json_err(session_status(&e), &msg))
+        }
+    }
+}
+
 async fn close_session(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -647,8 +791,17 @@ async fn close_session(
     if !authorized(&headers, &st.bearer) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    st.sessions.close(&id).map_err(|e| session_status(&e))?;
-    Ok(Json(serde_json::json!({ "ok": true, "closed": true })))
+    // A trajectory export at close writes files: keep it off the async workers.
+    let sessions = st.sessions.clone();
+    let exported = tokio::task::spawn_blocking(move || sessions.close(&id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| session_status(&e))?;
+    let mut body = serde_json::json!({ "ok": true, "closed": true });
+    if let Some(summary) = exported {
+        body["trajectory"] = serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
+    }
+    Ok(Json(body))
 }
 
 /// HUP-S3.2: parse `CITRATE_HERMES_SKILLS` — a platform path list (`:` on unix, `;` on windows)
@@ -692,7 +845,10 @@ pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>
             s.name, s.dropped_source, s.kept_source
         );
     }
-    eprintln!("citrate-agent-sidecar: {} instruction skills loaded", lib.len());
+    eprintln!(
+        "citrate-agent-sidecar: {} instruction skills loaded",
+        lib.len()
+    );
     Some(Arc::new(lib))
 }
 
@@ -742,7 +898,10 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
-/// `CITRATE_HERMES_SKILLS` is set and the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1`.
+/// `CITRATE_HERMES_SKILLS` is set, the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1` (run in
+/// the supervised toolchain worker process, HUP-S1.9), verified self-learning when
+/// `CITRATE_HERMES_LEARN_DIR` and `CITRATE_HERMES_LEARN_SKILLS_DIR` are both set (HUP-S3.4), the
+/// search tools when `CITRATE_HERMES_SEARCH=1`, and the decide() slot (Jev only when opted in).
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -762,45 +921,219 @@ pub fn production_sessions_with(
         }),
         timeout,
     );
+    // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
+    let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
+        None => mgr,
+    };
     let mgr = match skills_from_env() {
         Some(lib) => mgr.with_skills(lib),
         None => mgr,
     };
-    let mgr = match toolchain_from_env() {
-        Some(host) => mgr.with_toolchain(host),
+    // HUP-S1.9: the toolchain runs in its own supervised worker process (this binary started
+    // with `--worker toolchain`), so a crash there never takes the loop down.
+    let mgr = match std::env::current_exe() {
+        Ok(exe) => match workers::toolchain_worker_from_env(exe) {
+            Some(worker) => mgr
+                .with_toolchain(Arc::new(workers::RemoteToolHost::new(
+                    worker.clone(),
+                    workers::TOOLCHAIN_CALL_TIMEOUT,
+                )))
+                .with_workers(Arc::new(workers::WorkerSet::with_toolchain(worker))),
+            None => mgr,
+        },
+        Err(e) => {
+            if toolchain::ToolchainConfig::from_env().is_some() {
+                eprintln!(
+                    "citrate-agent-sidecar: toolchain tools off: cannot locate this binary to start the worker: {e}"
+                );
+            }
+            mgr
+        }
+    };
+    let mgr = mgr.with_metering(metering::metering_from_env());
+    let mgr = match trajectory::TrajectoryConfig::from_env() {
+        Some(cfg) => {
+            eprintln!(
+                "citrate-agent-sidecar: trajectory recording on (verified turns only, redacted) into {}",
+                cfg.dir().display()
+            );
+            mgr.with_trajectories(cfg)
+        }
         None => mgr,
     };
+    let mgr = match browser::from_env() {
+        Some(b) => mgr.with_browser(b),
+        None => mgr,
+    };
+    let mgr = match search::search_from_env() {
+        Some(host) => mgr.with_search(host),
+        None => mgr,
+    };
+    let mgr = mgr.with_decide(decide::DecideService::from_env());
+    let mgr = match learn::LearnService::from_env() {
+        Some(svc) => mgr.with_learn(svc),
+        None => mgr,
+    };
+    let mgr = match anchor::AnchorPaths::from_env() {
+        Some(paths) => match anchor::AnchorService::from_paths(&paths) {
+            Ok(svc) => mgr.with_anchor(Arc::new(svc)),
+            Err(e) => {
+                eprintln!("citrate-agent-sidecar: anchor store unavailable: {e}");
+                mgr
+            }
+        },
+        None => mgr,
+    };
+    let mgr = with_files_from_env(mgr);
     Arc::new(match mcp {
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
 }
 
-/// HUP-S6.3: the toolchain host when `CITRATE_HERMES_TOOLCHAIN=1` (default off → `None`). What it
-/// will use is logged to stderr for the operator.
-pub fn toolchain_from_env() -> Option<Arc<toolchain::ToolchainHost>> {
-    let cfg = toolchain::ToolchainConfig::from_env()?;
-    eprintln!(
-        "citrate-agent-sidecar: toolchain tools on: {} granted folder(s), solc {}",
-        cfg.roots.len(),
-        if cfg.solc.is_some() {
-            "configured"
-        } else {
-            "not found (builds will fail offline)"
+/// HUP-S2.9: open the checkpoint store when `CITRATE_HERMES_CHECKPOINTS` names one (the undo
+/// routes then serve it), and offer the file tools when `CITRATE_HERMES_FILES=1` with a grants
+/// file. The file tools never run without a store: no change the member could not undo. What is
+/// on is logged to stderr for the operator.
+pub fn with_files_from_env(mgr: sessions::SessionManager) -> sessions::SessionManager {
+    let get = |k: &str| std::env::var(k).ok();
+    let files_cfg = files::FilesConfig::from_env_vars(get);
+    let Some(dir) = files::checkpoints_dir_from_env_vars(get) else {
+        if files_cfg.is_some() {
+            eprintln!(
+                "citrate-agent-sidecar: file tools off: no checkpoint store ({} is not set), so changes could not be undone",
+                files::CHECKPOINTS_ENV
+            );
         }
-    );
-    match toolchain::ToolchainHost::new(cfg) {
-        Ok(h) => Some(Arc::new(h)),
+        return mgr;
+    };
+    let store = match citrate_agent_checkpoints::CheckpointStore::open(
+        &dir,
+        citrate_agent_checkpoints::Config::default(),
+    ) {
+        Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("citrate-agent-sidecar: toolchain tools off: {e}");
-            None
+            eprintln!("citrate-agent-sidecar: undo checkpoints off: {e}");
+            return mgr;
         }
+    };
+    let mgr = mgr.with_checkpoints(store.clone());
+    match files_cfg {
+        Some(cfg) => {
+            eprintln!("citrate-agent-sidecar: file tools on (fs_write, fs_edit, fs_delete, fs_rename), with undo checkpoints");
+            mgr.with_files(Arc::new(files::FileTools::new(
+                store,
+                files::GrantSource::File(cfg.grants_file),
+                cfg.home,
+            )))
+        }
+        None => mgr,
     }
 }
 
 // ---- HUP-S1.4: tracks + briefs ----
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
+
+// ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
+
+/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+async fn search_status(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(host) = st.sessions.search() else {
+        return Ok(Json(serde_json::json!({
+            "enabled": false, "searxng": "off", "reader": "local"
+        })));
+    };
+    let reader = if host.third_party_reader() {
+        "jina"
+    } else {
+        "local"
+    };
+    let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
+        citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
+        citrate_agent_search::SearxngState::Idle => "idle",
+        citrate_agent_search::SearxngState::Running { .. } => "running",
+        citrate_agent_search::SearxngState::GaveUp(_) => "failed",
+    })
+    .await
+    .unwrap_or("failed");
+    Ok(Json(serde_json::json!({
+        "enabled": true, "searxng": searxng, "reader": reader
+    })))
+}
+
+fn decide_status_code(e: &citrate_agent_loop::decide::DecideError) -> StatusCode {
+    use citrate_agent_loop::decide::DecideError as E;
+    match e {
+        E::Invalid(_) => StatusCode::BAD_REQUEST,
+        E::NotPermitted(_) => StatusCode::FORBIDDEN,
+        E::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+        E::Backend(_) | E::BadAnswer(_) => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// `POST /decide`: one typed decision. The work runs on the blocking pool.
+async fn decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    let req: decide::DecideHttpReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad decide request: {e}")))?;
+    let svc = st.sessions.decide_service();
+    let out = tokio::task::spawn_blocking(move || svc.decide(&req))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "decide task failed"))?;
+    match out {
+        Ok(d) => Ok(Json(serde_json::to_value(d).unwrap_or_default())),
+        Err(e) => Err(json_err(decide_status_code(&e), &e.to_string())),
+    }
+}
+
+/// `GET /decide/stats`: per-backend decision metering (no content).
+async fn decide_stats(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<decide::DecideStatus>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(st.sessions.decide_service().status()))
+}
+
+/// `POST /decide/outcomes`: record one task's success for a backend.
+async fn decide_outcome(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let o: decide::OutcomeReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad outcome: {e}")))?;
+    st.sessions
+        .decide_service()
+        .record_outcome(&o)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 fn json_err(c: StatusCode, m: &str) -> JsonErr {
     (c, Json(serde_json::json!({ "error": m })))
@@ -895,13 +1228,298 @@ async fn check_brief(
     ))
 }
 
+// ---- HUP-S3.3 + S3.7: personas + track workflows ----
+
+/// The shipped personas, each with the prompt fragment a client appends when it is active.
+async fn list_personas(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<personas::PersonaView>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    personas::persona_views()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
+#[derive(Deserialize)]
+struct CheckPersonaReq {
+    persona: personas::CustomPersona,
+}
+
+/// Validate a member-defined persona and render its fragment (422 with the reason when refused).
+async fn check_persona(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<personas::PersonaView>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: CheckPersonaReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad persona: {e}")))?;
+    req.persona
+        .check()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::UNPROCESSABLE_ENTITY, &e))
+}
+
+/// Every track's workflow family (definitions; the verifiers are named, not run).
+async fn list_workflows(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Vec<workflows::WorkflowView>>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    workflows::workflow_views()
+        .map(Json)
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e))
+}
+
+#[cfg(test)]
+mod anchor_route_tests;
+#[cfg(test)]
+mod mcp_session_tests;
+#[cfg(test)]
+mod metering_session_tests;
+#[cfg(test)]
+mod grants_session_tests;
+#[cfg(test)]
+mod learn_session_tests;
 #[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
-mod tests;
+mod sheets_session_tests;
 #[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]
-mod toolchain_tests;
+mod tests;
+
 #[cfg(test)]
-mod mcp_session_tests;
+mod browser_session_tests;
+#[cfg(test)]
+mod search_session_tests;
+#[cfg(test)]
+mod decide_route_tests;
+#[cfg(test)]
+mod toolchain_tests;
+
+// ---- HUP-S3.4: verified workflow runs + verified self-learning ----
+
+async fn start_workflow(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    if st.sessions.get(&id).is_none() {
+        return Err(json_err(StatusCode::NOT_FOUND, "no such session"));
+    }
+    let spec: workflow_spec::WorkflowSpec = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad workflow: {e}")))?;
+    let wf = spec
+        .build()
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
+    let run_id = st
+        .sessions
+        .run_workflow(&id, wf, st.dispatch.clone())
+        .map_err(|e| json_err(session_status(&e), "the session refused the workflow"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id })),
+    ))
+}
+
+async fn workflow_run(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path((id, run)): Path<(String, String)>,
+) -> Result<Json<sessions::RunView>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    st.sessions
+        .run_view(&id, &run)
+        .map(Json)
+        .map_err(|e| json_err(session_status(&e), "no such session or run"))
+}
+
+fn refusal(r: learn::LearnRefusal) -> JsonErr {
+    match r {
+        learn::LearnRefusal::NotFound(m) => json_err(StatusCode::NOT_FOUND, &m),
+        learn::LearnRefusal::Invalid(m) => json_err(StatusCode::BAD_REQUEST, &m),
+        learn::LearnRefusal::Failed(m) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &m),
+        learn::LearnRefusal::Conflict { message, conflicts } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": message, "conflicts": conflicts })),
+        ),
+    }
+}
+
+/// The learn service, after the bearer check. With `write`, also refused while the e-stop is
+/// engaged.
+fn learn_guard(
+    headers: &HeaderMap,
+    st: &Arc<AppState>,
+    write: bool,
+) -> Result<Arc<learn::LearnService>, JsonErr> {
+    if !authorized(headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if write && st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    st.sessions.learn().cloned().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "learning is off (no learn folder configured)",
+        )
+    })
+}
+
+async fn learn_status(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(match st.sessions.learn() {
+        Some(svc) => svc.status(),
+        None => serde_json::json!({ "enabled": false }),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposeReq {
+    session_id: String,
+    run_id: String,
+    content: citrate_agent_learn::ProposalContent,
+    #[serde(default)]
+    known_memories: Vec<citrate_agent_learn::KnownMemory>,
+}
+
+async fn learn_propose(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<citrate_agent_learn::Proposal>), JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: ProposeReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad proposal: {e}")))?;
+    let session = st
+        .sessions
+        .get(&req.session_id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let p = svc
+        .propose(&session, &req.run_id, req.content, &req.known_memories)
+        .map_err(refusal)?;
+    Ok((StatusCode::CREATED, Json(p)))
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+async fn learn_list(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, false)?;
+    Ok(Json(serde_json::json!({ "proposals": svc.list(q.all) })))
+}
+
+async fn learn_get(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+) -> Result<Json<citrate_agent_learn::Proposal>, JsonErr> {
+    let svc = learn_guard(&headers, &st, false)?;
+    svc.get(&pid)
+        .map(Json)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such proposal"))
+}
+
+async fn learn_accept(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let decision: citrate_agent_learn::MemberAccept = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad accept: {e}")))?;
+    let out = svc.accept(&pid, decision).map_err(refusal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "persisted": out })))
+}
+
+#[derive(Deserialize)]
+struct RejectReq {
+    member: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn learn_reject(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: RejectReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad reject: {e}")))?;
+    svc.reject(&pid, &req.member, &req.reason)
+        .map_err(refusal)?;
+    Ok(Json(serde_json::json!({ "ok": true, "rejected": true })))
+}
+
+#[derive(Deserialize)]
+struct PublishReq {
+    approval: citrate_agent_learn::PublishApproval,
+    params: citrate_agent_learn::PublishParams,
+}
+
+/// Build the SkillRegistry call for an accepted skill (HIC-1, recorded). Calldata only: core's
+/// SignatureCeremony signs, the member sends.
+async fn learn_publish(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(pid): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<citrate_agent_learn::SkillPublishPayload>, JsonErr> {
+    let svc = learn_guard(&headers, &st, true)?;
+    let req: PublishReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad publish: {e}")))?;
+    svc.publish(&pid, req.approval, req.params)
+        .map(Json)
+        .map_err(refusal)
+}
+#[cfg(test)]
+mod files_tests;
+#[cfg(test)]
+mod daemon_session_tests;
+#[cfg(test)]
+mod escalation_tests;
+#[cfg(test)]
+mod mcp_probe_tests;
+#[cfg(test)]
+mod personas_route_tests;

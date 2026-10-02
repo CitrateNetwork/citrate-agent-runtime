@@ -5,7 +5,7 @@
 //! | tool           | program | fixed argv                                                       | verdict                    |
 //! |----------------|---------|------------------------------------------------------------------|----------------------------|
 //! | `forge_test`   | forge   | `test --json [--match-test T] [--match-contract C]`              | all tests pass             |
-//! | `slither_scan` | slither | `. --sarif - --exclude-dependencies --disable-color`             | no finding ≥ `fail_on`     |
+//! | `slither_scan` | slither | `. --sarif - --exclude-dependencies --disable-color --compile-force-framework foundry` | no finding ≥ `fail_on` |
 //! | `aderyn_scan`  | aderyn  | `. --output aderyn-report.sarif --stdout --skip-update-check`    | no finding ≥ `fail_on`     |
 //! | `medusa_fuzz`  | medusa  | `fuzz --no-color --test-limit N --timeout S`                     | no failed property/assert  |
 //!
@@ -19,24 +19,33 @@
 //!
 //! **Where it may run.** The project must resolve (symlinks followed) inside one of the granted
 //! folders in `CITRATE_HERMES_TOOLCHAIN_ROOTS`, and pass the agent-guard default-deny list.
-//! With no granted folder every call is refused. This env list is the interim seam until the
-//! S2.1 folder grants reach the sidecar.
+//! With no granted folder every call is refused. This env list is the interim seam for a session
+//! opened without a grant document. HUP-S2.1: a session opened with the member's grants (sent by
+//! citrate-core) ignores the env list; its project must be covered by live read **and** write
+//! folder grants (see [`crate::grants`]), checked again at every call.
 //!
 //! **Network.** Every run gets `FOUNDRY_OFFLINE=true`, so forge (and the forge build slither
 //! starts) never downloads a compiler. The compiler comes from `CITRATE_HERMES_SOLC`, else the
 //! pinned solc 0.8.36 in the per-user svm directory when it is there; without either a build
 //! fails with forge's own "can't install missing solc in offline mode" error.
 //!
+//! **Project configuration.** Before a run, the project's build configuration is checked
+//! ([`crate::toolchain_config`]): a project that turns on `ffi`, sets `fs_permissions` beyond
+//! reading inside the project, names a compiler by path, or holds env files or other build
+//! front-end configs is refused with the reason, and nothing runs.
+//!
 //! **Honest scope.** These are fixed argv templates, but the programs execute project code by
-//! design (forge tests, FFI when a project's `foundry.toml` enables it, compilation). There is
+//! design (forge tests in the EVM, compilation). There is
 //! no OS sandbox yet (US-2.2 AC1 is a separate work item), and a session stop or the e-stop does
 //! not interrupt a run in progress; the wall-clock timeout bounds it. aderyn and medusa are
 //! often not installed: the tools then say so and their verifiers fail, never pass. This module
 //! never holds a key and never signs (Rule 3).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::grants::SessionGrants;
 use citrate_agent_guard::{check_path, GuardContext};
 use citrate_agent_loop::verifiers_tooling::{
     compiler_diagnostics, verify_forge_test_output, verify_medusa_output, verify_sarif_output,
@@ -75,6 +84,9 @@ const MAX_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_MEDUSA_TIMEOUT_SECS: u64 = 600;
 /// Extra wall-clock time a medusa run gets past its own `--timeout` to print its summary.
 const MEDUSA_GRACE_SECS: u64 = 60;
+/// HUP-S1.9: the longest a single toolchain run may take (the wall-clock cap plus medusa's grace);
+/// the worker call timeout is set above it.
+pub const LONGEST_RUN_SECS: u64 = MAX_TIMEOUT_SECS + MEDUSA_GRACE_SECS;
 /// Planset item 10: a call budget, not wall-clock minutes.
 const DEFAULT_MEDUSA_TEST_LIMIT: u64 = 50_000;
 const MAX_MEDUSA_TEST_LIMIT: u64 = 1_000_000;
@@ -158,6 +170,9 @@ impl ToolchainConfig {
 pub struct ToolchainHost {
     runner: ShellRunner,
     cfg: ToolchainConfig,
+    /// HUP-S2.1: the session's folder grants. When present they replace `cfg.roots`.
+    grants: Option<Arc<SessionGrants>>,
+    stdout_cap: usize,
 }
 
 impl std::fmt::Debug for ToolchainHost {
@@ -180,7 +195,11 @@ fn check_project(roots: &[PathBuf], home: &Path, cwd: &Path) -> Result<(), Strin
     check_path(cwd, &ctx).map(|_| ()).map_err(|d| d.to_string())
 }
 
-fn build_runner(cfg: &ToolchainConfig, stdout_cap: usize) -> Result<ShellRunner, String> {
+fn build_runner(
+    cfg: &ToolchainConfig,
+    grants: Option<Arc<SessionGrants>>,
+    stdout_cap: usize,
+) -> Result<ShellRunner, String> {
     let allow = Allowlist::empty()
         .allow("forge", ArgPolicy::Any)
         .allow("slither", ArgPolicy::Any)
@@ -192,6 +211,11 @@ fn build_runner(cfg: &ToolchainConfig, stdout_cap: usize) -> Result<ShellRunner,
         .with_default_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .with_max_timeout(Duration::from_secs(MAX_TIMEOUT_SECS + MEDUSA_GRACE_SECS))
         .with_output_caps(stdout_cap, STDERR_CAP);
+    if let Some(g) = grants {
+        return Ok(ShellRunner::new(policy, move |cwd: &Path| {
+            g.check_project(cwd).map(|_| ())
+        }));
+    }
     let roots = cfg.roots.clone();
     let home = cfg.home.clone();
     Ok(ShellRunner::new(policy, move |cwd: &Path| {
@@ -203,16 +227,31 @@ impl ToolchainHost {
     /// Fails only on a malformed search path (for example a relative entry).
     pub fn new(cfg: ToolchainConfig) -> Result<Self, String> {
         Ok(ToolchainHost {
-            runner: build_runner(&cfg, OUTPUT_CAP)?,
+            runner: build_runner(&cfg, None, OUTPUT_CAP)?,
             cfg,
+            grants: None,
+            stdout_cap: OUTPUT_CAP,
         })
     }
 
     /// The same host with a different stdout capture cap in bytes.
     pub fn with_output_cap(self, bytes: usize) -> Result<Self, String> {
         Ok(ToolchainHost {
-            runner: build_runner(&self.cfg, bytes)?,
+            runner: build_runner(&self.cfg, self.grants.clone(), bytes)?,
             cfg: self.cfg,
+            grants: self.grants,
+            stdout_cap: bytes,
+        })
+    }
+
+    /// HUP-S2.1: a host for one session whose project folder is checked against that session's
+    /// folder grants (read and write) instead of `CITRATE_HERMES_TOOLCHAIN_ROOTS`.
+    pub fn for_grants(&self, grants: Arc<SessionGrants>) -> Result<Self, String> {
+        Ok(ToolchainHost {
+            runner: build_runner(&self.cfg, Some(grants.clone()), self.stdout_cap)?,
+            cfg: self.cfg.clone(),
+            grants: Some(grants),
+            stdout_cap: self.stdout_cap,
         })
     }
 
@@ -330,8 +369,19 @@ impl ToolchainHost {
         if !project.is_absolute() {
             return refuse("project must be an absolute path inside a granted folder".into());
         }
-        if self.cfg.roots.is_empty() {
-            return refuse("no project folder is granted to the toolchain".into());
+        let project = match &self.grants {
+            // Run in the canonical folder the grants resolved; the runner checks it again.
+            Some(g) => match g.check_project(&project) {
+                Ok(canonical) => canonical,
+                Err(e) => return refuse(e),
+            },
+            None if self.cfg.roots.is_empty() => {
+                return refuse("no project folder is granted to the toolchain".into())
+            }
+            None => project,
+        };
+        if let Err(e) = crate::toolchain_config::check_project_config(&project) {
+            return refuse(e);
         }
         let plan = match plan_call(tool, &args) {
             Ok(p) => p,
@@ -454,6 +504,8 @@ fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
                 "-",
                 "--exclude-dependencies",
                 "--disable-color",
+                "--compile-force-framework",
+                "foundry",
             ]),
             threshold: severity_arg(args)?,
             wall_secs: int_arg(args, "timeout_secs", DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS)?,
