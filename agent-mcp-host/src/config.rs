@@ -296,8 +296,28 @@ impl McpConfig {
                     }
                     for (k, v) in &r.env {
                         validate_env_key(k)?;
+                        // The user-entry env rules apply to every entry the file holds, so the
+                        // file cannot bring in what the Settings form refuses.
+                        if !crate::user::valid_env_key(k) {
+                            return Err(format!(
+                                "server {:?}: env name {k:?} must use letters, digits and '_'",
+                                r.name
+                            ));
+                        }
+                        if crate::user::is_loader_env(k) {
+                            return Err(format!(
+                                "server {:?}: env {k} changes which code the server loads",
+                                r.name
+                            ));
+                        }
                         if v.contains('\0') {
                             return Err(format!("server {:?}: NUL in env value", r.name));
+                        }
+                        if crate::user::is_env_reference(v) {
+                            return Err(format!(
+                                "server {:?}: env {k} refers to another variable; values are literal",
+                                r.name
+                            ));
                         }
                     }
                     let cwd = match r.cwd {
