@@ -362,6 +362,49 @@ mod tests {
         assert!(TOOLCHAIN_CALL_TIMEOUT.as_secs() > crate::toolchain::LONGEST_RUN_SECS);
     }
 
+    /// The toolchain worker inherits only process basics and the toolchain's own settings, never
+    /// the rest of the sidecar's environment (model endpoints, API key files, ...).
+    #[test]
+    fn the_toolchain_worker_inherits_only_what_it_needs() {
+        let s = toolchain_worker_spec(PathBuf::from("/x/sidecar"), vec![]);
+        let allow = s.env_inherit.expect("an inherit list");
+        let passes = |k: &str| {
+            allow.iter().any(|a| match a.strip_suffix('*') {
+                Some(prefix) => k.starts_with(prefix),
+                None => a == k,
+            })
+        };
+        for k in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "TZ",
+            "TMPDIR",
+            "CITRATE_HERMES_TOOLCHAIN",
+            "CITRATE_HERMES_TOOLCHAIN_ROOTS",
+            "CITRATE_HERMES_TOOLCHAIN_PATH",
+            "CITRATE_HERMES_SOLC",
+        ] {
+            assert!(passes(k), "{k} is needed by the worker");
+        }
+        for k in [
+            "CITRATE_HERMES_TOKEN_FILE",
+            "CITRATE_HERMES_ADDR",
+            "CITRATE_HERMES_JEV_KEY_FILE",
+            "CITRATE_HERMES_JINA_KEY_FILE",
+            "CITRATE_HERMES_MCP",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "HF_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "FOUNDRY_FFI",
+        ] {
+            assert!(!passes(k), "{k} must not reach the worker");
+        }
+    }
+
     #[test]
     fn the_worker_spec_starts_the_toolchain_worker_mode() {
         let s = toolchain_worker_spec(PathBuf::from("/x/sidecar"), vec![]);
