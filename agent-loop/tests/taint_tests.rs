@@ -672,3 +672,60 @@ fn a_workflow_shares_the_session_taint_across_its_steps() {
     assert_eq!(hic_of(&sink.tool_call("c2")).0, Some("required"));
     assert_eq!(host.explicit().len(), 1);
 }
+
+/// HUP-S2.3: the budgeted sign-in path needs every source that brought untrusted content in, not
+/// only the first one (`WebSigningBudget.tla` `TaintDowngrade` with the O-3 exemption). A later
+/// source must never be hidden behind an earlier same-site one.
+#[test]
+fn every_taint_source_is_kept_not_only_the_first() {
+    let t = TaintState::default();
+    assert_eq!(
+        t.sources(),
+        Some(Vec::new()),
+        "a clean session has no sources"
+    );
+    assert!(t.taint("browser_snapshot", "page"));
+    assert!(!t.taint("mcp__notes__read", "second source"));
+    assert!(!t.taint("browser_snapshot", "same source again"));
+    assert_eq!(
+        t.sources(),
+        Some(vec![
+            "browser_snapshot".to_string(),
+            "mcp__notes__read".to_string()
+        ]),
+        "sorted, deduplicated, and the later source is visible"
+    );
+    assert_eq!(t.record().unwrap().source, "browser_snapshot");
+    t.clear_by_member(MemberClear::new("checked").unwrap());
+    assert_eq!(
+        t.sources(),
+        Some(Vec::new()),
+        "a member clear forgets the sources too"
+    );
+}
+
+#[test]
+fn the_loop_records_each_untrusted_tool_as_a_source() {
+    let llm = ScriptLlm::new(vec![
+        AssistantTurn::tools(vec![call("c1", "web_fetch")]),
+        AssistantTurn::tools(vec![call("c2", "node_status")]),
+        AssistantTurn::text("done"),
+    ]);
+    let host = Arc::new(RecHost::new(true, ToolOutcome::Untrusted("x".into())));
+    let tools = ToolRegistry::new(catalog()).with_host(HostKind::Core, host);
+    run_turn(
+        &cfg(),
+        &llm,
+        &tools,
+        &Sink::default(),
+        &StopFlag::default(),
+        &mut vec![],
+        "go",
+    );
+    let srcs = tools.taint().sources().unwrap_or_default();
+    assert_eq!(
+        srcs,
+        vec!["node_status".to_string(), "web_fetch".to_string()],
+        "both tools that returned untrusted content are sources"
+    );
+}

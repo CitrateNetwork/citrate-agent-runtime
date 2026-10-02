@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use citrate_agent_browser::cdp::{Cdp, EventHandler};
 use citrate_agent_browser::chromium::{attach_ws_url, ManagedChrome};
 use citrate_agent_browser::service::Action;
+use citrate_agent_browser::signin::{SignInAnswer, SignInKind};
 use citrate_agent_browser::{BrowserError, BrowserService};
 use serde_json::json;
 
@@ -357,4 +358,126 @@ impl Drop for MembersChrome {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.profile);
     }
+}
+
+/// HUP-S2.3: the managed browser's sign-in bridge, end to end in a real Chromium. The page's top
+/// frame gets a provider; its wallet methods wait for an answer from outside (core); the answer
+/// reaches the page; an embedded frame cannot reach the bridge at all.
+#[test]
+fn the_managed_browser_bridges_a_dapp_sign_in_and_hides_the_binding() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let base = common::serve();
+    let svc = BrowserService::new(common::config(exe));
+    svc.navigate(&format!("{base}/dapp")).expect("navigates");
+    let st = svc.status();
+    assert_eq!(st.mode, "managed");
+    assert!(
+        st.devtools_port.is_some(),
+        "core needs the DevTools port to attest"
+    );
+    assert!(st.target_id.is_some());
+
+    let (_, snap) = svc.snapshot().expect("snapshot");
+    assert!(
+        snap.text.contains("provider yes, binding undefined"),
+        "the top frame has a provider and no raw binding: {}",
+        snap.text
+    );
+    let frame_line = wait_for(
+        || {
+            let (_, s) = svc.snapshot().ok()?;
+            s.text.contains("frame: binding").then_some(s.text)
+        },
+        10,
+    )
+    .expect("the frame reported");
+    assert!(
+        frame_line.contains("frame: binding undefined, provider no"),
+        "an embedded frame sees neither: {frame_line}"
+    );
+
+    let (_, snap) = svc.snapshot().expect("snapshot");
+    let go = snap
+        .refs
+        .iter()
+        .find(|r| r.name == "Sign in")
+        .expect("the Sign in button")
+        .clone();
+    svc.act(&go.r#ref, &Action::Click).expect("clicks");
+
+    let accounts = wait_for(|| svc.sign_in_requests().into_iter().next(), 10)
+        .expect("an accounts request waits");
+    assert_eq!(accounts.kind, SignInKind::Accounts);
+    assert!(accounts.top_frame);
+    assert_eq!(
+        accounts.raise_origin, base,
+        "Chrome's origin for the asking context"
+    );
+    let addr = "0x00000000000000000000000000000000000000a1".to_string();
+    svc.answer_sign_in(&accounts.id, &SignInAnswer::Accounts(vec![addr.clone()]))
+        .expect("delivered");
+
+    let sign = wait_for(
+        || {
+            svc.sign_in_requests()
+                .into_iter()
+                .find(|r| r.kind == SignInKind::PersonalSign)
+        },
+        10,
+    )
+    .expect("a personal_sign request waits");
+    assert_eq!(sign.message_hex.as_deref(), Some("6869"));
+    assert_eq!(sign.address.as_deref(), Some(addr.as_str()));
+    let sig = format!("0x{}", "ab".repeat(65));
+    svc.answer_sign_in(&sign.id, &SignInAnswer::Signature(sig))
+        .expect("delivered");
+    let done = wait_for(
+        || {
+            let (_, s) = svc.snapshot().ok()?;
+            s.text.contains("signed 0xabab").then_some(())
+        },
+        10,
+    );
+    assert!(done.is_some(), "the page received the signature");
+    assert!(
+        svc.read_origins().contains(&base),
+        "the page's origin is remembered as read"
+    );
+}
+
+#[test]
+fn a_refused_sign_in_reaches_the_page_as_an_eip1193_error() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let base = common::serve();
+    let svc = BrowserService::new(common::config(exe));
+    svc.navigate(&format!("{base}/dapp")).expect("navigates");
+    let (_, snap) = svc.snapshot().expect("snapshot");
+    let go = snap
+        .refs
+        .iter()
+        .find(|r| r.name == "Sign in")
+        .expect("the Sign in button")
+        .clone();
+    svc.act(&go.r#ref, &Action::Click).expect("clicks");
+    let r = wait_for(|| svc.sign_in_requests().into_iter().next(), 10).expect("waits");
+    svc.answer_sign_in(
+        &r.id,
+        &SignInAnswer::Refused {
+            code: 4100,
+            message: "this site has no sign-in budget".into(),
+        },
+    )
+    .expect("delivered");
+    let done = wait_for(
+        || {
+            let (_, s) = svc.snapshot().ok()?;
+            s.text.contains("refused 4100").then_some(())
+        },
+        10,
+    );
+    assert!(done.is_some());
 }
