@@ -111,6 +111,9 @@ impl ToolchainBackend for ToolchainHost {
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
+// When the table is full, a new session replaces the idle session the app used least recently
+// (sessions mid-turn are never replaced). Sessions the app opened and never closed (a Stop, a
+// reload) therefore cannot fill the table for good.
 /// Events kept per session for replay; older ones are dropped (clients read by sequence).
 pub const EVENT_LOG_CAP: usize = 2000;
 /// Upper bounds a client may request.
@@ -364,6 +367,9 @@ pub struct Session {
     files: Option<Arc<FileTools>>,
     /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
     runs: Mutex<VecDeque<(String, RunState)>>,
+    /// When the app last used this session (the manager's use counter): a full table replaces
+    /// the idle session used least recently.
+    last_used: AtomicU64,
 }
 
 impl Session {
@@ -695,6 +701,8 @@ pub struct SessionManager {
     anchor: Option<Arc<AnchorService>>,
     /// HUP-S4.4: core's saved MCP server list; the probe starts only entries saved there.
     mcp_registry: Option<std::path::PathBuf>,
+    /// Use counter for [`Session::last_used`].
+    uses: AtomicU64,
 }
 
 impl SessionManager {
@@ -720,6 +728,7 @@ impl SessionManager {
             trajectories: None,
             anchor: None,
             mcp_registry: None,
+            uses: AtomicU64::new(0),
         }
     }
 
@@ -1007,8 +1016,15 @@ impl SessionManager {
             .sessions
             .lock()
             .map_err(|_| SessionError::Invalid("internal".into()))?;
+        let mut replaced = None;
         if sessions.len() >= MAX_SESSIONS {
-            return Err(SessionError::TooMany);
+            let victim = sessions
+                .values()
+                .filter(|s| !s.is_busy())
+                .min_by_key(|s| s.last_used.load(Ordering::SeqCst))
+                .map(|s| s.id.clone())
+                .ok_or(SessionError::TooMany)?;
+            replaced = sessions.remove(&victim);
         }
         let n = self.ids.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!(
@@ -1086,13 +1102,38 @@ impl SessionManager {
             trajectory,
             files: self.files.clone(),
             runs: Mutex::new(VecDeque::new()),
+            last_used: AtomicU64::new(self.uses.fetch_add(1, Ordering::SeqCst) + 1),
         });
         sessions.insert(id.clone(), session);
+        drop(sessions);
+        if let Some(old) = replaced {
+            Self::finish(&old);
+        }
         Ok(id)
     }
 
+    /// A session (marking it used now).
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+        let s = self.sessions.lock().ok().and_then(|s| s.get(id).cloned())?;
+        s.last_used.store(
+            self.uses.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Some(s)
+    }
+
+    /// Wind down a session removed from the table: stop it and, with trajectory recording on,
+    /// export its verified turns.
+    fn finish(s: &Arc<Session>) -> Option<ExportSummary> {
+        s.stop.stop();
+        s.trajectory.as_ref().map(|(rec, cfg)| {
+            let history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            export_session(cfg, rec, &history, &s.id, now_ms)
+        })
     }
 
     /// The tools a turn or workflow in this session can call: core-hosted ones park on core, and
@@ -1308,15 +1349,7 @@ impl SessionManager {
             .ok()
             .and_then(|mut m| m.remove(id))
             .ok_or(SessionError::NotFound)?;
-        s.stop.stop();
-        Ok(s.trajectory.as_ref().map(|(rec, cfg)| {
-            let history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
-            export_session(cfg, rec, &history, &s.id, now_ms)
-        }))
+        Ok(Self::finish(&s))
     }
 
     pub fn count(&self) -> usize {
