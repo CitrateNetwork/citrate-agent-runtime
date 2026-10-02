@@ -281,7 +281,12 @@ impl LinkerBuilder {
             .map_err(|e| linker_err("sockets::tcp_create_socket", e))?;
             b::sync::sockets::udp::add_to_linker::<HostCtx, WasiSockets>(l, HostCtx::sockets)
                 .map_err(|e| linker_err("sockets::udp", e))?;
-            b::sockets::udp_create_socket::add_to_linker::<HostCtx, WasiSockets>(
+            // HUP-S2.5: the sync bindings, as wasmtime-wasi's own
+            // `add_to_linker_sync` uses. The async ones made every
+            // socket-importing capsule fail to instantiate on the sync
+            // store ("`*_async` functions are used instead"); a compiled
+            // guest capsule found it (sandbox_guest_tests).
+            b::sync::sockets::udp_create_socket::add_to_linker::<HostCtx, WasiSockets>(
                 l,
                 HostCtx::sockets,
             )
@@ -298,7 +303,7 @@ impl LinkerBuilder {
                 HostCtx::sockets,
             )
             .map_err(|e| linker_err("sockets::network", e))?;
-            b::sockets::ip_name_lookup::add_to_linker::<HostCtx, WasiSockets>(
+            b::sync::sockets::ip_name_lookup::add_to_linker::<HostCtx, WasiSockets>(
                 l,
                 HostCtx::sockets,
             )
