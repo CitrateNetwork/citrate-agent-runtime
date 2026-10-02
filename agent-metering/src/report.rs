@@ -71,7 +71,7 @@ pub struct DailyReport {
     pub tainted_turns: u32,
 }
 
-fn nearest_rank(sorted: &[u64], pct: u64) -> u64 {
+pub(crate) fn nearest_rank(sorted: &[u64], pct: u64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
