@@ -748,6 +748,8 @@ pub struct SessionManager {
     metering: Arc<MeteringStore>,
     trajectories: Option<Arc<TrajectoryConfig>>,
     anchor: Option<Arc<AnchorService>>,
+    /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
+    records: Option<Arc<citrate_agent_records::DecisionLog>>,
 }
 
 impl SessionManager {
@@ -773,7 +775,20 @@ impl SessionManager {
             metering: Arc::new(MeteringStore::in_memory()),
             trajectories: None,
             anchor: None,
+            records: None,
         }
+    }
+
+    /// HUP-S2.6: record HIC decisions (ceremony bridge, browser actions, core's events) into this
+    /// log, the one in the records directory the anchor batches (default none: nothing recorded).
+    pub fn with_records(mut self, log: Arc<citrate_agent_records::DecisionLog>) -> Self {
+        self.records = Some(log);
+        self
+    }
+
+    /// HUP-S2.6: the decision records writer, when configured.
+    pub fn records(&self) -> Option<Arc<citrate_agent_records::DecisionLog>> {
+        self.records.clone()
     }
 
     /// HUP-S7.5: where finished metering records go (default: in memory for this process).
