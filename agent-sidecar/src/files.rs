@@ -1,0 +1,577 @@
+//! HUP-S2.9 — sidecar file tools with undo checkpoints.
+//!
+//! Four sidecar-hosted session tools change files inside the folders a member granted for
+//! writing (HUP-S2.1 grants):
+//!
+//! | tool        | arguments                                          | change                       |
+//! |-------------|----------------------------------------------------|------------------------------|
+//! | `fs_write`  | `path`, `content`                                  | create or overwrite a file   |
+//! | `fs_edit`   | `path`, `old_text`, `new_text`, `replace_all?`     | exact text replacement       |
+//! | `fs_delete` | `path`                                             | delete a file or a link      |
+//! | `fs_rename` | `from`, `to`                                       | rename inside one grant      |
+//!
+//! Every call runs in this order:
+//!
+//! 1. **Grant and deny list.** Build configuration (`foundry.toml`, env files and the rest of
+//!    `toolchain_config::build_config_file`) is refused first: the member edits it. Each path
+//!    then goes through [`FolderGrants::check`] for a write, which
+//!    asks the agent-guard default-deny list first (credentials, keychains, browser profiles,
+//!    wallet storage, app data, shell history) and then needs a live write grant covering the
+//!    resolved path. A refusal here happens before anything is read or snapshotted, so the bytes
+//!    of a denied file never enter the checkpoint store.
+//! 2. **Checkpoint.** [`CheckpointStore::begin_step`] snapshots the prior state of every path
+//!    and makes the step durable.
+//! 3. **Change.** The tool writes (temp sibling, then rename), deletes or renames.
+//! 4. **Commit.** The step records the post-change state ([`citrate_agent_checkpoints::Step::commit`]); a failed
+//!    change aborts the step (undo still accepts either state).
+//!
+//! The tool result names the checkpoint (`session`, `seq`) so the app can offer Undo on the
+//! change. Undo itself is a member action through the `/checkpoints` routes, never a tool.
+//!
+//! **Configuration.** Off unless `CITRATE_HERMES_FILES=1`, a grants file
+//! (`CITRATE_HERMES_GRANTS`, the [`citrate_agent_grants::GrantState`] JSON core stores) and a
+//! checkpoint store (`CITRATE_HERMES_CHECKPOINTS`) are all configured: no write without a grant,
+//! and no write that could not be undone. The grants file is read on every call, so a revoke or
+//! an expiry applies to the next call. Paths must be absolute (or start with `~/`).
+//!
+//! **Honest scope.** A file changed between the grant check and the write is caught by the
+//! checkpoint's own path checks (no write through a symbolic link, no path through a symlinked
+//! directory), not by an OS sandbox. Taint (HUP-S2.7) is enforced by the loop: these tools are
+//! effectful, so after the session reads untrusted content they are declined. This module never
+//! holds a key and never signs (Rule 3).
+
+use std::fs;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use citrate_agent_checkpoints::{Change, CheckpointStore, SessionId, Step};
+use citrate_agent_grants::{Decision, FolderGrants, Op};
+use citrate_agent_loop::{
+    Effect, HostKind, ToolAnnotations, ToolCall, ToolHost, ToolOutcome, ToolSpec, Trust,
+};
+
+/// `1` turns the file tools on; anything else (or unset) leaves them off.
+pub const FILES_ENV: &str = "CITRATE_HERMES_FILES";
+/// Absolute path of the grants file (the `GrantState` JSON core stores).
+pub const GRANTS_ENV: &str = "CITRATE_HERMES_GRANTS";
+/// Absolute directory of the undo checkpoint store (inside the app's data dir).
+pub const CHECKPOINTS_ENV: &str = "CITRATE_HERMES_CHECKPOINTS";
+
+pub const FS_WRITE_TOOL: &str = "fs_write";
+pub const FS_EDIT_TOOL: &str = "fs_edit";
+pub const FS_DELETE_TOOL: &str = "fs_delete";
+pub const FS_RENAME_TOOL: &str = "fs_rename";
+/// The tool names this module owns (reserved in sessions while it is on).
+pub const TOOL_NAMES: [&str; 4] = [FS_WRITE_TOOL, FS_EDIT_TOOL, FS_DELETE_TOOL, FS_RENAME_TOOL];
+
+/// Largest content `fs_write` accepts, and largest file `fs_edit` opens (4 MiB).
+pub const MAX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// What the env asks for (the store directory is configured separately).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesConfig {
+    pub grants_file: PathBuf,
+    /// The member's home (`~` and the deny list).
+    pub home: PathBuf,
+}
+
+impl FilesConfig {
+    /// `None` unless `CITRATE_HERMES_FILES` is exactly `1`, a home is known and an absolute
+    /// grants file is given (never resolved against the sidecar's cwd).
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        if get(FILES_ENV).as_deref() != Some("1") {
+            return None;
+        }
+        let home = PathBuf::from(get("HOME").filter(|h| !h.is_empty())?);
+        let grants_file = PathBuf::from(get(GRANTS_ENV).filter(|g| !g.is_empty())?);
+        if !grants_file.is_absolute() {
+            return None;
+        }
+        Some(FilesConfig { grants_file, home })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        Self::from_env_vars(|k| std::env::var(k).ok())
+    }
+}
+
+/// The checkpoint store directory from `CITRATE_HERMES_CHECKPOINTS`; relative paths are ignored.
+pub fn checkpoints_dir_from_env_vars(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    get(CHECKPOINTS_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// Where the grants come from.
+#[derive(Debug, Clone)]
+pub enum GrantSource {
+    /// Read and validated on every call (production). Missing or invalid = nothing granted.
+    File(PathBuf),
+    /// A fixed set (tests and embedders that manage grants themselves).
+    Fixed(FolderGrants),
+}
+
+/// The file tools shared by every session (one checkpoint store per process).
+pub struct FileTools {
+    store: Arc<CheckpointStore>,
+    grants: GrantSource,
+    home: PathBuf,
+    clock: fn() -> u64,
+}
+
+impl std::fmt::Debug for FileTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTools")
+            .field("grants", &self.grants)
+            .field("home", &self.home)
+            .finish_non_exhaustive()
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A path that passed the grant check: where to do the I/O and the grant root it is under.
+struct Allowed {
+    canonical: PathBuf,
+    root: PathBuf,
+}
+
+type Args = serde_json::Map<String, serde_json::Value>;
+
+/// Why a call did not change anything. `Policy` is a grant or deny-list refusal (the model sees
+/// "declined"); `Failed` is anything else.
+enum Refusal {
+    Policy(String),
+    Failed(String),
+}
+
+impl From<citrate_agent_checkpoints::Error> for Refusal {
+    fn from(e: citrate_agent_checkpoints::Error) -> Self {
+        Refusal::Failed(format!("no change was made: {e}"))
+    }
+}
+
+impl FileTools {
+    pub fn new(store: Arc<CheckpointStore>, grants: GrantSource, home: impl AsRef<Path>) -> Self {
+        FileTools {
+            store,
+            grants,
+            home: home.as_ref().to_path_buf(),
+            clock: unix_now,
+        }
+    }
+
+    /// Use a fixed clock (grant expiry is checked against it).
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn store(&self) -> &Arc<CheckpointStore> {
+        &self.store
+    }
+
+    /// Whether `name` is one of the file tools.
+    pub fn handles(name: &str) -> bool {
+        TOOL_NAMES.contains(&name)
+    }
+
+    /// The tool specs offered to the model.
+    pub fn specs() -> Vec<ToolSpec> {
+        let path = |what: &str| {
+            serde_json::json!({
+                "type": "string",
+                "description": format!("Absolute path of the {what} (inside a folder the member granted for writing).")
+            })
+        };
+        let ann = |destructive: bool, idempotent: bool| ToolAnnotations {
+            read_only: false,
+            destructive,
+            idempotent,
+            open_world: false,
+            effect: Some(Effect::Write),
+            trust: Some(Trust::Trusted),
+        };
+        let spec = |name: &str, description: &str, parameters: serde_json::Value, a| ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            host: HostKind::Sidecar,
+            annotations: a,
+        };
+        vec![
+            spec(
+                FS_WRITE_TOOL,
+                "Create or overwrite a text file in a folder the member granted for writing. The member can undo the change.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": path("file"),
+                        "content": {"type": "string", "description": "The complete new file content."}
+                    },
+                    "required": ["path", "content"]
+                }),
+                ann(true, true),
+            ),
+            spec(
+                FS_EDIT_TOOL,
+                "Replace exact text in a file in a granted folder. old_text must appear exactly once unless replace_all is true. The member can undo the change.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": path("file"),
+                        "old_text": {"type": "string", "description": "The exact text to replace."},
+                        "new_text": {"type": "string", "description": "The replacement text."},
+                        "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."}
+                    },
+                    "required": ["path", "old_text", "new_text"]
+                }),
+                ann(true, false),
+            ),
+            spec(
+                FS_DELETE_TOOL,
+                "Delete a file (or a symbolic link) in a granted folder. The member can undo the change.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": path("file")},
+                    "required": ["path"]
+                }),
+                ann(true, true),
+            ),
+            spec(
+                FS_RENAME_TOOL,
+                "Rename or move a file inside one granted folder, replacing anything at the destination. The member can undo the change.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"from": path("file to move"), "to": path("destination")},
+                    "required": ["from", "to"]
+                }),
+                ann(true, false),
+            ),
+        ]
+    }
+
+    fn load_grants(&self) -> Result<FolderGrants, Refusal> {
+        match &self.grants {
+            GrantSource::Fixed(g) => Ok(g.clone()),
+            GrantSource::File(p) => {
+                let json = fs::read_to_string(p).map_err(|e| {
+                    Refusal::Policy(format!(
+                        "no folder grants are readable ({e}); ask the member to grant a folder"
+                    ))
+                })?;
+                FolderGrants::from_json(&json, &self.home, &self.home).map_err(|e| {
+                    Refusal::Policy(format!("the folder grants could not be loaded: {e}"))
+                })
+            }
+        }
+    }
+
+    /// Grant + deny-list check for a write to `raw`. Nothing is read or snapshotted before this.
+    fn allow(&self, grants: &FolderGrants, raw: &str) -> Result<Allowed, Refusal> {
+        let p = Path::new(raw);
+        if !(p.is_absolute() || raw.starts_with("~/")) {
+            return Err(Refusal::Failed(format!(
+                "{raw:?} is not an absolute path; use an absolute path inside a folder the member granted"
+            )));
+        }
+        // Build configuration is the member's to edit: no fs tool creates, changes, moves or
+        // removes it (checked on the path as given and as resolved).
+        if let Some(name) = crate::toolchain_config::build_config_file(p) {
+            return Err(Refusal::Policy(
+                crate::toolchain_config::build_config_refusal(&name),
+            ));
+        }
+        match grants.check(p, Op::Write, (self.clock)()) {
+            Decision::Allowed {
+                canonical,
+                grant_id,
+            } => {
+                if let Some(name) = crate::toolchain_config::build_config_file(canonical.as_path())
+                {
+                    return Err(Refusal::Policy(
+                        crate::toolchain_config::build_config_refusal(&name),
+                    ));
+                }
+                let root = grants
+                    .state()
+                    .grants
+                    .iter()
+                    .find(|g| g.id == grant_id)
+                    .map(|g| g.root.clone())
+                    .ok_or_else(|| Refusal::Failed("internal: the grant disappeared".into()))?;
+                Ok(Allowed {
+                    canonical: canonical.into_path_buf(),
+                    root,
+                })
+            }
+            Decision::Denied { reason } => Err(Refusal::Policy(format!("{raw}: {reason}"))),
+        }
+    }
+
+    fn run(&self, session: &SessionId, call: &ToolCall) -> Result<serde_json::Value, Refusal> {
+        let args = parse_args(&call.arguments).map_err(Refusal::Failed)?;
+        let grants = self.load_grants()?;
+        let (paths, step) = match call.name.as_str() {
+            FS_WRITE_TOOL => {
+                let path = str_arg(&args, "path")?;
+                let content = str_arg(&args, "content")?;
+                if content.len() > MAX_CONTENT_BYTES {
+                    return Err(Refusal::Failed(format!(
+                        "the content is {} bytes, over the {MAX_CONTENT_BYTES}-byte limit",
+                        content.len()
+                    )));
+                }
+                let a = self.allow(&grants, path)?;
+                let bytes = content.as_bytes();
+                let step = self.store.begin_step(
+                    session,
+                    &a.root,
+                    &[Change::write(&a.canonical, bytes)],
+                )?;
+                let r = write_file(&a.canonical, bytes);
+                (vec![a.canonical], finish(step, r)?)
+            }
+            FS_EDIT_TOOL => {
+                let path = str_arg(&args, "path")?;
+                let old_text = str_arg(&args, "old_text")?;
+                let new_text = str_arg(&args, "new_text")?;
+                let replace_all = match args.get("replace_all") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(b)) => *b,
+                    Some(_) => {
+                        return Err(Refusal::Failed("replace_all must be true or false".into()))
+                    }
+                };
+                if old_text.is_empty() {
+                    return Err(Refusal::Failed("old_text is empty".into()));
+                }
+                let a = self.allow(&grants, path)?;
+                let before = read_text(&a.canonical)?;
+                let n = before.matches(old_text).count();
+                if n == 0 {
+                    return Err(Refusal::Failed(format!(
+                        "old_text was not found in {path}; nothing was changed"
+                    )));
+                }
+                if n > 1 && !replace_all {
+                    return Err(Refusal::Failed(format!(
+                        "old_text appears {n} times in {path}; give more context or set replace_all"
+                    )));
+                }
+                let after = if replace_all {
+                    before.replace(old_text, new_text)
+                } else {
+                    before.replacen(old_text, new_text, 1)
+                };
+                if after.len() > MAX_CONTENT_BYTES {
+                    return Err(Refusal::Failed(format!(
+                        "the edited file would be {} bytes, over the {MAX_CONTENT_BYTES}-byte limit",
+                        after.len()
+                    )));
+                }
+                let step = self.store.begin_step(
+                    session,
+                    &a.root,
+                    &[Change::write(&a.canonical, after.as_bytes())],
+                )?;
+                // The snapshot is of what is on disk now; refuse if that is not what was edited.
+                let r = write_if_unchanged(&a.canonical, &before, after.as_bytes());
+                (vec![a.canonical], finish(step, r)?)
+            }
+            FS_DELETE_TOOL => {
+                let path = str_arg(&args, "path")?;
+                let a = self.allow(&grants, path)?;
+                let step =
+                    self.store
+                        .begin_step(session, &a.root, &[Change::delete(&a.canonical)])?;
+                let r = fs::remove_file(&a.canonical).map_err(|e| format!("delete failed: {e}"));
+                (vec![a.canonical], finish(step, r)?)
+            }
+            FS_RENAME_TOOL => {
+                let from_raw = str_arg(&args, "from")?;
+                let to_raw = str_arg(&args, "to")?;
+                let from = self.allow(&grants, from_raw)?;
+                let to = self.allow(&grants, to_raw)?;
+                if from.root != to.root {
+                    return Err(Refusal::Failed(
+                        "from and to must be inside the same granted folder".into(),
+                    ));
+                }
+                let step = self.store.begin_step(
+                    session,
+                    &from.root,
+                    &[Change::rename(&from.canonical, &to.canonical)],
+                )?;
+                let r = to
+                    .canonical
+                    .parent()
+                    .map_or(Ok(()), fs::create_dir_all)
+                    .and_then(|()| fs::rename(&from.canonical, &to.canonical))
+                    .map_err(|e| format!("rename failed: {e}"));
+                (vec![from.canonical, to.canonical], finish(step, r)?)
+            }
+            other => {
+                return Err(Refusal::Failed(format!("'{other}' is not a file tool")));
+            }
+        };
+        Ok(serde_json::json!({
+            "ok": true,
+            "tool": call.name,
+            "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            "checkpoint": {"session": session.as_str(), "seq": step},
+            "undo": "The member can undo this change from the app."
+        }))
+    }
+}
+
+/// Commit after a change that happened, abort after one that failed. Returns the step's seq.
+fn finish(step: Step<'_>, change: Result<(), String>) -> Result<u64, Refusal> {
+    let seq = step.seq();
+    match change {
+        Ok(()) => match step.commit() {
+            Ok(_) => Ok(seq),
+            Err(e) => Err(Refusal::Failed(format!(
+                "the change was made, but its undo record could not be finished ({e}); undo of step {seq} still works"
+            ))),
+        },
+        Err(m) => {
+            let _ = step.abort();
+            Err(Refusal::Failed(m))
+        }
+    }
+}
+
+fn parse_args(raw: &str) -> Result<Args, String> {
+    let raw = if raw.trim().is_empty() { "{}" } else { raw };
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(m)) => Ok(m),
+        Ok(_) => Err("the arguments must be a JSON object".into()),
+        Err(_) => Err("the arguments are not valid JSON".into()),
+    }
+}
+
+fn str_arg<'a>(args: &'a Args, key: &str) -> Result<&'a str, Refusal> {
+    match args.get(key) {
+        Some(serde_json::Value::String(s))
+            if key == "content" || key == "new_text" || !s.is_empty() =>
+        {
+            Ok(s)
+        }
+        _ => Err(Refusal::Failed(format!("{key} is required (a string)"))),
+    }
+}
+
+/// Read a regular file (never through a symbolic link) as UTF-8 text, within the size limit.
+fn read_text(path: &Path) -> Result<String, Refusal> {
+    let shown = path.display();
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(Refusal::Failed(format!("{shown} does not exist")))
+        }
+        Err(e) => return Err(Refusal::Failed(format!("{shown}: {e}"))),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(Refusal::Failed(format!(
+            "{shown} is a symbolic link; edit its target instead"
+        )));
+    }
+    if !meta.is_file() {
+        return Err(Refusal::Failed(format!("{shown} is not a regular file")));
+    }
+    if meta.len() > MAX_CONTENT_BYTES as u64 {
+        return Err(Refusal::Failed(format!(
+            "{shown} is {} bytes, over the {MAX_CONTENT_BYTES}-byte edit limit",
+            meta.len()
+        )));
+    }
+    let bytes = fs::read(path).map_err(|e| Refusal::Failed(format!("{shown}: {e}")))?;
+    String::from_utf8(bytes).map_err(|_| Refusal::Failed(format!("{shown} is not UTF-8 text")))
+}
+
+/// Write `bytes` only if the file still holds `expected` (what the edit was computed from).
+pub(crate) fn write_if_unchanged(path: &Path, expected: &str, bytes: &[u8]) -> Result<(), String> {
+    match read_text(path) {
+        Ok(now) if now == expected => write_file(path, bytes),
+        Ok(_) => Err(format!(
+            "{} changed while it was being edited; nothing was changed",
+            path.display()
+        )),
+        Err(Refusal::Policy(m) | Refusal::Failed(m)) => Err(m),
+    }
+}
+
+static TMP_N: AtomicU64 = AtomicU64::new(0);
+
+/// Write through a temp sibling and a rename, keeping an existing file's permissions.
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the path has no parent folder".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("could not create the folder: {e}"))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(
+        ".{name}.citrate-write-{}-{}",
+        std::process::id(),
+        TMP_N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.is_file() {
+                fs::set_permissions(&tmp, meta.permissions())?;
+            }
+        }
+        fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res.map_err(|e| format!("write failed: {e}"))
+}
+
+/// The per-session host: the shared tools plus this session's checkpoint id.
+pub struct FileToolsHost {
+    tools: Arc<FileTools>,
+    session: SessionId,
+}
+
+impl FileToolsHost {
+    /// `None` when the session id is not a valid checkpoint session id.
+    pub fn new(tools: Arc<FileTools>, session: &str) -> Option<Self> {
+        Some(FileToolsHost {
+            tools,
+            session: SessionId::new(session).ok()?,
+        })
+    }
+}
+
+impl ToolHost for FileToolsHost {
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if !FileTools::handles(&call.name) {
+            return ToolOutcome::Error(format!("'{}' is not a file tool", call.name));
+        }
+        match self.tools.run(&self.session, call) {
+            Ok(v) => ToolOutcome::Ok(v.to_string()),
+            Err(Refusal::Policy(m)) => ToolOutcome::Denied(m),
+            Err(Refusal::Failed(m)) => ToolOutcome::Error(m),
+        }
+    }
+}

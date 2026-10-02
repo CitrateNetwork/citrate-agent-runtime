@@ -64,12 +64,38 @@ with `skillHash = keccak256(abi.encodePacked(msg.sender, name, version))`.
 - Registry names are not unique: readers must resolve by `skillHash` against an owner they trust.
   The payload carries `expected_skill_hash` for that.
 
+## Surviving a restart
+
+`Learner::open(cfg, log, clock, path)` keeps the proposals in a file (`citrate.learn.proposals.v1`)
+and rewrites it after every change (temporary file, flush, rename; `0600` on unix). Undecided
+proposals are always kept; decided ones are kept up to `MAX_KEPT_DECIDED` (512), oldest dropped
+first.
+
+- **Propose** saves before it returns. If the save fails, the proposal is forgotten and the call
+  fails with `store`, so nothing a caller was told about can be lost by a restart.
+- **Accept, reject, publish** stand once they are in the decision log. If the save after them
+  fails, the call still succeeds and `store_error()` says why until a later save succeeds.
+- **On open** every stored proposal is re-checked (id, content hash, kind, evidence session and
+  verdicts); one that fails is dropped and named in the `LoadReport`. A file that cannot be read
+  as a proposals file is moved aside (`<name>.unreadable-<ms>`), never deleted.
+- **Reconciling.** The log is written before every effect and the file after it, so the file can
+  be one decision behind. On open the log moves such proposals forward: a recorded reject is
+  final; a recorded, completed skill accept with the skill on disk is persisted; a recorded
+  publish is prepared; a recorded memory accept is offered again (`persist_failed`), because its
+  record may never have reached core (core keys memories by proposal id, so accepting again is
+  not a duplicate). Model: `formal/LearnRestart.tla`.
+
+## Wiring (HUP-S3.4 end to end)
+
+- The sidecar (`agent-sidecar/src/learn.rs`) serves the learn routes and the `learn_propose` tool
+  when `CITRATE_HERMES_LEARN_DIR` and `CITRATE_HERMES_LEARN_SKILLS_DIR` are both set. Verified runs
+  come from `POST /sessions/:id/workflows` (`run_verified_workflow` in the session).
+- citrate-core shows the proposal card, stores accepted memories, and routes the publish payload
+  to its SignatureCeremony (core branch `hup/n4-learn-e2e`).
+
 ## Not done here
 
-- **Not wired.** No sidecar route or session calls this crate yet; core has no proposal card,
-  no accept/reject UI, no memory storage for `MemoryRecord`, and no ceremony hookup for the
-  publish payload. Those are the core half of S3.4.
-- Proposals live in memory: a sidecar restart drops undecided proposals (decisions already made
-  are in the decision log).
 - Skills only: a proposal is one `SKILL.md`. Bundled `references/` or `scripts/` are not proposed.
 - No IPFS pin of the skill bundle, so `manifestCID` is empty unless supplied.
+- An accepted skill joins a running sidecar's skill index only after the sidecar restarts (the
+  library is loaded at start).
