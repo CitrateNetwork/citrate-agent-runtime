@@ -19,6 +19,7 @@ Planset: citrate-core `.agentile/planset/2026-09-30-hermes-upskill/` (D-22, US-3
 | Propose | `Learner::propose(&run, content, provenance, known_memories)` | Content is a full `SKILL.md` (validated by the agent-loop parser) or a `{key, value}` memory. The proposal carries the evidence (final verdicts, judged attempt count, a SHA-256 of the trajectory the workflow appended) and the provenance (its session must match the run). Nothing is written or recorded. |
 | Accept | `Learner::accept(id, MemberAccept)` | Conflicts are re-checked. A blocking conflict refuses. Every other conflict must be named in `acknowledged_conflicts`. Then an HIC-1 `learn.skill` / `learn.memory` decision is written to the agent-records log (write-ahead), the item is persisted, and the outcome (completed or failed) closes the record. |
 | Reject | `Learner::reject(id, member, reason)` | An HIC-1 denial is recorded. Final. |
+| Resolve | `Learner::resolve(MemberResolve { member, keep, retract })` | Two accepted memories on the same key (case and spacing ignored) with different values. An HIC-1 `learn.memory.resolve` decision is written first; then `retract` moves to `retracted` (kept for the record, never deleted, no longer known) and the [`Resolution`] goes back to core for its ledger and memory graph. `keep` is unchanged. |
 | Publish | `Learner::prepare_publish(id, PublishApproval, PublishParams)` | Skills only, after persist, with an approval naming this proposal and content hash. The saved file is re-read and must still match. Builds `registerSkill` calldata and records an HIC-1 `skill.publish` decision. Never signs or sends. |
 
 ## Persisting
@@ -39,13 +40,32 @@ Planset: citrate-core `.agentile/planset/2026-09-30-hermes-upskill/` (D-22, US-3
 | `same_name_skill` | a skill with this name is anywhere in the user skills folder (the loader scans it recursively, so a second copy would make both ambiguous) | yes: never overwritten |
 | `shadows_skill` | a skill with this name is in another configured source (bundled, team) | no: needs acknowledgement |
 | `pending_proposal` | another undecided proposal for the same skill name or memory key | no: needs acknowledgement |
-| `contradiction` | a known memory, or a memory accepted earlier from this learner (`proposal:<id>`), has the same key (case and spacing ignored) and a different value | no: needs acknowledgement; the record is stored as Belnap `both` with `contradicts` set, so core stops relying on either claim until the member resolves it |
+| `contradiction` | a known memory, or a memory accepted earlier from this learner (`proposal:<id>`, including one offered again after a lost save, whose accept is in the log), has the same key (case and spacing ignored) and a different value | no: needs acknowledgement; the record is stored as Belnap `both` with `contradicts` set, so core stops relying on either claim until the member resolves it |
 
 An identical item already saved, known, or pending is refused as `already_known`.
 Memory contradictions are found against the `known_memories` core passes at proposal time; at
 accept time the learner re-checks pending proposals and the memories it has accepted itself
 (so of two contradicting proposals accepted one after the other, the second is stored as
 `both`), but not core's store, which the runtime does not hold.
+
+## Resolving a contradiction
+
+A contradiction is never merged; the member settles it by keeping one memory and retracting the
+other (`Learner::resolve`, sidecar `POST /learn/memories/resolve`). Pairwise: with three memories
+on one key the member resolves twice.
+
+- Refused, with nothing recorded: no member; an unknown id; the same id twice; a skill; a memory
+  that is not `persisted` (undecided, rejected, already retracted); two memories on different
+  keys or with the same value (`not_a_contradiction`).
+- A retracted memory is no longer known: proposing its value again is a new proposal that
+  contradicts the kept memory, not "already known".
+- The log is written before the state changes. On restart, a recorded resolution retracts the
+  memory whatever the proposals file says, even when the file also lost the accept before it
+  (`formal/ContradictionResolve.tla` found that case).
+- Core applies the `Resolution` to its ledger: the retracted memory becomes Belnap `false`, and
+  only the kept one can become `true` again (when nothing else contradicts it). If the route's
+  answer is lost, core picks the resolution up from the proposal list (a retracted proposal names
+  the one kept).
 
 ## Publishing to SkillRegistry
 
@@ -90,12 +110,19 @@ first.
 - The sidecar (`agent-sidecar/src/learn.rs`) serves the learn routes and the `learn_propose` tool
   when `CITRATE_HERMES_LEARN_DIR` and `CITRATE_HERMES_LEARN_SKILLS_DIR` are both set. Verified runs
   come from `POST /sessions/:id/workflows` (`run_verified_workflow` in the session).
+- A skill accept reloads the sidecar's skills library from its sources (`CITRATE_HERMES_SKILLS`,
+  which core points at the same skills folder), so the skill is offered to the next session
+  without a restart. The accept answer says so (`skills_reloaded`, `skills_offered`). Sessions
+  already open keep the library they started with.
 - citrate-core shows the proposal card, stores accepted memories, and routes the publish payload
   to its SignatureCeremony (core branch `hup/n4-learn-e2e`).
 
 ## Not done here
 
 - Skills only: a proposal is one `SKILL.md`. Bundled `references/` or `scripts/` are not proposed.
-- No IPFS pin of the skill bundle, so `manifestCID` is empty unless supplied.
-- An accepted skill joins a running sidecar's skill index only after the sidecar restarts (the
-  library is loaded at start).
+- The runtime does not pin to IPFS: `manifestCID` is whatever the caller passes (core pins the
+  `SKILL.md` to the local IPFS node before it asks for the publish payload).
+- A session that is already open does not see a skill accepted after it started; the next
+  session does.
+- Contradictions with memories core passes in `known_memories` (not learned here) are surfaced,
+  but `resolve` only settles two learned memories; core has no other memory store to retract in.

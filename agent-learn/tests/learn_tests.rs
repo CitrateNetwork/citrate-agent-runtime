@@ -1222,3 +1222,202 @@ fn a_reject_reason_is_bounded_in_the_proposal_as_in_the_log() {
         "the proposal keeps what the log recorded"
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// Resolving a contradiction (US-3.4 AC4, the member's way out of Belnap `both`)
+// ------------------------------------------------------------------------------------------------
+
+/// Two learned memories that disagree on one key, both accepted (the second as `both`).
+fn two_contradicting(e: &mut Env) -> (Proposal, Proposal) {
+    let a = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("project.test-command", "forge test -vvv"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    e.learner.accept(&a.id, accept("m")).unwrap();
+    let b = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("Project.Test-Command", "npm test"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    e.learner
+        .accept(
+            &b.id,
+            MemberAccept {
+                member: "m".into(),
+                acknowledged_conflicts: vec![format!("proposal:{}", a.id)],
+            },
+        )
+        .unwrap();
+    (a, b)
+}
+
+fn resolve(member: &str, keep: &str, retract: &str) -> MemberResolve {
+    MemberResolve {
+        member: member.into(),
+        keep: keep.into(),
+        retract: retract.into(),
+    }
+}
+
+#[test]
+fn resolving_a_contradiction_keeps_one_retracts_the_other_and_records_hic1() {
+    let mut e = env();
+    let (a, b) = two_contradicting(&mut e);
+    let before = records(&e.logdir).len();
+    let r = e.learner.resolve(resolve("m", &b.id, &a.id)).unwrap();
+    assert_eq!(r.schema, RESOLUTION_SCHEMA);
+    assert_eq!(r.kept, b.id);
+    assert_eq!(r.retracted, a.id);
+    assert_eq!(r.kept_value, "npm test");
+    assert_eq!(r.retracted_value, "forge test -vvv");
+    assert_eq!(r.decided_by, "m");
+    // The kept memory stays persisted; the other is retracted, never deleted.
+    assert!(matches!(
+        e.learner.get(&b.id).unwrap().state,
+        ProposalState::Persisted
+    ));
+    match &e.learner.get(&a.id).unwrap().state {
+        ProposalState::Retracted { by, kept } => {
+            assert_eq!(by, "m");
+            assert_eq!(kept, &b.id);
+        }
+        other => panic!("expected retracted, got {other:?}"),
+    }
+    // The decision was recorded (write-ahead) as HIC-1 with both proposals as evidence, then
+    // closed as completed.
+    let recs = records(&e.logdir);
+    assert_eq!(recs.len(), before + 2);
+    let Entry::Decision(d) = &recs[before].record.entry else {
+        panic!("expected a decision")
+    };
+    assert_eq!(d.kind, "learn.memory.resolve");
+    assert_eq!(d.tier, HicTier::Hic1);
+    assert_eq!(d.decision, Decision::Approved);
+    assert_eq!(recs[before].record.seq, r.decision_seq);
+    assert_eq!(
+        d.evidence[0].uri,
+        format!("learn:proposal/{}", a.id),
+        "the retracted proposal is the subject"
+    );
+    assert!(
+        d.evidence
+            .iter()
+            .any(|x| x.uri == format!("learn:kept/{}", b.id)),
+        "{:?}",
+        d.evidence
+    );
+    assert!(matches!(
+        &recs[before + 1].record.entry,
+        Entry::Outcome(o) if o.outcome == Outcome::Completed
+    ));
+    assert!(verify_dir(&e.logdir).is_ok());
+    // The wire shape core reads.
+    let j = serde_json::to_value(&r).unwrap();
+    assert_eq!(j["schema"], "citrate.learn.resolve.v1");
+    assert_eq!(j["kept"], b.id.as_str());
+}
+
+#[test]
+fn only_two_accepted_memories_that_disagree_on_one_key_can_be_resolved() {
+    let mut e = env();
+    let (a, b) = two_contradicting(&mut e);
+    // A member is required; the ids must be known.
+    assert!(matches!(
+        e.learner.resolve(resolve(" ", &b.id, &a.id)),
+        Err(LearnError::MemberRequired)
+    ));
+    assert!(matches!(
+        e.learner.resolve(resolve("m", "lp-nope", &a.id)),
+        Err(LearnError::UnknownProposal(_))
+    ));
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &b.id, &b.id)),
+        Err(LearnError::NotAContradiction(_))
+    ));
+    // A memory on another key is not a contradiction.
+    let other = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("deploy chain", "40204"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    // ...and while it is undecided it cannot take part at all.
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &other.id, &a.id)),
+        Err(LearnError::WrongState { .. })
+    ));
+    e.learner.accept(&other.id, accept("m")).unwrap();
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &other.id, &a.id)),
+        Err(LearnError::NotAContradiction(_))
+    ));
+    // A skill is never part of a memory resolution.
+    let s = e
+        .learner
+        .propose(&verified_run(), skill_content(), provenance(), &[])
+        .unwrap();
+    e.learner.accept(&s.id, accept("m")).unwrap();
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &s.id, &a.id)),
+        Err(LearnError::NotAContradiction(_))
+    ));
+    // Nothing was recorded for any refusal, and nothing changed state.
+    let resolves = records(&e.logdir)
+        .into_iter()
+        .filter(
+            |r| matches!(&r.record.entry, Entry::Decision(d) if d.kind == "learn.memory.resolve"),
+        )
+        .count();
+    assert_eq!(resolves, 0);
+    // Once resolved, the retracted one cannot be kept or retracted again.
+    e.learner.resolve(resolve("m", &b.id, &a.id)).unwrap();
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &a.id, &b.id)),
+        Err(LearnError::WrongState { .. })
+    ));
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &b.id, &a.id)),
+        Err(LearnError::WrongState { .. })
+    ));
+}
+
+#[test]
+fn a_retracted_memory_no_longer_counts_as_known() {
+    let mut e = env();
+    let (a, b) = two_contradicting(&mut e);
+    e.learner.resolve(resolve("m", &b.id, &a.id)).unwrap();
+    // Proposing the retracted value again is a new proposal that contradicts the kept memory,
+    // not "already known".
+    let again = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("project.test-command", "forge test -vvv"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(again.conflicts.len(), 1, "{:?}", again.conflicts);
+    assert_eq!(again.conflicts[0].kind, ConflictKind::Contradiction);
+    assert_eq!(again.conflicts[0].existing_id, format!("proposal:{}", b.id));
+    // The kept value is still known.
+    let r = e.learner.propose(
+        &verified_run(),
+        memory("project.test-command", "npm test"),
+        provenance(),
+        &[],
+    );
+    assert!(matches!(r, Err(LearnError::AlreadyKnown { .. })), "{r:?}");
+}

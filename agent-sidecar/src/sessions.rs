@@ -63,14 +63,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
 use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
-use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
+use citrate_agent_loop::skills::{
+    skill_load_spec, SkillHost, SkillLibrary, SkillSource, SKILL_LOAD_TOOL,
+};
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
     LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
@@ -686,7 +688,11 @@ pub struct SessionManager {
     llm_factory: LlmFactory,
     core_tool_deadline: Duration,
     ids: AtomicU64,
-    skills: Option<Arc<SkillLibrary>>,
+    /// HUP-S3.2: the skills library offered to new sessions. HUP-S3.4: reloaded from
+    /// `skill_sources` after the member accepts a learned skill, so it joins the next session
+    /// without a sidecar restart (sessions already open keep the library they started with).
+    skills: RwLock<Option<Arc<SkillLibrary>>>,
+    skill_sources: Vec<SkillSource>,
     toolchain: Option<Arc<dyn ToolchainBackend>>,
     mcp: Option<Arc<McpHost>>,
     browser: Option<Arc<BrowserService>>,
@@ -713,7 +719,8 @@ impl SessionManager {
             llm_factory,
             core_tool_deadline,
             ids: AtomicU64::new(0),
-            skills: None,
+            skills: RwLock::new(None),
+            skill_sources: Vec::new(),
             toolchain: None,
             mcp: None,
             browser: None,
@@ -870,9 +877,54 @@ impl SessionManager {
     }
 
     /// HUP-S3.2: offer this skills library to every new session. An empty library offers nothing.
+    /// A library given this way is fixed: [`SessionManager::reload_skills`] has no sources to
+    /// read again.
     pub fn with_skills(mut self, lib: Arc<SkillLibrary>) -> Self {
-        self.skills = if lib.is_empty() { None } else { Some(lib) };
+        self.skills = RwLock::new(if lib.is_empty() { None } else { Some(lib) });
         self
+    }
+
+    /// HUP-S3.2 + S3.4: load the skills library from these sources (in precedence order) and
+    /// keep the sources, so [`SessionManager::reload_skills`] can read them again after the
+    /// member accepts a learned skill. Sources that hold no skills yet offer nothing until then.
+    pub fn with_skill_sources(mut self, sources: Vec<SkillSource>) -> Self {
+        let lib = SkillLibrary::load(&sources);
+        self.skills = RwLock::new(if lib.is_empty() {
+            None
+        } else {
+            Some(Arc::new(lib))
+        });
+        self.skill_sources = sources;
+        self
+    }
+
+    /// The library new sessions are offered now (a snapshot).
+    pub fn skills(&self) -> Option<Arc<SkillLibrary>> {
+        match self.skills.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// HUP-S3.4: read the skill sources again so a newly saved skill is offered to the next
+    /// session. Returns how many skills new sessions are offered, or `None` when the library was
+    /// not configured from sources (nothing to reload). Sessions already open are unchanged.
+    pub fn reload_skills(&self) -> Option<usize> {
+        if self.skill_sources.is_empty() {
+            return None;
+        }
+        let lib = SkillLibrary::load(&self.skill_sources);
+        let n = lib.len();
+        let next = if lib.is_empty() {
+            None
+        } else {
+            Some(Arc::new(lib))
+        };
+        match self.skills.write() {
+            Ok(mut g) => *g = next,
+            Err(p) => *p.into_inner() = next,
+        }
+        Some(n)
     }
 
     pub fn create(&self, req: CreateSessionReq) -> Result<String, SessionError> {
@@ -883,7 +935,9 @@ impl SessionManager {
         let mut specs = req.tools;
         let mut system_prompt = req.system_prompt;
         let mut pinned_tools = Vec::new();
-        if let Some(lib) = &self.skills {
+        // One snapshot for the prompt section and the session's `skill_load` host.
+        let skills = self.skills();
+        if let Some(lib) = &skills {
             if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{SKILL_LOAD_TOOL}' is reserved by the sidecar while skills are enabled"
@@ -1062,7 +1116,7 @@ impl SessionManager {
             stop: StopFlag::default(),
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            skills: self.skills.clone(),
+            skills,
             toolchain,
             grants,
             capsule_sandbox,
