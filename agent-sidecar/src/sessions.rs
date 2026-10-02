@@ -1080,6 +1080,20 @@ impl SessionManager {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
     }
 
+    /// HUP-S2.3: the taint sources of every live session that is tainted (one list per session).
+    /// `None` when the session table or any session's taint cannot be read, which callers treat
+    /// as "unknown" (tainted).
+    pub fn tainted_session_sources(&self) -> Option<Vec<Vec<String>>> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().ok()?.values().cloned().collect();
+        let mut out = Vec::new();
+        for s in sessions {
+            if s.taint().is_tainted() {
+                out.push(s.taint().sources()?);
+            }
+        }
+        Some(out)
+    }
+
     /// The tools a turn or workflow in this session can call: core-hosted ones park on core, and
     /// the sidecar-hosted ones (skills, toolchain, MCP, learn, capsules) run here.
     fn registry_for(

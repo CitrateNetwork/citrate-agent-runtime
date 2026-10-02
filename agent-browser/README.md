@@ -51,13 +51,36 @@ taint, `browser_navigate` and `browser_act` wait for the member's explicit decis
 The member decides through the sidecar's control routes, which citrate-core calls; the agent
 loop cannot reach them.
 
+## Sign-in bridge (HUP-S2.3, managed browser only)
+
+`src/signin.rs`. In the managed browser, Hermes's tab gets a minimal EIP-1193 provider (also
+announced through EIP-6963 as "Citrate (Hermes)") in its **top frame only**. `eth_chainId`,
+`net_version`, `eth_accounts` and `wallet_switchEthereumChain` (to 40204 only) are answered in the
+page; `eth_requestAccounts` and `personal_sign` become requests that wait here for citrate-core;
+every other method is refused with EIP-1193 code 4200. The provider reaches the worker through a
+CDP binding that the provider script removes from the page's global scope before any page script
+runs, so embedded frames and page scripts cannot call it directly.
+
+For each request the worker records, from Chrome's own events and never from the page: the
+execution context that asked, whether it is the default context of the tab's top frame, and that
+context's origin. Requests wait at most 120 s (then the page is told no), at most 4 at a time.
+citrate-core reads them over `GET /browser/sign-in`, attests the page origin with its own read of
+this browser's loopback DevTools endpoint, decides through its signature ceremony and answers over
+`POST /browser/sign-in/answer`; the answer must fit the request (one address, or a 65-byte
+signature, or a refusal) and is delivered only to the context that asked. The worker also keeps
+the set of origins whose page content reached the model, which the sidecar folds into the session
+taint core checks. The member's own Chrome (attach mode) gets no provider and no binding.
+
+Keyless: the worker never sees a key, never signs and never decides.
+
 ## Sidecar control routes (bearer-gated)
 
 `GET /browser/status`, `GET /browser/frame?after=N` (204 when nothing newer),
 `POST /browser/stop` (latches), `POST /browser/resume`, `POST /browser/attach {port, consent}`,
 `POST /browser/detach`, `POST /browser/origins {origin, allow, includeSensitive}`,
-`POST /browser/actions/decide {id, allow}`. The global e-stop (`POST /stop`) also stops the
-browser.
+`POST /browser/actions/decide {id, allow}`, `GET /browser/sign-in`,
+`POST /browser/sign-in/answer {id, accounts | signature | refused}`. The global e-stop
+(`POST /stop`) also stops the browser.
 
 ## Tests
 
@@ -74,7 +97,7 @@ browser.
 ## Not done here
 
 - Installing or updating the managed Chromium (HUP-S5.5 component updater).
-- `console`, `network` and `siwe_sign` browser tools from the architecture table (SIWE is the
-  HIC-2 budget path, HUP-S2.3).
+- `console` and `network` browser tools from the architecture table. (The architecture's
+  `siwe_sign` is served by the sign-in bridge above: the page asks, core decides.)
 - The `decide()` System-1 element picker (HUP-S5.3).
 - The default sensitive-origins list is pending owner sign-off.

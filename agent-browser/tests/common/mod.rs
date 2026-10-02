@@ -34,6 +34,33 @@ pub const NEXT: &str = r#"<!doctype html><html><head><title>Welcome page</title>
 <script>document.getElementById('who').textContent = 'Signed in as ' + new URLSearchParams(location.search).get('email');</script>
 </body></html>"#;
 
+/// HUP-S2.3: a dApp page that asks the wallet for an address and then a sign-in signature, and
+/// embeds a frame that tries to reach the sign-in bridge directly.
+pub const DAPP: &str = r#"<!doctype html><html><head><title>dapp</title></head>
+<body><h1>Example dApp</h1><p id="state">idle</p><p id="frame">frame: waiting</p>
+<button id="go">Sign in</button>
+<iframe src="/frame"></iframe>
+<script>
+var st = document.getElementById('state');
+st.textContent = 'provider ' + (window.ethereum && window.ethereum.isCitrateHermes ? 'yes' : 'no') + ', binding ' + (typeof window.__citrateHermesSignIn);
+window.addEventListener('message', function (e) { document.getElementById('frame').textContent = 'frame: ' + e.data; });
+document.getElementById('go').onclick = function () {
+  window.ethereum.request({ method: 'eth_chainId' }).then(function (c) {
+    return window.ethereum.request({ method: 'eth_requestAccounts' }).then(function (a) {
+      st.textContent = 'chain ' + c + ' account ' + a[0];
+      return window.ethereum.request({ method: 'personal_sign', params: ['0x6869', a[0]] });
+    });
+  }).then(function (sig) { st.textContent = 'signed ' + sig.slice(0, 6); })
+    .catch(function (e) { st.textContent = 'refused ' + e.code; });
+};
+</script></body></html>"#;
+
+/// The frame inside [`DAPP`]: reports whether it can see the bridge or a provider.
+pub const FRAME: &str = r#"<!doctype html><html><body><script>
+var r = 'binding ' + (typeof window.__citrateHermesSignIn) + ', provider ' + (window.ethereum ? 'yes' : 'no');
+window.parent.postMessage(r, '*');
+</script></body></html>"#;
+
 /// Serve LOGIN at /login and NEXT at /next on 127.0.0.1; returns the base URL.
 pub fn serve() -> String {
     let listener = match TcpListener::bind("127.0.0.1:0") {
@@ -70,6 +97,10 @@ pub fn serve() -> String {
                     ("200 OK", if yes { "yes" } else { "no" })
                 } else if path.starts_with("/next") {
                     ("200 OK", NEXT)
+                } else if path.starts_with("/dapp") {
+                    ("200 OK", DAPP)
+                } else if path.starts_with("/frame") {
+                    ("200 OK", FRAME)
                 } else {
                     ("404 Not Found", "<html><title>Not found</title>nope</html>")
                 };

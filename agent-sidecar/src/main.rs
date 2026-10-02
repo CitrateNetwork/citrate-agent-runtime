@@ -29,6 +29,8 @@
 //!   CITRATE_HERMES_RECORDS_DIR  HUP-S7.3: absolute folder of the HIC decision records to batch
 //!   CITRATE_HERMES_ANCHOR_DIR   HUP-S7.3: absolute folder for the anchor ledger; both must be set
 //!                               for the /anchor/* routes, else they answer "not configured"
+//!                               (HUP-S2.3: POST /records/web-signing writes core's web-signing
+//!                               decisions into CITRATE_HERMES_RECORDS_DIR; unset, it answers 404)
 //!   CITRATE_HERMES_LEARN_DIR    HUP-S3.4: learn data folder (decision log + proposals file);
 //!                               with CITRATE_HERMES_LEARN_SKILLS_DIR, turns on the learn routes
 //!                               and the `learn_propose` tool; unset = learning off (optional)
