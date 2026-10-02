@@ -858,11 +858,76 @@ pub fn skill_sources_from_env(value: &str) -> Vec<citrate_agent_loop::skills::Sk
         .collect()
 }
 
-/// HUP-S3.2: load the skills library named by `CITRATE_HERMES_SKILLS` (default off → `None`).
-/// What was refused or shadowed is logged to stderr for the operator, never sent to the model.
+/// HUP-S3.2: the path of the `skills.lock` citrate-core ships beside the staged reviewed skills.
+pub const SKILLS_LOCK_ENV: &str = "CITRATE_HERMES_SKILLS_LOCK";
+/// HUP-S3.2: the staged tree of reviewed third-party skills (`<root>/<source>/<path>/`).
+pub const SKILLS_THIRD_PARTY_ENV: &str = "CITRATE_HERMES_SKILLS_THIRD_PARTY";
+/// The source label reviewed third-party skills load under.
+pub const THIRD_PARTY_SKILLS_LABEL: &str = "reviewed";
+/// Largest `skills.lock` read.
+const MAX_SKILLS_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// HUP-S3.2: the reviewed third-party skills as a locked source: `lock` is `skills.lock`, `root`
+/// the staged tree. Every file is checked against the lock when the library loads.
+pub fn third_party_skill_source(
+    lock: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<citrate_agent_loop::skills::SkillSource, String> {
+    let meta = std::fs::metadata(lock)
+        .map_err(|e| format!("skills.lock at {}: {}", lock.display(), e.kind()))?;
+    if meta.len() > MAX_SKILLS_LOCK_BYTES {
+        return Err(format!(
+            "skills.lock at {} is larger than {MAX_SKILLS_LOCK_BYTES} bytes",
+            lock.display()
+        ));
+    }
+    let text = std::fs::read_to_string(lock)
+        .map_err(|e| format!("skills.lock at {}: {}", lock.display(), e.kind()))?;
+    let parsed = citrate_agent_loop::skills::SkillLock::from_toml(&text)?;
+    Ok(citrate_agent_loop::skills::SkillSource::locked(
+        THIRD_PARTY_SKILLS_LABEL,
+        root,
+        Arc::new(parsed),
+    ))
+}
+
+/// HUP-S3.2: every skill source in precedence order: the member's own folders
+/// (`CITRATE_HERMES_SKILLS`, first wins) and then, when both paths are given, the reviewed
+/// third-party skills. A lock that cannot be read is logged and left out (fail closed); the
+/// member's own skills still load.
+pub fn all_skill_sources(
+    member: &str,
+    third_party: Option<(&std::path::Path, &std::path::Path)>,
+) -> Vec<citrate_agent_loop::skills::SkillSource> {
+    let mut sources = skill_sources_from_env(member);
+    if let Some((lock, root)) = third_party {
+        match third_party_skill_source(lock, root) {
+            Ok(src) => sources.push(src),
+            Err(e) => eprintln!("citrate-agent-sidecar: reviewed third-party skills off: {e}"),
+        }
+    }
+    sources
+}
+
+/// [`all_skill_sources`] from the environment.
+fn skill_sources_from_process_env() -> Vec<citrate_agent_loop::skills::SkillSource> {
+    let member = std::env::var("CITRATE_HERMES_SKILLS").unwrap_or_default();
+    let lock = std::env::var_os(SKILLS_LOCK_ENV).filter(|v| !v.is_empty());
+    let root = std::env::var_os(SKILLS_THIRD_PARTY_ENV).filter(|v| !v.is_empty());
+    match (lock, root) {
+        (Some(lock), Some(root)) => all_skill_sources(
+            &member,
+            Some((std::path::Path::new(&lock), std::path::Path::new(&root))),
+        ),
+        _ => all_skill_sources(&member, None),
+    }
+}
+
+/// HUP-S3.2: load the skills library named by `CITRATE_HERMES_SKILLS` plus the reviewed
+/// third-party skills (default off → `None`). What was refused or shadowed is logged to stderr
+/// for the operator, never sent to the model.
 pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>> {
-    let value = std::env::var("CITRATE_HERMES_SKILLS").ok()?;
-    let sources = skill_sources_from_env(&value);
+    let sources = skill_sources_from_process_env();
     if sources.is_empty() {
         return None;
     }
@@ -968,8 +1033,7 @@ pub fn production_sessions_with(
     };
     // HUP-S3.2: the skills library. HUP-S3.4: kept with its sources, so a learned skill the
     // member accepts is offered to the next session without a restart.
-    let sources =
-        skill_sources_from_env(&std::env::var("CITRATE_HERMES_SKILLS").unwrap_or_default());
+    let sources = skill_sources_from_process_env();
     let mgr = if sources.is_empty() {
         mgr
     } else {
@@ -1489,6 +1553,8 @@ mod learn_more_session_tests;
 mod sessions_tests;
 #[cfg(test)]
 mod sheets_session_tests;
+#[cfg(test)]
+mod skills_lock_env_tests;
 #[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]

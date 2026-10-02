@@ -545,6 +545,9 @@ pub fn parse_skill_md(text: &str) -> Result<(SkillFrontmatter, String), SkillErr
 pub struct SkillSource {
     pub label: String,
     pub root: PathBuf,
+    /// HUP-S3.2 + S3.6: a reviewed third-party source. `root` is a staged tree
+    /// `<root>/<lock source>/<lock path>/` and only what the lock admits and pins is loaded.
+    pub lock: Option<Arc<SkillLock>>,
 }
 
 impl SkillSource {
@@ -552,6 +555,20 @@ impl SkillSource {
         SkillSource {
             label: label.into(),
             root: root.into(),
+            lock: None,
+        }
+    }
+
+    /// A reviewed third-party source checked file by file against `skills.lock`.
+    pub fn locked(
+        label: impl Into<String>,
+        root: impl Into<PathBuf>,
+        lock: Arc<SkillLock>,
+    ) -> Self {
+        SkillSource {
+            label: label.into(),
+            root: root.into(),
+            lock: Some(lock),
         }
     }
 }
@@ -571,6 +588,35 @@ pub struct Skill {
     pub refs: Vec<String>,
     /// Files under `scripts/`: listed and flagged, never executed or loaded.
     pub scripts: Vec<String>,
+    /// HUP-S3.2: where a reviewed third-party skill came from (`None` for the member's own).
+    pub provenance: Option<Provenance>,
+    /// The sha256 `skills.lock` pins for each listed ref of a locked skill; `read_ref` checks the
+    /// bytes against it on every read.
+    pub ref_sha256: BTreeMap<String, String>,
+    /// Scripts and executables the intake review stripped: named so the model knows, never
+    /// shipped, loaded or run.
+    pub stripped: Vec<String>,
+}
+
+/// Where a reviewed third-party skill came from, as `skills.lock` records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    /// The lock's source label (e.g. `trailofbits`).
+    pub source: String,
+    pub upstream: String,
+    /// The upstream commit the skill was reviewed at.
+    pub commit: String,
+    pub license: String,
+    /// The skill's directory inside the source.
+    pub path: String,
+    pub verdict: String,
+    /// sha256 of the `SKILL.md` that shipped (and was verified at load).
+    pub skill_md_sha256: String,
+    /// sha256 of the upstream `SKILL.md` (differs from the shipped one only after an intake
+    /// rewrite).
+    pub upstream_skill_md_sha256: String,
+    /// The intake rewrite applied, if any (e.g. `flatten-frontmatter`).
+    pub intake_rewrite: Option<String>,
 }
 
 /// A path that was not loaded, and why.
@@ -754,6 +800,9 @@ fn load_one(dir: &Path, source: &str) -> Result<Skill, String> {
         frontmatter: fm,
         refs,
         scripts,
+        provenance: None,
+        ref_sha256: BTreeMap::new(),
+        stripped: Vec::new(),
     })
 }
 
@@ -818,7 +867,33 @@ impl SkillLibrary {
             }
             let mut found: BTreeMap<String, Vec<Skill>> = BTreeMap::new();
             let mut accepted = 0usize;
-            for dir in discover(&src.root, &mut lib.report) {
+            if let Some(lock) = &src.lock {
+                for result in load_locked(&src.root, &src.label, lock) {
+                    match result {
+                        Ok(skill) => {
+                            if accepted >= MAX_SKILLS_PER_SOURCE {
+                                lib.report.rejected.push(Rejected {
+                                    path: skill.dir.join("SKILL.md"),
+                                    reason: format!(
+                                        "source '{}' has more than {MAX_SKILLS_PER_SOURCE} skills",
+                                        src.label
+                                    ),
+                                });
+                                continue;
+                            }
+                            accepted += 1;
+                            found.entry(skill.name.clone()).or_default().push(skill);
+                        }
+                        Err(rejected) => lib.report.rejected.push(rejected),
+                    }
+                }
+            }
+            let unlocked = if src.lock.is_some() {
+                Vec::new()
+            } else {
+                discover(&src.root, &mut lib.report)
+            };
+            for dir in unlocked {
                 let path = dir.join("SKILL.md");
                 if accepted >= MAX_SKILLS_PER_SOURCE {
                     lib.report.rejected.push(Rejected {
@@ -1028,7 +1103,22 @@ impl SkillLibrary {
         let s = self
             .get(name)
             .ok_or_else(|| format!("no skill named '{name}'"))?;
-        let mut out = format!("# Skill: {} (source: {})\n\n{}", s.name, s.source, s.body);
+        let mut out = format!("# Skill: {} (source: {})\n", s.name, s.source);
+        if let Some(p) = &s.provenance {
+            let short: String = p.commit.chars().take(12).collect();
+            out.push_str(&format!(
+                "Reviewed third-party skill from {} ({} at {short}), licence {}, SKILL.md sha256 {}.",
+                p.source, p.upstream, p.license, p.skill_md_sha256
+            ));
+            if let Some(r) = &p.intake_rewrite {
+                out.push_str(&format!(
+                    " Its frontmatter was rewritten at intake ({r}); the instructions are unchanged."
+                ));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&s.body);
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -1047,6 +1137,14 @@ impl SkillLibrary {
             );
             for r in &s.scripts {
                 out.push_str(&format!("- {r} [script, not run]\n"));
+            }
+        }
+        if !s.stripped.is_empty() {
+            out.push_str(
+                "\nStripped at intake review (not shipped; steps that need them cannot run):\n",
+            );
+            for r in &s.stripped {
+                out.push_str(&format!("- {r}\n"));
             }
         }
         Ok(out)
@@ -1090,6 +1188,13 @@ impl SkillLibrary {
         let bytes = std::fs::read(&canon).map_err(|_| format!("'{rel}' is unavailable"))?;
         if bytes.len() > MAX_REF_BYTES {
             return Err(format!("'{rel}' is too large (over {MAX_REF_BYTES} bytes)"));
+        }
+        if let Some(want) = s.ref_sha256.get(rel) {
+            if &sha256_hex(&bytes) != want {
+                return Err(format!(
+                    "'{rel}' no longer matches the sha256 skills.lock pins; it was not read"
+                ));
+            }
         }
         String::from_utf8(bytes).map_err(|_| format!("'{rel}' is not a text file"))
     }
@@ -1173,6 +1278,256 @@ impl ToolHost for SkillHost {
             Err(e) => ToolOutcome::Error(e),
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// skills.lock: reviewed third-party skills (HUP-S3.2 + S3.6)
+// ---------------------------------------------------------------------------------------------
+
+/// The lock verdicts that ship a skill's text. Anything else but `exclude` is refused.
+const SHIPPING_VERDICTS: &[&str] = &[
+    "include-as-is",
+    "include-with-scripts-stripped",
+    "convert-script-to-capsule",
+];
+
+/// One `[[source]]` of `skills.lock`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockSource {
+    pub label: String,
+    pub upstream: String,
+    pub commit: String,
+    pub license: String,
+}
+
+/// One pinned bundled file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockRef {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// One `[[skill]]` of `skills.lock`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockedSkill {
+    pub name: String,
+    pub source: String,
+    pub commit: String,
+    pub path: String,
+    pub verdict: String,
+    /// sha256 of the upstream `SKILL.md`.
+    pub skill_md_sha256: String,
+    /// sha256 of the `SKILL.md` that ships, when the intake rewrote it.
+    #[serde(default)]
+    pub shipped_skill_md_sha256: Option<String>,
+    #[serde(default)]
+    pub intake_rewrite: Option<String>,
+    #[serde(default)]
+    pub refs: Vec<LockRef>,
+    #[serde(default)]
+    pub stripped: Vec<String>,
+}
+
+impl LockedSkill {
+    fn ships(&self) -> bool {
+        SHIPPING_VERDICTS.contains(&self.verdict.as_str())
+    }
+    /// The hash the shipped `SKILL.md` must have.
+    pub fn shipped_sha256(&self) -> &str {
+        self.shipped_skill_md_sha256
+            .as_deref()
+            .unwrap_or(&self.skill_md_sha256)
+    }
+}
+
+/// The parsed `skills.lock` (citrate-core, generated by `scripts/skills-lock.mjs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SkillLock {
+    pub version: u32,
+    #[serde(rename = "source", default)]
+    pub sources: Vec<LockSource>,
+    #[serde(rename = "skill", default)]
+    pub skills: Vec<LockedSkill>,
+}
+
+impl SkillLock {
+    /// Parse and check a lock. Fails closed on an unknown version or verdict.
+    pub fn from_toml(text: &str) -> Result<SkillLock, String> {
+        let lock: SkillLock =
+            toml::from_str(text).map_err(|e| format!("skills.lock does not parse: {e}"))?;
+        if lock.version != 1 {
+            return Err(format!("unsupported skills.lock version {}", lock.version));
+        }
+        for sk in &lock.skills {
+            if sk.verdict != "exclude" && !sk.ships() {
+                return Err(format!(
+                    "skills.lock: skill '{}' has unknown verdict '{}' (refusing to guess)",
+                    sk.name, sk.verdict
+                ));
+            }
+        }
+        Ok(lock)
+    }
+
+    /// The skills the lock admits (every verdict but `exclude`).
+    pub fn admitted(&self) -> impl Iterator<Item = &LockedSkill> {
+        self.skills.iter().filter(|s| s.ships())
+    }
+
+    pub fn source(&self, label: &str) -> Option<&LockSource> {
+        self.sources.iter().find(|s| s.label == label)
+    }
+}
+
+/// Lowercase hex sha256.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A lock path must be relative, `/`-separated and stay inside its base.
+fn safe_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel.contains('\\')
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Read a file that must have the pinned hash, capped at `max` bytes.
+fn read_pinned(path: &Path, want: &str, max: usize) -> Result<Vec<u8>, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.kind().to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > max as u64 {
+        return Err(format!("larger than {max} bytes"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.kind().to_string())?;
+    if sha256_hex(&bytes) != want {
+        return Err("does not match skills.lock".into());
+    }
+    Ok(bytes)
+}
+
+/// Load every skill a lock admits from a staged tree. Each admitted skill yields a skill or the
+/// reason it was refused; nothing the lock does not pin is read or listed.
+fn load_locked(root: &Path, label: &str, lock: &SkillLock) -> Vec<Result<Skill, Rejected>> {
+    let canon_root = match std::fs::canonicalize(root) {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![Err(Rejected {
+                path: root.to_path_buf(),
+                reason: format!("source '{label}': {}", e.kind()),
+            })]
+        }
+    };
+    lock.admitted()
+        .map(|entry| load_locked_one(&canon_root, label, lock, entry))
+        .collect()
+}
+
+fn load_locked_one(
+    root: &Path,
+    label: &str,
+    lock: &SkillLock,
+    entry: &LockedSkill,
+) -> Result<Skill, Rejected> {
+    let reject = |path: PathBuf, reason: String| Rejected {
+        path,
+        reason: format!("source '{label}', skill '{}': {reason}", entry.name),
+    };
+    let nominal = root.join(&entry.source).join(&entry.path);
+    if !safe_rel(&entry.source) || !safe_rel(&entry.path) {
+        return Err(reject(
+            nominal,
+            "lock path is not a plain relative path".into(),
+        ));
+    }
+    let dir = std::fs::canonicalize(&nominal)
+        .map_err(|e| reject(nominal.clone(), format!("not staged ({})", e.kind())))?;
+    if !dir.starts_with(root) {
+        return Err(reject(nominal, "resolves outside the staged tree".into()));
+    }
+    let md_path = dir.join("SKILL.md");
+    let bytes = read_pinned(&md_path, entry.shipped_sha256(), MAX_SKILL_FILE_BYTES)
+        .map_err(|e| reject(md_path.clone(), format!("SKILL.md {e}")))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| reject(md_path.clone(), SkillError::NotUtf8.to_string()))?;
+    let (fm, body) = parse_skill_md(&text).map_err(|e| reject(md_path.clone(), e.to_string()))?;
+    if fm.name != entry.name {
+        return Err(reject(
+            md_path,
+            format!("SKILL.md names '{}', the lock '{}'", fm.name, entry.name),
+        ));
+    }
+    if dir.file_name().and_then(|n| n.to_str()) != Some(fm.name.as_str()) {
+        return Err(reject(md_path, "name does not match its directory".into()));
+    }
+    let mut refs = Vec::new();
+    let mut ref_sha256 = BTreeMap::new();
+    for r in &entry.refs {
+        if refs.len() >= MAX_FILES_LISTED {
+            break;
+        }
+        if !safe_rel(&r.path) || r.path.starts_with("scripts/") || r.path == "SKILL.md" {
+            return Err(reject(
+                dir.join(&r.path),
+                format!("ref '{}' is not allowed", r.path),
+            ));
+        }
+        let p = dir.join(&r.path);
+        match std::fs::canonicalize(&p) {
+            Ok(c) if c.starts_with(&dir) => {}
+            _ => {
+                return Err(reject(
+                    p,
+                    format!("ref '{}' is not staged inside the skill", r.path),
+                ))
+            }
+        }
+        read_pinned(&p, &r.sha256, MAX_REF_BYTES)
+            .map_err(|e| reject(p.clone(), format!("ref '{}' {e}", r.path)))?;
+        refs.push(r.path.clone());
+        ref_sha256.insert(r.path.clone(), r.sha256.clone());
+    }
+    refs.sort();
+    let Some(src) = lock.source(&entry.source) else {
+        return Err(reject(
+            md_path,
+            format!("source '{}' is not declared in the lock", entry.source),
+        ));
+    };
+    let provenance = Provenance {
+        source: entry.source.clone(),
+        upstream: src.upstream.clone(),
+        commit: entry.commit.clone(),
+        license: src.license.clone(),
+        path: entry.path.clone(),
+        verdict: entry.verdict.clone(),
+        skill_md_sha256: entry.shipped_sha256().to_string(),
+        upstream_skill_md_sha256: entry.skill_md_sha256.clone(),
+        intake_rewrite: entry.intake_rewrite.clone(),
+    };
+    let mut stripped = entry.stripped.clone();
+    stripped.sort();
+    Ok(Skill {
+        name: fm.name.clone(),
+        description: fm.description.clone(),
+        source: label.to_string(),
+        dir,
+        body,
+        frontmatter: fm,
+        refs,
+        scripts: Vec::new(),
+        provenance: Some(provenance),
+        ref_sha256,
+        stripped,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
