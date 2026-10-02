@@ -92,8 +92,17 @@ pub fn record_outcome(log: &DecisionLog, seq: u64, outcome: Outcome, detail: &st
     }
 }
 
-fn clip(s: &str, n: usize) -> String {
-    s.chars().filter(|c| !c.is_control()).take(n).collect()
+/// Control characters removed, then cut at a character boundary to at most `max` bytes (the
+/// record limits are in bytes, so a long or multibyte page summary never fails a record).
+fn clip(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn is_hash(s: &str) -> bool {

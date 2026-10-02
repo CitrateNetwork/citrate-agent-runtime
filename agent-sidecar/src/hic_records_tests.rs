@@ -600,3 +600,19 @@ fn learn_uses_the_records_dir_when_one_is_configured() {
     );
     let _ = Path::new("");
 }
+
+#[test]
+fn a_long_multibyte_subject_still_records() {
+    let fx = Fx::new();
+    let seq = hic_records::record_member_decision(
+        &fx.log,
+        "browser.action",
+        &"\u{1F600}".repeat(1000),
+        true,
+        &"\u{1F600}".repeat(5000),
+        vec![],
+    )
+    .unwrap();
+    hic_records::record_outcome(&fx.log, seq, Outcome::Completed, &"\u{1F600}".repeat(1000));
+    assert_eq!(outcome_of(&fx, seq), Some(Outcome::Completed));
+}
