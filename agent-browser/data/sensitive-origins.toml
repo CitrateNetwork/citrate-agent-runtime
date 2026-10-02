@@ -1,0 +1,55 @@
+# HUP-S5.6: origins Hermes never acts on in attach-to-Chrome mode unless the member
+# includes that one origin explicitly (a separate, per-origin, per-session choice).
+#
+# Default list, pending owner sign-off. It is a conservative starting set, not a claim of
+# completeness: a site missing here is still only reachable with the member's per-origin
+# consent, which every origin needs in attach mode anyway.
+#
+# Matching (see src/scope.rs):
+#   domains: the host is the domain or any subdomain of it ("chase.com" matches
+#            "secure.chase.com"). A bare top-level label ("bank") matches every host under
+#            that TLD.
+#   labels:  any one DNS label of the host equals the entry ("mychart" matches
+#            "mychart.example-health.org").
+# Hosts are compared lowercase and in ASCII (punycode) form. IP-address hosts never match.
+
+version = 1
+
+[[category]]
+id = "banking"
+label = "Banking, payments and exchanges"
+domains = [
+  "bank", "chase.com", "bankofamerica.com", "wellsfargo.com", "citi.com", "citibank.com",
+  "capitalone.com", "usbank.com", "pnc.com", "truist.com", "tdbank.com", "td.com",
+  "schwab.com", "fidelity.com", "vanguard.com", "ally.com", "discover.com",
+  "americanexpress.com", "navyfederal.org", "usaa.com", "sofi.com", "chime.com",
+  "paypal.com", "venmo.com", "cash.app", "zellepay.com", "wise.com", "revolut.com",
+  "hsbc.com", "barclays.co.uk", "lloydsbank.com", "natwest.com", "santander.com",
+  "bmo.com", "rbc.com", "rbcroyalbank.com", "scotiabank.com", "coinbase.com",
+  "kraken.com", "binance.com", "gemini.com", "robinhood.com", "etrade.com",
+  "interactivebrokers.com",
+]
+labels = ["onlinebanking", "netbanking", "ebanking"]
+
+[[category]]
+id = "email"
+label = "Email"
+domains = [
+  "gmail.com", "outlook.com", "outlook.live.com", "outlook.office.com",
+  "outlook.office365.com", "live.com", "hotmail.com", "icloud.com", "proton.me",
+  "protonmail.com", "fastmail.com", "tutanota.com", "tuta.com", "hey.com", "gmx.com",
+  "gmx.net", "mail.com", "zohomail.com",
+]
+labels = ["mail", "webmail"]
+
+[[category]]
+id = "health"
+label = "Health records and insurance"
+domains = [
+  "healthcare.gov", "medicare.gov", "va.gov", "kp.org", "kaiserpermanente.org",
+  "mychart.com", "followmyhealth.com", "healow.com", "cvs.com", "walgreens.com",
+  "labcorp.com", "questdiagnostics.com", "zocdoc.com", "teladoc.com", "onemedical.com",
+  "anthem.com", "aetna.com", "cigna.com", "uhc.com", "myuhc.com", "bcbs.com",
+  "humana.com", "goodrx.com", "23andme.com",
+]
+labels = ["mychart", "patientportal"]

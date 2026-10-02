@@ -1,0 +1,15 @@
+[package]
+name = "citrate-agent-workers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermes's worker supervisor (HUP-S1.9): runs the sidecar's browser and toolchain workers as separate child processes speaking line-delimited JSON over stdio, with a bounded restart policy, health checks, clean shutdown, and an honest status report. A crash in one worker never takes down the sidecar or another worker. Synchronous (std threads); keyless."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
