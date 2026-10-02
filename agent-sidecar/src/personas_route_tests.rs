@@ -82,7 +82,7 @@ async fn persona_and_workflow_routes_are_bearer_gated() {
 }
 
 #[tokio::test]
-async fn get_personas_lists_the_shipped_personas_with_fragments_and_pending_names() {
+async fn get_personas_lists_the_shipped_personas_with_fragments_and_approved_names() {
     let r = app(state())
         .oneshot(req("GET", "/personas", serde_json::Value::Null, true))
         .await
@@ -92,7 +92,7 @@ async fn get_personas_lists_the_shipped_personas_with_fragments_and_pending_name
     let ps = v.as_array().expect("array");
     assert!(ps.len() >= 5);
     for p in ps {
-        assert_eq!(p["name_pending_sign_off"], true, "{p}");
+        assert_eq!(p["name_pending_sign_off"], false, "{p}");
         assert_eq!(p["custom"], false);
         let frag = p["prompt_fragment"].as_str().expect("fragment");
         assert!(frag.contains(p["name"].as_str().expect("name")));

@@ -2,7 +2,7 @@
 created: 2026-10-01
 branch: hup/n4-personas
 author: Larry Klosowski + Claude Opus 5.5
-status: active (persona names pending owner sign-off)
+status: active (persona names owner-approved 2026-10-01)
 updated: 2026-10-01 (hup/n5-personas-rest: sessions apply the persona, track workflows run from a session)
 ---
 
@@ -26,9 +26,9 @@ Code: [`src/personas.rs`](src/personas.rs), [`src/workflows.rs`](src/workflows.r
   track.
 - A **workflow** is a list of steps, each judged by verifiers. Only verifiers say done.
 
-## Persona names: placeholders pending owner sign-off
+## Persona names: owner-approved (2026-10-01)
 
-| id | Role | Placeholder name | Default track | Default workflow |
+| id | Role | Name | Default track | Default workflow |
 |---|---|---|---|---|
 | `builder` | Builder | Graft | full-project | hello-mint |
 | `auditor` | Auditor | Pith | smart-contract | audit-a-contract |
@@ -38,9 +38,9 @@ Code: [`src/personas.rs`](src/personas.rs), [`src/workflows.rs`](src/workflows.r
 | `operator` | Operator | Crew | project-management | status-note |
 
 Each name is the first candidate in the draft that does not collide with an existing brand or
-product name. "Ledger" (Steward) and "Hive" (Operator) were skipped for that reason. To rename,
-change the one `name = "..."` line in `personas/personas.toml` and set `name_status` to
-`owner-approved`. The id does not change, so a member's saved choice survives the rename.
+product name. "Ledger" (Steward) and "Hive" (Operator) were skipped for that reason. The owner signed
+off on these names and on shipping Operator on 2026-10-01 (`name_status = "owner-approved"`). To
+rename later, change the one `name = "..."` line in `personas/personas.toml`. The id does not change, so a member's saved choice survives the rename.
 
 Guide and Operator have no dedicated track among the five launch tracks; they default to the
 nearest family (the hello-mint path as a learning checklist, and the status note). This is an
