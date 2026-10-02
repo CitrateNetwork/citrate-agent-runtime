@@ -34,6 +34,21 @@
 //!                               and the `learn_propose` tool; unset = learning off (optional)
 //!   CITRATE_HERMES_LEARN_SKILLS_DIR  the member's skills folder, where an accepted skill is
 //!                               written as <name>/SKILL.md (optional, see above)
+//!   CITRATE_HERMES_SEARCH       HUP-S5.2: `1` offers web_search + read_url in every session (optional)
+//!   CITRATE_HERMES_SEARXNG      absolute path of searxng-run (or its virtualenv); unset = web_search
+//!                               reports "not installed" (optional)
+//!   CITRATE_HERMES_SEARXNG_DATA folder for SearXNG's generated settings + log (optional)
+//!   CITRATE_HERMES_READER       `jina` opts read_url in to the third-party Jina Reader; anything else
+//!                               = local readability (optional)
+//!   CITRATE_HERMES_JINA_ENDPOINT / CITRATE_HERMES_JINA_KEY_FILE  Jina Reader base URL / key file
+//!   CITRATE_HERMES_JEV          HUP-S5.3: `1` turns the opt-in Jev decide() backend on, still per
+//!                               origin (CITRATE_HERMES_JEV_ORIGINS, CITRATE_HERMES_JEV_NON_WEB) and
+//!                               only with CITRATE_HERMES_JEV_KEY_FILE (optional)
+//!   CITRATE_HERMES_DECIDE_LOG   JSONL file for decide() metering (optional)
+//!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
+//!                               serves the /browser control routes; anything else = off (optional)
+//!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
+//!                               updater); unset = a system Chromium if one exists (optional)
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it

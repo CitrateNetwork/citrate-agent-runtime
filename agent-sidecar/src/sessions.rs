@@ -27,6 +27,14 @@
 //!   session is offered the allowlisted servers' tools as sidecar-hosted `mcp__<server>__<tool>`
 //!   specs (trust: untrusted, so an MCP result taints the session), and the `mcp__` namespace is
 //!   reserved. Unset, nothing here changes.
+//! - HUP-S5.1: when the browser is enabled (`CITRATE_HERMES_BROWSER=1`, default off), every
+//!   session is offered the sidecar-hosted `browser_*` tools (names reserved). Page content is
+//!   untrusted; after taint each effectful browser action waits for the member's decision on the
+//!   browser control routes, so the sidecar host can honor explicit approval for those calls (and
+//!   still declines every other effectful sidecar call, as before). Unset, nothing here changes.
+//! - HUP-S5.2: when search is enabled (`CITRATE_HERMES_SEARCH=1`, default off), every session also
+//!   offers the sidecar-hosted `web_search` and `read_url` tools ([`crate::search`]). Their output is
+//!   untrusted, so a call taints the session. The two names are reserved while search is on.
 //! - HUP-S3.4: a session can run a declarative workflow (`POST …/workflows`,
 //!   [`crate::workflow_spec`]) through `citrate_agent_learn::run_verified_workflow`; a run whose
 //!   verifiers all passed is kept (the last [`MAX_RUNS_KEPT`]) as the evidence a learn proposal
@@ -58,6 +66,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
+use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
 use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
@@ -72,6 +82,7 @@ use citrate_agent_trajectory::TrajectoryRecorder;
 use serde::{Deserialize, Serialize};
 
 use crate::anchor::AnchorService;
+use crate::decide::DecideService;
 use crate::files::{FileTools, FileToolsHost};
 use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
 use crate::metering::{MeteredLlm, MeteringStore, TeeSink};
@@ -80,6 +91,7 @@ use crate::toolchain::ToolchainHost;
 use crate::trajectory::{export_session, ExportSummary, TrajectoryConfig};
 use crate::workers::WorkerSet;
 use citrate_agent_checkpoints::CheckpointStore;
+use citrate_agent_search::SearchHost;
 
 /// The toolchain as the session manager holds it: in process ([`ToolchainHost`], tests) or in
 /// its worker process ([`crate::workers::RemoteToolHost`], HUP-S1.9). A session opened with
@@ -534,7 +546,7 @@ impl ToolHost for CoreHost {
 
 /// Executes sidecar-hosted tools: installed capsules through the capsule dispatch (whose chain
 /// effects still park on the approval queue for a human).
-struct CapsuleHost {
+pub(crate) struct CapsuleHost {
     dispatch: Arc<CapsuleDispatch>,
 }
 
@@ -555,22 +567,32 @@ impl ToolHost for CapsuleHost {
 
 /// The one host for [`HostKind::Sidecar`] tools: `skill_load` goes to the skill library, the
 /// toolchain tools to the toolchain host (when enabled), an offered `mcp__…` tool to its MCP
-/// server (HUP-S4.1), anything else to the capsule dispatch (when capsules are loaded).
-struct SidecarHost {
-    files: Option<FileToolHost>,
+/// server (HUP-S4.1), a `browser_*` tool to the browser (HUP-S5.1, when enabled), anything else
+/// to the capsule dispatch (when capsules are loaded).
+#[derive(Default)]
+pub(crate) struct SidecarHost {
+    pub(crate) files: Option<FileToolHost>,
     /// HUP-S10.2: the sheet tools, present with the file tools.
-    sheets: Option<SheetToolHost>,
-    skills: Option<SkillHost>,
-    toolchain: Option<Arc<dyn ToolHost>>,
+    pub(crate) sheets: Option<SheetToolHost>,
+    pub(crate) skills: Option<SkillHost>,
+    pub(crate) toolchain: Option<Arc<dyn ToolHost>>,
     /// HUP-S2.9: the checkpointed file tools (`fs_write`, `fs_edit`, `fs_delete`, `fs_rename`).
-    fs_tools: Option<FileToolsHost>,
-    mcp: Option<McpToolHost>,
-    capsules: Option<CapsuleHost>,
-    learn: Option<crate::learn::LearnToolHost>,
+    pub(crate) fs_tools: Option<FileToolsHost>,
+    /// HUP-S5.2: `web_search` and `read_url`, when search is enabled.
+    pub(crate) search: Option<Arc<SearchHost>>,
+    pub(crate) mcp: Option<McpToolHost>,
+    pub(crate) capsules: Option<CapsuleHost>,
+    pub(crate) learn: Option<crate::learn::LearnToolHost>,
+    pub(crate) browser: Option<BrowserToolHost>,
 }
 
 impl ToolHost for SidecarHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if browser_tools::handles(&call.name) {
+            if let Some(b) = &self.browser {
+                return b.execute(call);
+            }
+        }
         if call.name == crate::learn::LEARN_PROPOSE_TOOL {
             if let Some(l) = &self.learn {
                 return l.execute(call);
@@ -596,6 +618,11 @@ impl ToolHost for SidecarHost {
                 return t.execute(call);
             }
         }
+        if SearchHost::handles(&call.name) {
+            if let Some(s) = &self.search {
+                return s.execute(call);
+            }
+        }
         if FileTools::handles(&call.name) {
             if let Some(f) = &self.fs_tools {
                 return f.execute(call);
@@ -609,6 +636,24 @@ impl ToolHost for SidecarHost {
         match &self.capsules {
             Some(c) => c.execute(call),
             None => ToolOutcome::Error(format!("'{}' is not available in this session", call.name)),
+        }
+    }
+
+    /// HUP-S5.1: only the browser can put an action in front of the member (its decision routes).
+    /// Without the browser this stays false, so the loop declines as before.
+    fn honors_explicit_approval(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        match &self.browser {
+            Some(b) if browser_tools::handles(&call.name) => {
+                b.execute_with_explicit_approval(call, reason)
+            }
+            _ => ToolOutcome::Denied(
+                "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
+                    .into(),
+            ),
         }
     }
 }
@@ -633,6 +678,9 @@ pub struct SessionManager {
     skills: Option<Arc<SkillLibrary>>,
     toolchain: Option<Arc<dyn ToolchainBackend>>,
     mcp: Option<Arc<McpHost>>,
+    browser: Option<Arc<BrowserService>>,
+    search: Option<Arc<SearchHost>>,
+    decide: Arc<DecideService>,
     learn: Option<Arc<crate::learn::LearnService>>,
     run_ids: AtomicU64,
     files: Option<Arc<FileTools>>,
@@ -657,6 +705,9 @@ impl SessionManager {
             skills: None,
             toolchain: None,
             mcp: None,
+            browser: None,
+            search: None,
+            decide: Arc::new(DecideService::default()),
             learn: None,
             run_ids: AtomicU64::new(0),
             files: None,
@@ -738,6 +789,39 @@ impl SessionManager {
         self.learn.as_ref()
     }
 
+    /// HUP-S5.2: offer `web_search` and `read_url` to every new session.
+    pub fn with_search(mut self, host: Arc<SearchHost>) -> Self {
+        self.search = Some(host);
+        self
+    }
+
+    /// HUP-S5.2: the search host, when search is enabled.
+    pub fn search(&self) -> Option<Arc<SearchHost>> {
+        self.search.clone()
+    }
+
+    /// HUP-S5.3: the `decide()` slot and its metering (the default has Jev off).
+    pub fn with_decide(mut self, svc: Arc<DecideService>) -> Self {
+        self.decide = svc;
+        self
+    }
+
+    /// HUP-S5.3: the `decide()` service.
+    pub fn decide_service(&self) -> Arc<DecideService> {
+        self.decide.clone()
+    }
+
+    /// HUP-S5.1: offer the browser tools to every new session.
+    pub fn with_browser(mut self, browser: Arc<BrowserService>) -> Self {
+        self.browser = Some(browser);
+        self
+    }
+
+    /// HUP-S5.1: the browser worker (`None` when the browser is off).
+    pub fn browser(&self) -> Option<&Arc<BrowserService>> {
+        self.browser.as_ref()
+    }
+
     /// HUP-S6.3: offer the toolchain tools to every new session, executed by `host` (in
     /// production the toolchain worker process, HUP-S1.9). A session opened with folder grants
     /// (HUP-S2.1) gets the host scoped to its grants ([`ToolchainBackend::scoped_to`]).
@@ -809,6 +893,15 @@ impl SessionManager {
             }
             specs.extend(ToolchainHost::specs());
         }
+        if self.search.is_some() {
+            if let Some(t) = specs.iter().find(|t| SearchHost::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while search is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(SearchHost::specs());
+        }
         if self.files.is_some() {
             if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -826,6 +919,15 @@ impl SessionManager {
                 )));
             }
             specs.extend(mcp.specs());
+        }
+        if self.browser.is_some() {
+            if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
+                return Err(SessionError::Invalid(format!(
+                    "the tool name '{}' is reserved by the sidecar while the browser is enabled",
+                    t.name
+                )));
+            }
+            specs.extend(browser_tools::specs());
         }
         if self.learn.is_some() {
             if specs
@@ -987,6 +1089,7 @@ impl SessionManager {
             .and_then(|t| FileToolsHost::new(t, &session.id));
         let file_host = session.grants.clone().map(FileToolHost::new);
         let sheet_host = session.grants.clone().map(SheetToolHost::new);
+        let search = self.search.clone();
         let mcp_host = self
             .mcp
             .clone()
@@ -995,13 +1098,19 @@ impl SessionManager {
             .learn
             .clone()
             .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
+        let browser_host = self
+            .browser
+            .clone()
+            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
         if file_host.is_some()
             || skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
             || files.is_some()
+            || search.is_some()
             || mcp_host.is_some()
             || learn_host.is_some()
+            || browser_host.is_some()
         {
             registry = registry.with_host(
                 HostKind::Sidecar,
@@ -1011,9 +1120,11 @@ impl SessionManager {
                     skills: skill_host,
                     toolchain,
                     fs_tools: files,
+                    search,
                     mcp: mcp_host,
                     capsules: capsule_host,
                     learn: learn_host,
+                    browser: browser_host,
                 }),
             );
         }

@@ -24,10 +24,13 @@ pub mod anchor;
 mod chain_routes;
 mod checkpoint_routes;
 pub mod files;
+pub mod decide;
+pub mod browser;
 pub mod llm_http;
 pub mod metering;
 pub mod escalation;
 pub mod mcp_probe;
+pub mod search;
 pub mod sessions;
 pub mod sheets;
 pub mod toolchain;
@@ -265,6 +268,20 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/workflows", get(list_workflows))
         // HUP-S4.1: the configured MCP servers (read-only status).
         .route("/mcp/servers", get(mcp_servers))
+        // HUP-S5.1 + S5.6: the browser (member controls for the Browser pop-out).
+        .route("/browser/status", get(browser::status))
+        .route("/browser/frame", get(browser::frame))
+        .route("/browser/stop", post(browser::stop))
+        .route("/browser/resume", post(browser::resume))
+        .route("/browser/attach", post(browser::attach))
+        .route("/browser/detach", post(browser::detach))
+        .route("/browser/origins", post(browser::origins))
+        .route("/browser/actions/decide", post(browser::decide))
+        // HUP-S5.2: search status (read-only). HUP-S5.3: the decide() slot + its metering.
+        .route("/search/status", get(search_status))
+        .route("/decide", post(decide))
+        .route("/decide/stats", get(decide_stats))
+        .route("/decide/outcomes", post(decide_outcome))
         // HUP-S3.4: verified workflow runs and verified self-learning.
         .route("/sessions/:id/workflows", post(start_workflow))
         .route("/sessions/:id/workflows/:run", get(workflow_run))
@@ -574,6 +591,10 @@ async fn stop(
     st.estop.trigger();
     // HUP-S1.1b: the kill switch halts every agent session too.
     st.sessions.stop_all();
+    // HUP-S5.1: and the browser (closes it, denies any waiting browser action, latches).
+    if let Some(b) = st.sessions.browser().cloned() {
+        let _ = tokio::task::spawn_blocking(move || b.stop()).await;
+    }
     // PBA-L6b-010: freeze + drain the approval queue so nothing parked before the stop can be
     // released after it, and running skills cannot queue new effects.
     let drained = st.queue.freeze_and_drain();
@@ -878,8 +899,9 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
 /// Production session manager: OpenAI-compatible HTTP model client, 5-minute model and core-tool
 /// deadlines (matching citrate-core's AI request bound), plus the skills library when
 /// `CITRATE_HERMES_SKILLS` is set, the toolchain tools when `CITRATE_HERMES_TOOLCHAIN=1` (run in
-/// the supervised toolchain worker process, HUP-S1.9), and verified self-learning when
-/// `CITRATE_HERMES_LEARN_DIR` and `CITRATE_HERMES_LEARN_SKILLS_DIR` are both set (HUP-S3.4).
+/// the supervised toolchain worker process, HUP-S1.9), verified self-learning when
+/// `CITRATE_HERMES_LEARN_DIR` and `CITRATE_HERMES_LEARN_SKILLS_DIR` are both set (HUP-S3.4), the
+/// search tools when `CITRATE_HERMES_SEARCH=1`, and the decide() slot (Jev only when opted in).
 pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
@@ -940,6 +962,15 @@ pub fn production_sessions_with(
         }
         None => mgr,
     };
+    let mgr = match browser::from_env() {
+        Some(b) => mgr.with_browser(b),
+        None => mgr,
+    };
+    let mgr = match search::search_from_env() {
+        Some(host) => mgr.with_search(host),
+        None => mgr,
+    };
+    let mgr = mgr.with_decide(decide::DecideService::from_env());
     let mgr = match learn::LearnService::from_env() {
         Some(svc) => mgr.with_learn(svc),
         None => mgr,
@@ -1004,6 +1035,105 @@ pub fn with_files_from_env(mgr: sessions::SessionManager) -> sessions::SessionMa
 // ---- HUP-S1.4: tracks + briefs ----
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
+
+// ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
+
+/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+async fn search_status(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(host) = st.sessions.search() else {
+        return Ok(Json(serde_json::json!({
+            "enabled": false, "searxng": "off", "reader": "local"
+        })));
+    };
+    let reader = if host.third_party_reader() {
+        "jina"
+    } else {
+        "local"
+    };
+    let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
+        citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
+        citrate_agent_search::SearxngState::Idle => "idle",
+        citrate_agent_search::SearxngState::Running { .. } => "running",
+        citrate_agent_search::SearxngState::GaveUp(_) => "failed",
+    })
+    .await
+    .unwrap_or("failed");
+    Ok(Json(serde_json::json!({
+        "enabled": true, "searxng": searxng, "reader": reader
+    })))
+}
+
+fn decide_status_code(e: &citrate_agent_loop::decide::DecideError) -> StatusCode {
+    use citrate_agent_loop::decide::DecideError as E;
+    match e {
+        E::Invalid(_) => StatusCode::BAD_REQUEST,
+        E::NotPermitted(_) => StatusCode::FORBIDDEN,
+        E::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+        E::Backend(_) | E::BadAnswer(_) => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// `POST /decide`: one typed decision. The work runs on the blocking pool.
+async fn decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if st.estop.is_stopped() {
+        return Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged",
+        ));
+    }
+    let req: decide::DecideHttpReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad decide request: {e}")))?;
+    let svc = st.sessions.decide_service();
+    let out = tokio::task::spawn_blocking(move || svc.decide(&req))
+        .await
+        .map_err(|_| json_err(StatusCode::INTERNAL_SERVER_ERROR, "decide task failed"))?;
+    match out {
+        Ok(d) => Ok(Json(serde_json::to_value(d).unwrap_or_default())),
+        Err(e) => Err(json_err(decide_status_code(&e), &e.to_string())),
+    }
+}
+
+/// `GET /decide/stats`: per-backend decision metering (no content).
+async fn decide_stats(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<decide::DecideStatus>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(st.sessions.decide_service().status()))
+}
+
+/// `POST /decide/outcomes`: record one task's success for a backend.
+async fn decide_outcome(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let o: decide::OutcomeReq = serde_json::from_slice(&body)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad outcome: {e}")))?;
+    st.sessions
+        .decide_service()
+        .record_outcome(&o)
+        .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 fn json_err(c: StatusCode, m: &str) -> JsonErr {
     (c, Json(serde_json::json!({ "error": m })))
@@ -1166,6 +1296,13 @@ mod sheets_session_tests;
 mod skills_session_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod browser_session_tests;
+#[cfg(test)]
+mod search_session_tests;
+#[cfg(test)]
+mod decide_route_tests;
 #[cfg(test)]
 mod toolchain_tests;
 
