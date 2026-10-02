@@ -948,6 +948,38 @@ impl Verifier for SarifBelowThreshold {
     }
 }
 
+/// Passes when the latest scan of `tool` produced a SARIF report that was read, whatever it
+/// found (an audit reports the findings). A run whose output could not be read never passes.
+#[derive(Debug, Clone)]
+pub struct ScanReportRead {
+    pub tool: String,
+}
+
+impl ScanReportRead {
+    pub fn new(tool: &str) -> Self {
+        ScanReportRead { tool: tool.into() }
+    }
+}
+
+impl Verifier for ScanReportRead {
+    fn name(&self) -> String {
+        format!("{}: the scan report was read", self.tool)
+    }
+    fn verify(&self, ctx: &VerifyContext) -> Verdict {
+        rejudge(ctx, &self.tool, |r: &SarifReport| {
+            let tool = if r.tool.is_empty() { "scan" } else { &r.tool };
+            ToolchainVerdict {
+                passed: true,
+                reason: format!(
+                    "{tool}: report read ({})",
+                    plural(r.counts.total(), "finding", "findings")
+                ),
+                evidence: serde_json::to_value(r).unwrap_or(Value::Null),
+            }
+        })
+    }
+}
+
 /// Passes when the latest `medusa_fuzz` run finished with ≥ 1 test and no failures.
 #[derive(Debug, Clone)]
 pub struct MedusaNoFailures {

@@ -164,8 +164,8 @@ id = "scan"
 instruction = "Run slither_scan and aderyn_scan on the project."
 max_attempts = 2
 verifiers = [
-  { kind = "tool_succeeded", tool = "slither_scan" },
-  { kind = "tool_succeeded", tool = "aderyn_scan" },
+  { kind = "scan_report_read", tool = "slither_scan" },
+  { kind = "scan_report_read", tool = "aderyn_scan" },
   { kind = "tool_not_called", tool = "contract_deploy" },
 ]
 
