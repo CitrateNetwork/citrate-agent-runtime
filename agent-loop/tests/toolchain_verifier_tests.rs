@@ -768,3 +768,33 @@ mod workflow {
         }
     }
 }
+
+/// An audit reports findings, so its scan step needs a report that was read, whatever it found;
+/// a scanner run whose output could not be read is not a scan.
+#[test]
+fn a_scan_report_counts_only_when_it_was_read() {
+    let v = ScanReportRead::new(SLITHER_SCAN_TOOL);
+    let with_findings = ToolchainEnvelope::completed(
+        SLITHER_SCAN_TOOL,
+        verify_sarif_output(
+            &fixture("slither-medium.sarif"),
+            SarifProfile::Slither,
+            Severity::Low,
+        ),
+    )
+    .to_content();
+    assert_eq!(
+        judge(&v, &[rec(SLITHER_SCAN_TOOL, with_findings, "ok")]),
+        Verdict::Pass
+    );
+    let unread = ToolchainEnvelope::completed(
+        SLITHER_SCAN_TOOL,
+        verify_sarif_output("not a sarif log", SarifProfile::Slither, Severity::High),
+    )
+    .to_content();
+    assert!(matches!(
+        judge(&v, &[rec(SLITHER_SCAN_TOOL, unread, "ok")]),
+        Verdict::Fail(_)
+    ));
+    assert!(matches!(judge(&v, &[]), Verdict::Fail(_)));
+}
