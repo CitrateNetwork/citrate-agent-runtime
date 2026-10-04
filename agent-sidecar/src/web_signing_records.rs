@@ -270,17 +270,25 @@ pub async fn write(
     if !crate::authorized(&headers, &st.bearer) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Some(dir) = records_dir_from_env() else {
+    // HUP-S2.6: the session manager's records writer (the same log every other HIC record goes
+    // to); without one, the env folder through the process-wide writer.
+    let held = st.sessions.records();
+    let dir = records_dir_from_env();
+    if held.is_none() && dir.is_none() {
         return err(
             StatusCode::NOT_FOUND,
             "decision records are not configured (CITRATE_HERMES_RECORDS_DIR)",
         );
-    };
+    }
     let Ok(req) = serde_json::from_slice::<WriteReq>(&body) else {
         return err(StatusCode::BAD_REQUEST, "malformed records");
     };
     let out = tokio::task::spawn_blocking(move || {
-        let log = shared_log(&dir)?;
+        let log = match (held, dir) {
+            (Some(log), _) => log,
+            (None, Some(dir)) => shared_log(&dir)?,
+            (None, None) => return Err("decision records are not configured".to_string()),
+        };
         write_records(&log, &req.records).map(|last| (req.records.len(), last))
     })
     .await;

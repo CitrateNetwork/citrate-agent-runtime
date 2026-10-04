@@ -30,13 +30,18 @@
 //! - **A [`RunReport`]** with exit code / signal / timeout / duration that serializes to JSON
 //!   for the S1.3 verifiers (`JsonFieldEquals` on `exit_code`, `passed`, ...).
 //!
-//! What it does **not** do (honest scope): it is not a sandbox. Several allowlisted programs
-//! execute project code by design (forge scripts and FFI, npm lifecycle scripts, node), so the
-//! allowlist bounds *which entry points* the agent can reach, not what those entry points do.
-//! The enforced controls are HIC approval (US-2.2 AC2), folder grants on the cwd, and the OS
-//! sandbox (no network, scratch HOME) that US-2.2 AC1 calls for, which is a separate work item.
-//! Repository-local git configuration is only partly pinned, so read-only git is not a
-//! no-prompt template either; it goes through HIC-1 approval until that sandbox exists.
+//! - **An OS sandbox when the policy asks for one** ([`sandbox`], US-2.2 AC1): macOS Seatbelt
+//!   or Linux bubblewrap with no network, writes only in the caller's write roots (the granted
+//!   folder) and the scratch HOME, and reads limited to those, the system and the toolchain
+//!   directories. [`sandbox::SandboxMode::Required`] fails closed when no backend works here;
+//!   every report says whether the run was isolated ([`RunReport::sandbox`]).
+//!
+//! Honest scope: the allowlist alone is not a sandbox. Several allowlisted programs execute
+//! project code by design (forge scripts and FFI, npm lifecycle scripts, node), so the
+//! allowlist bounds *which entry points* the agent can reach; the OS sandbox bounds what they
+//! can touch (no network, writes only in the grant), and HIC approval (US-2.2 AC2) and folder
+//! grants on the cwd decide whether they run at all. A policy with the sandbox off (the
+//! default of [`ShellPolicy::new`]) runs exactly as before and reports `enforced: false`.
 //! This crate never holds a key and never signs (Rule 3).
 //!
 //! Lifted from `citrate-agent-code` (`agent-code/src/tools/shell_exec.rs`,
@@ -45,6 +50,9 @@
 //! That crate is async and tied to the legacy tool trait, so the logic is re-homed here as a
 //! synchronous, dependency-light library.
 
+pub mod sandbox;
+
+use sandbox::{Backend, SandboxMode, SandboxPolicy, SandboxSpec, SandboxSummary};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -90,6 +98,8 @@ pub enum ShellError {
     InvalidPolicy { reason: String },
     /// The OS refused to start the process (or the scratch HOME could not be created).
     Spawn { program: String, reason: String },
+    /// The policy requires the OS sandbox and no backend works on this machine; nothing ran.
+    SandboxUnavailable { reason: String },
 }
 
 impl fmt::Display for ShellError {
@@ -130,6 +140,10 @@ impl fmt::Display for ShellError {
             ShellError::Spawn { program, reason } => {
                 write!(f, "could not start {program:?}: {reason}")
             }
+            ShellError::SandboxUnavailable { reason } => write!(
+                f,
+                "the OS sandbox is required but not available on this machine ({reason}); nothing ran"
+            ),
         }
     }
 }
@@ -148,6 +162,7 @@ impl ShellError {
             ShellError::ProgramNotFound { .. } => "program_not_found",
             ShellError::InvalidPolicy { .. } => "invalid_policy",
             ShellError::Spawn { .. } => "spawn_failed",
+            ShellError::SandboxUnavailable { .. } => "sandbox_unavailable",
         }
     }
 }
@@ -245,7 +260,12 @@ pub enum ArgPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Allowlist {
     programs: BTreeMap<String, ArgPolicy>,
+    /// Every validated bare name is allowed with [`ArgPolicy::Any`] (names listed explicitly
+    /// keep their own policy). For runs a member approves command by command.
+    any_program: bool,
 }
+
+static ANY_ARGS: ArgPolicy = ArgPolicy::Any;
 
 impl Allowlist {
     /// Nothing allowed.
@@ -280,12 +300,30 @@ impl Allowlist {
         self
     }
 
+    /// Any bare program name on the search path, with any argv (still argv-only, resolved from
+    /// the fixed search path, never a path). Only for runs a member approves one by one.
+    pub fn any_program() -> Self {
+        Self {
+            programs: BTreeMap::new(),
+            any_program: true,
+        }
+    }
+
+    /// Whether every bare name is allowed.
+    pub fn allows_any_program(&self) -> bool {
+        self.any_program
+    }
+
     pub fn contains(&self, program: &str) -> bool {
-        self.programs.contains_key(program)
+        self.any_program || self.programs.contains_key(program)
     }
 
     pub fn policy_for(&self, program: &str) -> Option<&ArgPolicy> {
-        self.programs.get(program)
+        match self.programs.get(program) {
+            Some(p) => Some(p),
+            None if self.any_program => Some(&ANY_ARGS),
+            None => None,
+        }
     }
 
     /// Allowlisted program names, sorted.
@@ -434,6 +472,7 @@ pub struct ShellPolicy {
     max_timeout: Duration,
     stdout_cap: usize,
     stderr_cap: usize,
+    sandbox: SandboxPolicy,
 }
 
 impl ShellPolicy {
@@ -469,7 +508,18 @@ impl ShellPolicy {
             max_timeout: DEFAULT_MAX_TIMEOUT,
             stdout_cap: DEFAULT_OUTPUT_CAP,
             stderr_cap: DEFAULT_OUTPUT_CAP,
+            sandbox: SandboxPolicy::off(),
         })
+    }
+
+    /// Wrap runs in the OS sandbox ([`sandbox`]). Default: off.
+    pub fn with_sandbox(mut self, sandbox: SandboxPolicy) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    pub fn sandbox(&self) -> &SandboxPolicy {
+        &self.sandbox
     }
 
     /// The system directories, in lookup order. User-local toolchain directories (for example
@@ -620,6 +670,8 @@ pub struct RunReport {
     /// An output pipe was still open after the drain grace (a process outside the group held
     /// it); the capture is what had arrived by then.
     pub output_incomplete: bool,
+    /// Whether (and how) the run was wrapped in the OS sandbox.
+    pub sandbox: SandboxSummary,
 }
 
 impl RunReport {
@@ -646,12 +698,12 @@ impl RunReport {
 // Runner
 // ------------------------------------------------------------------------------------------
 
-type CwdCheck = dyn Fn(&Path) -> Result<(), String> + Send + Sync;
+type CwdScope = dyn Fn(&Path) -> Result<Vec<PathBuf>, String> + Send + Sync;
 
 /// Runs allowlisted programs under a [`ShellPolicy`]. `Send + Sync`; share it behind an `Arc`.
 pub struct ShellRunner {
     policy: ShellPolicy,
-    cwd_check: Box<CwdCheck>,
+    cwd_scope: Box<CwdScope>,
 }
 
 impl fmt::Debug for ShellRunner {
@@ -667,13 +719,26 @@ static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 impl ShellRunner {
     /// `cwd_check` receives the canonical cwd and returns `Err(reason)` to refuse the run. It is
     /// the seam for S2.1 folder grants and the S2.8 default-deny list.
+    /// The cwd itself is the only folder a sandboxed run may write (besides the scratch HOME).
     pub fn new<F>(policy: ShellPolicy, cwd_check: F) -> Self
     where
         F: Fn(&Path) -> Result<(), String> + Send + Sync + 'static,
     {
+        Self::with_scope(policy, move |cwd: &Path| {
+            cwd_check(cwd).map(|()| vec![cwd.to_path_buf()])
+        })
+    }
+
+    /// `cwd_scope` receives the canonical cwd and returns the folders a sandboxed run may write
+    /// (for example the folder grant that covers the cwd), or `Err(reason)` to refuse. Every
+    /// root must be absolute and one of them must contain the cwd.
+    pub fn with_scope<F>(policy: ShellPolicy, cwd_scope: F) -> Self
+    where
+        F: Fn(&Path) -> Result<Vec<PathBuf>, String> + Send + Sync + 'static,
+    {
         Self {
             policy,
-            cwd_check: Box::new(cwd_check),
+            cwd_scope: Box::new(cwd_scope),
         }
     }
 
@@ -706,18 +771,66 @@ impl ShellRunner {
                 });
             }
         }
-        let cwd = self.check_cwd(&req.cwd)?;
+        let (cwd, write_roots) = self.check_cwd(&req.cwd)?;
         let resolved_path = self.policy.resolve(&req.program)?;
+        let read_roots = self.read_roots(&resolved_path);
+        let (backend, sandbox) = match self.policy.sandbox.backend() {
+            Ok(b) => {
+                let summary = SandboxSummary::enforced(&b, &write_roots, &read_roots);
+                (Some(b), summary)
+            }
+            Err(reason) => match self.policy.sandbox.mode() {
+                SandboxMode::Required => return Err(ShellError::SandboxUnavailable { reason }),
+                SandboxMode::Preferred | SandboxMode::Off => {
+                    (None, SandboxSummary::not_enforced(&reason, &write_roots))
+                }
+            },
+        };
         Ok(RunPlan {
             resolved_path,
             cwd,
             args: effective_args(arg_policy, &req.args),
             arg_policy: arg_policy.clone(),
             timeout: self.policy.effective_timeout(req.timeout),
+            write_roots,
+            read_roots,
+            backend,
+            sandbox,
         })
     }
 
-    fn check_cwd(&self, cwd: &Path) -> Result<PathBuf, ShellError> {
+    /// Directories a sandboxed run may read beyond the system set: the search path, the
+    /// policy's extra roots, the program's own directory (symlinks resolved), and, for a Python
+    /// virtual environment's entry point, that environment. Canonical, without repeats.
+    fn read_roots(&self, program: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let mut add = |p: &Path| {
+            if let Ok(c) = std::fs::canonicalize(p) {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        };
+        for d in &self.policy.search_path {
+            add(d);
+        }
+        for d in self.policy.sandbox.extra_read_roots() {
+            add(d);
+        }
+        if let Ok(real) = std::fs::canonicalize(program) {
+            if let Some(dir) = real.parent() {
+                add(dir);
+                if let Some(env) = dir.parent() {
+                    if env.join("pyvenv.cfg").is_file() {
+                        add(env);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn check_cwd(&self, cwd: &Path) -> Result<(PathBuf, Vec<PathBuf>), ShellError> {
         let refuse = |reason: String| ShellError::CwdRefused {
             cwd: cwd.to_path_buf(),
             reason,
@@ -732,11 +845,34 @@ impl ShellRunner {
         if !canonical.is_dir() {
             return Err(refuse("not a directory".to_string()));
         }
-        (self.cwd_check)(&canonical).map_err(|reason| ShellError::CwdRefused {
+        let roots = (self.cwd_scope)(&canonical).map_err(|reason| ShellError::CwdRefused {
             cwd: canonical.clone(),
             reason,
         })?;
-        Ok(canonical)
+        let mut write_roots = Vec::with_capacity(roots.len());
+        for r in roots {
+            if !r.is_absolute() {
+                return Err(ShellError::CwdRefused {
+                    cwd: canonical,
+                    reason: format!("write root {} is not absolute", r.display()),
+                });
+            }
+            let c = std::fs::canonicalize(&r).map_err(|e| ShellError::CwdRefused {
+                cwd: canonical.clone(),
+                reason: format!("write root {} cannot be resolved: {e}", r.display()),
+            })?;
+            if !write_roots.contains(&c) {
+                write_roots.push(c);
+            }
+        }
+        if !write_roots.iter().any(|r| canonical.starts_with(r)) {
+            return Err(ShellError::CwdRefused {
+                cwd: canonical,
+                reason: "the working directory is not inside the folders this run may write"
+                    .to_string(),
+            });
+        }
+        Ok((canonical, write_roots))
     }
 
     /// Run one request to completion (or timeout). Blocking.
@@ -748,9 +884,30 @@ impl ShellRunner {
             reason: format!("cannot create scratch HOME: {e}"),
         })?;
 
-        let mut cmd = Command::new(&plan.resolved_path);
-        cmd.args(&plan.args)
-            .current_dir(&plan.cwd)
+        let mut cmd = match &plan.backend {
+            Some(backend) => {
+                // Seatbelt matches real paths (`/var` is `/private/var` on macOS).
+                let scratch_real =
+                    std::fs::canonicalize(scratch.path()).map_err(|e| ShellError::Spawn {
+                        program: req.program.clone(),
+                        reason: format!("cannot resolve the scratch HOME: {e}"),
+                    })?;
+                let spec = SandboxSpec {
+                    write_roots: plan.write_roots.clone(),
+                    read_roots: plan.read_roots.clone(),
+                    scratch: scratch_real,
+                    cwd: plan.cwd.clone(),
+                    masked_files: sandbox::env_files(&plan.write_roots),
+                };
+                sandbox::wrap(backend, &spec, &plan.resolved_path, &plan.args)
+            }
+            None => {
+                let mut c = Command::new(&plan.resolved_path);
+                c.args(&plan.args);
+                c
+            }
+        };
+        cmd.current_dir(&plan.cwd)
             .env_clear()
             .env("PATH", join_search_path(&self.policy.search_path))
             .env("HOME", scratch.path())
@@ -815,6 +972,7 @@ impl ShellRunner {
             stdout_truncated: out.truncated,
             stderr_truncated: err.truncated,
             output_incomplete: !(out.reached_eof && err.reached_eof),
+            sandbox: plan.sandbox,
         })
     }
 }
@@ -828,6 +986,14 @@ pub struct RunPlan {
     pub args: Vec<String>,
     pub arg_policy: ArgPolicy,
     pub timeout: Duration,
+    /// Folders a sandboxed run may write (canonical; one of them holds the cwd).
+    pub write_roots: Vec<PathBuf>,
+    /// Directories beyond the system set a sandboxed run may read (canonical).
+    pub read_roots: Vec<PathBuf>,
+    /// The sandbox backend the run will use; `None` when it runs without one.
+    pub backend: Option<Backend>,
+    /// What the member is shown about the sandbox.
+    pub sandbox: SandboxSummary,
 }
 
 fn duration_ms(d: Duration) -> u64 {

@@ -801,7 +801,12 @@ async fn run_skill_is_capped_pba_l6b_032() {
 async fn workers_route_needs_the_bearer_and_reports_every_worker_kind() {
     let st = state();
     let resp = app(st.clone())
-        .oneshot(Request::builder().uri("/workers").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/workers")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

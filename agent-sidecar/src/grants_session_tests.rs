@@ -46,6 +46,8 @@ fn now() -> u64 {
 /// `base/home/other` (not granted), `base/bin` (a toolchain search path).
 struct Fx {
     base: PathBuf,
+    /// HUP-S2.9: the undo store (one open per directory).
+    store: std::sync::OnceLock<Arc<citrate_agent_checkpoints::CheckpointStore>>,
 }
 impl Fx {
     fn new() -> Self {
@@ -64,7 +66,10 @@ impl Fx {
         std::fs::write(base.join("home/other/notes.txt"), "not granted").unwrap();
         std::fs::write(base.join("home/other/.env"), "K=other").unwrap();
         std::fs::write(base.join("home/.ssh/id_ed25519"), "secret").unwrap();
-        Fx { base }
+        Fx {
+            base,
+            store: std::sync::OnceLock::new(),
+        }
     }
     fn home(&self) -> PathBuf {
         self.base.join("home")
@@ -87,6 +92,20 @@ impl Fx {
         let g = SessionGrants::empty(self.home());
         g.replace(doc).unwrap();
         Arc::new(g)
+    }
+    /// HUP-S2.9: the file tools as a session gets them (writes checkpointed at `base/ckpt`).
+    fn files(&self, grants: Arc<SessionGrants>) -> FileToolHost {
+        let store = self.store.get_or_init(|| {
+            Arc::new(
+                citrate_agent_checkpoints::CheckpointStore::open(
+                    &self.base.join("ckpt"),
+                    citrate_agent_checkpoints::Config::default(),
+                )
+                .unwrap(),
+            )
+        });
+        let undo = crate::files::UndoScope::new(store.clone(), "s1-grants").unwrap();
+        FileToolHost::new(grants).with_undo(undo)
     }
 }
 impl Drop for Fx {
@@ -132,7 +151,7 @@ fn a_read_grant_reads_inside_and_nothing_outside() {
     let doc = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     match read(&host, &fx.proj().join("src/main.sol")) {
         ToolOutcome::Ok(body) => {
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -153,7 +172,7 @@ fn read_and_write_are_separate() {
     let read_only = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&read_only));
+    let host = fx.files(fx.grants(&read_only));
     assert!(is_denied(&write(
         &host,
         &fx.proj().join("src/new.sol"),
@@ -164,7 +183,7 @@ fn read_and_write_are_separate() {
     let write_only = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&write_only));
+    let host = fx.files(fx.grants(&write_only));
     match write(&host, &fx.proj().join("src/new.sol"), "contract B {}") {
         ToolOutcome::Ok(_) => {}
         other => panic!("a write grant must write: {other:?}"),
@@ -186,7 +205,7 @@ fn a_symlink_out_of_the_grant_is_denied() {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
         g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     assert!(is_denied(&read(&host, &fx.proj().join("escape/notes.txt"))));
     assert!(is_denied(&read(&host, &fx.proj().join("keys/id_ed25519"))));
     assert!(is_denied(&write(
@@ -203,7 +222,7 @@ fn parent_traversal_is_denied() {
     let doc = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     let sneaky = fx.proj().join("src/../../other/notes.txt");
     assert!(is_denied(&read(&host, &sneaky)));
     let rel = host.execute(&call(
@@ -222,7 +241,7 @@ fn a_write_never_follows_a_symlink_or_a_hard_link_out() {
     let doc = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     assert!(is_denied(&write(&host, &fx.proj().join("link.txt"), "x")));
     assert!(is_denied(&write(&host, &fx.proj().join("hard.txt"), "x")));
     assert_eq!(
@@ -246,7 +265,7 @@ fn list(host: &FileToolHost, p: &Path) -> ToolOutcome {
 fn file_write_leaves_build_configuration_to_the_member() {
     let fx = Fx::new();
     std::fs::create_dir_all(fx.proj().join(".cargo")).unwrap();
-    let host = FileToolHost::new(fx.grants(&rw(&fx)));
+    let host = fx.files(fx.grants(&rw(&fx)));
     for name in [
         "foundry.toml",
         "Foundry.TOML",
@@ -290,7 +309,7 @@ fn reads_refuse_hard_linked_files() {
     std::fs::hard_link(fx.other().join("notes.txt"), fx.proj().join("hard.txt")).unwrap();
     std::fs::write(fx.proj().join("a.txt"), "a").unwrap();
     std::fs::hard_link(fx.proj().join("a.txt"), fx.proj().join("b.txt")).unwrap();
-    let host = FileToolHost::new(fx.grants(&rw(&fx)));
+    let host = fx.files(fx.grants(&rw(&fx)));
     for name in ["hard.txt", "a.txt", "b.txt"] {
         let out = read(&host, &fx.proj().join(name));
         assert!(is_denied(&out), "{name}: {out:?}");
@@ -317,7 +336,7 @@ fn reads_never_follow_a_symlink_at_the_leaf() {
     let fx = Fx::new();
     symlink(fx.proj().join("src/main.sol"), fx.proj().join("alias.sol")).unwrap();
     symlink(fx.proj().join("src"), fx.proj().join("srclink")).unwrap();
-    let host = FileToolHost::new(fx.grants(&rw(&fx)));
+    let host = fx.files(fx.grants(&rw(&fx)));
     let out = read(&host, &fx.proj().join("alias.sol"));
     assert!(is_denied(&out), "{out:?}");
     let out = list(&host, &fx.proj().join("srclink"));
@@ -339,7 +358,7 @@ fn full_access_never_reaches_credentials_or_env() {
         )
         .unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     assert!(is_denied(&read(&host, &fx.home().join(".ssh/id_ed25519"))));
     assert!(is_denied(&read(&host, &fx.other().join(".env"))));
     // A listing never names what the agent may not read.
@@ -365,7 +384,7 @@ fn full_access_never_reaches_credentials_or_env() {
     let doc = fx.doc(|g| {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     assert!(matches!(
         read(&host, &fx.proj().join(".env")),
         ToolOutcome::Ok(_)
@@ -382,7 +401,7 @@ fn full_access_reads_are_untrusted_and_never_write() {
         )
         .unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     assert!(matches!(
         read(&host, &fx.other().join("notes.txt")),
         ToolOutcome::Untrusted(_)
@@ -407,7 +426,7 @@ fn an_expired_full_access_grant_allows_nothing() {
     });
     let grants = fx.grants(&doc);
     assert_eq!(grants.summary().active, 0);
-    let host = FileToolHost::new(grants);
+    let host = fx.files(grants);
     assert!(is_denied(&read(&host, &fx.other().join("notes.txt"))));
 }
 
@@ -417,7 +436,7 @@ fn a_replace_revokes_immediately() {
     let mut g = fx.fg();
     let id = g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
     let grants = fx.grants(&serde_json::to_value(g.state()).unwrap());
-    let host = FileToolHost::new(grants.clone());
+    let host = fx.files(grants.clone());
     assert!(matches!(
         read(&host, &fx.proj().join("src/main.sol")),
         ToolOutcome::Ok(_)
@@ -437,7 +456,7 @@ fn a_refused_document_leaves_the_session_with_nothing() {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
     });
     let grants = fx.grants(&doc);
-    let host = FileToolHost::new(grants.clone());
+    let host = fx.files(grants.clone());
     // A tampered document: full access made writable.
     let mut bad = fx.doc(|g| {
         g.grant(
@@ -466,7 +485,7 @@ fn oversized_and_binary_reads_are_reported_not_returned() {
         g.grant(folder(&fx.proj(), Access::Read), now()).unwrap();
         g.grant(folder(&fx.proj(), Access::Write), now()).unwrap();
     });
-    let host = FileToolHost::new(fx.grants(&doc));
+    let host = fx.files(fx.grants(&doc));
     assert!(matches!(
         read(&host, &fx.proj().join("big.txt")),
         ToolOutcome::Error(_)
@@ -779,6 +798,7 @@ fn env_rooted_host(fx: &Fx) -> ToolchainHost {
         search_path: vec![fx.base.join("bin")],
         solc: None,
         home: fx.home(),
+        sandbox: citrate_agent_shell::sandbox::SandboxMode::Off,
     })
     .unwrap()
 }
@@ -884,7 +904,7 @@ async fn a_grant_rooted_in_a_deny_location_grants_nothing_and_does_not_refuse_th
     let grants = SessionGrants::empty(fx.home());
     let s = grants.replace(&doc).expect("the usable grants still load");
     assert_eq!((s.total, s.active, s.ignored), (1, 1, 2));
-    let host = FileToolHost::new(Arc::new(grants));
+    let host = fx.files(Arc::new(grants));
     assert!(matches!(
         read(&host, &fx.proj().join("src/main.sol")),
         ToolOutcome::Ok(_)
