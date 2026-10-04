@@ -12,8 +12,8 @@
 //!   effects still park on the ceremony-grade approval queue.
 //! - The global e-stop halts every session.
 //! - HUP-S3.2: when a skills library is configured (`CITRATE_HERMES_SKILLS`, default off), every
-//!   session gets the skill description index in its system prompt and a pinned, sidecar-hosted
-//!   `skill_load` tool. Skills are instructions only; `skill_load` reads text and runs nothing.
+//!   turn's system prompt carries the at most five skills that match that turn's request (US-3.2
+//!   AC1) and the session gets a pinned, sidecar-hosted `skill_load` tool. Skills are instructions only; `skill_load` reads text and runs nothing.
 //! - HUP-S2.7 taint downgrade: tool specs carry `effect` / `trust` annotations (absent = effectful,
 //!   untrusted). Once a session has ingested untrusted content it stays tainted, and every
 //!   effectful call needs a member's explicit decision. A core-hosted call is only dispatched to
@@ -77,12 +77,12 @@ use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
 use citrate_agent_loop::skills::{
-    skill_load_spec, SkillHost, SkillLibrary, SkillSource, SKILL_LOAD_TOOL,
+    skill_load_spec, SkillHost, SkillLibrary, SkillSource, SkillTurnIndex, SKILL_LOAD_TOOL,
 };
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
     LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
-    ToolSpec, TurnOptions, Workflow,
+    ToolSpec, TurnContext, TurnOptions, Workflow,
 };
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use citrate_agent_metering::{MeteringSink, SystemClock};
@@ -132,8 +132,8 @@ pub const MAX_STEPS_CAP: u32 = 32;
 pub const MAX_TOKENS_CAP: u32 = 8192;
 /// Longest a long-poll may wait.
 pub const MAX_WAIT_MS: u64 = 25_000;
-/// Token budget for the skill description index in a session's system prompt.
-pub const SKILL_INDEX_TOKENS: usize = 1500;
+/// US-3.2 AC1: the most skills surfaced in one turn's system prompt.
+pub use citrate_agent_loop::skills::SKILLS_PER_TURN;
 /// Workflow runs remembered per session (oldest dropped first).
 pub const MAX_RUNS_KEPT: usize = 16;
 
@@ -1136,15 +1136,16 @@ impl SessionManager {
             system_prompt = format!("{system_prompt}\n\n{fragment}");
         }
         let mut pinned_tools = Vec::new();
+        let mut turn_context: Vec<Arc<dyn TurnContext>> = Vec::new();
         if let Some(lib) = &skills {
             if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{SKILL_LOAD_TOOL}' is reserved by the sidecar while skills are enabled"
                 )));
             }
-            if let Some(section) = lib.prompt_section(SKILL_INDEX_TOKENS, &CharTokenCounter) {
-                system_prompt = format!("{system_prompt}\n\n{section}");
-            }
+            // US-3.2 AC1: each turn carries the at most SKILLS_PER_TURN skills that match it,
+            // ranked over the (persona-restricted) library; never the whole index.
+            turn_context.push(Arc::new(SkillTurnIndex::new(lib.clone(), SKILLS_PER_TURN)));
             specs.push(skill_load_spec());
             pinned_tools.push(SKILL_LOAD_TOOL.to_string());
         }
@@ -1339,6 +1340,7 @@ impl SessionManager {
                 )
             }),
             pinned_tools,
+            turn_context,
         };
         let metering = Arc::new(MeteringSink::new(
             id.clone(),
