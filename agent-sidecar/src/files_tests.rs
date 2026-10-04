@@ -448,6 +448,43 @@ fn build_configuration_is_left_to_the_member_by_every_fs_tool() {
     assert_eq!(store.usage().unwrap().steps, 0, "nothing was snapshotted");
 }
 
+/// A hard link inside a granted folder can name a file kept elsewhere (a key, a token). No fs
+/// tool reads, snapshots, edits, moves or removes one: the edit search would otherwise answer
+/// questions about the linked file's text, and the checkpoint would copy it.
+#[cfg(unix)]
+#[test]
+fn hard_linked_files_are_left_to_the_member_by_every_fs_tool() {
+    let s = Scratch::new();
+    let (tools, store) = s.tools();
+    let host = FileToolsHost::new(tools, "s1-link").unwrap();
+    let secret = s.base.join("home/outside/secret.txt");
+    std::fs::write(&secret, "token-value").unwrap();
+    let link = s.proj().join("innocent.txt");
+    std::fs::hard_link(&secret, &link).unwrap();
+    for (tool, args) in [
+        (
+            FS_EDIT_TOOL,
+            serde_json::json!({"path": link, "old_text": "token", "new_text": "x"}),
+        ),
+        (
+            FS_WRITE_TOOL,
+            serde_json::json!({"path": link, "content": "x"}),
+        ),
+        (FS_DELETE_TOOL, serde_json::json!({"path": link})),
+        (
+            FS_RENAME_TOOL,
+            serde_json::json!({"from": link, "to": s.proj().join("moved.txt")}),
+        ),
+    ] {
+        let why = refused(&host, tool, args.clone());
+        assert!(why.contains("hard link"), "{tool} {args}: {why}");
+        assert!(!why.contains("token-value"));
+    }
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "token-value");
+    assert!(link.exists());
+    assert_eq!(store.usage().unwrap().steps, 0, "nothing was snapshotted");
+}
+
 #[test]
 fn paths_outside_a_write_grant_are_refused() {
     let s = Scratch::new();
@@ -986,4 +1023,178 @@ async fn after_untrusted_content_a_file_write_is_declined_and_nothing_is_written
         .steps(&SessionId::new(&id).unwrap())
         .unwrap()
         .is_empty());
+}
+
+/// L-21: a whole-file write is anchored to the folder that was checked. Once that folder is open,
+/// swapping its path for a link to somewhere else (the window between the check and the rename)
+/// does not move the write: it lands in the folder that was checked, and nothing is written where
+/// the link points.
+#[cfg(unix)]
+#[test]
+fn a_write_lands_in_the_folder_that_was_checked_even_if_its_path_is_swapped() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let checked = s.join("granted");
+    let elsewhere = s.join("elsewhere");
+    let moved = s.join("moved-away");
+    std::fs::create_dir_all(&checked).expect("granted");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    std::fs::write(elsewhere.join("notes.txt"), b"keep me").expect("seed");
+    let checked = checked.canonicalize().expect("canonical");
+
+    let dir = open_dir_checked(&checked).expect("the checked folder opens");
+    // The swap: the checked folder is moved away and a link to `elsewhere` takes its path.
+    std::fs::rename(&checked, &moved).expect("move away");
+    std::os::unix::fs::symlink(&elsewhere, &checked).expect("link in its place");
+
+    replace_in_dir(&dir, std::ffi::OsStr::new("notes.txt"), b"agent text").expect("written");
+    assert_eq!(
+        std::fs::read(elsewhere.join("notes.txt")).expect("still there"),
+        b"keep me",
+        "nothing was written where the link points"
+    );
+    assert_eq!(
+        std::fs::read(moved.join("notes.txt")).expect("written in the checked folder"),
+        b"agent text"
+    );
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// The checked folder must be where the check said: a folder reached through a link, or one
+/// that is not where it was asked for, is refused before anything is created.
+#[cfg(unix)]
+#[test]
+fn a_folder_reached_through_a_link_is_not_written_into() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-link-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let real = s.join("real");
+    std::fs::create_dir_all(&real).expect("real");
+    let link = s.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link");
+    let s_canon = s.canonicalize().expect("canonical");
+    assert!(open_dir_checked(&s_canon.join("link")).is_err());
+    assert!(write_file(&s_canon.join("link").join("x.txt"), b"x").is_err());
+    assert_eq!(std::fs::read_dir(&real).expect("readable").count(), 0);
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// A replaced file keeps the permissions it had; a new file gets the permissions any new file of
+/// the member's gets (the process umask).
+#[cfg(unix)]
+#[test]
+fn whole_file_writes_keep_permissions_and_create_private_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-mode-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    std::fs::create_dir_all(&s).expect("dir");
+    let s = s.canonicalize().expect("canonical");
+    let existing = s.join("script.sh");
+    std::fs::write(&existing, b"old").expect("seed");
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+    write_file(&existing, b"new").expect("replaced");
+    assert_eq!(std::fs::read(&existing).expect("read"), b"new");
+    let mode = std::fs::metadata(&existing)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o750);
+    let fresh = s.join("fresh.txt");
+    write_file(&fresh, b"hi").expect("created");
+    let control = s.join("control.txt");
+    std::fs::write(&control, b"hi").expect("control");
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&fresh), mode(&control));
+    // No temp file is left behind.
+    let names: Vec<String> = std::fs::read_dir(&s)
+        .expect("list")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains("citrate-write")),
+        "{names:?}"
+    );
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// L-21: fs_delete and fs_rename act inside the folders that were checked. With the folder open,
+/// a link swapped in at its path does not redirect the delete or the rename.
+#[cfg(unix)]
+#[test]
+fn delete_and_rename_act_in_the_folders_that_were_checked() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-mv-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let checked = s.join("granted");
+    let elsewhere = s.join("elsewhere");
+    let moved = s.join("moved-away");
+    std::fs::create_dir_all(&checked).expect("granted");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    for d in [&checked, &elsewhere] {
+        std::fs::write(d.join("a.txt"), b"a").expect("seed a");
+        std::fs::write(d.join("b.txt"), b"b").expect("seed b");
+    }
+    let checked = checked.canonicalize().expect("canonical");
+    let dir = open_dir_checked(&checked).expect("opens");
+    std::fs::rename(&checked, &moved).expect("move away");
+    std::os::unix::fs::symlink(&elsewhere, &checked).expect("link in its place");
+
+    remove_in_dir(&dir, std::ffi::OsStr::new("a.txt")).expect("deleted");
+    rename_between(
+        &dir,
+        std::ffi::OsStr::new("b.txt"),
+        &dir,
+        std::ffi::OsStr::new("c.txt"),
+    )
+    .expect("renamed");
+    assert!(
+        elsewhere.join("a.txt").exists(),
+        "the linked folder's file was not deleted"
+    );
+    assert!(
+        elsewhere.join("b.txt").exists(),
+        "the linked folder's file was not moved"
+    );
+    assert!(!moved.join("a.txt").exists());
+    assert!(!moved.join("b.txt").exists());
+    assert_eq!(std::fs::read(moved.join("c.txt")).expect("renamed"), b"b");
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// The path-level helpers refuse a folder reached through a link.
+#[cfg(unix)]
+#[test]
+fn delete_and_rename_refuse_a_folder_reached_through_a_link() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-mvlink-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let real = s.join("real");
+    std::fs::create_dir_all(&real).expect("real");
+    std::fs::write(real.join("a.txt"), b"a").expect("seed");
+    std::os::unix::fs::symlink(&real, s.join("link")).expect("link");
+    let s = s.canonicalize().expect("canonical");
+    assert!(remove_checked(&s.join("link").join("a.txt")).is_err());
+    assert!(rename_checked(&s.join("link").join("a.txt"), &s.join("real").join("z.txt")).is_err());
+    assert!(real.join("a.txt").exists());
+    let _ = std::fs::remove_dir_all(&s);
 }

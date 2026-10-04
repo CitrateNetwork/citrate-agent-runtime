@@ -9,6 +9,7 @@ description = "Hermes's browser worker (HUP-S5.1 + S5.6): drives a Chromium foun
 
 [dependencies]
 citrate-agent-loop = { path = "../agent-loop" }
+citrate-agent-guard = { path = "../agent-guard" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"

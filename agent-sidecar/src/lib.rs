@@ -30,8 +30,10 @@ pub mod grants;
 pub mod hic_records;
 pub mod learn;
 pub mod llm_http;
+pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
+pub mod retrieval_http;
 pub mod search;
 pub mod sessions;
 pub mod sheets;
@@ -40,6 +42,7 @@ pub mod signin_routes;
 pub mod toolchain;
 mod toolchain_config;
 pub mod trajectory;
+pub mod verify_probes;
 pub mod web_signing_records;
 pub mod workers;
 pub mod workflow_spec;
@@ -267,21 +270,31 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/skills", get(skills))
+        // HUP-S3.2: the SKILL.md instruction skills sessions are offered, and a reload after the
+        // member saves one.
+        .route("/instruction-skills", get(instruction_skills))
+        .route(
+            "/instruction-skills/reload",
+            post(reload_instruction_skills),
+        )
         .route("/approvals", get(approvals))
         .route("/approvals/approve", post(approve_head))
         .route("/approvals/reject", post(reject_head))
         .route("/run_skill", post(run_skill))
         .route("/stop", post(stop))
         // HUP-S1.1b — agent sessions (ADR loop-in-sidecar).
-        .route("/sessions", post(create_session))
+        .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:id", delete(close_session))
         .route("/sessions/:id/messages", post(send_message))
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
         .route("/sessions/:id/grants", post(replace_grants))
+        .route("/sessions/:id/retrieval", get(session_retrieval))
         .route("/sessions/:id/shell/pending", get(shell_pending))
         .route("/sessions/:id/shell/decide", post(shell_decide))
+        .route("/sessions/:id/mcp/pending", get(mcp_pending))
+        .route("/sessions/:id/mcp/decide", post(mcp_decide))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -425,8 +438,10 @@ async fn workers_status(
 }
 
 /// HUP-S4.4: `POST /mcp/probe` with one server entry (the allowlist's `[[servers]]` shape, JSON).
-/// 422 `{errors: [{field, message}]}` for an invalid entry; 429 while another probe runs; else
-/// 200 with the probe report (`ok: false` + `error` when the server could not be reached).
+/// 422 `{errors: [{field, message}]}` for an invalid entry; 503 when the sidecar was not given
+/// core's saved server list; 403 when the entry is not saved there exactly as sent (nothing is
+/// started); 429 while another probe runs; else 200 with the probe report (`ok: false` + `error`
+/// when the server could not be reached).
 async fn mcp_probe_route(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -438,7 +453,7 @@ async fn mcp_probe_route(
             Json(serde_json::json!({ "error": "unauthorized" })),
         ));
     }
-    mcp_probe::handle(entry).await
+    mcp_probe::handle(entry, st.sessions.mcp_registry()).await
 }
 
 async fn skills(
@@ -449,6 +464,70 @@ async fn skills(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(st.skills.clone()))
+}
+
+/// HUP-S3.2: the instruction skills new sessions are offered (before any persona allowlist), with
+/// provenance for reviewed third-party ones, the ranking method and how many surface per turn.
+async fn instruction_skills(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let lib = st.sessions.skills();
+    let mut skills = Vec::new();
+    let mut refused = 0usize;
+    if let Some(lib) = &lib {
+        refused = lib.report().rejected.len();
+        for name in lib.names() {
+            let Some(s) = lib.get(name) else { continue };
+            let provenance = s.provenance.as_ref().map(|p| {
+                serde_json::json!({
+                    "source": p.source,
+                    "upstream": p.upstream,
+                    "commit": p.commit,
+                    "license": p.license,
+                    "path": p.path,
+                    "verdict": p.verdict,
+                    "skill_md_sha256": p.skill_md_sha256,
+                    "intake_rewrite": p.intake_rewrite,
+                })
+            });
+            skills.push(serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "source": s.source,
+                "provenance": provenance,
+            }));
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "ranker": citrate_agent_loop::skills::SkillRanker::method(&citrate_agent_loop::skills::Bm25Ranker),
+        "per_turn": citrate_agent_loop::skills::SKILLS_PER_TURN,
+        "skills": skills,
+        "refused": refused,
+    })))
+}
+
+/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). Sessions already
+/// open keep their skills; the next session gets the new library.
+async fn reload_instruction_skills(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let sessions = st.sessions.clone();
+    let reloaded = tokio::task::spawn_blocking(move || sessions.reload_skills())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut body = serde_json::json!({ "ok": true, "reloaded": reloaded.is_some() });
+    if let Some(n) = reloaded {
+        body["skills_offered"] = serde_json::json!(n);
+    }
+    Ok(Json(body))
 }
 
 async fn approvals(
@@ -754,12 +833,26 @@ async fn create_session(
     })?;
     match st.sessions.create(req) {
         Ok(id) => {
+            let session = st.sessions.get(&id);
             // HUP-S3.3: say what the persona did (offered skills, missing ones, pinned tools).
-            let persona = st.sessions.get(&id).and_then(|s| s.persona().cloned());
-            let body = match persona {
-                Some(p) => serde_json::json!({ "id": id, "persona": p }),
-                None => serde_json::json!({ "id": id }),
+            let persona = session.as_ref().and_then(|s| s.persona().cloned());
+            // HUP-S1.2: say how tokens are counted and tools ranked (probed once, off the
+            // async runtime: the probes are blocking HTTP calls to the session's own endpoints).
+            let retrieval = match session {
+                Some(s) => tokio::task::spawn_blocking(move || s.probe_retrieval())
+                    .await
+                    .ok(),
+                None => None,
             };
+            let mut body = serde_json::json!({ "id": id });
+            if let Some(p) = persona {
+                body["persona"] = serde_json::json!(p);
+            }
+            if let Some(r) = retrieval {
+                body["tokenCounting"] = serde_json::json!(r.token_counting);
+                body["retrieval"] = serde_json::json!(r.retrieval);
+                body["maxToolSchemas"] = serde_json::json!(r.max_tool_schemas);
+            }
             Ok((StatusCode::CREATED, Json(body)))
         }
         Err(e) => {
@@ -773,6 +866,22 @@ async fn create_session(
             Err(err(session_status(&e), &msg))
         }
     }
+}
+
+/// HUP-S1.2: `GET /sessions/:id/retrieval` — how the session counts tokens and ranks tools and
+/// skills right now (a fallback after creation shows here).
+async fn session_retrieval(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<sessions::RetrievalReport>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    st.sessions
+        .get(&id)
+        .map(|s| Json(s.retrieval_report()))
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(Deserialize)]
@@ -910,6 +1019,131 @@ async fn shell_pending(
     Ok(Json(serde_json::json!({ "pending": pending })))
 }
 
+/// HUP-S4.1: `GET /sessions/:id/mcp/pending`: the MCP approval cards waiting for the member
+/// (effectful MCP calls after taint, and URL-mode elicitations). A session without them has none.
+async fn mcp_pending(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let pending = session.mcp_pending().unwrap_or_default();
+    Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
+#[derive(Deserialize)]
+struct McpDecideReq {
+    id: String,
+    allow: bool,
+    subject: String,
+}
+
+/// HUP-S4.1: `POST /sessions/:id/mcp/decide {id, allow, subject}`: the member's decision on one
+/// MCP card. `subject` must be the arguments (or URL) that were shown; otherwise 409 and nothing
+/// is decided. Recorded like the other HIC decisions (write-ahead for an allow).
+async fn mcp_decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let req: McpDecideReq = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {id, allow, subject}"))?;
+    let card = session
+        .mcp_waiting(&req.id)
+        .filter(|c| c.subject == req.subject)
+        .ok_or_else(|| {
+            json_err(
+                StatusCode::CONFLICT,
+                "that request is no longer waiting, or the decision does not match what is waiting; nothing was decided",
+            )
+        })?;
+    let (kind, subject) = if card.kind == "open_url" {
+        (
+            "mcp.open_url",
+            format!("open {} for MCP server '{}'", card.subject, card.server),
+        )
+    } else {
+        (
+            "mcp.tool_call",
+            format!(
+                "{} on MCP server '{}' with {}",
+                card.remote_tool, card.server, card.subject
+            ),
+        )
+    };
+    let log = st.sessions.records();
+    let record = |allow: bool, log: &citrate_agent_records::DecisionLog| {
+        hic_records::record_member_decision(
+            log,
+            kind,
+            &subject,
+            allow,
+            "the member decided on the exact request shown",
+            vec![citrate_agent_records::EvidenceRef {
+                kind: kind.replace('.', "_"),
+                uri: format!("sidecar:sessions/{id}/mcp/{}", req.id),
+                digest: None,
+            }],
+        )
+    };
+    let allow_seq = match &log {
+        Some(log) if req.allow => match record(true, log) {
+            Ok(seq) => Some(seq),
+            Err(e) => return Err(json_err(StatusCode::SERVICE_UNAVAILABLE, &e)),
+        },
+        _ => None,
+    };
+    match session.mcp_decide(&req.id, req.allow, &req.subject) {
+        Ok(()) => {
+            if let Some(log) = &log {
+                match allow_seq {
+                    Some(seq) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Completed,
+                        "released; the call's own result is in the session",
+                    ),
+                    None => {
+                        if let Err(e) = record(false, log) {
+                            eprintln!("citrate-agent-sidecar: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) => {
+            if let (Some(log), Some(seq)) = (&log, allow_seq) {
+                hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "not released (no longer waiting, or the subject differed)",
+                );
+            }
+            let msg = match e {
+                sessions::SessionError::Invalid(m) => m,
+                _ => "that request is no longer waiting for a decision".to_string(),
+            };
+            Err(json_err(StatusCode::CONFLICT, &msg))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ShellDecideReq {
     id: String,
@@ -1000,6 +1234,18 @@ async fn shell_decide(
     }
 }
 
+/// HUP-S1.1: `GET /sessions` — the open sessions (id, model, busy, last sequence number, persona,
+/// waiting core calls), so every client (app, CLI, MCP) can find and attach to the same session.
+async fn list_sessions(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(serde_json::json!({ "sessions": st.sessions.list() })))
+}
+
 async fn close_session(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1040,11 +1286,76 @@ pub fn skill_sources_from_env(value: &str) -> Vec<citrate_agent_loop::skills::Sk
         .collect()
 }
 
-/// HUP-S3.2: load the skills library named by `CITRATE_HERMES_SKILLS` (default off → `None`).
-/// What was refused or shadowed is logged to stderr for the operator, never sent to the model.
+/// HUP-S3.2: the path of the `skills.lock` citrate-core ships beside the staged reviewed skills.
+pub const SKILLS_LOCK_ENV: &str = "CITRATE_HERMES_SKILLS_LOCK";
+/// HUP-S3.2: the staged tree of reviewed third-party skills (`<root>/<source>/<path>/`).
+pub const SKILLS_THIRD_PARTY_ENV: &str = "CITRATE_HERMES_SKILLS_THIRD_PARTY";
+/// The source label reviewed third-party skills load under.
+pub const THIRD_PARTY_SKILLS_LABEL: &str = "reviewed";
+/// Largest `skills.lock` read.
+const MAX_SKILLS_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// HUP-S3.2: the reviewed third-party skills as a locked source: `lock` is `skills.lock`, `root`
+/// the staged tree. Every file is checked against the lock when the library loads.
+pub fn third_party_skill_source(
+    lock: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<citrate_agent_loop::skills::SkillSource, String> {
+    let meta = std::fs::metadata(lock)
+        .map_err(|e| format!("skills.lock at {}: {}", lock.display(), e.kind()))?;
+    if meta.len() > MAX_SKILLS_LOCK_BYTES {
+        return Err(format!(
+            "skills.lock at {} is larger than {MAX_SKILLS_LOCK_BYTES} bytes",
+            lock.display()
+        ));
+    }
+    let text = std::fs::read_to_string(lock)
+        .map_err(|e| format!("skills.lock at {}: {}", lock.display(), e.kind()))?;
+    let parsed = citrate_agent_loop::skills::SkillLock::from_toml(&text)?;
+    Ok(citrate_agent_loop::skills::SkillSource::locked(
+        THIRD_PARTY_SKILLS_LABEL,
+        root,
+        Arc::new(parsed),
+    ))
+}
+
+/// HUP-S3.2: every skill source in precedence order: the member's own folders
+/// (`CITRATE_HERMES_SKILLS`, first wins) and then, when both paths are given, the reviewed
+/// third-party skills. A lock that cannot be read is logged and left out (fail closed); the
+/// member's own skills still load.
+pub fn all_skill_sources(
+    member: &str,
+    third_party: Option<(&std::path::Path, &std::path::Path)>,
+) -> Vec<citrate_agent_loop::skills::SkillSource> {
+    let mut sources = skill_sources_from_env(member);
+    if let Some((lock, root)) = third_party {
+        match third_party_skill_source(lock, root) {
+            Ok(src) => sources.push(src),
+            Err(e) => eprintln!("citrate-agent-sidecar: reviewed third-party skills off: {e}"),
+        }
+    }
+    sources
+}
+
+/// [`all_skill_sources`] from the environment.
+fn skill_sources_from_process_env() -> Vec<citrate_agent_loop::skills::SkillSource> {
+    let member = std::env::var("CITRATE_HERMES_SKILLS").unwrap_or_default();
+    let lock = std::env::var_os(SKILLS_LOCK_ENV).filter(|v| !v.is_empty());
+    let root = std::env::var_os(SKILLS_THIRD_PARTY_ENV).filter(|v| !v.is_empty());
+    match (lock, root) {
+        (Some(lock), Some(root)) => all_skill_sources(
+            &member,
+            Some((std::path::Path::new(&lock), std::path::Path::new(&root))),
+        ),
+        _ => all_skill_sources(&member, None),
+    }
+}
+
+/// HUP-S3.2: load the skills library named by `CITRATE_HERMES_SKILLS` plus the reviewed
+/// third-party skills (default off → `None`). What was refused or shadowed is logged to stderr
+/// for the operator, never sent to the model.
 pub fn skills_from_env() -> Option<Arc<citrate_agent_loop::skills::SkillLibrary>> {
-    let value = std::env::var("CITRATE_HERMES_SKILLS").ok()?;
-    let sources = skill_sources_from_env(&value);
+    let sources = skill_sources_from_process_env();
     if sources.is_empty() {
         return None;
     }
@@ -1074,6 +1385,9 @@ fn log_skill_report(lib: &citrate_agent_loop::skills::SkillLibrary) {
     );
 }
 
+/// How often the MCP host checks for servers to reconnect and tool lists to re-read.
+pub const MCP_MAINTENANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// HUP-S4.1: read and validate an MCP allowlist file and connect to its servers. `Ok(None)` for
 /// an allowlist with no servers. Blocking (spawns processes, runs handshakes): call it off the
 /// async runtime. A server that fails to start is reported in its status, not here.
@@ -1098,6 +1412,8 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
     }
     match mcp_from_path(std::path::Path::new(&value)) {
         Ok(Some(host)) => {
+            // HUP-S4.1: reconnect servers that drop (with backoff) and re-list on list_changed.
+            citrate_agent_mcp_host::McpHost::start_maintenance(&host, MCP_MAINTENANCE_EVERY);
             for s in host.status() {
                 eprintln!(
                     "citrate-agent-sidecar: MCP server '{}' ({}): {:?}, {} tools{}",
@@ -1128,30 +1444,83 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
 
+/// HUP-S1.2: llama-server `/tokenize` for a loopback chat endpoint; any other endpoint (an https
+/// gateway) has no tokenizer the sidecar can reach, so its sessions estimate.
+pub fn production_tokenizer() -> sessions::TokenizerFactory {
+    Arc::new(|ep: &sessions::LlmEndpoint| {
+        if retrieval_http::is_loopback_http(&ep.base_url) {
+            Ok(Arc::new(retrieval_http::LlamaTokenizer::new(
+                &ep.base_url,
+                &ep.bearer,
+            ))
+                as Arc<dyn citrate_agent_loop::retrieval::Tokenizer>)
+        } else {
+            Err("the model endpoint is not the local llama-server, so tokens are estimated".into())
+        }
+    })
+}
+
+/// HUP-S1.2: the embedding endpoint named by `CITRATE_HERMES_EMBED_URL` (loopback http or https,
+/// no bearer), else the session's own loopback chat server (which answers only when it was
+/// started with `--embeddings`). An https chat endpoint is never sent tool or skill text for
+/// embedding unless it is named here.
+pub fn production_embedder(embed_url: Option<String>) -> sessions::EmbedderFactory {
+    let embed_url = embed_url.filter(|u| !u.trim().is_empty());
+    Arc::new(move |ep: &sessions::LlmEndpoint| match &embed_url {
+        Some(url) => {
+            sessions::validate_endpoint(url)
+                .map_err(|e| format!("{} was refused: {e}", retrieval_http::EMBED_URL_ENV))?;
+            Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, ""))
+                as Arc<dyn citrate_agent_loop::retrieval::Embedder>)
+        }
+        None if retrieval_http::is_loopback_http(&ep.base_url) => Ok(Arc::new(
+            retrieval_http::HttpEmbedder::new(&ep.base_url, &ep.bearer),
+        )
+            as Arc<dyn citrate_agent_loop::retrieval::Embedder>),
+        None => Err(format!(
+            "no embedding endpoint: {} is not set and the model endpoint is not local",
+            retrieval_http::EMBED_URL_ENV
+        )),
+    })
+}
+
 /// [`production_sessions`] plus the MCP host when one is configured (HUP-S4.1).
 pub fn production_sessions_with(
     mcp: Option<Arc<citrate_agent_mcp_host::McpHost>>,
 ) -> Arc<sessions::SessionManager> {
     let timeout = std::time::Duration::from_secs(300);
+    // HUP-S1.1 (g1-render): answers stream to the session events unless switched off.
+    let streaming =
+        llm_http::streaming_from_value(std::env::var(llm_http::LLM_STREAM_ENV).ok().as_deref());
     let mgr = sessions::SessionManager::new(
         Arc::new(move |ep: &sessions::LlmEndpoint| {
-            Arc::new(llm_http::OpenAiCompatClient::new(
-                &ep.base_url,
-                &ep.bearer,
-                timeout,
-            )) as Arc<dyn citrate_agent_loop::LlmClient>
+            Arc::new(
+                llm_http::OpenAiCompatClient::new(&ep.base_url, &ep.bearer, timeout)
+                    .with_streaming(streaming),
+            ) as Arc<dyn citrate_agent_loop::LlmClient>
         }),
         timeout,
     );
+    // HUP-S1.2 (US-1.4 AC1): token counts from the model's tokenizer, and tools and skills ranked
+    // by embeddings plus keywords, each with an honest fallback the session reports.
+    let mgr = mgr
+        .with_tokenizer(production_tokenizer())
+        .with_embedder(production_embedder(
+            std::env::var(retrieval_http::EMBED_URL_ENV).ok(),
+        ));
     // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
     let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
         None => mgr,
     };
+    // HUP-S4.4: the MCP probe starts only entries core saved in this list.
+    let mgr = match std::env::var_os(mcp_probe::MCP_REGISTRY_ENV).filter(|p| !p.is_empty()) {
+        Some(p) => mgr.with_mcp_registry(std::path::PathBuf::from(p)),
+        None => mgr,
+    };
     // HUP-S3.2: the skills library. HUP-S3.4: kept with its sources, so a learned skill the
     // member accepts is offered to the next session without a restart.
-    let sources =
-        skill_sources_from_env(&std::env::var("CITRATE_HERMES_SKILLS").unwrap_or_default());
+    let sources = skill_sources_from_process_env();
     let mgr = if sources.is_empty() {
         mgr
     } else {
@@ -1233,6 +1602,11 @@ pub fn production_sessions_with(
         None => mgr,
     };
     let mgr = with_files_from_env(mgr);
+    // US-1.3 AC2: record the model's self-review of each workflow step attempt as an opinion
+    // (on unless CITRATE_HERMES_SELF_REVIEW=0).
+    let mgr = mgr.with_self_review(self_review_from_env_var(
+        std::env::var("CITRATE_HERMES_SELF_REVIEW").ok().as_deref(),
+    ));
     // US-2.2 AC2: shell_run (off by default; always inside the OS sandbox).
     let mgr = match shell_run::ShellRunConfig::from_env() {
         Some(cfg) => {
@@ -1253,6 +1627,11 @@ pub fn production_sessions_with(
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
+}
+
+/// US-1.3 AC2: workflow runs record the model's self-review unless the variable is exactly `0`.
+pub fn self_review_from_env_var(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("0")
 }
 
 /// HUP-S2.9: open the checkpoint store when `CITRATE_HERMES_CHECKPOINTS` names one (the undo
@@ -1691,6 +2070,8 @@ mod capsule_sandbox_tests;
 #[cfg(test)]
 mod grants_session_tests;
 #[cfg(test)]
+mod instruction_skills_route_tests;
+#[cfg(test)]
 mod learn_more_session_tests;
 #[cfg(test)]
 mod learn_session_tests;
@@ -1699,13 +2080,21 @@ mod mcp_session_tests;
 #[cfg(test)]
 mod metering_session_tests;
 #[cfg(test)]
+mod retrieval_http_tests;
+#[cfg(test)]
+mod session_reattach_tests;
+#[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]
 mod sheets_session_tests;
 #[cfg(test)]
+mod skills_lock_env_tests;
+#[cfg(test)]
 mod skills_session_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_probes_tests;
 
 #[cfg(test)]
 mod browser_session_tests;
@@ -1742,8 +2131,14 @@ async fn start_workflow(
     }
     let spec: workflow_spec::WorkflowSpec = serde_json::from_slice(&body)
         .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad workflow: {e}")))?;
+    // HUP-S1.3: HTTP checks reach loopback or consented origins only; hash checks read only
+    // inside this session's folder grants (none: refused).
+    let env = verify_probes::env_for(
+        st.sessions.browser().cloned(),
+        st.sessions.get(&id).and_then(|s| s.grants().cloned()),
+    );
     let wf = spec
-        .build()
+        .build_in(&env)
         .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
     let run_id = st
         .sessions

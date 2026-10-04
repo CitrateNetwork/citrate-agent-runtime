@@ -408,6 +408,55 @@ fn verifier_verdicts_attach_to_the_attempt_they_judge() {
 }
 
 #[test]
+fn a_self_review_opinion_opens_no_turn_and_never_marks_an_attempt_passed() {
+    // US-1.3 AC2: the opinion arrives after the attempt's `done`, like a verdict. It must not
+    // open a phantom turn, and a "PASS" opinion must not turn a failed attempt into a pass.
+    let clock = FakeClock::at(T0);
+    let m = sink(clock.clone(), &["contract_deploy"]);
+    let llm = Script::new(
+        clock.clone(),
+        vec![
+            AssistantTurn::text("Deployed!"),
+            AssistantTurn::text("PASS: it is deployed."),
+            AssistantTurn::tools(vec![call("d", "contract_deploy", "{}")]),
+            AssistantTurn::text("deployed for real"),
+            AssistantTurn::text("PASS: deployed."),
+        ],
+    );
+    let tools = registry(
+        ToolOutcome::Ok("{}".into()),
+        &[("contract_deploy", Trust::Trusted)],
+    );
+    let wf = Workflow::new(
+        "deploy",
+        vec![Step {
+            id: "deploy".into(),
+            instruction: "deploy it".into(),
+            verifiers: vec![Arc::new(ToolSucceeded("contract_deploy".into()))],
+            max_attempts: 2,
+        }],
+    )
+    .unwrap();
+    let reviewer = LlmSelfReviewer::new(&llm, "m", 32);
+    let out = run_workflow_reviewed(
+        &cfg(4),
+        &TurnOptions::default(),
+        &llm,
+        &tools,
+        m.as_ref(),
+        &StopFlag::default(),
+        &mut vec![],
+        &wf,
+        Some(&reviewer),
+    );
+    assert!(matches!(out, WorkflowOutcome::Succeeded { .. }));
+    let recs = m.records();
+    assert_eq!(recs.len(), 2, "an opinion is not a turn");
+    assert_eq!(recs[0].verification(), Verification::Failed);
+    assert_eq!(recs[1].verification(), Verification::Passed);
+}
+
+#[test]
 fn taint_and_explicit_approval_calls_are_counted() {
     let clock = FakeClock::at(T0);
     let m = sink(clock.clone(), &["web_fetch"]);

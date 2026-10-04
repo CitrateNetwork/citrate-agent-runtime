@@ -36,6 +36,23 @@ fn worker_child_entry() {
             if params.get("fail").and_then(Value::as_bool) == Some(true) {
                 return Err("the handler refused".into());
             }
+            // Start a long-running program in its own process group, the way the toolchain
+            // runner starts forge, and report its pid.
+            #[cfg(unix)]
+            if params.get("spawn_tool").and_then(Value::as_bool) == Some(true) {
+                use std::os::unix::process::CommandExt;
+                let child = std::process::Command::new("/bin/sleep")
+                    .arg("300")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+                let pid = child.id();
+                std::mem::forget(child);
+                return Ok(json!({"tool_pid": pid}));
+            }
             let env = params
                 .get("env_var")
                 .and_then(Value::as_str)
@@ -101,6 +118,7 @@ fn spec(mode: &str) -> WorkerSpec {
         ],
         env: vec![(MODE_ENV.into(), mode.into())],
         env_remove: vec![],
+        env_inherit: None,
     }
 }
 
@@ -318,6 +336,59 @@ fn removed_environment_variables_do_not_reach_the_worker() {
     let without = b.call(q, Duration::from_secs(5)).unwrap();
     assert!(with["env"].is_string(), "{with}");
     assert!(without["env"].is_null(), "{without}");
+}
+
+/// With an inherit list, a worker gets only the named variables (exact names, or a prefix
+/// ending in `*`) plus its explicit `env`; nothing else from the sidecar reaches it.
+#[test]
+fn a_worker_with_an_inherit_list_gets_only_those_variables() {
+    assert!(std::env::var("HOME").is_ok(), "the test process has a HOME");
+    assert!(std::env::var("PATH").is_ok(), "the test process has a PATH");
+    let mut s = spec("echo");
+    s.env_inherit = Some(vec!["PATH".into(), "CITRATE_WORKERS_*".into()]);
+    let w = Worker::start(s, fast_policy());
+    wait_for("running", Duration::from_secs(15), || running(&w));
+    let get = |k: &str| {
+        w.call(json!({"env_var": k}), Duration::from_secs(5))
+            .expect("call")["env"]
+            .clone()
+    };
+    assert!(get("PATH").is_string());
+    assert!(get("HOME").is_null(), "not on the list");
+    assert_eq!(get(MODE_ENV), json!("echo"), "explicit env still applies");
+}
+
+/// Programs a worker started in their own process group (forge, slither, medusa) are stopped
+/// when the worker dies, so a crash loop cannot stack long tool runs.
+#[cfg(unix)]
+#[test]
+fn programs_a_killed_worker_started_are_stopped_with_it() {
+    fn alive(pid: u32) -> bool {
+        // SAFETY: kill(2) with signal 0 only checks that the pid exists; no memory involved.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    let w = Worker::start(spec("echo"), fast_policy());
+    wait_for("running", Duration::from_secs(15), || running(&w));
+    let worker = w.status().pid.expect("pid");
+    let out = w
+        .call(json!({"spawn_tool": true}), Duration::from_secs(5))
+        .expect("call");
+    let tool = out["tool_pid"].as_u64().expect("tool pid") as u32;
+    assert!(alive(tool), "the tool is running");
+    kill9(worker);
+    wait_for("the tool to stop", Duration::from_secs(10), || !alive(tool));
+
+    // A requested shutdown stops them too.
+    wait_for("restart", Duration::from_secs(15), || {
+        running(&w) && w.status().pid != Some(worker)
+    });
+    let out = w
+        .call(json!({"spawn_tool": true}), Duration::from_secs(5))
+        .expect("call");
+    let tool = out["tool_pid"].as_u64().expect("tool pid") as u32;
+    assert!(alive(tool));
+    w.shutdown();
+    wait_for("the tool to stop", Duration::from_secs(10), || !alive(tool));
 }
 
 #[test]

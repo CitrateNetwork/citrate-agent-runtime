@@ -38,6 +38,8 @@
 //! * Hard links cannot be detected from a path. Write grants must not let an
 //!   agent create hard links into a granted folder.
 
+pub mod net;
+
 use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 

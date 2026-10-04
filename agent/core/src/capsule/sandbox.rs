@@ -65,8 +65,9 @@ use crate::capsule::filesystem::{self, FilesystemAccess};
 use crate::capsule::manifest::{Manifest, NetworkPolicy};
 use crate::error::AgentError;
 use citrate_agent_grants::{Decision, DenialReason, FolderGrants, GrantKind, GrantScope, Op};
+use citrate_agent_guard::net::is_public_ip;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use wasmtime_wasi::sockets::SocketAddrUse;
@@ -300,7 +301,7 @@ impl SandboxPlan {
 /// the same grant check the file tools use, for every operation the mount
 /// allows. A symlink whose target is merely outside the grant is tolerated
 /// (WASI refuses to follow it out of the preopen); a deny-listed target is
-/// not.
+/// not. A regular file with another hard link refuses the mount (Unix).
 fn scan_mount(
     root: &Path,
     ops: &[Op],
@@ -389,80 +390,10 @@ fn network_plan(manifest: &Manifest, consent: &[SocketAddr]) -> Result<NetworkPl
     })
 }
 
-/// Whether `ip` is a public (globally routable unicast) address a capsule
-/// may be allowed to reach. Everything else is refused: unspecified,
-/// loopback, private (RFC 1918, ULA), shared (100.64/10), link-local
-/// (including the 169.254.169.254 metadata address), benchmarking,
-/// documentation, the IETF and reserved blocks, broadcast and multicast,
-/// and IPv6 forms that carry an IPv4 address (mapped, compatible, NAT64,
-/// 6to4) unless the carried address is itself public. Teredo is refused
-/// outright.
-pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4_public(v4),
-        IpAddr::V6(v6) => v6_public(v6),
-    }
-}
-
-fn v4_public(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    let blocked = a == 0 // "this network"
-        || a == 10 // RFC 1918
-        || a == 127 // loopback
-        || (a == 100 && (64..=127).contains(&b)) // shared address space
-        || (a == 169 && b == 254) // link-local, cloud metadata
-        || (a == 172 && (16..=31).contains(&b)) // RFC 1918
-        || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
-        || (a == 192 && b == 0 && c == 2) // TEST-NET-1
-        || (a == 192 && b == 88 && c == 99) // 6to4 relay anycast
-        || (a == 192 && b == 168) // RFC 1918
-        || (a == 198 && (18..=19).contains(&b)) // benchmarking
-        || (a == 198 && b == 51 && c == 100) // TEST-NET-2
-        || (a == 203 && b == 0 && c == 113) // TEST-NET-3
-        || a >= 224; // multicast, reserved, broadcast
-    !blocked
-}
-
-fn v6_public(ip: Ipv6Addr) -> bool {
-    let seg = ip.segments();
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return v4_public(v4);
-    }
-    // ::/96 (unspecified, loopback, IPv4-compatible): never public.
-    if seg[..6].iter().all(|s| *s == 0) {
-        return false;
-    }
-    // 64:ff9b::/96 NAT64: judge the embedded IPv4 address.
-    if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6].iter().all(|s| *s == 0) {
-        return v4_public(embedded_v4(seg[6], seg[7]));
-    }
-    // 2002::/16 6to4: judge the embedded IPv4 address.
-    if seg[0] == 0x2002 {
-        return v4_public(embedded_v4(seg[1], seg[2]));
-    }
-    // 2001::/32 Teredo: the real endpoint is obscured, refuse.
-    if seg[0] == 0x2001 && seg[1] == 0 {
-        return false;
-    }
-    // 2001:db8::/32 documentation.
-    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
-        return false;
-    }
-    // Only global unicast (2000::/3) is public; this excludes ULA
-    // (fc00::/7), link-local (fe80::/10), multicast (ff00::/8) and the
-    // reserved remainder.
-    (seg[0] & 0xe000) == 0x2000
-}
-
-fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
-    let [a, b] = hi.to_be_bytes();
-    let [c, d] = lo.to_be_bytes();
-    Ipv4Addr::new(a, b, c, d)
-}
-
 /// Parse `[capability].network_allow`: each entry an exact remote
 /// `ip:port` (`[v6]:port`), not port 0, and a public address
-/// ([`is_public_ip`]).
+/// ([`citrate_agent_guard::net::is_public_ip`], the one predicate shared with
+/// `read_url` and the managed browser).
 pub fn parse_network_allow(entries: &[String]) -> Result<Vec<SocketAddr>, AgentError> {
     entries
         .iter()
@@ -1040,9 +971,9 @@ tier = "bundled"
 
     #[test]
     fn socket_rule_admits_only_allowlisted_remotes_and_implicit_binds() {
-        let ok: SocketAddr = "203.0.113.7:443".parse().expect("addr");
-        let other: SocketAddr = "203.0.113.8:443".parse().expect("addr");
-        let other_port: SocketAddr = "203.0.113.7:80".parse().expect("addr");
+        let ok: SocketAddr = "1.1.1.1:443".parse().expect("addr");
+        let other: SocketAddr = "1.0.0.1:443".parse().expect("addr");
+        let other_port: SocketAddr = "1.1.1.1:80".parse().expect("addr");
         let implicit: SocketAddr = "0.0.0.0:0".parse().expect("addr");
         let explicit_bind: SocketAddr = "0.0.0.0:8080".parse().expect("addr");
         let allow = [ok];

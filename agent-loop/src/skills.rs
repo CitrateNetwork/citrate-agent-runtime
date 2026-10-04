@@ -2,9 +2,9 @@
 //!
 //! A skill is **instructions only** (planset 02_ARCHITECTURE, "Skill" row): an agentskills.io
 //! `SKILL.md` — YAML frontmatter with `name` + `description`, then a markdown body — plus optional
-//! bundled files (`references/`, `assets/`, `scripts/`). Hermes keeps every skill's name and
-//! description in context (one short line each, token-bounded) and loads a body only when the model
-//! asks for it with the `skill_load` tool.
+//! bundled files (`references/`, `assets/`, `scripts/`). For each turn Hermes ranks the skill
+//! descriptions against the request and puts at most [`SKILLS_PER_TURN`] of them in context (one
+//! short line each); a body loads only when the model asks for it with the `skill_load` tool.
 //!
 //! What this module guarantees:
 //! - **Strict, bounded parsing.** The frontmatter is a small, explicit YAML subset (plain/quoted
@@ -20,7 +20,10 @@
 //!   they exist; they cannot be run or loaded through this module. Anything side-effecting is a tool
 //!   or a capsule, never a skill.
 
-use crate::{HostKind, TokenCounter, ToolAnnotations, ToolCall, ToolHost, ToolOutcome, ToolSpec};
+use crate::{
+    HostKind, Message, Role, TokenCounter, ToolAnnotations, ToolCall, ToolHost, ToolOutcome,
+    ToolSpec, TurnContext,
+};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +54,8 @@ pub const MAX_FILES_LISTED: usize = 64;
 pub const MAX_RESOURCE_DEPTH: usize = 4;
 /// A skill description is cut to this many characters in the index (about 30 tokens).
 pub const INDEX_DESC_CHARS: usize = 120;
+/// US-3.2 AC1: the most skills surfaced in the system prompt for one turn.
+pub const SKILLS_PER_TURN: usize = 5;
 
 /// Keys from the agentskills.io specification.
 const SPEC_KEYS: &[&str] = &[
@@ -540,6 +545,9 @@ pub fn parse_skill_md(text: &str) -> Result<(SkillFrontmatter, String), SkillErr
 pub struct SkillSource {
     pub label: String,
     pub root: PathBuf,
+    /// HUP-S3.2 + S3.6: a reviewed third-party source. `root` is a staged tree
+    /// `<root>/<lock source>/<lock path>/` and only what the lock admits and pins is loaded.
+    pub lock: Option<Arc<SkillLock>>,
 }
 
 impl SkillSource {
@@ -547,6 +555,20 @@ impl SkillSource {
         SkillSource {
             label: label.into(),
             root: root.into(),
+            lock: None,
+        }
+    }
+
+    /// A reviewed third-party source checked file by file against `skills.lock`.
+    pub fn locked(
+        label: impl Into<String>,
+        root: impl Into<PathBuf>,
+        lock: Arc<SkillLock>,
+    ) -> Self {
+        SkillSource {
+            label: label.into(),
+            root: root.into(),
+            lock: Some(lock),
         }
     }
 }
@@ -566,6 +588,35 @@ pub struct Skill {
     pub refs: Vec<String>,
     /// Files under `scripts/`: listed and flagged, never executed or loaded.
     pub scripts: Vec<String>,
+    /// HUP-S3.2: where a reviewed third-party skill came from (`None` for the member's own).
+    pub provenance: Option<Provenance>,
+    /// The sha256 `skills.lock` pins for each listed ref of a locked skill; `read_ref` checks the
+    /// bytes against it on every read.
+    pub ref_sha256: BTreeMap<String, String>,
+    /// Scripts and executables the intake review stripped: named so the model knows, never
+    /// shipped, loaded or run.
+    pub stripped: Vec<String>,
+}
+
+/// Where a reviewed third-party skill came from, as `skills.lock` records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    /// The lock's source label (e.g. `trailofbits`).
+    pub source: String,
+    pub upstream: String,
+    /// The upstream commit the skill was reviewed at.
+    pub commit: String,
+    pub license: String,
+    /// The skill's directory inside the source.
+    pub path: String,
+    pub verdict: String,
+    /// sha256 of the `SKILL.md` that shipped (and was verified at load).
+    pub skill_md_sha256: String,
+    /// sha256 of the upstream `SKILL.md` (differs from the shipped one only after an intake
+    /// rewrite).
+    pub upstream_skill_md_sha256: String,
+    /// The intake rewrite applied, if any (e.g. `flatten-frontmatter`).
+    pub intake_rewrite: Option<String>,
 }
 
 /// A path that was not loaded, and why.
@@ -749,6 +800,9 @@ fn load_one(dir: &Path, source: &str) -> Result<Skill, String> {
         frontmatter: fm,
         refs,
         scripts,
+        provenance: None,
+        ref_sha256: BTreeMap::new(),
+        stripped: Vec::new(),
     })
 }
 
@@ -813,7 +867,33 @@ impl SkillLibrary {
             }
             let mut found: BTreeMap<String, Vec<Skill>> = BTreeMap::new();
             let mut accepted = 0usize;
-            for dir in discover(&src.root, &mut lib.report) {
+            if let Some(lock) = &src.lock {
+                for result in load_locked(&src.root, &src.label, lock) {
+                    match result {
+                        Ok(skill) => {
+                            if accepted >= MAX_SKILLS_PER_SOURCE {
+                                lib.report.rejected.push(Rejected {
+                                    path: skill.dir.join("SKILL.md"),
+                                    reason: format!(
+                                        "source '{}' has more than {MAX_SKILLS_PER_SOURCE} skills",
+                                        src.label
+                                    ),
+                                });
+                                continue;
+                            }
+                            accepted += 1;
+                            found.entry(skill.name.clone()).or_default().push(skill);
+                        }
+                        Err(rejected) => lib.report.rejected.push(rejected),
+                    }
+                }
+            }
+            let unlocked = if src.lock.is_some() {
+                Vec::new()
+            } else {
+                discover(&src.root, &mut lib.report)
+            };
+            for dir in unlocked {
                 let path = dir.join("SKILL.md");
                 if accepted >= MAX_SKILLS_PER_SOURCE {
                     lib.report.rejected.push(Rejected {
@@ -952,25 +1032,79 @@ impl SkillLibrary {
         }
     }
 
-    /// The system-prompt section that introduces the skills (or `None` with no skills).
-    pub fn prompt_section(
+    /// US-3.2 AC1: the at most `k` skills that best match `query`, ranked by BM25 over each
+    /// skill's name and description. A query that matches no skill surfaces none.
+    pub fn select(&self, query: &str, k: usize) -> Vec<&Skill> {
+        self.select_with(&Bm25Ranker, query, k)
+    }
+
+    /// [`SkillLibrary::select`] with another ranker (for example an embedding ranker). The result
+    /// is capped at `k` whatever the ranker returns.
+    pub fn select_with(&self, ranker: &dyn SkillRanker, query: &str, k: usize) -> Vec<&Skill> {
+        let skills: Vec<&Skill> = self.skills.values().collect();
+        let docs: Vec<(&str, &str)> = skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str()))
+            .collect();
+        let mut out: Vec<&Skill> = Vec::new();
+        for i in ranker.rank(query, &docs, k) {
+            if out.len() >= k {
+                break;
+            }
+            if let Some(s) = skills.get(i) {
+                if !out.iter().any(|o| o.name == s.name) {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// The system-prompt section for one turn: the skills that match `query` (at most `k`, best
+    /// first) and how many are installed in all. `None` when no skill is installed.
+    pub fn turn_section(&self, query: &str, k: usize) -> Option<String> {
+        self.turn_section_with(&Bm25Ranker, query, k)
+    }
+
+    /// [`SkillLibrary::turn_section`] with another ranker.
+    pub fn turn_section_with(
         &self,
-        budget_tokens: usize,
-        counter: &dyn TokenCounter,
+        ranker: &dyn SkillRanker,
+        query: &str,
+        k: usize,
     ) -> Option<String> {
         if self.is_empty() {
             return None;
         }
-        let idx = self.index(budget_tokens, counter);
-        if idx.text.is_empty() {
-            return None;
+        let total = self.len();
+        let installed = if total == 1 {
+            "1 skill is installed".to_string()
+        } else {
+            format!("{total} skills are installed")
+        };
+        let picked = self.select_with(ranker, query, k);
+        if picked.is_empty() {
+            return Some(format!(
+                "## Skills\n{installed}; none matches this request. If the member asks for one by \
+                 name, call `{SKILL_LOAD_TOOL}` with that exact name."
+            ));
         }
+        let lines: Vec<String> = picked
+            .iter()
+            .map(|s| {
+                format!(
+                    "- {}: {}",
+                    s.name,
+                    one_line(&s.description, INDEX_DESC_CHARS)
+                )
+            })
+            .collect();
         Some(format!(
-            "## Skills\nSkills are instructions, not actions. Before a task one of these covers, \
-             call `{SKILL_LOAD_TOOL}` with its exact name to read it; it may list files you can \
-             read the same way. Follow it using your tools; every effect still goes through \
-             their approval gates.\n{}",
-            idx.text
+            "## Skills\nSkills are instructions, not actions. {installed}; these match this \
+             request best. Before a task one of these covers, call `{SKILL_LOAD_TOOL}` with its \
+             exact name to read it; it may list files you can read the same way. Follow it using \
+             your tools; every effect still goes through their approval gates.\n{}",
+            lines.join("\n")
         ))
     }
 
@@ -979,7 +1113,22 @@ impl SkillLibrary {
         let s = self
             .get(name)
             .ok_or_else(|| format!("no skill named '{name}'"))?;
-        let mut out = format!("# Skill: {} (source: {})\n\n{}", s.name, s.source, s.body);
+        let mut out = format!("# Skill: {} (source: {})\n", s.name, s.source);
+        if let Some(p) = &s.provenance {
+            let short: String = p.commit.chars().take(12).collect();
+            out.push_str(&format!(
+                "Reviewed third-party skill from {} ({} at {short}), licence {}, SKILL.md sha256 {}.",
+                p.source, p.upstream, p.license, p.skill_md_sha256
+            ));
+            if let Some(r) = &p.intake_rewrite {
+                out.push_str(&format!(
+                    " Its frontmatter was rewritten at intake ({r}); the instructions are unchanged."
+                ));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&s.body);
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -998,6 +1147,14 @@ impl SkillLibrary {
             );
             for r in &s.scripts {
                 out.push_str(&format!("- {r} [script, not run]\n"));
+            }
+        }
+        if !s.stripped.is_empty() {
+            out.push_str(
+                "\nStripped at intake review (not shipped; steps that need them cannot run):\n",
+            );
+            for r in &s.stripped {
+                out.push_str(&format!("- {r}\n"));
             }
         }
         Ok(out)
@@ -1041,6 +1198,13 @@ impl SkillLibrary {
         let bytes = std::fs::read(&canon).map_err(|_| format!("'{rel}' is unavailable"))?;
         if bytes.len() > MAX_REF_BYTES {
             return Err(format!("'{rel}' is too large (over {MAX_REF_BYTES} bytes)"));
+        }
+        if let Some(want) = s.ref_sha256.get(rel) {
+            if &sha256_hex(&bytes) != want {
+                return Err(format!(
+                    "'{rel}' no longer matches the sha256 skills.lock pins; it was not read"
+                ));
+            }
         }
         String::from_utf8(bytes).map_err(|_| format!("'{rel}' is not a text file"))
     }
@@ -1123,5 +1287,395 @@ impl ToolHost for SkillHost {
             Ok(s) => ToolOutcome::Ok(s),
             Err(e) => ToolOutcome::Error(e),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// skills.lock: reviewed third-party skills (HUP-S3.2 + S3.6)
+// ---------------------------------------------------------------------------------------------
+
+/// The lock verdicts that ship a skill's text. Anything else but `exclude` is refused.
+/// Largest pinned file hashed at load. A ref over [`MAX_REF_BYTES`] is still checked and listed
+/// (as in an unlocked source); `skill_load` refuses to read it.
+const MAX_LOCKED_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+const SHIPPING_VERDICTS: &[&str] = &[
+    "include-as-is",
+    "include-with-scripts-stripped",
+    "convert-script-to-capsule",
+];
+
+/// One `[[source]]` of `skills.lock`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockSource {
+    pub label: String,
+    pub upstream: String,
+    pub commit: String,
+    pub license: String,
+}
+
+/// One pinned bundled file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockRef {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// One `[[skill]]` of `skills.lock`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockedSkill {
+    pub name: String,
+    pub source: String,
+    pub commit: String,
+    pub path: String,
+    pub verdict: String,
+    /// sha256 of the upstream `SKILL.md`.
+    pub skill_md_sha256: String,
+    /// sha256 of the `SKILL.md` that ships, when the intake rewrote it.
+    #[serde(default)]
+    pub shipped_skill_md_sha256: Option<String>,
+    #[serde(default)]
+    pub intake_rewrite: Option<String>,
+    #[serde(default)]
+    pub refs: Vec<LockRef>,
+    #[serde(default)]
+    pub stripped: Vec<String>,
+}
+
+impl LockedSkill {
+    fn ships(&self) -> bool {
+        SHIPPING_VERDICTS.contains(&self.verdict.as_str())
+    }
+    /// The hash the shipped `SKILL.md` must have.
+    pub fn shipped_sha256(&self) -> &str {
+        self.shipped_skill_md_sha256
+            .as_deref()
+            .unwrap_or(&self.skill_md_sha256)
+    }
+}
+
+/// The parsed `skills.lock` (citrate-core, generated by `scripts/skills-lock.mjs`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SkillLock {
+    pub version: u32,
+    #[serde(rename = "source", default)]
+    pub sources: Vec<LockSource>,
+    #[serde(rename = "skill", default)]
+    pub skills: Vec<LockedSkill>,
+}
+
+impl SkillLock {
+    /// Parse and check a lock. Fails closed on an unknown version or verdict.
+    pub fn from_toml(text: &str) -> Result<SkillLock, String> {
+        let lock: SkillLock =
+            toml::from_str(text).map_err(|e| format!("skills.lock does not parse: {e}"))?;
+        if lock.version != 1 {
+            return Err(format!("unsupported skills.lock version {}", lock.version));
+        }
+        for sk in &lock.skills {
+            if sk.verdict != "exclude" && !sk.ships() {
+                return Err(format!(
+                    "skills.lock: skill '{}' has unknown verdict '{}' (refusing to guess)",
+                    sk.name, sk.verdict
+                ));
+            }
+        }
+        Ok(lock)
+    }
+
+    /// The skills the lock admits (every verdict but `exclude`).
+    pub fn admitted(&self) -> impl Iterator<Item = &LockedSkill> {
+        self.skills.iter().filter(|s| s.ships())
+    }
+
+    pub fn source(&self, label: &str) -> Option<&LockSource> {
+        self.sources.iter().find(|s| s.label == label)
+    }
+}
+
+/// Lowercase hex sha256.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A lock path must be relative, `/`-separated and stay inside its base.
+fn safe_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel.contains('\\')
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Read a file that must have the pinned hash, capped at `max` bytes.
+fn read_pinned(path: &Path, want: &str, max: usize) -> Result<Vec<u8>, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.kind().to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > max as u64 {
+        return Err(format!("larger than {max} bytes"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.kind().to_string())?;
+    if sha256_hex(&bytes) != want {
+        return Err("does not match skills.lock".into());
+    }
+    Ok(bytes)
+}
+
+/// Load every skill a lock admits from a staged tree. Each admitted skill yields a skill or the
+/// reason it was refused; nothing the lock does not pin is read or listed.
+fn load_locked(root: &Path, label: &str, lock: &SkillLock) -> Vec<Result<Skill, Rejected>> {
+    let canon_root = match std::fs::canonicalize(root) {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![Err(Rejected {
+                path: root.to_path_buf(),
+                reason: format!("source '{label}': {}", e.kind()),
+            })]
+        }
+    };
+    lock.admitted()
+        .map(|entry| load_locked_one(&canon_root, label, lock, entry))
+        .collect()
+}
+
+fn load_locked_one(
+    root: &Path,
+    label: &str,
+    lock: &SkillLock,
+    entry: &LockedSkill,
+) -> Result<Skill, Rejected> {
+    let reject = |path: PathBuf, reason: String| Rejected {
+        path,
+        reason: format!("source '{label}', skill '{}': {reason}", entry.name),
+    };
+    let nominal = root.join(&entry.source).join(&entry.path);
+    if !safe_rel(&entry.source) || !safe_rel(&entry.path) {
+        return Err(reject(
+            nominal,
+            "lock path is not a plain relative path".into(),
+        ));
+    }
+    let dir = std::fs::canonicalize(&nominal)
+        .map_err(|e| reject(nominal.clone(), format!("not staged ({})", e.kind())))?;
+    if !dir.starts_with(root) {
+        return Err(reject(nominal, "resolves outside the staged tree".into()));
+    }
+    let md_path = dir.join("SKILL.md");
+    let bytes = read_pinned(&md_path, entry.shipped_sha256(), MAX_SKILL_FILE_BYTES)
+        .map_err(|e| reject(md_path.clone(), format!("SKILL.md {e}")))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| reject(md_path.clone(), SkillError::NotUtf8.to_string()))?;
+    let (fm, body) = parse_skill_md(&text).map_err(|e| reject(md_path.clone(), e.to_string()))?;
+    if fm.name != entry.name {
+        return Err(reject(
+            md_path,
+            format!("SKILL.md names '{}', the lock '{}'", fm.name, entry.name),
+        ));
+    }
+    if dir.file_name().and_then(|n| n.to_str()) != Some(fm.name.as_str()) {
+        return Err(reject(md_path, "name does not match its directory".into()));
+    }
+    let mut refs = Vec::new();
+    let mut ref_sha256 = BTreeMap::new();
+    for r in &entry.refs {
+        if refs.len() >= MAX_FILES_LISTED {
+            break;
+        }
+        if !safe_rel(&r.path) || r.path.starts_with("scripts/") || r.path == "SKILL.md" {
+            return Err(reject(
+                dir.join(&r.path),
+                format!("ref '{}' is not allowed", r.path),
+            ));
+        }
+        let p = dir.join(&r.path);
+        match std::fs::canonicalize(&p) {
+            Ok(c) if c.starts_with(&dir) => {}
+            _ => {
+                return Err(reject(
+                    p,
+                    format!("ref '{}' is not staged inside the skill", r.path),
+                ))
+            }
+        }
+        read_pinned(&p, &r.sha256, MAX_LOCKED_FILE_BYTES)
+            .map_err(|e| reject(p.clone(), format!("ref '{}' {e}", r.path)))?;
+        refs.push(r.path.clone());
+        ref_sha256.insert(r.path.clone(), r.sha256.clone());
+    }
+    refs.sort();
+    let Some(src) = lock.source(&entry.source) else {
+        return Err(reject(
+            md_path,
+            format!("source '{}' is not declared in the lock", entry.source),
+        ));
+    };
+    let provenance = Provenance {
+        source: entry.source.clone(),
+        upstream: src.upstream.clone(),
+        commit: entry.commit.clone(),
+        license: src.license.clone(),
+        path: entry.path.clone(),
+        verdict: entry.verdict.clone(),
+        skill_md_sha256: entry.shipped_sha256().to_string(),
+        upstream_skill_md_sha256: entry.skill_md_sha256.clone(),
+        intake_rewrite: entry.intake_rewrite.clone(),
+    };
+    let mut stripped = entry.stripped.clone();
+    stripped.sort();
+    Ok(Skill {
+        name: fm.name.clone(),
+        description: fm.description.clone(),
+        source: label.to_string(),
+        dir,
+        body,
+        frontmatter: fm,
+        refs,
+        scripts: Vec::new(),
+        provenance: Some(provenance),
+        ref_sha256,
+        stripped,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-turn skill retrieval (US-3.2 AC1)
+// ---------------------------------------------------------------------------------------------
+
+/// Ranks skill descriptions against a request. `docs` are `(name, description)` pairs; the result
+/// is indices into `docs`, best first, at most `k`.
+pub trait SkillRanker: Send + Sync {
+    /// Which method ran, for the operator log and tests (for example `bm25-lexical`).
+    fn method(&self) -> &'static str;
+    fn rank(&self, query: &str, docs: &[(&str, &str)], k: usize) -> Vec<usize>;
+}
+
+/// Okapi BM25 over each skill's name (counted three times) and description. Deterministic: equal
+/// scores break by position, which is name order in a [`SkillLibrary`]. Only skills that share a
+/// term with the query are returned. It is also the fallback of
+/// [`crate::retrieval::HybridRetriever`] when no embedding endpoint answers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Bm25Ranker;
+
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+const NAME_WEIGHT: usize = 3;
+
+impl SkillRanker for Bm25Ranker {
+    fn method(&self) -> &'static str {
+        "bm25-lexical"
+    }
+
+    fn rank(&self, query: &str, docs: &[(&str, &str)], k: usize) -> Vec<usize> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(usize, f64)> = bm25_scores(query, docs)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, sc)| *sc > 0.0)
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+}
+
+/// The BM25 score of every doc for `query` (same order as `docs`; 0 = no shared term). The name
+/// counts three times. [`Bm25Ranker`] ranks by it; the hybrid ranker blends it with embeddings.
+pub fn bm25_scores(query: &str, docs: &[(&str, &str)]) -> Vec<f64> {
+    let mut q = crate::words(query);
+    q.sort();
+    q.dedup();
+    if q.is_empty() || docs.is_empty() {
+        return vec![0.0; docs.len()];
+    }
+    let terms: Vec<Vec<String>> = docs
+        .iter()
+        .map(|(name, desc)| {
+            let mut t = Vec::new();
+            for _ in 0..NAME_WEIGHT {
+                t.extend(crate::words(name));
+            }
+            t.extend(crate::words(desc));
+            t
+        })
+        .collect();
+    let n = terms.len() as f64;
+    let avg_len = terms.iter().map(Vec::len).sum::<usize>() as f64 / n;
+    terms
+        .iter()
+        .map(|doc| {
+            let len = doc.len() as f64;
+            let mut score = 0.0;
+            for w in &q {
+                let tf = doc.iter().filter(|t| *t == w).count() as f64;
+                if tf == 0.0 {
+                    continue;
+                }
+                let df = terms.iter().filter(|d| d.contains(w)).count() as f64;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let norm = if avg_len > 0.0 {
+                    1.0 - BM25_B + BM25_B * len / avg_len
+                } else {
+                    1.0
+                };
+                score += idf * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm);
+            }
+            score
+        })
+        .collect()
+}
+
+/// The per-turn skill index: a [`TurnContext`] that puts the at most `k` skills matching the
+/// turn's request in the system prompt. A follow-up with no signal of its own ("ok, go ahead") is
+/// ranked with the member's previous message instead.
+#[derive(Clone)]
+pub struct SkillTurnIndex {
+    lib: Arc<SkillLibrary>,
+    k: usize,
+    ranker: Arc<dyn SkillRanker>,
+}
+
+impl SkillTurnIndex {
+    /// Ranked with [`Bm25Ranker`].
+    pub fn new(lib: Arc<SkillLibrary>, k: usize) -> Self {
+        SkillTurnIndex {
+            lib,
+            k,
+            ranker: Arc::new(Bm25Ranker),
+        }
+    }
+
+    /// HUP-S1.2: rank with another ranker (the sidecar passes the same hybrid retriever that picks
+    /// its tools, which falls back to BM25 when no embedding endpoint answers). The `k` cap holds
+    /// whatever the ranker returns.
+    pub fn with_ranker(mut self, ranker: Arc<dyn SkillRanker>) -> Self {
+        self.ranker = ranker;
+        self
+    }
+
+    /// The method that ranks the skills (see [`Bm25Ranker`]).
+    pub fn method(&self) -> &'static str {
+        self.ranker.method()
+    }
+}
+
+impl TurnContext for SkillTurnIndex {
+    fn section(&self, user: &str, history: &[Message]) -> Option<String> {
+        let r = self.ranker.as_ref();
+        if self.lib.select_with(r, user, self.k).is_empty() {
+            if let Some(prev) = history.iter().rev().find(|m| m.role == Role::User) {
+                if !self.lib.select_with(r, &prev.content, self.k).is_empty() {
+                    return self.lib.turn_section_with(r, &prev.content, self.k);
+                }
+            }
+        }
+        self.lib.turn_section_with(r, user, self.k)
     }
 }
