@@ -1575,7 +1575,8 @@ impl SessionManager {
             // tools included (or the session's own `maxToolsPerRequest`, if it asked for more).
             max_tools_total: Some(max_tools.max(TOOL_SCHEMA_CEILING)),
         };
-        let metering = Arc::new(MeteringSink::new(
+        // D-27: the store attaches its machine sampler and energy model to the session's sink.
+        let metering = Arc::new(self.metering.sink(
             id.clone(),
             cfg.model.clone(),
             specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),

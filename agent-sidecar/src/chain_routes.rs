@@ -8,7 +8,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use citrate_agent_metering::{build_benchmark_payload, BenchmarkOptIn, MeteringError};
+use citrate_agent_metering::{
+    build_benchmark_payload_with, BenchmarkOptIn, ChainPurpose, ChainReceipt, MeteringError,
+    CHAIN_RECEIPT_SCHEMA,
+};
 use serde::Deserialize;
 
 use crate::anchor::{AnchorRouteError, AnchorStatus};
@@ -29,7 +32,9 @@ fn now_ms() -> u64 {
 
 fn metering_err(e: MeteringError) -> (StatusCode, Json<serde_json::Value>) {
     let code = match e {
-        MeteringError::InvalidDay(_) | MeteringError::InvalidAddress(_) => StatusCode::BAD_REQUEST,
+        MeteringError::InvalidDay(_)
+        | MeteringError::InvalidAddress(_)
+        | MeteringError::InvalidReceipt(_) => StatusCode::BAD_REQUEST,
         MeteringError::NotOptedIn => StatusCode::BAD_REQUEST,
         MeteringError::EmptyReport => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -121,12 +126,53 @@ pub(crate) async fn metering_benchmark(
     let store = st.sessions.metering().clone();
     let payload = blocking(move || {
         let daily = store.daily(&day).map_err(metering_err)?;
-        build_benchmark_payload(&daily.report, Some(&opt_in)).map_err(metering_err)
+        build_benchmark_payload_with(&daily.report, Some(&daily.chain), Some(&opt_in))
+            .map_err(metering_err)
     })
     .await?;
     serde_json::to_value(payload)
         .map(Json)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+}
+
+/// One mined Hermes transaction, as citrate-core reports it after its ceremony (or the anchor
+/// signer) got the receipt. Public facts only.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ChainReceiptReq {
+    tx_hash: String,
+    purpose: ChainPurpose,
+    status: u8,
+    gas_used: u64,
+    effective_gas_price_wei: String,
+    value_wei: String,
+}
+
+/// `POST /metering/chain-receipt` (HUP-S7.5, D-27): keep one mined Hermes transaction so the
+/// day's report carries its gas and the SALT it spent. The sidecar stamps the time it was told.
+pub(crate) async fn metering_chain_receipt(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Reply {
+    if !authorized(&headers, &st.bearer) {
+        return Err(err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let req: ChainReceiptReq = serde_json::from_slice(&body)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad chain receipt"))?;
+    let rec = ChainReceipt {
+        schema: CHAIN_RECEIPT_SCHEMA,
+        tx_hash: req.tx_hash,
+        purpose: req.purpose,
+        mined_unix_ms: now_ms(),
+        status: req.status,
+        gas_used: req.gas_used,
+        effective_gas_price_wei: req.effective_gas_price_wei,
+        value_wei: req.value_wei,
+    };
+    let store = st.sessions.metering().clone();
+    blocking(move || store.append_chain_receipt(rec).map_err(metering_err)).await?;
+    Ok(Json(serde_json::json!({ "recorded": true })))
 }
 
 /// `GET /anchor/status`.
