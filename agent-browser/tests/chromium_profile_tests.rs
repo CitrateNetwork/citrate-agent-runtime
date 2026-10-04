@@ -10,10 +10,7 @@ use std::sync::{Arc, Barrier};
 use citrate_agent_browser::chromium::new_profile_dir;
 
 fn scratch(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "citrate-profile-test-{tag}-{}",
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("citrate-profile-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("scratch folder");
     p
@@ -47,7 +44,11 @@ fn launches_at_the_same_moment_get_different_fresh_folders() {
                 0,
                 "a fresh, empty folder"
             );
-            assert!(all.insert(p.clone()), "{} was handed out twice", p.display());
+            assert!(
+                all.insert(p.clone()),
+                "{} was handed out twice",
+                p.display()
+            );
         }
     }
     assert_eq!(all.len(), threads * per);
