@@ -607,6 +607,7 @@ pub fn run_turn_with(
     history: &mut Vec<Message>,
     user: &str,
 ) -> RunOutcome {
+    let system_prompt = turn_system_prompt(cfg, opts, user, history);
     history.push(Message::user(user));
     for step in 1..=cfg.max_steps {
         if stop.is_stopped() {
@@ -614,7 +615,7 @@ pub fn run_turn_with(
         }
         sink.emit(Event::StepStart { step });
         let mut messages = Vec::with_capacity(history.len() + 1);
-        messages.push(Message::system(cfg.system_prompt.clone()));
+        messages.push(Message::system(system_prompt.clone()));
         messages.extend(history.iter().cloned());
         let offered = offered_tools(
             tools.specs(),
@@ -800,6 +801,35 @@ pub struct TurnOptions {
     /// `max_tools_per_request` (e.g. `skill_load`, which only works if the model can always see it).
     /// Names that are not in the registry are ignored.
     pub pinned_tools: Vec<String>,
+    /// HUP-S3.2: sections appended to the system prompt for each turn, built from that turn's
+    /// request (e.g. the five skills that match it). Computed once per turn, never stored in
+    /// the history.
+    pub turn_context: Vec<Arc<dyn TurnContext>>,
+}
+
+/// HUP-S3.2: per-turn context for the system prompt. `section` sees the turn's user message and
+/// the history before it, and returns the text to append (or `None` for nothing).
+pub trait TurnContext: Send + Sync {
+    fn section(&self, user: &str, history: &[Message]) -> Option<String>;
+}
+
+/// The system prompt for one turn: the configured prompt plus every turn-context section.
+fn turn_system_prompt(
+    cfg: &LoopConfig,
+    opts: &TurnOptions,
+    user: &str,
+    history: &[Message],
+) -> String {
+    let mut out = cfg.system_prompt.clone();
+    for ctx in &opts.turn_context {
+        if let Some(section) = ctx.section(user, history) {
+            if !section.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&section);
+            }
+        }
+    }
+    out
 }
 
 /// Chooses which tool schemas to offer for a query. Tool schemas are the largest fixed cost in a
@@ -820,7 +850,7 @@ const STOPWORDS: &[&str] = &[
     "you", "please", "with", "from", "at", "by", "be",
 ];
 
-fn words(s: &str) -> Vec<String> {
+pub(crate) fn words(s: &str) -> Vec<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| w.len() >= 2 && !STOPWORDS.contains(w))
