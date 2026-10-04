@@ -178,6 +178,10 @@ declaring URL elicitation on every request, skipping the offered-spec check, ign
 `list_changed`, not sending `tasks/cancel` on stop, an MCP host that never honors
 approvals, and not sending `Mcp-Param-*` headers.
 
+`tests/node_demo.rs` (ignored; manual) records Hermes's host against citrate-core's real node
+MCP server through the stdio shim, using the allowlist core writes for its built-in `node` entry
+(run citrate-core's `hermes_node_entry_demo` first; see its doc comment).
+
 `cargo test -p citrate-agent-mcp-host`: 17 unit tests (config validation, env
 filtering, naming, annotation mapping, rendering, the bounded line reader), 22 tests
 against a real stdio MCP server (`fixtures/stdio_server.rs`, built as the
