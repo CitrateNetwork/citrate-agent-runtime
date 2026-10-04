@@ -391,6 +391,9 @@ pub struct Session {
     /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
     /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
     toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S6.3 → S6.4: the raw reports of this session's toolchain runs, for core's deploy gate
+    /// (present with the toolchain).
+    toolchain_reports: Option<Arc<crate::toolchain_reports::ToolchainReports>>,
     /// HUP-S7.5: derives one metering record per turn from the event stream.
     metering: Arc<MeteringSink>,
     /// Where this session's finished metering records go.
@@ -412,6 +415,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
+    /// given. `None` when this session has no toolchain.
+    pub fn toolchain_reports(
+        &self,
+        project: Option<&str>,
+    ) -> Option<Vec<crate::toolchain_reports::StoredReport>> {
+        self.toolchain_reports.as_ref().map(|r| r.list(project))
+    }
+
     /// US-2.2 AC2: the commands waiting for the member (`None` when the session has no
     /// `shell_run`).
     pub fn shell_pending(&self) -> Option<Vec<ShellPending>> {
@@ -1238,6 +1250,17 @@ impl SessionManager {
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
             (None, _) => None,
         };
+        // HUP-S6.3 → S6.4: keep each run's raw report for core's deploy gate; the model sees the
+        // result without it.
+        let toolchain_reports = toolchain
+            .as_ref()
+            .map(|_| Arc::new(crate::toolchain_reports::ToolchainReports::default()));
+        let toolchain: Option<Arc<dyn ToolHost>> = match (toolchain, &toolchain_reports) {
+            (Some(t), Some(r)) => Some(Arc::new(
+                crate::toolchain_reports::CapturingToolchain::new(t, r.clone()),
+            )),
+            (t, _) => t,
+        };
         // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
         // grant store), not a grants file.
         let files = match (&grants, &self.checkpoints) {
@@ -1326,6 +1349,7 @@ impl SessionManager {
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills,
             toolchain,
+            toolchain_reports,
             grants,
             capsule_sandbox,
             metering,

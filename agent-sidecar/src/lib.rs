@@ -39,6 +39,7 @@ pub mod shell_run;
 pub mod signin_routes;
 pub mod toolchain;
 mod toolchain_config;
+pub mod toolchain_reports;
 pub mod trajectory;
 pub mod web_signing_records;
 pub mod workers;
@@ -288,6 +289,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/stop", post(stop_session))
         .route("/sessions/:id/grants", post(replace_grants))
         .route("/sessions/:id/shell/pending", get(shell_pending))
+        .route("/sessions/:id/toolchain/reports", get(toolchain_reports))
         .route("/sessions/:id/shell/decide", post(shell_decide))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
@@ -974,6 +976,34 @@ async fn shell_pending(
         .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
     let pending = session.shell_pending().unwrap_or_default();
     Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
+#[derive(Deserialize)]
+struct ToolchainReportsQuery {
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// HUP-S6.3 → S6.4: `GET /sessions/:id/toolchain/reports[?project=<abs path>]` — the latest raw
+/// report per (project, tool) of this session's toolchain runs, for core's deploy gate. 404 when
+/// the session is unknown or was opened without the toolchain.
+async fn toolchain_reports(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ToolchainReportsQuery>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let reports = session
+        .toolchain_reports(q.project.as_deref())
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "this session has no toolchain"))?;
+    Ok(Json(serde_json::json!({ "reports": reports })))
 }
 
 #[derive(Deserialize)]
@@ -1851,6 +1881,8 @@ mod search_session_tests;
 mod shell_run_tests;
 #[cfg(test)]
 mod signin_route_tests;
+#[cfg(test)]
+mod toolchain_reports_tests;
 #[cfg(test)]
 mod toolchain_tests;
 

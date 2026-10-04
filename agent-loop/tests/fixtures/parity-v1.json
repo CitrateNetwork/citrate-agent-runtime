@@ -45,6 +45,7 @@
     { "name": "models_list", "host": "core", "read_only": true },
     { "name": "contract_deploy", "host": "core", "read_only": false },
     { "name": "get_verified_source", "host": "core", "read_only": true },
+    { "name": "contract_view", "host": "core", "read_only": true },
     { "name": "fl_round_plan", "host": "core", "read_only": true },
     { "name": "fl_round_start", "host": "core", "read_only": false }
   ],

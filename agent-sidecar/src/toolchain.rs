@@ -47,6 +47,15 @@
 //! bounds it. aderyn and medusa are
 //! often not installed: the tools then say so and their verifiers fail, never pass. This module
 //! never holds a key and never signs (Rule 3).
+//!
+//! **Deploy gate hand-over (retro A27).** The verdict in each envelope drives workflow steps only.
+//! A completed run also carries its raw report ([`GateReport`]: stdout, the project's source
+//! digest before and after, forge's built bytecode digests, medusa's call budget and lcov). The
+//! session takes it out of the result before the model sees it
+//! ([`crate::toolchain_reports::CapturingToolchain`]); core reads it back and its deploy gate,
+//! the one source of truth for a deploy verdict, parses the raw report itself. Without an
+//! explicit `test_limit`, `medusa_fuzz` uses the tier budget the template renderer recorded in
+//! the project's `citrate-template.lock.json` (HUP-S6.9).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,8 +65,8 @@ use crate::grants::SessionGrants;
 use citrate_agent_guard::{check_path, GuardContext};
 use citrate_agent_loop::verifiers_tooling::{
     compiler_diagnostics, verify_forge_test_output, verify_medusa_output, verify_sarif_output,
-    RunStatus, SarifProfile, Severity, ToolchainEnvelope, ADERYN_SCAN_TOOL, FORGE_TEST_TOOL,
-    MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
+    GateReport, RunStatus, SarifProfile, Severity, ToolchainEnvelope, ADERYN_SCAN_TOOL,
+    FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
 };
 use citrate_agent_loop::{
     Effect, HostKind, ToolAnnotations, ToolCall, ToolHost, ToolOutcome, ToolSpec, Trust,
@@ -373,7 +382,7 @@ impl ToolchainHost {
                     "project": project,
                     "test_limit": {
                         "type": "integer", "minimum": 1, "maximum": MAX_MEDUSA_TEST_LIMIT,
-                        "description": format!("Call budget (default {DEFAULT_MEDUSA_TEST_LIMIT}).")
+                        "description": format!("Call budget (default: the tier budget recorded in the project's {}, else {DEFAULT_MEDUSA_TEST_LIMIT}).", crate::toolchain_reports::TEMPLATE_LOCK_FILE)
                     },
                     "timeout_secs": timeout(DEFAULT_MEDUSA_TIMEOUT_SECS),
                 }),
@@ -417,7 +426,7 @@ impl ToolchainHost {
         if let Err(e) = crate::toolchain_config::check_project_config(&project) {
             return refuse(e);
         }
-        let plan = match plan_call(tool, &args) {
+        let plan = match plan_call(tool, &args, &project) {
             Ok(p) => p,
             Err(e) => return refuse(e),
         };
@@ -427,8 +436,19 @@ impl ToolchainHost {
         if let Some(solc) = &self.cfg.solc {
             req = req.env("FOUNDRY_SOLC", &solc.to_string_lossy());
         }
+        // HUP-S6.3 → S6.4: bind the run to the project's sources, taken before and after.
+        let started = std::time::SystemTime::now();
+        let sources_before = crate::toolchain_reports::sources_sha256(&project);
         match self.runner.run(&req) {
-            Ok(report) => judge_run(tool, &plan, &report),
+            Ok(report) => {
+                let sources_after = crate::toolchain_reports::sources_sha256(&project);
+                let ctx = RunContext {
+                    project: &project,
+                    started,
+                    sources: sources_before.filter(|b| Some(b) == sources_after.as_ref()),
+                };
+                judge_run(tool, &plan, &report, &ctx)
+            }
             Err(e) => {
                 let (status, summary) = match &e {
                     ShellError::ProgramNotFound { program, search_path } => (
@@ -510,9 +530,19 @@ struct CallPlan {
     argv: Vec<String>,
     wall_secs: u64,
     threshold: Severity,
+    /// medusa: the call budget passed as `--test-limit`.
+    test_limit: Option<u64>,
 }
 
-fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
+/// Where a finished run happened, for its gate report.
+struct RunContext<'a> {
+    project: &'a Path,
+    started: std::time::SystemTime,
+    /// The project's source digest when it was the same before and after the run.
+    sources: Option<String>,
+}
+
+fn plan_call(tool: &str, args: &Args, project: &Path) -> Result<CallPlan, String> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     match tool {
         FORGE_TEST_TOOL => {
@@ -528,6 +558,7 @@ fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
                 argv,
                 wall_secs: int_arg(args, "timeout_secs", DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS)?,
                 threshold: Severity::High,
+                test_limit: None,
             })
         }
         SLITHER_SCAN_TOOL => Ok(CallPlan {
@@ -543,6 +574,7 @@ fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
             ]),
             threshold: severity_arg(args)?,
             wall_secs: int_arg(args, "timeout_secs", DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS)?,
+            test_limit: None,
         }),
         ADERYN_SCAN_TOOL => Ok(CallPlan {
             program: "aderyn",
@@ -555,14 +587,15 @@ fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
             ]),
             threshold: severity_arg(args)?,
             wall_secs: int_arg(args, "timeout_secs", DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS)?,
+            test_limit: None,
         }),
         MEDUSA_FUZZ_TOOL => {
-            let limit = int_arg(
-                args,
-                "test_limit",
-                DEFAULT_MEDUSA_TEST_LIMIT,
-                MAX_MEDUSA_TEST_LIMIT,
-            )?;
+            // HUP-S6.9: without an explicit test_limit, the tier budget the template renderer
+            // recorded for this project; the deploy gate in core enforces the tier budget itself.
+            let default_limit = crate::toolchain_reports::lock_test_limit(project)
+                .filter(|l| (1..=MAX_MEDUSA_TEST_LIMIT).contains(l))
+                .unwrap_or(DEFAULT_MEDUSA_TEST_LIMIT);
+            let limit = int_arg(args, "test_limit", default_limit, MAX_MEDUSA_TEST_LIMIT)?;
             let secs = int_arg(
                 args,
                 "timeout_secs",
@@ -581,6 +614,7 @@ fn plan_call(tool: &str, args: &Args) -> Result<CallPlan, String> {
                 ],
                 wall_secs: secs + MEDUSA_GRACE_SECS,
                 threshold: Severity::High,
+                test_limit: Some(limit),
             })
         }
         other => Err(format!("'{other}' is not a toolchain tool")),
@@ -605,7 +639,7 @@ fn run_facts(r: &RunReport) -> serde_json::Value {
 }
 
 /// Turn a finished run into the tool result.
-fn judge_run(tool: &str, plan: &CallPlan, r: &RunReport) -> ToolOutcome {
+fn judge_run(tool: &str, plan: &CallPlan, r: &RunReport, ctx: &RunContext<'_>) -> ToolOutcome {
     let facts = run_facts(r);
     if r.timed_out {
         return ToolOutcome::Error(
@@ -643,7 +677,26 @@ fn judge_run(tool: &str, plan: &CallPlan, r: &RunReport) -> ToolOutcome {
         _ => verify_medusa_output(&r.stdout),
     };
     let unparsed = verdict.evidence.get("error").is_some();
-    let mut env = ToolchainEnvelope::completed(tool, verdict).with_run(facts);
+    let gate = GateReport {
+        project: ctx.project.to_string_lossy().into_owned(),
+        output: r.stdout.clone(),
+        duration_ms: r.duration_ms,
+        sources_sha256: ctx.sources.clone(),
+        test_limit: plan.test_limit,
+        coverage_lcov: if tool == MEDUSA_FUZZ_TOOL {
+            crate::toolchain_reports::medusa_lcov(ctx.project, ctx.started)
+        } else {
+            None
+        },
+        artifacts: if tool == FORGE_TEST_TOOL {
+            crate::toolchain_reports::forge_artifacts(ctx.project)
+        } else {
+            Default::default()
+        },
+    };
+    let mut env = ToolchainEnvelope::completed(tool, verdict)
+        .with_run(facts)
+        .with_gate(gate);
     if unparsed {
         env = env.with_diagnostics(compiler_diagnostics(
             &format!("{}\n{}", r.stderr, r.stdout),
