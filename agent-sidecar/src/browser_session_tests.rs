@@ -285,6 +285,62 @@ async fn status_says_not_installed_honestly_and_a_tool_call_reports_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_read_only_tools_and_the_picker_are_wired_into_sessions() {
+    // HUP-S5.1 (02 §5 console/network) and HUP-S5.3 (browser_pick over the session's decide()).
+    let (st, rec) = state(
+        vec![
+            tool_call("c1", "browser_console_messages", serde_json::json!({})),
+            tool_call(
+                "c2",
+                "browser_pick",
+                serde_json::json!({"goal": "open the docs"}),
+            ),
+        ],
+        Some(no_chromium()),
+    );
+    let id = open(&st).await;
+    call(
+        &st,
+        "POST",
+        &format!("/sessions/{id}/messages"),
+        serde_json::json!({"text": "look at the page"}),
+    )
+    .await;
+    let events = events_until_done(&st, &id).await;
+    let results: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["type"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 2, "{events:?}");
+    let console = results[0]["content"].as_str().unwrap_or_default();
+    assert!(
+        console.contains("no page open"),
+        "launches nothing: {console}"
+    );
+    let pick = results[1]["content"].as_str().unwrap_or_default();
+    assert!(
+        pick.contains("no Chromium is installed"),
+        "the session has a picker, so it went on to read the page: {pick}"
+    );
+    assert!(!pick.contains("not configured"), "{pick}");
+    let offered: Vec<String> = rec
+        .seen
+        .lock()
+        .map(|s| s[0].tools.iter().map(|t| t.name.clone()).collect())
+        .unwrap_or_default();
+    for t in [
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_pick",
+    ] {
+        assert!(
+            offered.contains(&t.to_string()),
+            "{t} not offered: {offered:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn after_taint_a_browser_action_waits_for_the_members_decision() {
     // The first call's output (even an error body) is untrusted, so the session is tainted;
     // the navigate after it must wait for the member, who declines here.

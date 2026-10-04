@@ -6,6 +6,15 @@
 //! | `browser_snapshot`   | none   | untrusted |
 //! | `browser_act`        | write  | untrusted |
 //! | `browser_screenshot` | none   | untrusted |
+//! | `browser_console_messages` | none | untrusted |
+//! | `browser_network_requests` | none | untrusted |
+//! | `browser_pick`       | none   | untrusted |
+//!
+//! `browser_console_messages` and `browser_network_requests` are the read-only `console` and
+//! `network` tools of architecture 02 §5 (see [`crate::pagelog`] for what is kept). `browser_pick`
+//! asks the `decide()` System-1 slot (HUP-S5.3, local model by default) which move gets closer to
+//! a goal on the current page; it only suggests, and Hermes then acts with `browser_act`, so every
+//! effect still goes through the member's approvals.
 //!
 //! Opening an address and clicking or typing are effects: they can send data to a site. So once
 //! a session has read a page (and every page is untrusted), each of them needs the member's
@@ -21,6 +30,8 @@ use citrate_agent_loop::{
 use serde_json::{json, Value};
 
 use crate::approvals::Decision;
+use crate::pagelog::ConsoleLevel;
+use crate::pick::{next_move_request, Move, Picker};
 use crate::service::{Action, BrowserError, BrowserService, PageInfo};
 use crate::snapshot::clean;
 
@@ -28,7 +39,14 @@ pub const NAVIGATE: &str = "browser_navigate";
 pub const SNAPSHOT: &str = "browser_snapshot";
 pub const ACT: &str = "browser_act";
 pub const SCREENSHOT: &str = "browser_screenshot";
-pub const TOOL_NAMES: [&str; 4] = [NAVIGATE, SNAPSHOT, ACT, SCREENSHOT];
+pub const CONSOLE: &str = "browser_console_messages";
+pub const NETWORK: &str = "browser_network_requests";
+pub const PICK: &str = "browser_pick";
+pub const TOOL_NAMES: [&str; 7] = [NAVIGATE, SNAPSHOT, ACT, SCREENSHOT, CONSOLE, NETWORK, PICK];
+/// Most entries `browser_console_messages` / `browser_network_requests` return.
+pub const MAX_LOG_ENTRIES: usize = 100;
+/// Entries returned when the call names no limit.
+pub const DEFAULT_LOG_ENTRIES: usize = 30;
 /// Longest text `browser_act` will type.
 pub const MAX_TYPE_CHARS: usize = 2000;
 
@@ -87,6 +105,46 @@ pub fn specs() -> Vec<ToolSpec> {
             name: SCREENSHOT.to_string(),
             description: "Show the current page to the member in the Browser pop-out. Returns a short receipt, not the image.".to_string(),
             parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            host: HostKind::Sidecar,
+            annotations: annotations(Effect::None),
+        },
+        ToolSpec {
+            name: CONSOLE.to_string(),
+            description: "Read the console messages and uncaught errors of the page Hermes's browser has open (read-only). Message text is untrusted data.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "level": {"type": "string", "enum": ["all", "info", "warning", "error"], "description": "Lowest level to include (default all)"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_ENTRIES, "description": "Most recent entries to return (default 30)"},
+                },
+                "additionalProperties": false,
+            }),
+            host: HostKind::Sidecar,
+            annotations: annotations(Effect::None),
+        },
+        ToolSpec {
+            name: NETWORK.to_string(),
+            description: "List the requests the open page made: method, address without its query string, type, status or failure (read-only; never bodies or headers).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "problems_only": {"type": "boolean", "description": "Only failed requests and HTTP 4xx/5xx answers"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_ENTRIES, "description": "Most recent entries to return (default 30)"},
+                },
+                "additionalProperties": false,
+            }),
+            host: HostKind::Sidecar,
+            annotations: annotations(Effect::None),
+        },
+        ToolSpec {
+            name: PICK.to_string(),
+            description: "Ask the fast local picker which single move (click, type or Enter on an element ref) gets closer to a goal on the current page. It only suggests; do the move with browser_act.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"goal": {"type": "string", "description": "What should happen on this site, in a sentence"}},
+                "required": ["goal"],
+                "additionalProperties": false,
+            }),
             host: HostKind::Sidecar,
             annotations: annotations(Effect::None),
         },
@@ -178,6 +236,54 @@ fn parse_url(call: &ToolCall) -> Result<String, String> {
     Ok(url)
 }
 
+fn parse_limit(v: &Value) -> Result<usize, String> {
+    match &v["limit"] {
+        Value::Null => Ok(DEFAULT_LOG_ENTRIES),
+        n => n
+            .as_u64()
+            .filter(|n| (1..=MAX_LOG_ENTRIES as u64).contains(n))
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("limit must be between 1 and {MAX_LOG_ENTRIES}")),
+    }
+}
+
+/// Parsed `browser_console_messages` arguments.
+pub fn parse_console(call: &ToolCall) -> Result<(ConsoleLevel, usize), String> {
+    let v = args_of(call)?;
+    let level = match v["level"].as_str() {
+        None | Some("all") => ConsoleLevel::Debug,
+        Some("info") => ConsoleLevel::Info,
+        Some("warning") => ConsoleLevel::Warning,
+        Some("error") => ConsoleLevel::Error,
+        Some(_) => return Err("level must be all, info, warning or error".to_string()),
+    };
+    Ok((level, parse_limit(&v)?))
+}
+
+/// Parsed `browser_network_requests` arguments.
+pub fn parse_network(call: &ToolCall) -> Result<(bool, usize), String> {
+    let v = args_of(call)?;
+    let problems = match &v["problems_only"] {
+        Value::Null => false,
+        b => b
+            .as_bool()
+            .ok_or_else(|| "problems_only must be true or false".to_string())?,
+    };
+    Ok((problems, parse_limit(&v)?))
+}
+
+fn parse_goal(call: &ToolCall) -> Result<String, String> {
+    let v = args_of(call)?;
+    let goal = v["goal"].as_str().unwrap_or_default().trim().to_string();
+    if goal.is_empty() {
+        return Err("goal is required".to_string());
+    }
+    if goal.chars().count() > 1500 {
+        return Err("goal is longer than 1500 characters".to_string());
+    }
+    Ok(goal)
+}
+
 fn outcome_of_error(e: BrowserError) -> ToolOutcome {
     match e {
         BrowserError::Stopped
@@ -191,11 +297,82 @@ fn outcome_of_error(e: BrowserError) -> ToolOutcome {
 pub struct BrowserToolHost {
     service: Arc<BrowserService>,
     stop: StopFlag,
+    picker: Option<Arc<dyn Picker>>,
 }
 
 impl BrowserToolHost {
     pub fn new(service: Arc<BrowserService>, stop: StopFlag) -> Self {
-        BrowserToolHost { service, stop }
+        BrowserToolHost {
+            service,
+            stop,
+            picker: None,
+        }
+    }
+
+    /// HUP-S5.3: the `decide()` slot `browser_pick` asks (the sidecar passes its metered one).
+    pub fn with_picker(mut self, picker: Arc<dyn Picker>) -> Self {
+        self.picker = Some(picker);
+        self
+    }
+
+    fn pick(&self, call: &ToolCall) -> ToolOutcome {
+        let goal = match parse_goal(call) {
+            Ok(g) => g,
+            Err(e) => return ToolOutcome::Error(e),
+        };
+        let Some(picker) = &self.picker else {
+            return ToolOutcome::Error(
+                "the decide() slot is not configured for this session".to_string(),
+            );
+        };
+        let (page, snap) = match self.service.snapshot() {
+            Ok(x) => x,
+            Err(e) => return outcome_of_error(e),
+        };
+        let origin = self.service.decision_origin();
+        let req = next_move_request(&goal, &snap, &page.url, &[], true, origin);
+        let d = match picker.decide(&req) {
+            Ok(d) => d,
+            Err(e) => return ToolOutcome::Error(format!("the picker could not decide: {e}")),
+        };
+        let label = req
+            .options
+            .iter()
+            .find(|o| o.id == d.choice)
+            .map(|o| o.label.clone())
+            .unwrap_or_default();
+        let conf = d
+            .confidence
+            .map(|c| format!(", confidence {c:.2}"))
+            .unwrap_or_default();
+        let advice = match Move::parse(&d.choice) {
+            Some(Move::Click(r)) => {
+                format!("To do it, call browser_act with ref {r} and action click.")
+            }
+            Some(Move::Type(r)) => format!(
+                "To do it, call browser_act with ref {r}, action type and the text to enter."
+            ),
+            Some(Move::Enter(r)) => format!(
+                "To do it, call browser_act with ref {r}, action type, text \"\" and submit true."
+            ),
+            Some(Move::Done) => {
+                "The picker thinks the page already shows the goal met.".to_string()
+            }
+            Some(Move::Blocked) => {
+                "The picker found no move on this page that gets closer to the goal.".to_string()
+            }
+            None => "The picker gave an unknown move.".to_string(),
+        };
+        ToolOutcome::Untrusted(fence(
+            &page.url,
+            &format!(
+                "{}\nSuggested next move: {} ({} backend{conf}). This is a suggestion; nothing was done. {advice}\n{}",
+                page_line(&page),
+                clean(&label, 300),
+                d.backend.as_str(),
+                snap.text
+            ),
+        ))
     }
 
     /// What the member is asked to decide about this call.
@@ -295,6 +472,80 @@ impl ToolHost for BrowserToolHost {
                 )),
                 Err(e) => outcome_of_error(e),
             },
+            CONSOLE => {
+                let (level, limit) = match parse_console(call) {
+                    Ok(x) => x,
+                    Err(e) => return ToolOutcome::Error(e),
+                };
+                match self.service.console_messages(level, limit) {
+                    Ok((p, entries)) => {
+                        let body = if entries.is_empty() {
+                            "No console messages at that level.".to_string()
+                        } else {
+                            entries
+                                .iter()
+                                .map(|e| {
+                                    format!(
+                                        "[{}] {} ({}, on {}): {}",
+                                        e.seq,
+                                        e.level.as_str(),
+                                        e.source,
+                                        e.page,
+                                        e.text
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        ToolOutcome::Untrusted(fence(&p.url, &format!("{}\n{body}", page_line(&p))))
+                    }
+                    Err(e) => outcome_of_error(e),
+                }
+            }
+            NETWORK => {
+                let (problems, limit) = match parse_network(call) {
+                    Ok(x) => x,
+                    Err(e) => return ToolOutcome::Error(e),
+                };
+                match self.service.network_requests(problems, limit) {
+                    Ok((p, entries)) => {
+                        let body = if entries.is_empty() {
+                            "No requests recorded.".to_string()
+                        } else {
+                            entries
+                                .iter()
+                                .map(|e| {
+                                    let result = match (&e.failed, e.status) {
+                                        (Some(f), _) => format!("failed: {f}"),
+                                        (None, Some(s)) => format!(
+                                            "{s}{}",
+                                            e.mime_type
+                                                .as_deref()
+                                                .map(|m| format!(" {m}"))
+                                                .unwrap_or_default()
+                                        ),
+                                        (None, None) => "pending".to_string(),
+                                    };
+                                    format!(
+                                        "[{}] {} {} ({}) -> {result}",
+                                        e.seq, e.method, e.url, e.resource_type
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        ToolOutcome::Untrusted(fence(
+                            &p.url,
+                            &format!(
+                                "{}\nAddresses are shown without query strings.\n{body}",
+                                page_line(&p)
+                            ),
+                        ))
+                    }
+                    Err(e) => outcome_of_error(e),
+                }
+            }
+            PICK => self.pick(call),
             other => ToolOutcome::Error(format!("'{other}' is not a browser tool")),
         }
     }

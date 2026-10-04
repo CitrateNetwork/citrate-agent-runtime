@@ -409,6 +409,9 @@ pub struct Session {
     persona: Option<PersonaReport>,
     /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
     shell: Option<Arc<ShellRunSession>>,
+    /// HUP-S5.3: the session's own model endpoint, which `browser_pick` asks through the metered
+    /// `decide()` slot (local grammar backend unless the member opted into Jev for the origin).
+    decide_llm: LlmEndpoint,
 }
 
 impl Session {
@@ -1301,6 +1304,7 @@ impl SessionManager {
                 c.clone(),
             )
         });
+        let decide_llm = req.llm.clone();
         let llm: Arc<dyn LlmClient> = Arc::new(MeteredLlm::new(
             (self.llm_factory)(&req.llm),
             metering.clone(),
@@ -1333,6 +1337,7 @@ impl SessionManager {
             runs: Mutex::new(VecDeque::new()),
             persona,
             shell,
+            decide_llm,
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -1411,10 +1416,15 @@ impl SessionManager {
             .learn
             .clone()
             .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
-        let browser_host = self
-            .browser
-            .clone()
-            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        let browser_host = self.browser.clone().map(|b| {
+            BrowserToolHost::new(b, session.stop.clone()).with_picker(Arc::new(
+                crate::decide::SessionPicker::new(
+                    self.decide.clone(),
+                    session.decide_llm.clone(),
+                    &session.cfg.model,
+                ),
+            ))
+        });
         let shell_host = session
             .shell
             .as_ref()

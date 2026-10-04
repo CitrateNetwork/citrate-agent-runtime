@@ -25,6 +25,7 @@ use crate::approvals::{ActionApprovals, Decision, PendingAction};
 use crate::cdp::{Cdp, CdpEvent, EventHandler, Reply};
 use crate::chromium::{self, ChromiumStatus, ManagedChrome};
 use crate::frames::{FrameBuffer, FrameView, Highlight};
+use crate::pagelog::{ConsoleEntry, ConsoleLevel, NetworkEntry, PageLog};
 use crate::scope::{Denylist, Origin, OriginScope, ScopeDecision};
 use crate::signin::{self, SignInAnswer, SignInBridge, SignInRequest};
 use crate::snapshot::{build_snapshot, Snapshot, SnapshotLimits};
@@ -207,6 +208,8 @@ struct Shared {
     signin: SignInBridge,
     /// HUP-S2.3: the managed browser's loopback DevTools port.
     devtools_port: Mutex<Option<u16>>,
+    /// 02 §5 `console` / `network`: what the tab logged and requested (read-only tools).
+    pagelog: PageLog,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -284,7 +287,11 @@ impl Shared {
                     session_id: ev.session_id.clone(),
                 })
             }
-            _ => None,
+            other => {
+                let page = self.url();
+                self.pagelog.on_event(other, &ev.params, &page);
+                None
+            }
         }
     }
 }
@@ -791,6 +798,102 @@ impl BrowserService {
         Ok((PageInfo { url, title }, bytes))
     }
 
+    /// The open page, or why there is none. Read-only tools use this: they never launch a
+    /// browser, and in attach mode the page must be one the member consented to.
+    fn open_page(&self) -> Result<PageInfo> {
+        if self.is_stopped() {
+            return Err(BrowserError::Stopped);
+        }
+        let guard = lock(&self.live);
+        let live = guard.as_ref().ok_or_else(|| {
+            BrowserError::Failed(
+                "the browser has no page open yet; use browser_navigate first".to_string(),
+            )
+        })?;
+        let url = self.current_url(live)?;
+        if matches!(live.mode, Mode::Attached(_)) {
+            self.check_scope_url(&url)?;
+        }
+        let title = self.title(live);
+        Ok(PageInfo { url, title })
+    }
+
+    /// Whether an entry logged on `page` may be shown (attach mode: only consented origins).
+    fn shown_page(&self, page: &str) -> bool {
+        self.shared.frames_allowed(page)
+    }
+
+    /// 02 §5 `console`: the latest `limit` console messages at `min` level or above.
+    pub fn console_messages(
+        &self,
+        min: ConsoleLevel,
+        limit: usize,
+    ) -> Result<(PageInfo, Vec<ConsoleEntry>)> {
+        let page = self.open_page()?;
+        let entries = self
+            .shared
+            .pagelog
+            .console(min, limit, &|p: &str| self.shown_page(p));
+        self.shared.signin.note_read(&page.url);
+        Ok((page, entries))
+    }
+
+    /// 02 §5 `network`: the latest `limit` requests (only failed ones with `problems_only`).
+    pub fn network_requests(
+        &self,
+        problems_only: bool,
+        limit: usize,
+    ) -> Result<(PageInfo, Vec<NetworkEntry>)> {
+        let page = self.open_page()?;
+        let entries = self
+            .shared
+            .pagelog
+            .network(problems_only, limit, &|p: &str| self.shown_page(p));
+        self.shared.signin.note_read(&page.url);
+        Ok((page, entries))
+    }
+
+    /// The visible text of the open page (`document.body.innerText`), cut to 20000 characters.
+    /// Used by the web-subset runner to check a task's end state; never launches a browser.
+    pub fn page_text(&self) -> Result<String> {
+        self.open_page()?;
+        let guard = lock(&self.live);
+        let live = guard
+            .as_ref()
+            .ok_or_else(|| BrowserError::Failed("the browser has no page open".to_string()))?;
+        let v = self.call(
+            live,
+            "Runtime.evaluate",
+            json!({"expression": "document.body ? document.body.innerText : ''", "returnByValue": true}),
+        )?;
+        let text = v["result"]["value"].as_str().unwrap_or_default();
+        Ok(text.chars().take(20_000).collect())
+    }
+
+    /// The facts the `decide()` slot needs about the open page (ADR red-team correction 5): its
+    /// origin, taken from the top-level frame the worker tracks (never from page content), whether
+    /// the browser holds any cookie for it, and whether this is attach mode. `None` when no
+    /// http(s) page is open. When the cookie check cannot be made, the page is treated as having
+    /// a session cookie, which keeps third-party backends away from it.
+    pub fn decision_origin(&self) -> Option<citrate_agent_loop::decide::DecisionOrigin> {
+        if self.is_stopped() {
+            return None;
+        }
+        let guard = lock(&self.live);
+        let live = guard.as_ref()?;
+        let url = self.current_url(live).ok()?;
+        let origin = Origin::parse(&url).ok()?.to_string();
+        let has_session_cookie = self
+            .call(live, "Network.getCookies", json!({"urls": [url]}))
+            .map(|v| v["cookies"].as_array().is_none_or(|c| !c.is_empty()))
+            .unwrap_or(true);
+        Some(citrate_agent_loop::decide::DecisionOrigin {
+            origin,
+            has_session_cookie,
+            attach_mode: matches!(live.mode, Mode::Attached(_)),
+        })
+    }
+
     // --- internals ----------------------------------------------------------------------------
 
     fn call(&self, live: &Live, method: &str, params: Value) -> Result<Value> {
@@ -1013,8 +1116,12 @@ impl BrowserService {
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({"source": signin::provider_script()}),
             )?;
-            self.call(&live, "Runtime.enable", json!({}))?;
         }
+        // Console messages and requests for the read-only console and network tools, in both
+        // modes (only the tab this worker opened is ever listened to).
+        self.call(&live, "Runtime.enable", json!({}))?;
+        self.call(&live, "Network.enable", json!({}))?;
+        self.call(&live, "Log.enable", json!({}))?;
         let (w, h) = self.cfg.viewport;
         self.call(
             &live,
@@ -1058,6 +1165,7 @@ impl BrowserService {
             }
         }
         self.shared.frames.clear();
+        self.shared.pagelog.clear();
     }
 }
 

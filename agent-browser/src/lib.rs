@@ -25,6 +25,8 @@ pub mod approvals;
 pub mod cdp;
 pub mod chromium;
 pub mod frames;
+pub mod pagelog;
+pub mod pick;
 pub mod scope;
 pub mod service;
 pub mod signin;

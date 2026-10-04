@@ -335,6 +335,11 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/checkpoints/:session/undo",
             post(checkpoint_routes::undo_session),
         )
+        // HUP-S5.4: one step's diff for the Code and diff pop-out (read-only).
+        .route(
+            "/checkpoints/:session/steps/:seq/diff",
+            get(checkpoint_routes::step_diff),
+        )
         // HUP-S1.9: the worker processes (toolchain, browser) and their health
         .route("/workers", get(workers_status))
         // HUP-S7.5: the daily metering report + opt-in BenchmarkRegistry calldata (built, never sent)
