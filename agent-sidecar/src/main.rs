@@ -6,6 +6,9 @@
 //!   CITRATE_HERMES_CAPSULES     capsule (skill) directory to load; default ./capsules (optional)
 //!   CITRATE_HERMES_SKILLS       HUP-S3.2: SKILL.md instruction-skill directories, a path list in
 //!                               precedence order (first wins); unset = no skills (optional)
+//!   CITRATE_HERMES_SKILLS_LOCK  HUP-S3.2: path of the skills.lock citrate-core ships; with
+//!   CITRATE_HERMES_SKILLS_THIRD_PARTY (the staged reviewed-skills tree) the reviewed third-party
+//!                               skills load last, each file checked against the lock (optional)
 //!   CITRATE_HERMES_TOOLCHAIN    HUP-S6.3: `1` offers forge_test / slither_scan / aderyn_scan /
 //!                               medusa_fuzz in every session; anything else = off (optional)
 //!   CITRATE_HERMES_TOOLCHAIN_ROOTS  granted project folders for those tools, a path list;

@@ -257,7 +257,7 @@ async fn an_accepted_skill_is_offered_to_the_next_session_without_a_restart() {
 
     // The next session sees the skill in its index and can load it.
     let after = open_session(&st).await;
-    send(&st, &after, "hello again").await;
+    send(&st, &after, "check my contract before deploy").await;
     let seen = rec.seen.lock().unwrap();
     let last = seen.last().unwrap();
     assert!(

@@ -594,7 +594,10 @@ async fn a_persona_session_offers_only_allowlisted_skills_and_pins_its_tools() {
         serde_json::json!([SKILL_LOAD_TOOL, "memory_search"])
     );
     let sid = v["id"].as_str().unwrap().to_string();
-    st.sessions.send(&sid, "hello".into(), None).unwrap();
+    // The request names planset too: the allowlist filters before ranking, so it never surfaces.
+    st.sessions
+        .send(&sid, "frontend design for a planset page".into(), None)
+        .unwrap();
     let session = st.sessions.get(&sid).unwrap();
     let mut after = 0;
     for _ in 0..200 {
