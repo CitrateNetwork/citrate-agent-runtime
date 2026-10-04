@@ -99,9 +99,29 @@ mod tests {
             ("2002:a9fe:a9fe::", false),
             ("2002:808:808::", true),
             ("2001:0:808:808:0:0:f5ff:fffe", false),
-            ("2001:0:808:808:0:0:f7f7:f7f7", true),
+            // Teredo hides the real endpoint behind a relay: never public, whatever it carries.
+            ("2001:0:808:808:0:0:f7f7:f7f7", false),
         ] {
             assert_eq!(is_public_ip(ip(wrapped)), public, "{wrapped}");
+        }
+    }
+
+    /// Only global unicast is public: the 6to4 relay anycast block, IPv6 outside 2000::/3
+    /// (reserved, discard-only, deprecated site-local) and the 3fff::/20 documentation block are not.
+    #[test]
+    fn reserved_and_relay_ranges_are_not_public() {
+        for (addr, public) in [
+            ("192.88.99.1", false),    // 6to4 relay anycast
+            ("100::1", false),         // discard-only
+            ("4000::1", false),        // reserved, outside 2000::/3
+            ("8000::1", false),        // reserved
+            ("3fff::1", false),        // documentation (RFC 9637)
+            ("2001:2::1", false),      // benchmarking
+            ("2001:10::1", false),     // ORCHID
+            ("2606:4700::1111", true), // global unicast
+            ("2a00:1450:4001::1", true),
+        ] {
+            assert_eq!(is_public_ip(ip(addr)), public, "{addr}");
         }
     }
 }
