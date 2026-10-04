@@ -6,6 +6,10 @@
 //!   CITRATE_HERMES_CAPSULES     capsule (skill) directory to load; default ./capsules (optional)
 //!   CITRATE_HERMES_SKILLS       HUP-S3.2: SKILL.md instruction-skill directories, a path list in
 //!                               precedence order (first wins); unset = no skills (optional)
+//!   CITRATE_HERMES_EMBED_URL    HUP-S1.2: an OpenAI-compatible embeddings endpoint (llama-server
+//!                               with --embeddings, e.g. a BGE model; loopback http or https) that
+//!                               ranks tools and skills with keywords; unset, sessions try their
+//!                               own loopback chat server and rank lexically if it does not embed
 //!   CITRATE_HERMES_SKILLS_LOCK  HUP-S3.2: path of the skills.lock citrate-core ships; with
 //!   CITRATE_HERMES_SKILLS_THIRD_PARTY (the staged reviewed-skills tree) the reviewed third-party
 //!                               skills load last, each file checked against the lock (optional)

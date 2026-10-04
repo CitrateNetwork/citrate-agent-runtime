@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 pub mod decide;
 pub mod interview;
 pub mod personas;
+pub mod retrieval;
 pub mod skills;
 pub mod verifiers_tooling;
 pub mod workflows;
@@ -623,6 +624,10 @@ pub fn run_turn_with(
             user,
             opts.max_tools_per_request,
             &opts.pinned_tools,
+            opts.selector
+                .as_deref()
+                .unwrap_or(&KeywordSelector as &dyn ToolSelector),
+            opts.max_tools_total,
         );
         if let Some((budget, counter)) = &opts.budget {
             let tool_tokens = counter.count(&serde_json::to_string(&offered).unwrap_or_default());
@@ -805,6 +810,15 @@ pub struct TurnOptions {
     /// request (e.g. the five skills that match it). Computed once per turn, never stored in
     /// the history.
     pub turn_context: Vec<Arc<dyn TurnContext>>,
+    /// HUP-S1.2: ranks the tools offered on each request. `None` uses [`KeywordSelector`]; the
+    /// sidecar passes a [`retrieval::HybridRetriever`] (embedding plus keywords, which falls back
+    /// to keywords by itself when no embedding endpoint answers).
+    pub selector: Option<Arc<dyn ToolSelector>>,
+    /// US-1.4 AC1: a hard ceiling on the tool schemas in one request, pinned and in-use tools
+    /// included. When it binds, pinned tools come first, then the tools used most recently, then
+    /// retrieval. `None` keeps the plain `max_tools_per_request` rule (pinned tools and tools in
+    /// use ride outside it).
+    pub max_tools_total: Option<usize>,
 }
 
 /// HUP-S3.2: per-turn context for the system prompt. `section` sees the turn's user message and
@@ -840,7 +854,7 @@ pub trait ToolSelector: Send + Sync {
 
 /// Deterministic keyword scorer over tool names (weighted) and descriptions. Snake_case names are
 /// split into words. With no signal at all it falls back to the first `k` tools in catalog order.
-/// (An embedding selector can implement the same trait once the knowledge graph is bundled.)
+/// [`retrieval::HybridRetriever`] adds embedding similarity on top of this score.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeywordSelector;
 
@@ -864,24 +878,30 @@ pub(crate) fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// The keyword score of every spec for `query` (same order as `specs`): three points for each
+/// query word in the tool's name, one for each in its description.
+pub fn keyword_scores(query: &str, specs: &[ToolSpec]) -> Vec<usize> {
+    let q = words(query);
+    specs
+        .iter()
+        .map(|s| {
+            let name = words(&s.name);
+            let desc = words(&s.description);
+            q.iter()
+                .map(|w| {
+                    3 * name.iter().filter(|n| *n == w).count()
+                        + desc.iter().filter(|d| *d == w).count()
+                })
+                .sum()
+        })
+        .collect()
+}
+
 impl ToolSelector for KeywordSelector {
     fn select(&self, query: &str, specs: &[ToolSpec], k: usize) -> Vec<ToolSpec> {
-        let q = words(query);
-        let mut scored: Vec<(usize, usize)> = specs
-            .iter()
+        let mut scored: Vec<(usize, usize)> = keyword_scores(query, specs)
+            .into_iter()
             .enumerate()
-            .map(|(i, s)| {
-                let name = words(&s.name);
-                let desc = words(&s.description);
-                let score = q
-                    .iter()
-                    .map(|w| {
-                        3 * name.iter().filter(|n| *n == w).count()
-                            + desc.iter().filter(|d| *d == w).count()
-                    })
-                    .sum();
-                (i, score)
-            })
             .collect();
         if scored.iter().all(|(_, sc)| *sc == 0) {
             return specs.iter().take(k).cloned().collect();
@@ -896,33 +916,55 @@ impl ToolSelector for KeywordSelector {
     }
 }
 
+/// The tool schemas for one request. Pinned tools first, then tools already used in this
+/// conversation (most recent first), then `selector`'s picks over the rest, up to `k` retrieved
+/// tools (or as many as are in use, if more). `total` caps the whole list (US-1.4 AC1).
+#[allow(clippy::too_many_arguments)]
 fn offered_tools(
     specs: &[ToolSpec],
     history: &[Message],
     user: &str,
     k: Option<usize>,
     pinned: &[String],
+    selector: &dyn ToolSelector,
+    total: Option<usize>,
 ) -> Vec<ToolSpec> {
-    let Some(k) = k else { return specs.to_vec() };
+    let cap = total.unwrap_or(usize::MAX);
+    let k = match (k, total) {
+        (Some(k), _) => k,
+        (None, Some(t)) => t,
+        (None, None) => return specs.to_vec(),
+    };
     let is_pinned = |s: &ToolSpec| pinned.iter().any(|p| p == &s.name);
     // Pinned tools first, then retrieval over the rest (so pinning never costs a retrieval slot).
-    let mut out: Vec<ToolSpec> = specs.iter().filter(|s| is_pinned(s)).cloned().collect();
+    let mut out: Vec<ToolSpec> = specs
+        .iter()
+        .filter(|s| is_pinned(s))
+        .take(cap)
+        .cloned()
+        .collect();
     let rest: Vec<ToolSpec> = specs.iter().filter(|s| !is_pinned(s)).cloned().collect();
     let base = out.len();
-    let specs = rest.as_slice();
-    let in_use: Vec<&str> = history
+    let mut in_use: Vec<&str> = Vec::new();
+    for name in history
         .iter()
-        .flat_map(|m| m.tool_calls.iter().map(|c| c.name.as_str()))
-        .filter(|n| !pinned.iter().any(|p| p == n))
-        .collect();
-    out.extend(
-        specs
-            .iter()
-            .filter(|s| in_use.contains(&s.name.as_str()))
-            .cloned(),
-    );
-    for s in KeywordSelector.select(user, specs, k) {
-        if out.len() - base >= k.max(in_use.len()) {
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev().map(|c| c.name.as_str()))
+    {
+        if !in_use.contains(&name) && rest.iter().any(|s| s.name == name) {
+            in_use.push(name);
+        }
+    }
+    for name in &in_use {
+        if out.len() >= cap {
+            break;
+        }
+        if let Some(s) = rest.iter().find(|s| s.name == *name) {
+            out.push(s.clone());
+        }
+    }
+    for s in selector.select(user, &rest, k) {
+        if out.len() - base >= k.max(in_use.len()) || out.len() >= cap {
             break;
         }
         if !out.iter().any(|o| o.name == s.name) {

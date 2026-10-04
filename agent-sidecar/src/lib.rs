@@ -30,6 +30,7 @@ pub mod browser;
 pub mod signin_routes;
 pub mod web_signing_records;
 pub mod llm_http;
+pub mod retrieval_http;
 pub mod metering;
 pub mod escalation;
 pub mod mcp_probe;
@@ -285,6 +286,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
         .route("/sessions/:id/grants", post(replace_grants))
+        .route("/sessions/:id/retrieval", get(session_retrieval))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -751,12 +753,26 @@ async fn create_session(
     })?;
     match st.sessions.create(req) {
         Ok(id) => {
+            let session = st.sessions.get(&id);
             // HUP-S3.3: say what the persona did (offered skills, missing ones, pinned tools).
-            let persona = st.sessions.get(&id).and_then(|s| s.persona().cloned());
-            let body = match persona {
-                Some(p) => serde_json::json!({ "id": id, "persona": p }),
-                None => serde_json::json!({ "id": id }),
+            let persona = session.as_ref().and_then(|s| s.persona().cloned());
+            // HUP-S1.2: say how tokens are counted and tools ranked (probed once, off the
+            // async runtime: the probes are blocking HTTP calls to the session's own endpoints).
+            let retrieval = match session {
+                Some(s) => tokio::task::spawn_blocking(move || s.probe_retrieval())
+                    .await
+                    .ok(),
+                None => None,
             };
+            let mut body = serde_json::json!({ "id": id });
+            if let Some(p) = persona {
+                body["persona"] = serde_json::json!(p);
+            }
+            if let Some(r) = retrieval {
+                body["tokenCounting"] = serde_json::json!(r.token_counting);
+                body["retrieval"] = serde_json::json!(r.retrieval);
+                body["maxToolSchemas"] = serde_json::json!(r.max_tool_schemas);
+            }
             Ok((StatusCode::CREATED, Json(body)))
         }
         Err(e) => {
@@ -770,6 +786,22 @@ async fn create_session(
             Err(err(session_status(&e), &msg))
         }
     }
+}
+
+/// HUP-S1.2: `GET /sessions/:id/retrieval` — how the session counts tokens and ranks tools and
+/// skills right now (a fallback after creation shows here).
+async fn session_retrieval(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<sessions::RetrievalReport>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    st.sessions
+        .get(&id)
+        .map(|s| Json(s.retrieval_report()))
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(Deserialize)]
@@ -1082,6 +1114,46 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
 
+/// HUP-S1.2: llama-server `/tokenize` for a loopback chat endpoint; any other endpoint (an https
+/// gateway) has no tokenizer the sidecar can reach, so its sessions estimate.
+pub fn production_tokenizer() -> sessions::TokenizerFactory {
+    Arc::new(|ep: &sessions::LlmEndpoint| {
+        if retrieval_http::is_loopback_http(&ep.base_url) {
+            Ok(Arc::new(retrieval_http::LlamaTokenizer::new(
+                &ep.base_url,
+                &ep.bearer,
+            ))
+                as Arc<dyn citrate_agent_loop::retrieval::Tokenizer>)
+        } else {
+            Err("the model endpoint is not the local llama-server, so tokens are estimated".into())
+        }
+    })
+}
+
+/// HUP-S1.2: the embedding endpoint named by `CITRATE_HERMES_EMBED_URL` (loopback http or https,
+/// no bearer), else the session's own loopback chat server (which answers only when it was
+/// started with `--embeddings`). An https chat endpoint is never sent tool or skill text for
+/// embedding unless it is named here.
+pub fn production_embedder(embed_url: Option<String>) -> sessions::EmbedderFactory {
+    let embed_url = embed_url.filter(|u| !u.trim().is_empty());
+    Arc::new(move |ep: &sessions::LlmEndpoint| match &embed_url {
+        Some(url) => {
+            sessions::validate_endpoint(url)
+                .map_err(|e| format!("{} was refused: {e}", retrieval_http::EMBED_URL_ENV))?;
+            Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, ""))
+                as Arc<dyn citrate_agent_loop::retrieval::Embedder>)
+        }
+        None if retrieval_http::is_loopback_http(&ep.base_url) => Ok(Arc::new(
+            retrieval_http::HttpEmbedder::new(&ep.base_url, &ep.bearer),
+        )
+            as Arc<dyn citrate_agent_loop::retrieval::Embedder>),
+        None => Err(format!(
+            "no embedding endpoint: {} is not set and the model endpoint is not local",
+            retrieval_http::EMBED_URL_ENV
+        )),
+    })
+}
+
 /// [`production_sessions`] plus the MCP host when one is configured (HUP-S4.1).
 pub fn production_sessions_with(
     mcp: Option<Arc<citrate_agent_mcp_host::McpHost>>,
@@ -1097,6 +1169,13 @@ pub fn production_sessions_with(
         }),
         timeout,
     );
+    // HUP-S1.2 (US-1.4 AC1): token counts from the model's tokenizer, and tools and skills ranked
+    // by embeddings plus keywords, each with an honest fallback the session reports.
+    let mgr = mgr
+        .with_tokenizer(production_tokenizer())
+        .with_embedder(production_embedder(
+            std::env::var(retrieval_http::EMBED_URL_ENV).ok(),
+        ));
     // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
     let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
@@ -1630,6 +1709,8 @@ mod instruction_skills_route_tests;
 mod skills_lock_env_tests;
 #[cfg(test)]
 mod skills_session_tests;
+#[cfg(test)]
+mod retrieval_http_tests;
 #[cfg(test)]
 mod tests;
 

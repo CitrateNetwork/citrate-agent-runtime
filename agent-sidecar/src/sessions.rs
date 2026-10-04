@@ -70,13 +70,16 @@ use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
 use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
+use citrate_agent_loop::retrieval::{
+    Embedder, HybridRetriever, ModelTokenCounter, RetrievalMode, TokenCounting, Tokenizer,
+};
 use citrate_agent_loop::skills::{
     skill_load_spec, SkillHost, SkillLibrary, SkillSource, SkillTurnIndex, SKILL_LOAD_TOOL,
 };
 use citrate_agent_loop::{
-    run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
-    LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
-    ToolSpec, TurnContext, TurnOptions, Workflow,
+    run_turn_with, ContextBudget, Event, EventSink, HostKind, LlmClient, LoopConfig, Message,
+    StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry, ToolSpec, TurnContext,
+    TurnOptions, Workflow,
 };
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use citrate_agent_metering::{MeteringSink, SystemClock};
@@ -250,6 +253,40 @@ pub fn validate_endpoint(url: &str) -> Result<(), String> {
 /// tests: a script).
 pub type LlmFactory = Arc<dyn Fn(&LlmEndpoint) -> Arc<dyn LlmClient> + Send + Sync>;
 
+/// HUP-S1.2: the model's tokenizer for an endpoint (production: llama-server `/tokenize` on a
+/// loopback endpoint). `Err` says why there is none; the session then estimates and reports it.
+pub type TokenizerFactory =
+    Arc<dyn Fn(&LlmEndpoint) -> Result<Arc<dyn Tokenizer>, String> + Send + Sync>;
+
+/// HUP-S1.2: the embedding model for a session's endpoint (production: `CITRATE_HERMES_EMBED_URL`,
+/// else the loopback chat server's `/v1/embeddings`). `Err` says why there is none; the session
+/// then ranks lexically and reports it.
+pub type EmbedderFactory =
+    Arc<dyn Fn(&LlmEndpoint) -> Result<Arc<dyn Embedder>, String> + Send + Sync>;
+
+/// US-1.4 AC1: the most tool schemas in one request by default, pinned tools (`skill_load`, a
+/// persona's emphasis) and tools already in use included. `maxToolsPerRequest` is the retrieval
+/// budget inside it; a session that asks for a larger budget gets that as its ceiling instead.
+pub const TOOL_SCHEMA_CEILING: usize = 8;
+
+/// Why a session estimates tokens when the sidecar was built without a tokenizer.
+pub const NO_TOKENIZER_REASON: &str = "this sidecar has no tokenizer configured";
+/// Why a session ranks lexically when the sidecar was built without an embedder.
+pub const NO_EMBEDDER_REASON: &str = "this sidecar has no embedding endpoint configured";
+
+/// HUP-S1.2 (US-1.4 AC1): how a session counts tokens and ranks tools and skills, as `POST
+/// /sessions` and `GET /sessions/:id/retrieval` report it. `token_counting` is absent when the
+/// session has no context budget (nothing is counted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrievalReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_counting: Option<TokenCounting>,
+    pub retrieval: RetrievalMode,
+    /// The most tool schemas in one request, pinned and in-use tools included.
+    pub max_tool_schemas: usize,
+}
+
 /// `POST /sessions` body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,7 +299,8 @@ pub struct CreateSessionReq {
     pub max_steps: Option<u32>,
     pub max_tokens: Option<u32>,
     pub max_tool_calls_per_step: Option<u32>,
-    /// HUP-S1.2: offer at most this many tool schemas per request (default 8).
+    /// HUP-S1.2: retrieve at most this many tool schemas per request (default 8). Every request
+    /// stays within [`TOOL_SCHEMA_CEILING`] (or this, if larger), pinned and in-use tools included.
     pub max_tools_per_request: Option<usize>,
     /// HUP-S1.2: the model's context window in tokens; when given, every request is compacted to
     /// fit (or the turn fails honestly).
@@ -398,9 +436,32 @@ pub struct Session {
     runs: Mutex<VecDeque<(String, RunState)>>,
     /// HUP-S3.3: present when this session was opened with a persona.
     persona: Option<PersonaReport>,
+    /// HUP-S1.2: the session's token counter (present when it has a context budget).
+    token_counter: Option<Arc<ModelTokenCounter>>,
+    /// HUP-S1.2: ranks the session's tools and skills.
+    retriever: Arc<HybridRetriever>,
 }
 
 impl Session {
+    /// HUP-S1.2: how this session counts tokens and ranks tools and skills right now.
+    pub fn retrieval_report(&self) -> RetrievalReport {
+        RetrievalReport {
+            token_counting: self.token_counter.as_ref().map(|c| c.mode()),
+            retrieval: self.retriever.mode(),
+            max_tool_schemas: self.opts.max_tools_total.unwrap_or(self.specs.len()),
+        }
+    }
+
+    /// HUP-S1.2: count one probe and embed one probe, so the report is known before the first
+    /// turn. Blocking (HTTP): call it on the blocking pool.
+    pub fn probe_retrieval(&self) -> RetrievalReport {
+        if let Some(c) = &self.token_counter {
+            c.probe();
+        }
+        self.retriever.probe();
+        self.retrieval_report()
+    }
+
     fn push(&self, event: Event) {
         if let Ok(mut log) = self.log.lock() {
             log.next_seq += 1;
@@ -722,6 +783,8 @@ pub enum SessionError {
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     llm_factory: LlmFactory,
+    tokenizer_factory: Option<TokenizerFactory>,
+    embedder_factory: Option<EmbedderFactory>,
     core_tool_deadline: Duration,
     ids: AtomicU64,
     /// HUP-S3.2: the skills library offered to new sessions. HUP-S3.4: reloaded from
@@ -753,6 +816,8 @@ impl SessionManager {
         SessionManager {
             sessions: Mutex::new(HashMap::new()),
             llm_factory,
+            tokenizer_factory: None,
+            embedder_factory: None,
             core_tool_deadline,
             ids: AtomicU64::new(0),
             skills: RwLock::new(None),
@@ -772,6 +837,20 @@ impl SessionManager {
             trajectories: None,
             anchor: None,
         }
+    }
+
+    /// HUP-S1.2: count each session's tokens with the model's tokenizer (default: none, so
+    /// sessions estimate and say so).
+    pub fn with_tokenizer(mut self, f: TokenizerFactory) -> Self {
+        self.tokenizer_factory = Some(f);
+        self
+    }
+
+    /// HUP-S1.2: rank each session's tools and skills with embeddings plus keywords (default:
+    /// none, so sessions rank lexically and say so).
+    pub fn with_embedder(mut self, f: EmbedderFactory) -> Self {
+        self.embedder_factory = Some(f);
+        self
     }
 
     /// HUP-S7.5: where finished metering records go (default: in memory for this process).
@@ -1015,6 +1094,14 @@ impl SessionManager {
             ),
             (None, lib) => (lib.clone(), None),
         };
+        // HUP-S1.2: one retriever ranks this session's tools and its per-turn skills.
+        let retriever = Arc::new(match &self.embedder_factory {
+            None => HybridRetriever::lexical(NO_EMBEDDER_REASON),
+            Some(f) => match f(&req.llm) {
+                Ok(e) => HybridRetriever::new(e),
+                Err(reason) => HybridRetriever::lexical(reason),
+            },
+        });
         let mut specs = req.tools;
         let system_prompt = req.system_prompt;
         let mut pinned_tools = Vec::new();
@@ -1027,7 +1114,9 @@ impl SessionManager {
             }
             // US-3.2 AC1: each turn carries the at most SKILLS_PER_TURN skills that match it,
             // ranked over the (persona-restricted) library; never the whole index.
-            turn_context.push(Arc::new(SkillTurnIndex::new(lib.clone(), SKILLS_PER_TURN)));
+            turn_context.push(Arc::new(
+                SkillTurnIndex::new(lib.clone(), SKILLS_PER_TURN).with_ranker(retriever.clone()),
+            ));
             specs.push(skill_load_spec());
             pinned_tools.push(SKILL_LOAD_TOOL.to_string());
         }
@@ -1165,19 +1254,37 @@ impl SessionManager {
             max_tool_calls_per_step: req.max_tool_calls_per_step.unwrap_or(4).clamp(1, 16),
             max_tokens: req.max_tokens.unwrap_or(2048).clamp(64, MAX_TOKENS_CAP),
         };
+        // US-1.4 AC1: token counts come from the model's tokenizer when it answers.
+        let token_counter = req.context_tokens.map(|_| {
+            Arc::new(match &self.tokenizer_factory {
+                None => ModelTokenCounter::estimated(NO_TOKENIZER_REASON),
+                Some(f) => match f(&req.llm) {
+                    Ok(t) => ModelTokenCounter::new(t),
+                    Err(reason) => ModelTokenCounter::estimated(reason),
+                },
+            })
+        });
+        let max_tools = req.max_tools_per_request.unwrap_or(8).clamp(1, 64);
         let opts = TurnOptions {
-            max_tools_per_request: Some(req.max_tools_per_request.unwrap_or(8).clamp(1, 64)),
-            budget: req.context_tokens.map(|ctx| {
-                (
-                    ContextBudget {
-                        max_context_tokens: ctx.clamp(512, 1 << 20),
-                        reserve_for_output: cfg.max_tokens as usize,
-                    },
-                    Arc::new(CharTokenCounter) as Arc<dyn citrate_agent_loop::TokenCounter>,
-                )
-            }),
+            max_tools_per_request: Some(max_tools),
+            budget: req
+                .context_tokens
+                .zip(token_counter.clone())
+                .map(|(ctx, c)| {
+                    (
+                        ContextBudget {
+                            max_context_tokens: ctx.clamp(512, 1 << 20),
+                            reserve_for_output: cfg.max_tokens as usize,
+                        },
+                        c as Arc<dyn citrate_agent_loop::TokenCounter>,
+                    )
+                }),
             pinned_tools,
             turn_context,
+            selector: Some(retriever.clone() as Arc<dyn citrate_agent_loop::ToolSelector>),
+            // US-1.4 AC1: at most TOOL_SCHEMA_CEILING schemas per request, pinned and in-use
+            // tools included (or the session's own `maxToolsPerRequest`, if it asked for more).
+            max_tools_total: Some(max_tools.max(TOOL_SCHEMA_CEILING)),
         };
         let metering = Arc::new(MeteringSink::new(
             id.clone(),
@@ -1228,6 +1335,8 @@ impl SessionManager {
             files: self.files.clone(),
             runs: Mutex::new(VecDeque::new()),
             persona,
+            token_counter,
+            retriever,
         });
         sessions.insert(id.clone(), session);
         Ok(id)
