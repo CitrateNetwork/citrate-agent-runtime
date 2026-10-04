@@ -428,6 +428,65 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
         self.complete(req).map(|t| (t, None))
     }
+
+    /// HUP-S1.1 (g1-render): [`LlmClient::complete_with_usage`] that also hands each piece of
+    /// assistant text to `on_delta` as the provider produces it. The returned turn is the whole
+    /// answer, exactly as the non-streaming call would return it. The default produces no deltas:
+    /// a client that cannot stream behaves as before.
+    fn complete_streaming(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        let _ = on_delta;
+        self.complete_with_usage(req)
+    }
+}
+
+/// HUP-S1.1 (g1-render): batches streamed assistant text into `assistant_delta` events, so a long
+/// answer becomes tens of events, not one per token (the session event log is bounded).
+pub struct DeltaCoalescer {
+    step: u32,
+    buf: String,
+    last: std::time::Instant,
+}
+
+impl DeltaCoalescer {
+    /// Bytes buffered before an event is emitted.
+    pub const MAX_BYTES: usize = 64;
+    /// Longest a piece of text waits before it is emitted.
+    pub const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    pub fn new(step: u32) -> Self {
+        DeltaCoalescer {
+            step,
+            buf: String::new(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Add streamed text; emits when enough text is waiting or it has waited long enough.
+    pub fn push(&mut self, sink: &dyn EventSink, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.buf.push_str(text);
+        if self.buf.len() >= Self::MAX_BYTES || self.last.elapsed() >= Self::MAX_WAIT {
+            self.flush(sink);
+        }
+    }
+
+    /// Emit whatever is waiting.
+    pub fn flush(&mut self, sink: &dyn EventSink) {
+        if self.buf.is_empty() {
+            return;
+        }
+        sink.emit(Event::AssistantDelta {
+            step: self.step,
+            text: std::mem::take(&mut self.buf),
+        });
+        self.last = std::time::Instant::now();
+    }
 }
 
 /// Token usage one model call reported (HUP-S7.5 metering). Taken from the provider's own
@@ -476,6 +535,13 @@ pub enum Event {
         source: String,
         reason: String,
     },
+    /// HUP-S1.1 (g1-render): a piece of the assistant's text while the model is still writing.
+    /// Informational only: the step's `final` event (when the step answers) carries the whole
+    /// answer, and a step that ends in tool calls has no `final`.
+    AssistantDelta {
+        step: u32,
+        text: String,
+    },
     Final {
         content: String,
     },
@@ -503,6 +569,7 @@ impl Event {
             Event::ToolResult { .. } => "tool_result",
             Event::StepEnd { .. } => "step_end",
             Event::Tainted { .. } => "tainted",
+            Event::AssistantDelta { .. } => "assistant_delta",
             Event::Final { .. } => "final",
             Event::Verifier { .. } => "verifier",
             Event::Error { .. } => "error",
@@ -643,8 +710,11 @@ pub fn run_turn_with(
             tools: offered,
             max_tokens: cfg.max_tokens,
         };
-        let turn = match llm.complete(&req) {
-            Ok(t) => t,
+        let mut deltas = DeltaCoalescer::new(step);
+        let streamed = llm.complete_streaming(&req, &mut |d| deltas.push(sink, d));
+        deltas.flush(sink);
+        let turn = match streamed {
+            Ok((t, _)) => t,
             Err(e) => {
                 let msg = e.to_string();
                 sink.emit(Event::Error {

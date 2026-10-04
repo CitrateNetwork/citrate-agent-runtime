@@ -273,7 +273,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/run_skill", post(run_skill))
         .route("/stop", post(stop))
         // HUP-S1.1b — agent sessions (ADR loop-in-sidecar).
-        .route("/sessions", post(create_session))
+        .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:id", delete(close_session))
         .route("/sessions/:id/messages", post(send_message))
         .route("/sessions/:id/events", get(session_events))
@@ -995,6 +995,18 @@ async fn shell_decide(
     }
 }
 
+/// HUP-S1.1: `GET /sessions` — the open sessions (id, model, busy, last sequence number, persona,
+/// waiting core calls), so every client (app, CLI, MCP) can find and attach to the same session.
+async fn list_sessions(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(serde_json::json!({ "sessions": st.sessions.list() })))
+}
+
 async fn close_session(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1128,13 +1140,15 @@ pub fn production_sessions_with(
     mcp: Option<Arc<citrate_agent_mcp_host::McpHost>>,
 ) -> Arc<sessions::SessionManager> {
     let timeout = std::time::Duration::from_secs(300);
+    // HUP-S1.1 (g1-render): answers stream to the session events unless switched off.
+    let streaming =
+        llm_http::streaming_from_value(std::env::var(llm_http::LLM_STREAM_ENV).ok().as_deref());
     let mgr = sessions::SessionManager::new(
         Arc::new(move |ep: &sessions::LlmEndpoint| {
-            Arc::new(llm_http::OpenAiCompatClient::new(
-                &ep.base_url,
-                &ep.bearer,
-                timeout,
-            )) as Arc<dyn citrate_agent_loop::LlmClient>
+            Arc::new(
+                llm_http::OpenAiCompatClient::new(&ep.base_url, &ep.bearer, timeout)
+                    .with_streaming(streaming),
+            ) as Arc<dyn citrate_agent_loop::LlmClient>
         }),
         timeout,
     );
@@ -1693,6 +1707,8 @@ mod learn_session_tests;
 mod mcp_session_tests;
 #[cfg(test)]
 mod metering_session_tests;
+#[cfg(test)]
+mod session_reattach_tests;
 #[cfg(test)]
 mod sessions_tests;
 #[cfg(test)]

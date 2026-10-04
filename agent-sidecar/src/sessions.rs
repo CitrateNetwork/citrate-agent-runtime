@@ -351,6 +351,22 @@ pub struct EventsPage {
     /// The highest sequence number assigned so far (pass it back as `after`).
     pub last_seq: u64,
     pub busy: bool,
+    /// HUP-S1.1: core-hosted tool calls this session is waiting on (no result posted yet). A view
+    /// that comes back after a reload uses it to finish or honestly close calls it lost track of.
+    pub pending_core_calls: Vec<String>,
+}
+
+/// HUP-S1.1: one open session, as listed by `GET /sessions` (no history, no prompt, no keys).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: String,
+    pub model: String,
+    pub busy: bool,
+    pub last_seq: u64,
+    /// The persona the session applies, if any.
+    pub persona: Option<String>,
+    pub pending_core_calls: Vec<String>,
 }
 
 struct EventLog {
@@ -462,6 +478,31 @@ impl Session {
             events,
             last_seq,
             busy: self.busy.load(Ordering::SeqCst),
+            pending_core_calls: self.pending_core_calls(),
+        }
+    }
+
+    /// HUP-S1.1: the core-hosted call ids waiting for a result, sorted.
+    pub fn pending_core_calls(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .pending
+            .lock()
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// HUP-S1.1: this session as `GET /sessions` lists it.
+    pub fn summary(&self) -> SessionSummary {
+        let last_seq = self.log.lock().map(|l| l.next_seq).unwrap_or(0);
+        SessionSummary {
+            id: self.id.clone(),
+            model: self.cfg.model.clone(),
+            busy: self.is_busy(),
+            last_seq,
+            persona: self.persona.as_ref().map(|p| p.id.clone()),
+            pending_core_calls: self.pending_core_calls(),
         }
     }
 
@@ -1340,6 +1381,18 @@ impl SessionManager {
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// HUP-S1.1: every open session, oldest id first.
+    pub fn list(&self) -> Vec<SessionSummary> {
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default();
+        let mut out: Vec<SessionSummary> = sessions.iter().map(|s| s.summary()).collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// HUP-S2.3: the taint sources of every live session that is tainted (one list per session).
