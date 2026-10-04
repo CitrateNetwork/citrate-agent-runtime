@@ -569,7 +569,7 @@ impl FileTools {
                 let step =
                     self.store
                         .begin_step(session, &a.root, &[Change::delete(&a.canonical)])?;
-                let r = fs::remove_file(&a.canonical).map_err(|e| format!("delete failed: {e}"));
+                let r = remove_checked(&a.canonical).map_err(|e| format!("delete failed: {e}"));
                 (vec![a.canonical], finish(step, r)?)
             }
             FS_RENAME_TOOL => {
@@ -591,7 +591,7 @@ impl FileTools {
                     .canonical
                     .parent()
                     .map_or(Ok(()), fs::create_dir_all)
-                    .and_then(|()| fs::rename(&from.canonical, &to.canonical))
+                    .and_then(|()| rename_checked(&from.canonical, &to.canonical))
                     .map_err(|e| format!("rename failed: {e}"));
                 (vec![from.canonical, to.canonical], finish(step, r)?)
             }
@@ -834,6 +834,86 @@ pub(crate) fn replace_in_dir(
         unlink_tmp();
     }
     res
+}
+
+fn parent_and_name(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr)> {
+    match (path.parent(), path.file_name()) {
+        (Some(p), Some(n)) => Ok((p, n)),
+        _ => Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "the path has no parent folder or file name",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn c_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "a NUL in the name"))
+}
+
+/// Delete the file at `path` (resolved by the grant check) inside its checked folder (L-21): the
+/// folder is opened and confirmed ([`open_dir_checked`]) and the name removed relative to it.
+pub(crate) fn remove_checked(path: &Path) -> std::io::Result<()> {
+    let (parent, name) = parent_and_name(path)?;
+    #[cfg(unix)]
+    {
+        let dir = open_dir_checked(parent)?;
+        remove_in_dir(&dir, name)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, name);
+        fs::remove_file(path)
+    }
+}
+
+/// Rename `from` to `to` (both resolved by the grant check), relative to their checked folders.
+pub(crate) fn rename_checked(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (fp, fname) = parent_and_name(from)?;
+    let (tp, tname) = parent_and_name(to)?;
+    #[cfg(unix)]
+    {
+        let fdir = open_dir_checked(fp)?;
+        let tdir = open_dir_checked(tp)?;
+        rename_between(&fdir, fname, &tdir, tname)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fp, fname, tp, tname);
+        fs::rename(from, to)
+    }
+}
+
+/// Remove `name` (a file, or a link itself, never a folder) inside the open folder `dir`.
+#[cfg(unix)]
+pub(crate) fn remove_in_dir(dir: &fs::File, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let n = c_name(name)?;
+    // SAFETY: unlinkat on a valid directory fd with a NUL-terminated name.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), n.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Rename `from` in the open folder `fdir` to `to` in the open folder `tdir`.
+#[cfg(unix)]
+pub(crate) fn rename_between(
+    fdir: &fs::File,
+    from: &std::ffi::OsStr,
+    tdir: &fs::File,
+    to: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let f = c_name(from)?;
+    let t = c_name(to)?;
+    // SAFETY: renameat on two valid directory fds with NUL-terminated names.
+    if unsafe { libc::renameat(fdir.as_raw_fd(), f.as_ptr(), tdir.as_raw_fd(), t.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The per-session host: the shared tools plus this session's checkpoint id.

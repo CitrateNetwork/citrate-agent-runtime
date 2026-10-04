@@ -1126,8 +1126,14 @@ fn delete_and_rename_act_in_the_folders_that_were_checked() {
         std::ffi::OsStr::new("c.txt"),
     )
     .expect("renamed");
-    assert!(elsewhere.join("a.txt").exists(), "the linked folder's file was not deleted");
-    assert!(elsewhere.join("b.txt").exists(), "the linked folder's file was not moved");
+    assert!(
+        elsewhere.join("a.txt").exists(),
+        "the linked folder's file was not deleted"
+    );
+    assert!(
+        elsewhere.join("b.txt").exists(),
+        "the linked folder's file was not moved"
+    );
     assert!(!moved.join("a.txt").exists());
     assert!(!moved.join("b.txt").exists());
     assert_eq!(std::fs::read(moved.join("c.txt")).expect("renamed"), b"b");
