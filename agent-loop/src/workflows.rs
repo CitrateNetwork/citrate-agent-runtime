@@ -16,11 +16,12 @@
 
 use crate::interview::bundled_tracks;
 use crate::verifiers_tooling::{
-    ForgeTestsPass, MedusaNoFailures, SarifBelowThreshold, Severity, ADERYN_SCAN_TOOL,
-    FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
+    ForgeTestsPass, MedusaNoFailures, SarifBelowThreshold, ScanReportRead, Severity,
+    ADERYN_SCAN_TOOL, FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
 };
 use crate::{
-    AnswerContains, JsonFieldEquals, Step, ToolNotCalled, ToolSucceeded, Verifier, Workflow,
+    AnswerContains, FileDigest, HttpProbe, HttpStatusIs, JsonFieldEquals, Sha256Equals, Step,
+    ToolNotCalled, ToolSucceeded, Verifier, Workflow,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -61,6 +62,18 @@ pub const KNOWN_TOOLS: &[&str] = &[
 
 const MAX_INSTRUCTION_CHARS: usize = 1000;
 const MAX_TEXT_CHARS: usize = 200;
+/// Longest URL or path an HTTP or hash verifier may name, in bytes.
+pub const MAX_LOCATION_BYTES: usize = 2048;
+
+/// HUP-S1.3: the hosts the I/O verifiers need. The bundled catalog builds with none, so it can
+/// never name an HTTP or hash check; a sidecar session supplies its own scoped probes.
+#[derive(Clone, Default)]
+pub struct VerifierEnv {
+    /// For `http_status_is` (loopback or member-consented origins only, in the sidecar).
+    pub http: Option<Arc<dyn HttpProbe>>,
+    /// For `sha256_equals` (inside the session's folder grants only, in the sidecar).
+    pub files: Option<Arc<dyn FileDigest>>,
+}
 
 /// One verifier, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +99,20 @@ pub enum VerifierSpec {
         threshold: String,
     },
     MedusaNoFailures {},
+    /// The latest scan of a SARIF scanner produced a report that was read (any findings).
+    ScanReportRead {
+        tool: String,
+    },
+    /// HUP-S1.3: `GET url` answers exactly `status`.
+    HttpStatusIs {
+        url: String,
+        status: u16,
+    },
+    /// HUP-S1.3: the file at `path` has this SHA-256 (64 hex characters).
+    Sha256Equals {
+        path: String,
+        hex: String,
+    },
 }
 
 impl VerifierSpec {
@@ -95,10 +122,13 @@ impl VerifierSpec {
             VerifierSpec::ToolSucceeded { tool }
             | VerifierSpec::ToolNotCalled { tool }
             | VerifierSpec::JsonFieldEquals { tool, .. }
-            | VerifierSpec::SarifBelowThreshold { tool, .. } => Some(tool),
+            | VerifierSpec::SarifBelowThreshold { tool, .. }
+            | VerifierSpec::ScanReportRead { tool } => Some(tool),
             VerifierSpec::ForgeTestsPass {} => Some(FORGE_TEST_TOOL),
             VerifierSpec::MedusaNoFailures {} => Some(MEDUSA_FUZZ_TOOL),
-            VerifierSpec::AnswerContains { .. } => None,
+            VerifierSpec::AnswerContains { .. }
+            | VerifierSpec::HttpStatusIs { .. }
+            | VerifierSpec::Sha256Equals { .. } => None,
         }
     }
 
@@ -106,18 +136,31 @@ impl VerifierSpec {
     pub fn requires_call(&self) -> bool {
         !matches!(
             self,
-            VerifierSpec::ToolNotCalled { .. } | VerifierSpec::AnswerContains { .. }
+            VerifierSpec::ToolNotCalled { .. }
+                | VerifierSpec::AnswerContains { .. }
+                | VerifierSpec::HttpStatusIs { .. }
+                | VerifierSpec::Sha256Equals { .. }
         )
     }
 
-    /// True when the verdict comes from a tool's result rather than the answer's shape.
+    /// True when the verdict comes from evidence outside the answer: a tool's result, or (HTTP
+    /// and hash checks) the state of the world the step was meant to change.
     pub fn reads_a_tool_report(&self) -> bool {
         self.requires_call()
+            || matches!(
+                self,
+                VerifierSpec::HttpStatusIs { .. } | VerifierSpec::Sha256Equals { .. }
+            )
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.validate_with(&|t| KNOWN_TOOLS.contains(&t))
+    }
+
+    /// Shape checks, with `known` deciding which tool names may appear.
+    pub fn validate_with(&self, known: &dyn Fn(&str) -> bool) -> Result<(), String> {
         if let Some(t) = self.tool() {
-            if !KNOWN_TOOLS.contains(&t) {
+            if !known(t) {
                 return Err(format!("unknown tool {t:?}"));
             }
         }
@@ -140,14 +183,64 @@ impl VerifierSpec {
                     return Err(format!("unknown severity {threshold:?}"));
                 }
             }
+            VerifierSpec::ScanReportRead { tool }
+                if tool != SLITHER_SCAN_TOOL && tool != ADERYN_SCAN_TOOL =>
+            {
+                return Err(format!("{tool:?} is not a SARIF scanner"));
+            }
+            VerifierSpec::HttpStatusIs { url, status } => {
+                let lower = url.to_ascii_lowercase();
+                if url.len() > MAX_LOCATION_BYTES
+                    || url.chars().any(char::is_control)
+                    || !(lower.starts_with("http://") || lower.starts_with("https://"))
+                    || lower.len() <= "https://".len()
+                {
+                    return Err(format!("{url:?} is not an http(s) URL"));
+                }
+                if !(100..=599).contains(status) {
+                    return Err(format!("{status} is not an HTTP status"));
+                }
+            }
+            VerifierSpec::Sha256Equals { path, hex } => {
+                if path.trim().is_empty()
+                    || path.len() > MAX_LOCATION_BYTES
+                    || path.chars().any(char::is_control)
+                {
+                    return Err("sha256_equals needs a file path".into());
+                }
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("sha256_equals needs 64 hex characters".into());
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
-    /// The real verifier.
+    /// The real verifier. The bundled catalog has no I/O hosts, so an HTTP or hash check is
+    /// refused here; see [`VerifierSpec::build_in`].
     pub fn build(&self) -> Result<Arc<dyn Verifier>, String> {
+        self.build_in(&VerifierEnv::default())
+    }
+
+    /// The real verifier, with `env`'s hosts for the I/O checks.
+    pub fn build_in(&self, env: &VerifierEnv) -> Result<Arc<dyn Verifier>, String> {
         self.validate()?;
+        self.build_checked(env)
+    }
+
+    /// The real verifier, with `known` deciding which tool names may appear (a model-proposed
+    /// plan names the session's own tools, not the catalog's).
+    pub fn build_with(
+        &self,
+        env: &VerifierEnv,
+        known: &dyn Fn(&str) -> bool,
+    ) -> Result<Arc<dyn Verifier>, String> {
+        self.validate_with(known)?;
+        self.build_checked(env)
+    }
+
+    fn build_checked(&self, env: &VerifierEnv) -> Result<Arc<dyn Verifier>, String> {
         Ok(match self {
             VerifierSpec::ToolSucceeded { tool } => Arc::new(ToolSucceeded(tool.clone())),
             VerifierSpec::ToolNotCalled { tool } => Arc::new(ToolNotCalled(tool.clone())),
@@ -168,6 +261,19 @@ impl VerifierSpec {
                 Arc::new(SarifBelowThreshold::new(tool, t))
             }
             VerifierSpec::MedusaNoFailures {} => Arc::new(MedusaNoFailures::default()),
+            VerifierSpec::ScanReportRead { tool } => Arc::new(ScanReportRead::new(tool)),
+            VerifierSpec::HttpStatusIs { url, status } => {
+                let probe = env.http.clone().ok_or_else(|| {
+                    "http_status_is needs the sidecar session's HTTP probe".to_string()
+                })?;
+                Arc::new(HttpStatusIs::new(url.clone(), *status, probe))
+            }
+            VerifierSpec::Sha256Equals { path, hex } => {
+                let files = env.files.clone().ok_or_else(|| {
+                    "sha256_equals needs the sidecar session's folder grants".to_string()
+                })?;
+                Arc::new(Sha256Equals::new(path.clone(), hex, files))
+            }
         })
     }
 }
