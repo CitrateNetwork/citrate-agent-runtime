@@ -646,3 +646,42 @@ async fn the_benchmark_payload_carries_the_days_gas_and_salt() {
     );
     assert_eq!(p["sent"], false);
 }
+
+#[tokio::test]
+async fn a_workflow_run_is_metered_with_its_verdict_and_the_self_review_opinion() {
+    // HUP-S7.5 (D-27): workflow attempts reach metering like chat turns, so the day's report shows
+    // the verifier's verdict next to the model's labelled opinion (never its text).
+    let script: Arc<dyn LlmClient> = Arc::new(Script {
+        turns: Mutex::new(vec![
+            AssistantTurn::text("READY"),
+            AssistantTurn::text("PASS: OPINION-CANARY it said ready."),
+        ]),
+        usage: None,
+    });
+    let mgr = sessions::SessionManager::new(
+        Arc::new(move |_ep: &sessions::LlmEndpoint| script.clone()),
+        Duration::from_secs(5),
+    )
+    .with_self_review(true);
+    let st = state(mgr);
+    let id = create(&st, no_tools()).await;
+    let wf = serde_json::json!({"id": "say-ready", "steps": [{"id": "ready", "instruction": "Reply READY.", "max_attempts": 1, "verifiers": [{"kind": "answer_contains", "text": "READY"}]}]});
+    let r = app(st.clone())
+        .oneshot(req("POST", &format!("/sessions/{id}/workflows"), wf, true))
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.status());
+    for _ in 0..300 {
+        if !st.sessions.get(&id).unwrap().is_busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, v) = daily(&st, &today()).await;
+    assert_eq!(v["report"]["turns"], 1, "{v}");
+    assert_eq!(v["report"]["verification"]["passed"], 1);
+    assert_eq!(v["report"]["self_review"]["pass"], 1);
+    assert_eq!(v["report"]["self_review"]["label"], "opinion");
+    assert_eq!(v["report"]["self_review"]["agreed_with_verifiers"], 1);
+    assert!(!v.to_string().contains("OPINION-CANARY"));
+}

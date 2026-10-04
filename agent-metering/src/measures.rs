@@ -186,9 +186,11 @@ pub enum SelfReviewClaim {
 
 impl SelfReviewClaim {
     /// The claim from the opinion's first word (the reviewer is asked to start with PASS or FAIL).
+    /// Leading markup (`**PASS**`, `- FAIL`, a quote) is skipped; a reply that starts with any
+    /// other word is unclear.
     pub fn parse(text: &str) -> Self {
         let first: String = text
-            .trim_start()
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
             .chars()
             .take_while(|c| c.is_ascii_alphabetic())
             .collect();

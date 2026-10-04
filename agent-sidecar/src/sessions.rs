@@ -1827,7 +1827,13 @@ impl SessionManager {
         let rid = run_id.clone();
         let self_review = self.self_review;
         tokio::task::spawn_blocking(move || {
-            let sink = SessionSink(s.clone());
+            // HUP-S7.5 (D-27): a workflow's attempts are metered like chat turns, so their verifier
+            // verdicts and self-review opinions reach the daily report.
+            let session_sink = SessionSink(s.clone());
+            let sink = TeeSink {
+                observers: vec![s.metering.as_ref()],
+                last: &session_sink,
+            };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
             let reviewer =
                 LlmSelfReviewer::new(s.llm.as_ref(), s.cfg.model.clone(), SELF_REVIEW_MAX_TOKENS);
@@ -1850,6 +1856,8 @@ impl SessionManager {
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
+            // The last attempt's verdicts and opinion arrive after its `done`: drain now.
+            s.metering_store.append(s.metering.take_records());
             s.set_run(
                 &rid,
                 match out {

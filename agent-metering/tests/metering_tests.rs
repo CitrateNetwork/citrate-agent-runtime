@@ -1223,6 +1223,14 @@ fn the_self_review_claim_is_kept_as_a_labelled_opinion_without_its_text() {
     );
     assert_eq!(SelfReviewClaim::parse("Passable"), SelfReviewClaim::Unclear);
     assert_eq!(SelfReviewClaim::parse("PASS."), SelfReviewClaim::Pass);
+    assert_eq!(
+        SelfReviewClaim::parse("**PASS** it is."),
+        SelfReviewClaim::Pass
+    );
+    assert_eq!(SelfReviewClaim::parse("- Fail: no."), SelfReviewClaim::Fail);
+    assert_eq!(SelfReviewClaim::parse("\"FAIL\""), SelfReviewClaim::Fail);
+    assert_eq!(SelfReviewClaim::parse("2 PASS"), SelfReviewClaim::Unclear);
+    assert_eq!(SelfReviewClaim::parse(""), SelfReviewClaim::Unclear);
 }
 
 #[test]
