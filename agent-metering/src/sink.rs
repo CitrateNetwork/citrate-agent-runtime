@@ -187,7 +187,10 @@ impl MeteringSink {
                 }
             }
             // Content-bearing or boundary-only events: nothing to count.
-            Event::StepEnd { .. } | Event::Final { .. } | Event::Error { .. } => {}
+            Event::StepEnd { .. }
+            | Event::AssistantDelta { .. }
+            | Event::Final { .. }
+            | Event::Error { .. } => {}
             Event::Verifier { .. } | Event::SelfReview { .. } => {}
         }
     }

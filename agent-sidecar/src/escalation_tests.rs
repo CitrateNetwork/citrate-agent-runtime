@@ -218,3 +218,108 @@ async fn the_registry_route_reports_disabled() {
         .map(|a| !a.is_empty())
         .unwrap_or(false));
 }
+
+// ---- US-1.5 AC3: escalation receipts land in metering ----
+
+fn get(path: &str) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .header("authorization", format!("Bearer {BEARER}"))
+        .body(Body::empty())
+        .expect("req")
+}
+
+#[tokio::test]
+async fn a_settled_escalation_leaves_a_content_free_receipt_in_the_daily_report() {
+    let base = serve_once(
+        200,
+        serde_json::json!({"choices": [{"message": {"content": "step 1, step 2"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 20}}).to_string(),
+    );
+    let st = state();
+    let resp = app(st.clone())
+        .oneshot(post(
+            "/escalations",
+            Some(BEARER),
+            escalation_body(&base, 1_000),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let receipts = st
+        .sessions
+        .metering()
+        .escalation_receipts()
+        .expect("receipts");
+    assert_eq!(receipts.len(), 1);
+    let r = &receipts[0];
+    assert_eq!(r.escalation_id, "esc-7");
+    assert_eq!(r.model, "planner");
+    assert_eq!((r.tokens_in, r.tokens_out), (Some(10), Some(20)));
+    assert_eq!((r.reserved_micros, r.charged_micros), (1_000, 50));
+    let line = serde_json::to_string(r).expect("json");
+    assert!(!line.contains(KEY) && !line.contains("Plan it.") && !line.contains("step 1"));
+    assert!(
+        !line.contains("127.0.0.1"),
+        "no endpoint URL in the receipt"
+    );
+
+    let day = citrate_agent_metering::utc_day_of_ms(r.started_unix_ms);
+    let resp = app(st)
+        .oneshot(get(&format!("/metering/daily?day={day}")))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["escalations"]["count"], 1);
+    assert_eq!(j["escalations"]["chargedMicros"], 50);
+    assert!(j["markdown"]
+        .as_str()
+        .unwrap_or("")
+        .contains("## Escalations"));
+}
+
+#[tokio::test]
+async fn a_failure_after_sending_charges_the_reservation_in_its_receipt() {
+    let base = serve_once(500, "{}".into());
+    let st = state();
+    let resp = app(st.clone())
+        .oneshot(post(
+            "/escalations",
+            Some(BEARER),
+            escalation_body(&base, 1_000),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let receipts = st
+        .sessions
+        .metering()
+        .escalation_receipts()
+        .expect("receipts");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].settlement,
+        citrate_agent_metering::EscalationSettlement::FailedAfterSend
+    );
+    assert_eq!(receipts[0].charged_micros, 1_000);
+}
+
+#[tokio::test]
+async fn a_request_refused_before_sending_leaves_no_receipt() {
+    let st = state();
+    let resp = app(st.clone())
+        .oneshot(post(
+            "/escalations",
+            Some(BEARER),
+            escalation_body("https://x.example/v1", 0),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(st
+        .sessions
+        .metering()
+        .escalation_receipts()
+        .expect("receipts")
+        .is_empty());
+}

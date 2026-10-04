@@ -180,7 +180,7 @@ async fn without_skills_configured_sessions_offer_no_skill_load() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn with_skills_the_index_is_in_the_prompt_and_skill_load_is_always_offered() {
+async fn with_skills_the_matching_skills_are_in_the_prompt_and_skill_load_is_always_offered() {
     let s = Scratch::new();
     skill(
         &s.0,
@@ -190,17 +190,56 @@ async fn with_skills_the_index_is_in_the_prompt_and_skill_load_is_always_offered
     );
     let (st, rec) = state(vec![], Some(library(&s.0)));
     run_one(&st, create_body(core_tools()), "what is the node height").await;
+    run_one(
+        &st,
+        create_body(core_tools()),
+        "write my weekly staking report",
+    )
+    .await;
     let seen = rec.seen.lock().unwrap();
     let names: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
     // Pinned outside the per-request retrieval budget of 1.
     assert_eq!(names, vec![SKILL_LOAD_TOOL, "node_status"]);
+    // A request the skill does not match: no skill line, only the installed count.
     let sys = &seen[0].messages[0].content;
     assert!(sys.starts_with("You are Hermes."));
+    assert!(!sys.contains("- staking-report:"), "{sys}");
+    assert!(sys.contains("1 skill is installed"), "{sys}");
+    // A request it matches: its line rides in that turn's prompt.
+    let sys = &seen[1].messages[0].content;
     assert!(sys.contains("- staking-report: Write the weekly staking report."));
     assert!(
         !sys.contains("BODY"),
         "bodies load on demand, not in the prompt"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_surfaces_at_most_five_skills_from_a_large_library() {
+    let s = Scratch::new();
+    for i in 0..40 {
+        skill(
+            &s.0,
+            &format!("contract-skill-{i:02}"),
+            &format!("Contract helper number {i} for audits and deploys."),
+            "BODY",
+        );
+    }
+    let (st, rec) = state(vec![], Some(library(&s.0)));
+    run_one(
+        &st,
+        create_body(core_tools()),
+        "audit and deploy my contract",
+    )
+    .await;
+    let seen = rec.seen.lock().unwrap();
+    let sys = &seen[0].messages[0].content;
+    let listed = sys
+        .lines()
+        .filter(|l| l.starts_with("- contract-skill-"))
+        .count();
+    assert_eq!(listed, 5, "{sys}");
+    assert!(sys.contains("40 skills are installed"), "{sys}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

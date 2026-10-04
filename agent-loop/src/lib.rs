@@ -31,6 +31,7 @@ pub mod decide;
 pub mod interview;
 pub mod personas;
 pub mod planner;
+pub mod retrieval;
 pub mod skills;
 pub mod verifiers_tooling;
 pub mod workflows;
@@ -429,6 +430,65 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
         self.complete(req).map(|t| (t, None))
     }
+
+    /// HUP-S1.1 (g1-render): [`LlmClient::complete_with_usage`] that also hands each piece of
+    /// assistant text to `on_delta` as the provider produces it. The returned turn is the whole
+    /// answer, exactly as the non-streaming call would return it. The default produces no deltas:
+    /// a client that cannot stream behaves as before.
+    fn complete_streaming(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        let _ = on_delta;
+        self.complete_with_usage(req)
+    }
+}
+
+/// HUP-S1.1 (g1-render): batches streamed assistant text into `assistant_delta` events, so a long
+/// answer becomes tens of events, not one per token (the session event log is bounded).
+pub struct DeltaCoalescer {
+    step: u32,
+    buf: String,
+    last: std::time::Instant,
+}
+
+impl DeltaCoalescer {
+    /// Bytes buffered before an event is emitted.
+    pub const MAX_BYTES: usize = 64;
+    /// Longest a piece of text waits before it is emitted.
+    pub const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    pub fn new(step: u32) -> Self {
+        DeltaCoalescer {
+            step,
+            buf: String::new(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Add streamed text; emits when enough text is waiting or it has waited long enough.
+    pub fn push(&mut self, sink: &dyn EventSink, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.buf.push_str(text);
+        if self.buf.len() >= Self::MAX_BYTES || self.last.elapsed() >= Self::MAX_WAIT {
+            self.flush(sink);
+        }
+    }
+
+    /// Emit whatever is waiting.
+    pub fn flush(&mut self, sink: &dyn EventSink) {
+        if self.buf.is_empty() {
+            return;
+        }
+        sink.emit(Event::AssistantDelta {
+            step: self.step,
+            text: std::mem::take(&mut self.buf),
+        });
+        self.last = std::time::Instant::now();
+    }
 }
 
 /// Token usage one model call reported (HUP-S7.5 metering). Taken from the provider's own
@@ -477,6 +537,13 @@ pub enum Event {
         source: String,
         reason: String,
     },
+    /// HUP-S1.1 (g1-render): a piece of the assistant's text while the model is still writing.
+    /// Informational only: the step's `final` event (when the step answers) carries the whole
+    /// answer, and a step that ends in tool calls has no `final`.
+    AssistantDelta {
+        step: u32,
+        text: String,
+    },
     Final {
         content: String,
     },
@@ -513,6 +580,7 @@ impl Event {
             Event::ToolResult { .. } => "tool_result",
             Event::StepEnd { .. } => "step_end",
             Event::Tainted { .. } => "tainted",
+            Event::AssistantDelta { .. } => "assistant_delta",
             Event::Final { .. } => "final",
             Event::Verifier { .. } => "verifier",
             Event::SelfReview { .. } => "self_review",
@@ -618,6 +686,7 @@ pub fn run_turn_with(
     history: &mut Vec<Message>,
     user: &str,
 ) -> RunOutcome {
+    let system_prompt = turn_system_prompt(cfg, opts, user, history);
     history.push(Message::user(user));
     for step in 1..=cfg.max_steps {
         if stop.is_stopped() {
@@ -625,7 +694,7 @@ pub fn run_turn_with(
         }
         sink.emit(Event::StepStart { step });
         let mut messages = Vec::with_capacity(history.len() + 1);
-        messages.push(Message::system(cfg.system_prompt.clone()));
+        messages.push(Message::system(system_prompt.clone()));
         messages.extend(history.iter().cloned());
         let offered = offered_tools(
             tools.specs(),
@@ -633,6 +702,10 @@ pub fn run_turn_with(
             user,
             opts.max_tools_per_request,
             &opts.pinned_tools,
+            opts.selector
+                .as_deref()
+                .unwrap_or(&KeywordSelector as &dyn ToolSelector),
+            opts.max_tools_total,
         );
         if let Some((budget, counter)) = &opts.budget {
             let tool_tokens = counter.count(&serde_json::to_string(&offered).unwrap_or_default());
@@ -654,8 +727,11 @@ pub fn run_turn_with(
             tools: offered,
             max_tokens: cfg.max_tokens,
         };
-        let turn = match llm.complete(&req) {
-            Ok(t) => t,
+        let mut deltas = DeltaCoalescer::new(step);
+        let streamed = llm.complete_streaming(&req, &mut |d| deltas.push(sink, d));
+        deltas.flush(sink);
+        let turn = match streamed {
+            Ok((t, _)) => t,
             Err(e) => {
                 let msg = e.to_string();
                 sink.emit(Event::Error {
@@ -811,6 +887,44 @@ pub struct TurnOptions {
     /// `max_tools_per_request` (e.g. `skill_load`, which only works if the model can always see it).
     /// Names that are not in the registry are ignored.
     pub pinned_tools: Vec<String>,
+    /// HUP-S3.2: sections appended to the system prompt for each turn, built from that turn's
+    /// request (e.g. the five skills that match it). Computed once per turn, never stored in
+    /// the history.
+    pub turn_context: Vec<Arc<dyn TurnContext>>,
+    /// HUP-S1.2: ranks the tools offered on each request. `None` uses [`KeywordSelector`]; the
+    /// sidecar passes a [`retrieval::HybridRetriever`] (embedding plus keywords, which falls back
+    /// to keywords by itself when no embedding endpoint answers).
+    pub selector: Option<Arc<dyn ToolSelector>>,
+    /// US-1.4 AC1: a hard ceiling on the tool schemas in one request, pinned and in-use tools
+    /// included. When it binds, pinned tools come first, then the tools used most recently, then
+    /// retrieval. `None` keeps the plain `max_tools_per_request` rule (pinned tools and tools in
+    /// use ride outside it).
+    pub max_tools_total: Option<usize>,
+}
+
+/// HUP-S3.2: per-turn context for the system prompt. `section` sees the turn's user message and
+/// the history before it, and returns the text to append (or `None` for nothing).
+pub trait TurnContext: Send + Sync {
+    fn section(&self, user: &str, history: &[Message]) -> Option<String>;
+}
+
+/// The system prompt for one turn: the configured prompt plus every turn-context section.
+fn turn_system_prompt(
+    cfg: &LoopConfig,
+    opts: &TurnOptions,
+    user: &str,
+    history: &[Message],
+) -> String {
+    let mut out = cfg.system_prompt.clone();
+    for ctx in &opts.turn_context {
+        if let Some(section) = ctx.section(user, history) {
+            if !section.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&section);
+            }
+        }
+    }
+    out
 }
 
 /// Chooses which tool schemas to offer for a query. Tool schemas are the largest fixed cost in a
@@ -821,7 +935,7 @@ pub trait ToolSelector: Send + Sync {
 
 /// Deterministic keyword scorer over tool names (weighted) and descriptions. Snake_case names are
 /// split into words. With no signal at all it falls back to the first `k` tools in catalog order.
-/// (An embedding selector can implement the same trait once the knowledge graph is bundled.)
+/// [`retrieval::HybridRetriever`] adds embedding similarity on top of this score.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeywordSelector;
 
@@ -831,7 +945,7 @@ const STOPWORDS: &[&str] = &[
     "you", "please", "with", "from", "at", "by", "be",
 ];
 
-fn words(s: &str) -> Vec<String> {
+pub(crate) fn words(s: &str) -> Vec<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| w.len() >= 2 && !STOPWORDS.contains(w))
@@ -845,24 +959,30 @@ fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// The keyword score of every spec for `query` (same order as `specs`): three points for each
+/// query word in the tool's name, one for each in its description.
+pub fn keyword_scores(query: &str, specs: &[ToolSpec]) -> Vec<usize> {
+    let q = words(query);
+    specs
+        .iter()
+        .map(|s| {
+            let name = words(&s.name);
+            let desc = words(&s.description);
+            q.iter()
+                .map(|w| {
+                    3 * name.iter().filter(|n| *n == w).count()
+                        + desc.iter().filter(|d| *d == w).count()
+                })
+                .sum()
+        })
+        .collect()
+}
+
 impl ToolSelector for KeywordSelector {
     fn select(&self, query: &str, specs: &[ToolSpec], k: usize) -> Vec<ToolSpec> {
-        let q = words(query);
-        let mut scored: Vec<(usize, usize)> = specs
-            .iter()
+        let mut scored: Vec<(usize, usize)> = keyword_scores(query, specs)
+            .into_iter()
             .enumerate()
-            .map(|(i, s)| {
-                let name = words(&s.name);
-                let desc = words(&s.description);
-                let score = q
-                    .iter()
-                    .map(|w| {
-                        3 * name.iter().filter(|n| *n == w).count()
-                            + desc.iter().filter(|d| *d == w).count()
-                    })
-                    .sum();
-                (i, score)
-            })
             .collect();
         if scored.iter().all(|(_, sc)| *sc == 0) {
             return specs.iter().take(k).cloned().collect();
@@ -877,33 +997,55 @@ impl ToolSelector for KeywordSelector {
     }
 }
 
+/// The tool schemas for one request. Pinned tools first, then tools already used in this
+/// conversation (most recent first), then `selector`'s picks over the rest, up to `k` retrieved
+/// tools (or as many as are in use, if more). `total` caps the whole list (US-1.4 AC1).
+#[allow(clippy::too_many_arguments)]
 fn offered_tools(
     specs: &[ToolSpec],
     history: &[Message],
     user: &str,
     k: Option<usize>,
     pinned: &[String],
+    selector: &dyn ToolSelector,
+    total: Option<usize>,
 ) -> Vec<ToolSpec> {
-    let Some(k) = k else { return specs.to_vec() };
+    let cap = total.unwrap_or(usize::MAX);
+    let k = match (k, total) {
+        (Some(k), _) => k,
+        (None, Some(t)) => t,
+        (None, None) => return specs.to_vec(),
+    };
     let is_pinned = |s: &ToolSpec| pinned.iter().any(|p| p == &s.name);
     // Pinned tools first, then retrieval over the rest (so pinning never costs a retrieval slot).
-    let mut out: Vec<ToolSpec> = specs.iter().filter(|s| is_pinned(s)).cloned().collect();
+    let mut out: Vec<ToolSpec> = specs
+        .iter()
+        .filter(|s| is_pinned(s))
+        .take(cap)
+        .cloned()
+        .collect();
     let rest: Vec<ToolSpec> = specs.iter().filter(|s| !is_pinned(s)).cloned().collect();
     let base = out.len();
-    let specs = rest.as_slice();
-    let in_use: Vec<&str> = history
+    let mut in_use: Vec<&str> = Vec::new();
+    for name in history
         .iter()
-        .flat_map(|m| m.tool_calls.iter().map(|c| c.name.as_str()))
-        .filter(|n| !pinned.iter().any(|p| p == n))
-        .collect();
-    out.extend(
-        specs
-            .iter()
-            .filter(|s| in_use.contains(&s.name.as_str()))
-            .cloned(),
-    );
-    for s in KeywordSelector.select(user, specs, k) {
-        if out.len() - base >= k.max(in_use.len()) {
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev().map(|c| c.name.as_str()))
+    {
+        if !in_use.contains(&name) && rest.iter().any(|s| s.name == name) {
+            in_use.push(name);
+        }
+    }
+    for name in &in_use {
+        if out.len() >= cap {
+            break;
+        }
+        if let Some(s) = rest.iter().find(|s| s.name == *name) {
+            out.push(s.clone());
+        }
+    }
+    for s in selector.select(user, &rest, k) {
+        if out.len() - base >= k.max(in_use.len()) || out.len() >= cap {
             break;
         }
         if !out.iter().any(|o| o.name == s.name) {
