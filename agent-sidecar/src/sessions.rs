@@ -491,6 +491,19 @@ pub struct Session {
 impl Session {
     /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
     /// given. `None` when this session has no toolchain.
+    /// The conversation so far (what the model is sent next turn, after the system prompt).
+    pub fn history_snapshot(&self) -> Vec<Message> {
+        self.history.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    /// HUP-S6 US-6.2: the deploy guard over this session's toolchain reports (`None` without
+    /// the toolchain).
+    pub fn deploy_guard(&self) -> Option<crate::deploy_guard::DeployGuard> {
+        self.toolchain_reports
+            .clone()
+            .map(crate::deploy_guard::DeployGuard::new)
+    }
+
     pub fn toolchain_reports(
         &self,
         project: Option<&str>,
@@ -1708,6 +1721,11 @@ impl SessionManager {
         let mut registry = ToolRegistry::new(session.specs.clone())
             .with_host(HostKind::Core, core)
             .with_taint(session.taint.clone());
+        // US-6.2: while the session's latest toolchain reports block a deploy, `contract_deploy`
+        // is declined before it is announced, so core never opens a SignatureCeremony for it.
+        if let Some(guard) = session.deploy_guard() {
+            registry = registry.with_policy(Arc::new(guard));
+        }
         let skill_host = session.skills.clone().map(SkillHost::new);
         let capsule_host = capsules.map(|d| CapsuleHost {
             dispatch: d,
@@ -1903,16 +1921,23 @@ impl SessionManager {
                 last: &session_sink,
             };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            run_turn_with(
-                &s.cfg,
-                &s.opts,
-                s.llm.as_ref(),
-                &registry,
-                &sink,
-                &s.stop,
-                &mut history,
-                &text,
-            );
+            // US-6.1 AC2 / US-6.2: a deploy request while the gate blocks is answered with the
+            // refusal, the findings and the proposed fix, without a model call or any tool call.
+            match s.deploy_guard().and_then(|g| g.answer_to(&text)) {
+                Some(refusal) => answer_without_model(&sink, &mut history, &text, refusal),
+                None => {
+                    run_turn_with(
+                        &s.cfg,
+                        &s.opts,
+                        s.llm.as_ref(),
+                        &registry,
+                        &sink,
+                        &s.stop,
+                        &mut history,
+                        &text,
+                    );
+                }
+            }
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
@@ -1960,6 +1985,28 @@ impl SessionManager {
 }
 
 /// Parse a `tool_results` status into an outcome.
+/// A turn the sidecar answers itself (the deploy guard's refusal): the same events a model turn
+/// that answers in one step emits, and the same history.
+fn answer_without_model(
+    sink: &dyn EventSink,
+    history: &mut Vec<Message>,
+    user: &str,
+    answer: String,
+) {
+    history.push(Message::user(user));
+    sink.emit(Event::StepStart { step: 1 });
+    history.push(Message {
+        role: citrate_agent_loop::Role::Assistant,
+        content: answer.clone(),
+        tool_calls: vec![],
+        tool_call_id: None,
+    });
+    sink.emit(Event::Final { content: answer });
+    sink.emit(Event::Done {
+        outcome: "answered".into(),
+    });
+}
+
 pub fn outcome_from(req: ToolResultReq) -> Result<ToolOutcome, SessionError> {
     let untrusted = match req.trust.as_deref() {
         None | Some("trusted") => false,

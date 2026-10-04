@@ -24,6 +24,7 @@ pub mod capsule_sandbox;
 mod chain_routes;
 mod checkpoint_routes;
 pub mod decide;
+pub mod deploy_guard;
 pub mod escalation;
 pub mod files;
 pub mod grants;
@@ -2133,6 +2134,8 @@ mod verify_probes_tests;
 mod browser_session_tests;
 #[cfg(test)]
 mod decide_route_tests;
+#[cfg(test)]
+mod deploy_guard_session_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]

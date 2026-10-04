@@ -25,3 +25,11 @@ deploy gate (the one source of truth for a deploy verdict) parses them. Both rep
 agree on every verdict: clean is a pass for slither, aderyn and medusa; the injected
 `selfdestruct` is High for slither (`0-0-suicidal`) and for aderyn (`selfdestruct`, level
 `warning`).
+
+## Added for US-6.1 AC2 / US-6.2 (fan-out 7, `hup/n7-hellomint-agent-loop`)
+
+| file | what |
+|---|---|
+| `forge-hellomint-unbounded-mint.json` | `forge test --json` (forge 1.5.1) on the `hello-mint` project with the supply cap check removed, captured by citrate-core's hello-mint e2e on 2026-10-04. Trimmed to the fields the parsers read (`status`, `reason`, `counterexample`, `duration`, `warnings`); the per-test traces and logs are left out. |
+| `hellomint-Token-unbounded.sol` | The `hello-mint` contract as citrate-core's renderer writes it today (`Lemon Drops`, `LEMON`, 500 supply, 5 SALT), with the one line the e2e removes (`if (quantity > remaining) revert SoldOut(...)`). |
+| `erc20-Token-selfdestruct.sol` | The `erc20` contract as the renderer writes it today, plus the same injected `shutdown()` as `forge-gate-proof.sh`. The capture above was taken on an older render that had one more line, so its locations point one line lower than this file; the fix proposal finds the `selfdestruct` by its code, not by the line number. |
