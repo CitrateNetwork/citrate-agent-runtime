@@ -620,3 +620,11 @@ fn worst_case_golden_shared_with_core() {
     with_empty_system.system = Some(String::new());
     assert_eq!(with_empty_system.worst_case_micros(), Some(152));
 }
+
+#[test]
+fn the_registry_status_no_longer_lists_the_eip712_hasher_and_names_native_payment() {
+    let s = DisabledRegistry.status();
+    assert!(!s.enabled);
+    assert!(!s.missing.iter().any(|m| m.contains("EIP-712")));
+    assert!(s.missing.iter().any(|m| m.contains("native SALT")));
+}

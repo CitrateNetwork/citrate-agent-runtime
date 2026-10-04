@@ -4,6 +4,9 @@
 //! - `GET  /checkpoints/:session`                 the session's steps, newest first
 //! - `POST /checkpoints/:session/steps/:seq/undo` undo one step
 //! - `POST /checkpoints/:session/undo`            undo every step not undone yet (all or nothing)
+//! - `GET  /checkpoints/:session/steps/:seq/diff` HUP-S5.4: what one step changed, path by path,
+//!   for the Code and diff pop-out (read-only; text up to 256 KiB per side, binary and larger
+//!   files described, the after side only while the file still holds the step's result)
 //!
 //! A refusal is a JSON body `{error, kind, conflicts?}`: `kind` is `disabled` (503, no store
 //! configured), `invalid` (400), `not_found` (404), `pruned` (410), `conflict`, `busy` or
@@ -17,7 +20,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use citrate_agent_checkpoints::{CheckpointStore, Error, SessionId, StepSummary, UndoReport};
+use citrate_agent_checkpoints::{
+    CheckpointStore, Error, SessionId, StepSummary, UndoReport, DEFAULT_MAX_SIDE_BYTES,
+};
 
 use crate::{authorized, AppState};
 
@@ -124,19 +129,41 @@ pub(crate) async fn list_steps(
     })))
 }
 
+fn positive_seq(seq: &str) -> Result<u64, Reply> {
+    seq.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+        refusal(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "the step must be a positive whole number",
+        )
+    })
+}
+
+/// HUP-S5.4: `GET /checkpoints/:session/steps/:seq/diff`.
+pub(crate) async fn step_diff(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path((session, seq)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, Reply> {
+    let (store, sid) = prepare(&headers, &st, &session)?;
+    let seq = positive_seq(&seq)?;
+    let d = blocking(move || store.step_diff(&sid, seq, DEFAULT_MAX_SIDE_BYTES)).await?;
+    serde_json::to_value(&d).map(Json).map_err(|_| {
+        refusal(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed",
+            "the diff could not be encoded",
+        )
+    })
+}
+
 pub(crate) async fn undo_step(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
     Path((session, seq)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, Reply> {
     let (store, sid) = prepare(&headers, &st, &session)?;
-    let seq: u64 = seq.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
-        refusal(
-            StatusCode::BAD_REQUEST,
-            "invalid",
-            "the step must be a positive whole number",
-        )
-    })?;
+    let seq = positive_seq(&seq)?;
     let report = blocking(move || store.undo_step(&sid, seq)).await?;
     Ok(Json(report_json(&report)))
 }

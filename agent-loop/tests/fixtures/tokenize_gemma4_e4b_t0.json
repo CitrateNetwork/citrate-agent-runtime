@@ -1,0 +1,153 @@
+{
+ "recorded": "2026-10-04",
+ "server": "citrate-core bundled llama-server 0.4.0-dev (build 10909, commit a2878d30d)",
+ "model": "gemma-4-E4B-it-Q4_0.gguf (T0)",
+ "request": {
+  "path": "/tokenize",
+  "add_special": false
+ },
+ "cases": [
+  {
+   "content": "What is my block height and how many peers do I have?",
+   "response": {
+    "tokens": [
+     3689,
+     563,
+     1041,
+     3355,
+     3558,
+     532,
+     1217,
+     1551,
+     30055,
+     776,
+     564,
+     735,
+     236881
+    ]
+   }
+  },
+  {
+   "content": "You are Hermes, the member's agent on the Citrate network. Answer briefly.",
+   "response": {
+    "tokens": [
+     3048,
+     659,
+     141066,
+     236764,
+     506,
+     4374,
+     236789,
+     236751,
+     8726,
+     580,
+     506,
+     19007,
+     4720,
+     3707,
+     236761,
+     25685,
+     21485,
+     236761
+    ]
+   }
+  },
+  {
+   "content": "Read the local node's block height, peers and sync state.",
+   "response": {
+    "tokens": [
+     6190,
+     506,
+     2263,
+     5349,
+     236789,
+     236751,
+     3355,
+     3558,
+     236764,
+     30055,
+     532,
+     27674,
+     1883,
+     236761
+    ]
+   }
+  },
+  {
+   "content": "Semantic search over the member's memory graph and Citrate docs.",
+   "response": {
+    "tokens": [
+     128447,
+     3927,
+     1024,
+     506,
+     4374,
+     236789,
+     236751,
+     6571,
+     3753,
+     532,
+     19007,
+     4720,
+     48949,
+     236761
+    ]
+   }
+  },
+  {
+   "content": "Propose deploying compiled contract bytecode through the signing ceremony.",
+   "response": {
+    "tokens": [
+     1489,
+     3518,
+     76702,
+     28725,
+     4258,
+     219777,
+     1343,
+     506,
+     21502,
+     17620,
+     236761
+    ]
+   }
+  },
+  {
+   "content": "Großartig! Ünïcödé text, emoji 🙂 and code: fn main() { println!(\"hi\"); }",
+   "response": {
+    "tokens": [
+     69201,
+     237435,
+     132578,
+     236888,
+     15356,
+     236749,
+     238527,
+     236755,
+     55515,
+     236859,
+     1816,
+     236764,
+     64334,
+     57235,
+     532,
+     3393,
+     236787,
+     12751,
+     1689,
+     825,
+     642,
+     32374,
+     36492,
+     2202,
+     1443,
+     682
+    ]
+   }
+  }
+ ],
+ "embeddings_on_chat_server": {
+  "status": 501,
+  "body": "{\"error\":{\"code\":501,\"message\":\"This server does not support embeddings. Start it with `--embeddings`\",\"type\":\"not_supported_error\"}}"
+ }
+}
