@@ -452,3 +452,91 @@ fn shutdown_stops_every_stdio_server_now() {
     assert!(matches!(out, ToolOutcome::Error(_)), "{out:?}");
     host.shutdown(); // idempotent
 }
+
+/// A fresh, empty folder under the system temp dir for one test.
+fn docs_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "citrate-mcp-eval-docs-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).expect("docs dir");
+    d
+}
+
+#[test]
+fn eval_docs_mode_lists_only_read_doc_and_write_note() {
+    let dir = docs_dir("list");
+    let dir_s = dir.to_string_lossy().to_string();
+    let host = McpHost::connect(&McpConfig {
+        servers: vec![{
+            let mut s = server("fixture", &["--eval-docs", &dir_s]);
+            s.allow_write_tools = true;
+            s
+        }],
+    });
+    let specs = host.specs();
+    let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["mcp__fixture__read_doc", "mcp__fixture__write_note"]
+    );
+    let read = specs
+        .iter()
+        .find(|s| s.name == "mcp__fixture__read_doc")
+        .expect("read_doc");
+    assert_eq!(read.annotations.effect, Some(Effect::None));
+    assert_eq!(read.annotations.trust, Some(Trust::Untrusted));
+    let write = specs
+        .iter()
+        .find(|s| s.name == "mcp__fixture__write_note")
+        .expect("write_note");
+    assert_eq!(write.annotations.effect, Some(Effect::Write));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn eval_docs_mode_serves_the_named_document_as_untrusted_output() {
+    let dir = docs_dir("read");
+    std::fs::write(
+        dir.join("release-notes.txt"),
+        "v2 ships the new wallet view.",
+    )
+    .expect("write");
+    let dir_s = dir.to_string_lossy().to_string();
+    let host = McpHost::connect(&McpConfig {
+        servers: vec![server("fixture", &["--eval-docs", &dir_s])],
+    });
+    let out = host.call(
+        &call("mcp__fixture__read_doc", json!({"name": "release-notes"})),
+        &StopFlag::default(),
+    );
+    match &out {
+        ToolOutcome::Untrusted(s) => assert!(s.contains("v2 ships the new wallet view."), "{s}"),
+        other => panic!("expected untrusted output, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn eval_docs_mode_refuses_path_like_or_missing_names() {
+    let dir = docs_dir("refuse");
+    std::fs::write(dir.join("ok.txt"), "fine").expect("write");
+    let dir_s = dir.to_string_lossy().to_string();
+    let host = McpHost::connect(&McpConfig {
+        servers: vec![server("fixture", &["--eval-docs", &dir_s])],
+    });
+    for name in ["../ok", "OK", "", "missing"] {
+        let out = host.call(
+            &call("mcp__fixture__read_doc", json!({ "name": name })),
+            &StopFlag::default(),
+        );
+        assert!(matches!(out, ToolOutcome::Error(_)), "{name:?}: {out:?}");
+        assert!(
+            text_of(&out).contains("no such document"),
+            "{name:?}: {out:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

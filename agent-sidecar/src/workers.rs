@@ -8,8 +8,9 @@
 //!   worker is this same binary started as `citrate-agent-sidecar --worker toolchain`; it builds
 //!   its [`ToolchainHost`] from the same `CITRATE_HERMES_TOOLCHAIN*` environment it inherits and
 //!   serves calls over stdio. Sessions reach it through [`RemoteToolHost`].
-//! - **browser**: reserved. The browser tools arrive with HUP-S5.1; until then the report says
-//!   `not_built` and nothing is started.
+//! - **browser**: reserved. The browser tools (HUP-S5.1) run in the sidecar process and drive the
+//!   managed Chromium, which is its own process; a separate browser worker is not built, so the
+//!   report says `not_built` and no worker is started.
 //!
 //! A worker crash fails only the calls that were in flight in that worker. Each such call
 //! returns a tool error that says the worker ended, how, that it is being restarted, and that the
@@ -235,7 +236,7 @@ impl WorkerSet {
         let browser = serde_json::json!({
             "kind": "browser",
             "state": "not_built",
-            "detail": "the browser worker arrives with HUP-S5.1; no browser tools exist yet",
+            "detail": "the browser tools (HUP-S5.1) run in the sidecar and drive the managed Chromium as its own process; a separate browser worker is not built",
         });
         vec![toolchain, browser]
     }

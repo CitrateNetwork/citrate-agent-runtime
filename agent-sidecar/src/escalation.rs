@@ -10,6 +10,9 @@
 //! reservation), `true` means the provider may have received and billed the request (core keeps the
 //! reservation charged; over-counting is the safe direction).
 //!
+//! Each escalation that may have cost money (settled, or failed after sending) leaves a content-free
+//! receipt in the session metering store (US-1.5 AC3); `GET /metering/daily` sums them.
+//!
 //! `GET /escalations/registry` reports the registry route's status. It is disabled in this build.
 
 use std::sync::Arc;
@@ -23,6 +26,7 @@ use axum::{
 use citrate_agent_escalation::{
     run, DisabledRegistry, EscalationError, EscalationRequest, HttpTransport, RegistryEscalation,
 };
+use citrate_agent_metering::EscalationReceipt;
 
 use crate::{authorized, AppState};
 
@@ -72,11 +76,20 @@ pub(crate) async fn escalate(
             false,
         )
     };
+    // What the receipt needs, taken before the request (and its key) moves to the worker.
+    let receipt_id = req.escalation_id.clone();
+    let receipt_model = req.model.clone();
+    let reserved = req.reserved_micros;
     let permit = tokio::time::timeout(SLOT_WAIT, SLOTS.acquire())
         .await
         .map_err(|_| busy())?
         .map_err(|_| busy())?;
     let estop = st.estop.clone();
+    let started_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let started = std::time::Instant::now();
     let outcome = tokio::task::spawn_blocking(move || {
         // A stop that lands while this request waited for a worker still wins.
         if estop.is_stopped() {
@@ -86,6 +99,34 @@ pub(crate) async fn escalate(
     })
     .await;
     drop(permit);
+    // US-1.5 AC3: every escalation that may have cost money leaves a content-free receipt in
+    // metering. A request refused before sending costs nothing and leaves none.
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let receipt = match &outcome {
+        Ok(Ok(out)) => Some(EscalationReceipt::settled(
+            &receipt_id,
+            &receipt_model,
+            started_unix_ms,
+            latency_ms,
+            out.usage.map(|u| (u.prompt_tokens, u.completion_tokens)),
+            reserved,
+            out.charged_micros,
+            out.exceeded_quote,
+        )),
+        Ok(Err(e)) if !e.may_have_reached_provider() => None,
+        Ok(Err(_)) | Err(_) => Some(EscalationReceipt::failed_after_send(
+            &receipt_id,
+            &receipt_model,
+            started_unix_ms,
+            latency_ms,
+            reserved,
+        )),
+    };
+    if let Some(rec) = receipt {
+        let store = st.sessions.metering().clone();
+        // The log append is file I/O: keep it off the async workers.
+        let _ = tokio::task::spawn_blocking(move || store.append_escalation(rec)).await;
+    }
     match outcome {
         Ok(Ok(out)) => Ok(Json(serde_json::to_value(&out).map_err(|_| {
             refuse(
