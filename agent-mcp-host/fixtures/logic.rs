@@ -70,6 +70,10 @@ pub struct Fixture {
     pub call_caps: Vec<Value>,
     /// Every modern request's method, in order.
     pub modern_methods: Vec<String>,
+    /// HUP-S1.10 eval mode (`--eval-docs <dir>`): the server lists only `read_doc` (read-only,
+    /// returns `<dir>/<name>.txt`) and `write_note` (a write), so an eval session sees a small,
+    /// realistic MCP surface whose read output the eval controls.
+    pub docs_dir: Option<std::path::PathBuf>,
 }
 
 pub const KNOWN: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -93,6 +97,7 @@ impl Fixture {
             pending_list_changed: false,
             call_caps: Vec::new(),
             modern_methods: Vec::new(),
+            docs_dir: None,
         }
     }
 
@@ -101,7 +106,44 @@ impl Fixture {
         self
     }
 
+    /// The eval-mode tool list (see [`Fixture::docs_dir`]).
+    fn eval_tools() -> Vec<Value> {
+        vec![
+            json!({"name": "read_doc", "description": "Read one document from the team's shared notes by name.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "document name, lowercase letters, digits and dashes"}}, "required": ["name"]}, "annotations": {"readOnlyHint": true, "openWorldHint": true}}),
+            json!({"name": "write_note", "description": "Write a note into the team's shared notes.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true}}),
+        ]
+    }
+
+    /// `read_doc` in eval mode: only `[a-z0-9-]{1,64}` names, read from the docs folder.
+    fn read_doc(&self, id: &Value, args: &Value) -> Vec<Out> {
+        let Some(dir) = &self.docs_dir else {
+            return vec![Self::error(id, -32602, "Unknown tool")];
+        };
+        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+        let ok = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !ok {
+            return vec![Self::reply(
+                id,
+                json!({"content": [{"type": "text", "text": "no such document"}], "isError": true}),
+            )];
+        }
+        match std::fs::read_to_string(dir.join(format!("{name}.txt"))) {
+            Ok(text) => vec![Self::text(id, text)],
+            Err(_) => vec![Self::reply(
+                id,
+                json!({"content": [{"type": "text", "text": "no such document"}], "isError": true}),
+            )],
+        }
+    }
+
     fn tools_now(&self) -> Vec<Value> {
+        if self.docs_dir.is_some() {
+            return Self::eval_tools();
+        }
         let mut all = Self::tools();
         if self.era != FxEra::Legacy {
             all.extend(Self::modern_tools());
@@ -540,6 +582,9 @@ impl Fixture {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        if name == "read_doc" {
+            return self.read_doc(id, &args);
+        }
         match name {
             "echo" | "dotted.name" | "plain" => vec![Self::text(id, format!("echo: {text_arg}"))],
             "write_note" => vec![Self::text(id, format!("noted: {text_arg}"))],

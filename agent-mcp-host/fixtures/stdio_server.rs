@@ -2,6 +2,8 @@
 //! integration tests. Flags: `--version <v>` answers initialize with that protocol version;
 //! `--paged` splits tools/list over two pages; `--noisy` writes to stderr on every message;
 //! `--modern` speaks only 2026-07-28 (stateless, `server/discover`); `--dual` speaks both.
+//! `--eval-docs <dir>` lists only `read_doc` + `write_note` and serves `<dir>/<name>.txt` (the
+//! HUP-S1.10 injection eval in citrate-core drives a real sidecar session against it).
 
 #[path = "logic.rs"]
 mod logic;
@@ -33,9 +35,15 @@ fn main() {
     } else {
         FxEra::Legacy
     };
+    let docs_dir = args
+        .iter()
+        .position(|a| a == "--eval-docs")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
     let fixture = Arc::new(Mutex::new(Fixture::new(version, paged).with_era(era)));
     if let Ok(mut f) = fixture.lock() {
         f.env = std::env::vars().collect();
+        f.docs_dir = docs_dir;
     }
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let stdin = std::io::stdin();

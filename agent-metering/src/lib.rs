@@ -11,6 +11,8 @@
 //!   error text or model-invented tool names.
 //! - [`MeteringLog`] is a local append-only JSONL file of records.
 //! - [`DailyReport`] aggregates one UTC day into JSON and markdown.
+//! - [`EscalationReceipt`] / [`EscalationLog`] / [`EscalationSummary`] (HUP-S1.5, US-1.5 AC3): one
+//!   content-free receipt per escalation that may have cost the member money, summed per day.
 //! - [`DecisionLog`] / [`DecisionReport`] (HUP-S5.3): the `decide()` slot's content-free decision
 //!   records and task outcomes, reported per backend (local, jev) with task success rates.
 //! - [`build_benchmark_payload`] turns a report into calldata for
@@ -30,6 +32,7 @@ mod benchmark;
 mod clock;
 mod day;
 mod decisions;
+mod escalations;
 mod log;
 mod record;
 mod report;
@@ -44,6 +47,10 @@ pub use clock::{Clock, SystemClock};
 pub use day::{utc_day_bounds_ms, utc_day_of_ms};
 pub use decisions::{
     BackendStats, DecisionLine, DecisionLog, DecisionReport, TaskRecord, DECISION_REPORT_SCHEMA,
+};
+pub use escalations::{
+    EscalationLog, EscalationReceipt, EscalationRoute, EscalationSettlement, EscalationSummary,
+    ESCALATION_RECEIPT_SCHEMA,
 };
 pub use log::MeteringLog;
 pub use record::{ToolTally, TurnOutcome, TurnRecord, Verification, VerifierOutcome};

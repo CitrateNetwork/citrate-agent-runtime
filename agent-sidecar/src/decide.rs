@@ -47,6 +47,9 @@ pub const JEV_DEFAULT_MODEL: &str = "jev-latest";
 /// Local decisions get the model's own budget; Jev answers in about a second when it is up.
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 const JEV_TIMEOUT: Duration = Duration::from_secs(5);
+/// Largest decision reply read from a backend (local or Jev). A decision is a short
+/// grammar-constrained answer; 1 MiB is a conservative placeholder, pending owner sign-off.
+pub const MAX_DECIDE_RESPONSE_BYTES: usize = 1 << 20;
 /// Lines kept in memory for `/decide/stats`.
 const STATS_CAP: usize = 10_000;
 
@@ -99,18 +102,28 @@ impl DecideTransport for HttpDecideTransport {
             }
         })?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .map_err(|_| "could not read the response".to_string())?;
         if !status.is_success() {
             return Err(format!("HTTP {}", status.as_u16()));
         }
-        Ok(text)
+        read_capped(resp, MAX_DECIDE_RESPONSE_BYTES)
     }
 
     fn destination(&self) -> String {
         self.destination.clone()
     }
+}
+
+/// Read at most `cap` bytes of a reply as UTF-8; a longer reply is refused, never buffered whole.
+fn read_capped(resp: impl std::io::Read, cap: usize) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    resp.take(cap as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| "could not read the response".to_string())?;
+    if buf.len() > cap {
+        return Err(format!("the response was larger than {cap} bytes"));
+    }
+    String::from_utf8(buf).map_err(|_| "the response was not text".to_string())
 }
 
 /// The opted-in Jev connection (the key never leaves this struct except as a bearer header).

@@ -940,3 +940,79 @@ fn tool_result_trust_maps_to_the_outcome() {
         Ok(ToolOutcome::Denied("body".into()))
     );
 }
+
+async fn events_status(st: &Arc<AppState>, id: &str) -> StatusCode {
+    app(st.clone())
+        .oneshot(req(
+            "GET",
+            &format!("/sessions/{id}/events?after=0"),
+            serde_json::Value::Null,
+            true,
+        ))
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Sessions the app never closed (a Stop, a reload) do not fill the table for good: when it is
+/// full, a new session replaces the idle session used least recently.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_table_replaces_the_least_recently_used_idle_session() {
+    let st = state_with(vec![], Duration::from_secs(5));
+    let mut ids = Vec::new();
+    for _ in 0..sessions::MAX_SESSIONS {
+        ids.push(create(&st).await);
+    }
+    // The first session is used again, so the second is now the least recently used.
+    assert_eq!(events_status(&st, &ids[0]).await, StatusCode::OK);
+    let newest = create(&st).await;
+    assert_eq!(st.sessions.count(), sessions::MAX_SESSIONS);
+    assert_eq!(events_status(&st, &ids[0]).await, StatusCode::OK);
+    assert_eq!(events_status(&st, &ids[1]).await, StatusCode::NOT_FOUND);
+    assert_eq!(events_status(&st, &newest).await, StatusCode::OK);
+}
+
+/// A session in the middle of a turn is never replaced; with every session busy the table is
+/// full as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_sessions_are_never_replaced() {
+    let turns = (0..sessions::MAX_SESSIONS)
+        .map(|i| {
+            AssistantTurn::tools(vec![ToolCall {
+                id: format!("c{i}"),
+                name: "node_status".into(),
+                arguments: "{}".into(),
+            }])
+        })
+        .collect();
+    let st = state_with(turns, Duration::from_secs(30));
+    let mut ids = Vec::new();
+    for _ in 0..sessions::MAX_SESSIONS {
+        let id = create(&st).await;
+        app(st.clone())
+            .oneshot(req(
+                "POST",
+                &format!("/sessions/{id}/messages"),
+                serde_json::json!({"text": "status?"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        wait_for(&st, &id, "tool_call").await;
+        ids.push(id);
+    }
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/sessions",
+            create_body("http://127.0.0.1:18080/v1"),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    for id in &ids {
+        assert_eq!(events_status(&st, id).await, StatusCode::OK);
+    }
+    st.sessions.stop_all();
+}

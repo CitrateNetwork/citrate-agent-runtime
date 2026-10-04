@@ -488,3 +488,25 @@ fn a_non_browser_sidecar_call_after_taint_is_still_declined() {
         "unchanged without the browser"
     );
 }
+
+/// Sidecar shutdown stops the browser (and the other child processes) explicitly and latches it,
+/// so nothing starts a new Chromium while the sidecar exits.
+#[test]
+fn shutdown_stops_and_latches_the_browser() {
+    let browser = no_chromium();
+    let mgr = sessions::SessionManager::new(
+        Arc::new(|_ep: &sessions::LlmEndpoint| -> Arc<dyn LlmClient> {
+            Arc::new(llm_http::OpenAiCompatClient::new(
+                "http://127.0.0.1:9/v1",
+                "k",
+                Duration::from_secs(1),
+            ))
+        }),
+        Duration::from_secs(5),
+    )
+    .with_browser(browser.clone());
+    mgr.shutdown_children();
+    assert!(browser.is_stopped());
+    assert_eq!(browser.status().mode, "off");
+    mgr.shutdown_children(); // idempotent
+}

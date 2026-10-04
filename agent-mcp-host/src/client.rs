@@ -966,6 +966,11 @@ impl McpClient {
         self.transport.broken()
     }
 
+    /// Stop the server now (a stdio child is killed). Idempotent.
+    pub fn close(&self) {
+        self.transport.close();
+    }
+
     /// The server announced a changed tool list (not yet acted on).
     pub fn tools_changed(&self) -> bool {
         self.transport.tools_changed()

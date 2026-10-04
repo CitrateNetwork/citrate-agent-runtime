@@ -106,7 +106,8 @@ pub fn is_loader_env(k: &str) -> bool {
     LOADER_ENV_EXACT.contains(&up.as_str()) || LOADER_ENV_PREFIXES.iter().any(|p| up.starts_with(p))
 }
 
-fn valid_env_key(k: &str) -> bool {
+/// Whether `k` is a plain env identifier (`[A-Za-z_][A-Za-z0-9_]*`, at most 128 chars).
+pub fn valid_env_key(k: &str) -> bool {
     let mut chars = k.chars();
     let first_ok = chars
         .next()

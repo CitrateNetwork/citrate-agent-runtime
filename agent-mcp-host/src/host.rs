@@ -21,6 +21,7 @@ use citrate_agent_loop::{Effect, StopFlag, ToolCall, ToolHost, ToolOutcome, Tool
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -181,6 +182,8 @@ pub struct McpHost {
     /// exposed name → route. Lock order: `routes`, then an entry's state.
     routes: RwLock<HashMap<String, Route>>,
     maintaining: Mutex<()>,
+    /// Set by [`McpHost::shutdown`]: no server is reconnected afterwards.
+    stopped: AtomicBool,
 }
 
 fn backoff(failures: u32) -> Duration {
@@ -246,6 +249,7 @@ impl McpHost {
             entries,
             routes: RwLock::new(HashMap::new()),
             maintaining: Mutex::new(()),
+            stopped: AtomicBool::new(false),
         };
         host.rebuild();
         host
@@ -290,6 +294,9 @@ impl McpHost {
     /// background thread ([`McpHost::start_maintenance`]). Concurrent passes are serialised.
     pub fn maintain_now(&self) {
         let _guard = self.maintaining.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let mut changed = false;
         for e in &self.entries {
             let (client, due) = {
@@ -397,6 +404,20 @@ impl McpHost {
     /// Whether `name` is in the reserved MCP tool namespace.
     pub fn reserved(name: &str) -> bool {
         name.starts_with(TOOL_PREFIX)
+    }
+
+    /// Stop every server now (sidecar shutdown): stdio children are killed rather than left to
+    /// the host being dropped. Idempotent; later calls report the server as gone.
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        // Wait out a maintenance pass in progress, so it cannot reconnect a server after this.
+        let _guard = self.maintaining.lock().unwrap_or_else(|p| p.into_inner());
+        for e in &self.entries {
+            let client = e.lock().client.clone();
+            if let Some(c) = client {
+                c.close();
+            }
+        }
     }
 
     pub fn status(&self) -> Vec<ServerStatus> {

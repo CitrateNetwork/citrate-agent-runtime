@@ -304,8 +304,28 @@ impl McpConfig {
                     }
                     for (k, v) in &r.env {
                         validate_env_key(k)?;
+                        // The user-entry env rules apply to every entry the file holds, so the
+                        // file cannot bring in what the Settings form refuses.
+                        if !crate::user::valid_env_key(k) {
+                            return Err(format!(
+                                "server {:?}: env name {k:?} must use letters, digits and '_'",
+                                r.name
+                            ));
+                        }
+                        if crate::user::is_loader_env(k) {
+                            return Err(format!(
+                                "server {:?}: env {k} changes which code the server loads",
+                                r.name
+                            ));
+                        }
                         if v.contains('\0') {
                             return Err(format!("server {:?}: NUL in env value", r.name));
+                        }
+                        if crate::user::is_env_reference(v) {
+                            return Err(format!(
+                                "server {:?}: env {k} refers to another variable; values are literal",
+                                r.name
+                            ));
                         }
                     }
                     let cwd = match r.cwd {
@@ -453,6 +473,31 @@ url = "https://scan.example/api/mcp"
         for c in cases {
             assert!(McpConfig::parse_toml(c).is_err(), "accepted: {c}");
         }
+    }
+
+    /// The allowlist file is checked with the same env rules as a user entry when it is loaded,
+    /// so whoever can write the file still cannot make a server load other code or inherit a
+    /// secret by reference.
+    #[test]
+    fn the_allowlist_refuses_loader_env_and_env_references_at_load() {
+        for env in [
+            "{\"LD_PRELOAD\": \"/tmp/x.so\"}",
+            "{\"DYLD_INSERT_LIBRARIES\": \"/tmp/x.dylib\"}",
+            "{\"ld_library_path\": \"/tmp\"}",
+            "{\"NODE_OPTIONS\": \"--require /tmp/x.js\"}",
+            "{\"PYTHONPATH\": \"/tmp\"}",
+            "{\"TOKEN\": \"${GITHUB_TOKEN}\"}",
+            "{\"TOKEN\": \"$OPENAI_API_KEY\"}",
+            "{\"TOKEN\": \"%APPDATA%\"}",
+            "{\"1BAD\": \"x\"}",
+        ] {
+            let json = format!(
+                "{{\"servers\": [{{\"name\": \"a\", \"transport\": \"stdio\", \"command\": \"/bin/x\", \"env\": {env}}}]}}"
+            );
+            assert!(McpConfig::parse_json(&json).is_err(), "accepted: {env}");
+        }
+        let ok = r#"{"servers": [{"name": "a", "transport": "stdio", "command": "/bin/x", "env": {"MEM_TENANT": "personal", "PRICE": "pa$$word"}}]}"#;
+        assert!(McpConfig::parse_json(ok).is_ok());
     }
 
     #[test]

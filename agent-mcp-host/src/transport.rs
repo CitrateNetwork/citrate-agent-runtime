@@ -120,6 +120,8 @@ pub(crate) trait Transport: Send + Sync {
     fn bad_messages(&self) -> u64;
     /// The server said its tool list changed (recorded, not acted on).
     fn tools_changed(&self) -> bool;
+    /// Stop the server now (stdio: close its input and kill the process). Idempotent.
+    fn close(&self) {}
 }
 
 pub(crate) fn connect(cfg: &ServerConfig) -> Result<Box<dyn Transport>, McpError> {
@@ -554,10 +556,8 @@ impl Transport for StdioTransport {
             .shared
             .send_line(message(Some(id), "subscriptions/listen", params).to_string());
     }
-}
 
-impl Drop for StdioTransport {
-    fn drop(&mut self) {
+    fn close(&self) {
         // Closing the writer closes the server's stdin; then make sure the process is gone.
         if let Ok(mut w) = self.shared.writer.lock() {
             w.take();
@@ -568,6 +568,12 @@ impl Drop for StdioTransport {
                 let _ = child.wait();
             }
         }
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
