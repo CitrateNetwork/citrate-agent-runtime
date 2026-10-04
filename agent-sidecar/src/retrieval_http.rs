@@ -93,6 +93,21 @@ pub fn parse_embeddings(body: &str, n: usize) -> Result<Vec<Vec<f32>>, String> {
         .ok_or_else(|| format!("the embedding answer has fewer than {n} vectors"))
 }
 
+/// Read at most `cap` bytes of a response body as UTF-8; a longer body is refused without reading
+/// past `cap + 1` bytes.
+pub fn read_capped<R: std::io::Read>(r: R, cap: usize) -> Result<String, String> {
+    use std::io::Read;
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    let mut buf = Vec::new();
+    r.take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|_| "could not read the response".to_string())?;
+    if buf.len() > cap {
+        return Err("the response is too large".into());
+    }
+    String::from_utf8(buf).map_err(|_| "the response is not UTF-8".to_string())
+}
+
 /// One blocking POST of a JSON body; the response text or a coarse error.
 fn post_json(url: &str, bearer: &str, timeout: Duration, body: &Value) -> Result<String, String> {
     let http = reqwest::blocking::Client::builder()
@@ -114,16 +129,10 @@ fn post_json(url: &str, bearer: &str, timeout: Duration, body: &Value) -> Result
         }
     })?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|_| "could not read the response".to_string())?;
     if !status.is_success() {
         return Err(format!("HTTP {}", status.as_u16()));
     }
-    if text.len() > MAX_BODY {
-        return Err("the response is too large".into());
-    }
-    Ok(text)
+    read_capped(resp, MAX_BODY)
 }
 
 /// llama-server's tokenizer, over HTTP.

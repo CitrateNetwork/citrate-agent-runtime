@@ -55,6 +55,34 @@ fn urls_map_from_the_chat_base_url() {
 }
 
 #[test]
+fn a_response_body_is_read_at_most_to_the_cap() {
+    // Review fix: the cap bounds what is read, not only what is kept after reading it all.
+    let small = read_capped(std::io::Cursor::new(b"{\"tokens\":[1,2]}".to_vec()), 64).unwrap();
+    assert_eq!(parse_tokenize(&small).unwrap(), 2);
+    let exact = read_capped(std::io::Cursor::new(vec![b'a'; 64]), 64).unwrap();
+    assert_eq!(exact.len(), 64);
+    struct Endless(usize);
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            buf.fill(b'a');
+            Ok(buf.len())
+        }
+    }
+    let mut endless = Endless(0);
+    assert_eq!(
+        read_capped(&mut endless, 64).unwrap_err(),
+        "the response is too large"
+    );
+    assert!(
+        endless.0 <= 65,
+        "read {} bytes for a 64-byte cap",
+        endless.0
+    );
+    assert!(read_capped(std::io::Cursor::new(vec![0xff, 0xfe]), 64).is_err());
+}
+
+#[test]
 fn the_recorded_tokenize_answers_parse_to_their_token_counts() {
     for case in recorded()["cases"].as_array().unwrap() {
         let body = case["response"].to_string();
