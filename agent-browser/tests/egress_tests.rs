@@ -104,7 +104,11 @@ fn a_local_address_is_refused_before_any_connection_is_made() {
         );
     }
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the local service");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "nothing reached the local service"
+    );
 }
 
 #[test]

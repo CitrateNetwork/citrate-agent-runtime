@@ -477,7 +477,10 @@ fn a_page_cannot_open_a_websocket_to_another_local_service() {
     svc2.navigate(&format!("{base2}/wsopener?u={ws2}/ws"))
         .expect("the allowed page opens");
     let reached = wait_for(|| (common::hits(&base2_log, "/ws") > 0).then_some(()), 10);
-    assert!(reached.is_some(), "an allowed origin's WebSocket is not blocked");
+    assert!(
+        reached.is_some(),
+        "an allowed origin's WebSocket is not blocked"
+    );
 }
 
 /// HUP-S2.3: the managed browser's sign-in bridge, end to end in a real Chromium. The page's top

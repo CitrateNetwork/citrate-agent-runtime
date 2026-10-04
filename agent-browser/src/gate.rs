@@ -14,10 +14,11 @@
 //!   its origin has the member's consent ([`crate::scope`]), so a redirect or a click from a
 //!   consented origin never sends a request, with the member's cookies, to another origin.
 //!
-//! Residual: a host name used by a sub-resource is judged by its name only (resolving every
-//! request would stall the browser); a name that resolves to a private address after the check
-//! (DNS rebinding) is not caught; requests made by workers or by out-of-process frames are not
-//! paused by the tab's `Fetch` domain. Snapshots read only the main frame.
+//! What this pause cannot see (WebSocket handshakes, requests from workers and out-of-process
+//! frames, a sub-resource host name that resolves to a local address, a name re-pointed after the
+//! check) is held to the same rule in managed mode by the connection-level gate,
+//! [`crate::egress`]. In attach mode those are the member's own browser's business: only
+//! top-level page loads are scoped. Snapshots read only the main frame.
 
 use std::net::{IpAddr, SocketAddr};
 

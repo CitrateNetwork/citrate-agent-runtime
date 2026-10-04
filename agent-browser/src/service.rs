@@ -12,7 +12,9 @@
 //! In both modes the browser pauses requests before they are sent and this worker answers each one
 //! ([`crate::gate`]): the managed browser reaches public internet addresses only (plus origins a
 //! developer allowed), and in attach mode a page load to an origin without consent is stopped
-//! before the member's cookies are sent there.
+//! before the member's cookies are sent there. Below that, every connection the managed browser
+//! makes goes through [`crate::egress`], which holds the same rule for WebSockets, workers and
+//! names that resolve to a local address.
 //!
 //! The member's Stop ([`BrowserService::stop`]) closes the connection at once (an in-flight step
 //! fails), denies any action waiting for a decision, tears the browser down, and latches: no
@@ -29,6 +31,7 @@ use serde_json::{json, Value};
 use crate::approvals::{ActionApprovals, Decision, PendingAction};
 use crate::cdp::{Cdp, CdpEvent, EventHandler, Reply};
 use crate::chromium::{self, ChromiumStatus, ManagedChrome};
+use crate::egress::EgressGate;
 use crate::frames::{FrameBuffer, FrameView, Highlight};
 use crate::gate::{self, Verdict};
 use crate::scope::{Denylist, Origin, OriginScope, ScopeDecision};
@@ -438,6 +441,8 @@ struct Live {
     cdp: Arc<Cdp>,
     session: String,
     _chrome: Option<ManagedChrome>,
+    /// The managed browser's connection gate; dropped after the browser it serves.
+    _egress: Option<EgressGate>,
     snapshot: Option<Snapshot>,
 }
 
@@ -618,7 +623,7 @@ impl BrowserService {
         let ws =
             chromium::attach_ws_url(port, Duration::from_secs(5)).map_err(BrowserError::Failed)?;
         let mut live = lock(&self.live);
-        let l = self.connect(&ws, Mode::Attached(port), None)?;
+        let l = self.connect(&ws, Mode::Attached(port), None, None)?;
         *live = Some(l);
         Ok(PageInfo {
             url: self.shared.url(),
@@ -1109,20 +1114,28 @@ impl BrowserService {
                 .path()
                 .ok_or_else(|| BrowserError::Failed("internal: no browser path".to_string()))?,
         };
-        let chrome = ManagedChrome::launch(
-            &exe,
-            self.cfg.viewport,
-            &self.cfg.extra_args,
-            self.cfg.launch_timeout,
-        )
-        .map_err(BrowserError::Failed)?;
+        // Every connection the managed browser makes goes through the egress gate (public
+        // addresses and developer-allowed origins only). Without it the browser is not started.
+        let egress = EgressGate::start(self.cfg.allow_private.clone()).map_err(|e| {
+            BrowserError::Failed(format!("could not start the browser's network gate: {e}"))
+        })?;
+        let mut args = egress.browser_args();
+        args.extend(self.cfg.extra_args.iter().cloned());
+        let chrome = ManagedChrome::launch(&exe, self.cfg.viewport, &args, self.cfg.launch_timeout)
+            .map_err(BrowserError::Failed)?;
         let ws = chrome.ws_url().to_string();
-        let live = self.connect(&ws, Mode::Managed, Some(chrome))?;
+        let live = self.connect(&ws, Mode::Managed, Some(chrome), Some(egress))?;
         *guard = Some(live);
         Ok(guard)
     }
 
-    fn connect(&self, ws: &str, mode: Mode, chrome: Option<ManagedChrome>) -> Result<Live> {
+    fn connect(
+        &self,
+        ws: &str,
+        mode: Mode,
+        chrome: Option<ManagedChrome>,
+        egress: Option<EgressGate>,
+    ) -> Result<Live> {
         let shared = self.shared.clone();
         let handler: EventHandler = Arc::new(move |ev: &CdpEvent| shared.on_event(ev));
         let cdp = Arc::new(
@@ -1170,6 +1183,7 @@ impl BrowserService {
             cdp,
             session,
             _chrome: chrome,
+            _egress: egress,
             snapshot: None,
         };
         self.call(&live, "Page.enable", json!({}))?;
