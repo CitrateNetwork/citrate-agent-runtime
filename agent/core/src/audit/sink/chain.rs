@@ -134,7 +134,7 @@ impl AuditSink for ChainAnchorSink {
     ) -> Result<Box<dyn Iterator<Item = Result<AuditRecord, AgentError>> + '_>, AgentError>
     {
         Err(AgentError::Audit(
-            "ChainAnchorSink is write-only; iterate via the off-chain log + reconcile via is_anchored() lookups"
+            "ChainAnchorSink is write-only; iterate via the off-chain log + reconcile via is_anchored_by_self() lookups"
                 .to_string(),
         ))
     }

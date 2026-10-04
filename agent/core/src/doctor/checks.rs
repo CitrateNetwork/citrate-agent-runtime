@@ -891,7 +891,8 @@ impl Check for RetentionAgeCheck {
 // ── 11. Anchor reconciliation ─────────────────────────────────────
 
 /// For each (record_hash, expected_kind) pair, verifies
-/// `AnchorRegistryClient::is_anchored(record_hash)` returns true.
+/// `AnchorRegistryClient::is_anchored_by_self(record_hash)` returns true: the record was
+/// anchored by this client's own key (HUP-S7.1), not merely by someone (`isAnchored`).
 /// Reports any that didn't land. Async; uses `block_on` to bridge to
 /// the sync `Check::run` API. CIT-AGENT-7b.
 ///
@@ -942,7 +943,7 @@ impl Check for AnchorReconciliationCheck {
             // Block on the eth_call. Each call is independent so we
             // don't bother with parallelism here.
             let result = tokio::task::block_in_place(|| {
-                handle.block_on(async move { client_ref.is_anchored(root_copy).await })
+                handle.block_on(async move { client_ref.is_anchored_by_self(root_copy).await })
             });
             match result {
                 Ok(true) => found += 1,
