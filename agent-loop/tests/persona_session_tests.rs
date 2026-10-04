@@ -8,7 +8,8 @@
 
 use citrate_agent_loop::interview::bundled_tracks;
 use citrate_agent_loop::personas::{
-    bundled_personas, session_persona, session_persona_fragment, CustomPersona, SessionPersona, MAX_PINNED_EMPHASIS,
+    bundled_personas, session_persona, session_persona_fragment, CustomPersona, SessionPersona,
+    MAX_PINNED_EMPHASIS,
 };
 use citrate_agent_loop::skills::{SkillLibrary, SkillSource};
 use citrate_agent_loop::verifiers_tooling::{
