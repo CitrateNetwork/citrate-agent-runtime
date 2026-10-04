@@ -702,37 +702,138 @@ pub(crate) fn write_if_unchanged(path: &Path, expected: &str, bytes: &[u8]) -> R
 static TMP_N: AtomicU64 = AtomicU64::new(0);
 
 /// Write through a temp sibling and a rename, keeping an existing file's permissions.
+///
+/// On Unix the write is anchored to the folder that was checked (L-21): the folder is opened once
+/// without following a link and confirmed to be at the checked path, and the temp file's creation
+/// and the final rename are both made relative to that open folder (`openat`, `renameat`), so a
+/// folder on the way swapped for a link after the check cannot move the write elsewhere.
 pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the path has no parent folder".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| format!("could not create the folder: {e}"))?;
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = parent.join(format!(
-        ".{name}.citrate-write-{}-{}",
+        .ok_or_else(|| "the path has no file name".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("could not create the folder: {e}"))?;
+    #[cfg(unix)]
+    {
+        let dir = open_dir_checked(parent).map_err(|e| format!("write failed: {e}"))?;
+        replace_in_dir(&dir, name, bytes).map_err(|e| format!("write failed: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let tmp = parent.join(temp_name(name));
+        let res = (|| -> std::io::Result<()> {
+            let mut f = crate::grants::open_checked(&tmp, true)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            if let Ok(meta) = fs::metadata(path) {
+                if meta.is_file() {
+                    fs::set_permissions(&tmp, meta.permissions())?;
+                }
+            }
+            fs::rename(&tmp, path)
+        })();
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        res.map_err(|e| format!("write failed: {e}"))
+    }
+}
+
+fn temp_name(name: &std::ffi::OsStr) -> String {
+    format!(
+        ".{}.citrate-write-{}-{}",
+        name.to_string_lossy(),
         std::process::id(),
         TMP_N.fetch_add(1, Ordering::SeqCst)
-    ));
+    )
+}
+
+/// Open the folder at `dir` (already resolved by the grant check) without following a link at
+/// its last component, and confirm the open folder is at that path (a folder on the way swapped
+/// for a link makes it land elsewhere, which is refused).
+#[cfg(unix)]
+pub(crate) fn open_dir_checked(dir: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    if !crate::grants::opened_at(&f, dir) {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "the folder changed while it was being opened",
+        ));
+    }
+    Ok(f)
+}
+
+/// Replace `name` inside the open folder `dir` with `bytes`: a new temp file created there
+/// (exclusive, never through a link), synced, given the replaced file's permissions, then renamed
+/// over `name`, all relative to `dir`. The temp file is removed on failure.
+#[cfg(unix)]
+pub(crate) fn replace_in_dir(
+    dir: &fs::File,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let cstr = |s: &[u8]| {
+        CString::new(s)
+            .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "a NUL in the name"))
+    };
+    let target = cstr(name.as_bytes())?;
+    let tmp_name = temp_name(name);
+    let tmp = cstr(tmp_name.as_bytes())?;
+    let dfd = dir.as_raw_fd();
+    // SAFETY: openat on a valid directory fd with a NUL-terminated name; the returned fd is owned
+    // by the File built from it (closed on drop).
+    let fd = unsafe {
+        libc::openat(
+            dfd,
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nothing else.
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    let unlink_tmp = || {
+        // SAFETY: unlinkat on a valid directory fd with a NUL-terminated name.
+        unsafe {
+            libc::unlinkat(dfd, tmp.as_ptr(), 0);
+        }
+    };
     let res = (|| -> std::io::Result<()> {
-        // A new temp file, confirmed to be where it was asked for (a folder on the way swapped
-        // for a link after the grant check is refused, see `grants::open_checked`).
-        let mut f = crate::grants::open_checked(&tmp, true)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.is_file() {
-                fs::set_permissions(&tmp, meta.permissions())?;
+        // Keep a replaced regular file's permissions (looked up in the same folder, no link).
+        // SAFETY: `stat` is a plain C struct of integers, valid when zeroed.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstatat writes one `stat` into `st`; the fd and name are valid.
+        let rc = unsafe { libc::fstatat(dfd, target.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFREG {
+            // SAFETY: fchmod on the temp file's own fd.
+            if unsafe { libc::fchmod(f.as_raw_fd(), st.st_mode & 0o7777) } != 0 {
+                return Err(std::io::Error::last_os_error());
             }
         }
-        fs::rename(&tmp, path)
+        // SAFETY: renameat within one valid directory fd, both names NUL-terminated.
+        if unsafe { libc::renameat(dfd, tmp.as_ptr(), dfd, target.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     })();
     if res.is_err() {
-        let _ = fs::remove_file(&tmp);
+        unlink_tmp();
     }
-    res.map_err(|e| format!("write failed: {e}"))
+    res
 }
 
 /// The per-session host: the shared tools plus this session's checkpoint id.

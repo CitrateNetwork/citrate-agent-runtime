@@ -658,7 +658,7 @@ fn opened_path(f: &std::fs::File) -> Option<PathBuf> {
 /// Whether the opened file is the one at `expected` (the grant check's resolved path). macOS
 /// volumes are usually case-insensitive, so case alone is not a mismatch there.
 #[cfg(unix)]
-fn opened_at(f: &std::fs::File, expected: &Path) -> bool {
+pub(crate) fn opened_at(f: &std::fs::File, expected: &Path) -> bool {
     match opened_path(f) {
         Some(actual) if actual == expected => true,
         Some(actual) if cfg!(target_os = "macos") => actual

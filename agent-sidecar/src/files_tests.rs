@@ -1048,7 +1048,8 @@ fn a_folder_reached_through_a_link_is_not_written_into() {
     let _ = std::fs::remove_dir_all(&s);
 }
 
-/// A replaced file keeps the permissions it had; a new file is private to the member.
+/// A replaced file keeps the permissions it had; a new file gets the permissions any new file of
+/// the member's gets (the process umask).
 #[cfg(unix)]
 #[test]
 fn whole_file_writes_keep_permissions_and_create_private_files() {
@@ -1066,18 +1067,28 @@ fn whole_file_writes_keep_permissions_and_create_private_files() {
     std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o750)).expect("chmod");
     write_file(&existing, b"new").expect("replaced");
     assert_eq!(std::fs::read(&existing).expect("read"), b"new");
-    let mode = std::fs::metadata(&existing).expect("stat").permissions().mode() & 0o777;
+    let mode = std::fs::metadata(&existing)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o750);
     let fresh = s.join("fresh.txt");
     write_file(&fresh, b"hi").expect("created");
-    let mode = std::fs::metadata(&fresh).expect("stat").permissions().mode() & 0o777;
-    assert_eq!(mode & 0o077, 0, "a new file is not open to others: {mode:o}");
+    let control = s.join("control.txt");
+    std::fs::write(&control, b"hi").expect("control");
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&fresh), mode(&control));
     // No temp file is left behind.
     let names: Vec<String> = std::fs::read_dir(&s)
         .expect("list")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.iter().all(|n| !n.contains("citrate-write")), "{names:?}");
+    assert!(
+        names.iter().all(|n| !n.contains("citrate-write")),
+        "{names:?}"
+    );
     let _ = std::fs::remove_dir_all(&s);
 }
