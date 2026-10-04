@@ -409,9 +409,29 @@ pub struct Session {
     persona: Option<PersonaReport>,
     /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
     shell: Option<Arc<ShellRunSession>>,
+    /// HUP-S4.1: the MCP specs this session was offered (calls to tools that changed since are
+    /// refused), and its MCP approval cards (present only for an HIC-aware client).
+    mcp_offered: Option<Arc<HashMap<String, ToolSpec>>>,
+    mcp_approvals: Option<Arc<crate::mcp_approvals::McpApprovals>>,
 }
 
 impl Session {
+    /// HUP-S4.1: the MCP cards waiting for the member (`None` when the session has none).
+    pub fn mcp_pending(&self) -> Option<Vec<crate::mcp_approvals::McpPending>> {
+        self.mcp_approvals.as_ref().map(|a| a.pending())
+    }
+
+    /// HUP-S4.1: the waiting card `id` (for its decision record).
+    pub fn mcp_waiting(&self, id: &str) -> Option<crate::mcp_approvals::McpPending> {
+        self.mcp_approvals.as_ref().and_then(|a| a.waiting(id))
+    }
+
+    /// HUP-S4.1: the member's decision on a waiting MCP card; it must carry the subject shown.
+    pub fn mcp_decide(&self, id: &str, allow: bool, subject: &str) -> Result<(), SessionError> {
+        let a = self.mcp_approvals.as_ref().ok_or(SessionError::NotFound)?;
+        a.decide(id, allow, subject).map_err(SessionError::Invalid)
+    }
+
     /// US-2.2 AC2: the commands waiting for the member (`None` when the session has no
     /// `shell_run`).
     pub fn shell_pending(&self) -> Option<Vec<ShellPending>> {
@@ -727,13 +747,23 @@ impl ToolHost for SidecarHost {
         }
     }
 
-    /// HUP-S5.1: only the browser can put an action in front of the member (its decision routes).
-    /// Without the browser this stays false, so the loop declines as before.
+    /// HUP-S5.1: the browser can put an action in front of the member (its decision routes);
+    /// HUP-S4.1: so can MCP, through the session's MCP approval cards (HIC-aware clients only).
+    /// Without either this stays false, so the loop declines as before.
     fn honors_explicit_approval(&self) -> bool {
         self.browser.is_some()
+            || self
+                .mcp
+                .as_ref()
+                .is_some_and(|m| m.honors_explicit_approval())
     }
 
     fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        if let Some(m) = &self.mcp {
+            if m.handles(&call.name) && m.honors_explicit_approval() {
+                return m.execute_with_explicit_approval(call, reason);
+            }
+        }
         match &self.browser {
             Some(b) if browser_tools::handles(&call.name) => {
                 b.execute_with_explicit_approval(call, reason)
@@ -1125,6 +1155,7 @@ impl SessionManager {
             }
             specs.extend(FileTools::specs());
         }
+        let mut mcp_offered = None;
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1132,8 +1163,18 @@ impl SessionManager {
                     t.name
                 )));
             }
-            specs.extend(mcp.specs());
+            let offered = mcp.specs();
+            mcp_offered = Some(Arc::new(
+                offered
+                    .iter()
+                    .map(|t| (t.name.clone(), t.clone()))
+                    .collect::<HashMap<_, _>>(),
+            ));
+            specs.extend(offered);
         }
+        // HUP-S4.1: MCP approval cards only for a client that shows `hic: required` to a person.
+        let mcp_approvals = (self.mcp.is_some() && req.hic_aware)
+            .then(|| Arc::new(crate::mcp_approvals::McpApprovals::default()));
         if self.browser.is_some() {
             if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1333,6 +1374,8 @@ impl SessionManager {
             runs: Mutex::new(VecDeque::new()),
             persona,
             shell,
+            mcp_offered,
+            mcp_approvals,
         });
         sessions.insert(id.clone(), session);
         Ok(id)
@@ -1403,10 +1446,16 @@ impl SessionManager {
             }
         });
         let search = self.search.clone();
-        let mcp_host = self
-            .mcp
-            .clone()
-            .map(|h| McpToolHost::new(h, session.stop.clone()));
+        let mcp_host = self.mcp.clone().map(|h| {
+            let mut t = McpToolHost::new(h, session.stop.clone());
+            if let Some(o) = &session.mcp_offered {
+                t = t.with_offered(o.clone());
+            }
+            if let Some(a) = &session.mcp_approvals {
+                t = t.with_approver(a.clone());
+            }
+            t
+        });
         let learn_host = self
             .learn
             .clone()

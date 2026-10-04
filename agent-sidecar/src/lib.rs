@@ -30,6 +30,7 @@ pub mod grants;
 pub mod hic_records;
 pub mod learn;
 pub mod llm_http;
+pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
 pub mod search;
@@ -282,6 +283,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/grants", post(replace_grants))
         .route("/sessions/:id/shell/pending", get(shell_pending))
         .route("/sessions/:id/shell/decide", post(shell_decide))
+        .route("/sessions/:id/mcp/pending", get(mcp_pending))
+        .route("/sessions/:id/mcp/decide", post(mcp_decide))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -905,6 +908,131 @@ async fn shell_pending(
     Ok(Json(serde_json::json!({ "pending": pending })))
 }
 
+/// HUP-S4.1: `GET /sessions/:id/mcp/pending`: the MCP approval cards waiting for the member
+/// (effectful MCP calls after taint, and URL-mode elicitations). A session without them has none.
+async fn mcp_pending(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let pending = session.mcp_pending().unwrap_or_default();
+    Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
+#[derive(Deserialize)]
+struct McpDecideReq {
+    id: String,
+    allow: bool,
+    subject: String,
+}
+
+/// HUP-S4.1: `POST /sessions/:id/mcp/decide {id, allow, subject}`: the member's decision on one
+/// MCP card. `subject` must be the arguments (or URL) that were shown; otherwise 409 and nothing
+/// is decided. Recorded like the other HIC decisions (write-ahead for an allow).
+async fn mcp_decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let req: McpDecideReq = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {id, allow, subject}"))?;
+    let card = session
+        .mcp_waiting(&req.id)
+        .filter(|c| c.subject == req.subject)
+        .ok_or_else(|| {
+            json_err(
+                StatusCode::CONFLICT,
+                "that request is no longer waiting, or the decision does not match what is waiting; nothing was decided",
+            )
+        })?;
+    let (kind, subject) = if card.kind == "open_url" {
+        (
+            "mcp.open_url",
+            format!("open {} for MCP server '{}'", card.subject, card.server),
+        )
+    } else {
+        (
+            "mcp.tool_call",
+            format!(
+                "{} on MCP server '{}' with {}",
+                card.remote_tool, card.server, card.subject
+            ),
+        )
+    };
+    let log = st.sessions.records();
+    let record = |allow: bool, log: &citrate_agent_records::DecisionLog| {
+        hic_records::record_member_decision(
+            log,
+            kind,
+            &subject,
+            allow,
+            "the member decided on the exact request shown",
+            vec![citrate_agent_records::EvidenceRef {
+                kind: kind.replace('.', "_"),
+                uri: format!("sidecar:sessions/{id}/mcp/{}", req.id),
+                digest: None,
+            }],
+        )
+    };
+    let allow_seq = match &log {
+        Some(log) if req.allow => match record(true, log) {
+            Ok(seq) => Some(seq),
+            Err(e) => return Err(json_err(StatusCode::SERVICE_UNAVAILABLE, &e)),
+        },
+        _ => None,
+    };
+    match session.mcp_decide(&req.id, req.allow, &req.subject) {
+        Ok(()) => {
+            if let Some(log) = &log {
+                match allow_seq {
+                    Some(seq) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Completed,
+                        "released; the call's own result is in the session",
+                    ),
+                    None => {
+                        if let Err(e) = record(false, log) {
+                            eprintln!("citrate-agent-sidecar: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) => {
+            if let (Some(log), Some(seq)) = (&log, allow_seq) {
+                hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "not released (no longer waiting, or the subject differed)",
+                );
+            }
+            let msg = match e {
+                sessions::SessionError::Invalid(m) => m,
+                _ => "that request is no longer waiting for a decision".to_string(),
+            };
+            Err(json_err(StatusCode::CONFLICT, &msg))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ShellDecideReq {
     id: String,
@@ -1069,6 +1197,9 @@ fn log_skill_report(lib: &citrate_agent_loop::skills::SkillLibrary) {
     );
 }
 
+/// How often the MCP host checks for servers to reconnect and tool lists to re-read.
+pub const MCP_MAINTENANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// HUP-S4.1: read and validate an MCP allowlist file and connect to its servers. `Ok(None)` for
 /// an allowlist with no servers. Blocking (spawns processes, runs handshakes): call it off the
 /// async runtime. A server that fails to start is reported in its status, not here.
@@ -1093,6 +1224,8 @@ pub fn mcp_from_env() -> Option<Arc<citrate_agent_mcp_host::McpHost>> {
     }
     match mcp_from_path(std::path::Path::new(&value)) {
         Ok(Some(host)) => {
+            // HUP-S4.1: reconnect servers that drop (with backoff) and re-list on list_changed.
+            citrate_agent_mcp_host::McpHost::start_maintenance(&host, MCP_MAINTENANCE_EVERY);
             for s in host.status() {
                 eprintln!(
                     "citrate-agent-sidecar: MCP server '{}' ({}): {:?}, {} tools{}",

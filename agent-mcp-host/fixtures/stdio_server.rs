@@ -1,11 +1,12 @@
 //! A real, tiny MCP server over stdio (newline-delimited JSON-RPC), used only by this crate's
 //! integration tests. Flags: `--version <v>` answers initialize with that protocol version;
-//! `--paged` splits tools/list over two pages; `--noisy` writes to stderr on every message.
+//! `--paged` splits tools/list over two pages; `--noisy` writes to stderr on every message;
+//! `--modern` speaks only 2026-07-28 (stateless, `server/discover`); `--dual` speaks both.
 
 #[path = "logic.rs"]
 mod logic;
 
-use logic::{Fixture, Out};
+use logic::{Fixture, FxEra, Out};
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +26,14 @@ fn main() {
         .cloned();
     let paged = args.iter().any(|a| a == "--paged");
     let noisy = args.iter().any(|a| a == "--noisy");
-    let fixture = Arc::new(Mutex::new(Fixture::new(version, paged)));
+    let era = if args.iter().any(|a| a == "--modern") {
+        FxEra::Modern
+    } else if args.iter().any(|a| a == "--dual") {
+        FxEra::Dual
+    } else {
+        FxEra::Legacy
+    };
+    let fixture = Arc::new(Mutex::new(Fixture::new(version, paged).with_era(era)));
     if let Ok(mut f) = fixture.lock() {
         f.env = std::env::vars().collect();
     }
