@@ -986,3 +986,98 @@ async fn after_untrusted_content_a_file_write_is_declined_and_nothing_is_written
         .unwrap()
         .is_empty());
 }
+
+/// L-21: a whole-file write is anchored to the folder that was checked. Once that folder is open,
+/// swapping its path for a link to somewhere else (the window between the check and the rename)
+/// does not move the write: it lands in the folder that was checked, and nothing is written where
+/// the link points.
+#[cfg(unix)]
+#[test]
+fn a_write_lands_in_the_folder_that_was_checked_even_if_its_path_is_swapped() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let checked = s.join("granted");
+    let elsewhere = s.join("elsewhere");
+    let moved = s.join("moved-away");
+    std::fs::create_dir_all(&checked).expect("granted");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    std::fs::write(elsewhere.join("notes.txt"), b"keep me").expect("seed");
+    let checked = checked.canonicalize().expect("canonical");
+
+    let dir = open_dir_checked(&checked).expect("the checked folder opens");
+    // The swap: the checked folder is moved away and a link to `elsewhere` takes its path.
+    std::fs::rename(&checked, &moved).expect("move away");
+    std::os::unix::fs::symlink(&elsewhere, &checked).expect("link in its place");
+
+    replace_in_dir(&dir, std::ffi::OsStr::new("notes.txt"), b"agent text").expect("written");
+    assert_eq!(
+        std::fs::read(elsewhere.join("notes.txt")).expect("still there"),
+        b"keep me",
+        "nothing was written where the link points"
+    );
+    assert_eq!(
+        std::fs::read(moved.join("notes.txt")).expect("written in the checked folder"),
+        b"agent text"
+    );
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// The checked folder must be where the check said: a folder reached through a link, or one
+/// that is not where it was asked for, is refused before anything is created.
+#[cfg(unix)]
+#[test]
+fn a_folder_reached_through_a_link_is_not_written_into() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-link-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let real = s.join("real");
+    std::fs::create_dir_all(&real).expect("real");
+    let link = s.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link");
+    let s_canon = s.canonicalize().expect("canonical");
+    assert!(open_dir_checked(&s_canon.join("link")).is_err());
+    assert!(write_file(&s_canon.join("link").join("x.txt"), b"x").is_err());
+    assert_eq!(std::fs::read_dir(&real).expect("readable").count(), 0);
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// A replaced file keeps the permissions it had; a new file is private to the member.
+#[cfg(unix)]
+#[test]
+fn whole_file_writes_keep_permissions_and_create_private_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-mode-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    std::fs::create_dir_all(&s).expect("dir");
+    let s = s.canonicalize().expect("canonical");
+    let existing = s.join("script.sh");
+    std::fs::write(&existing, b"old").expect("seed");
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+    write_file(&existing, b"new").expect("replaced");
+    assert_eq!(std::fs::read(&existing).expect("read"), b"new");
+    let mode = std::fs::metadata(&existing).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o750);
+    let fresh = s.join("fresh.txt");
+    write_file(&fresh, b"hi").expect("created");
+    let mode = std::fs::metadata(&fresh).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode & 0o077, 0, "a new file is not open to others: {mode:o}");
+    // No temp file is left behind.
+    let names: Vec<String> = std::fs::read_dir(&s)
+        .expect("list")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|n| !n.contains("citrate-write")), "{names:?}");
+    let _ = std::fs::remove_dir_all(&s);
+}
