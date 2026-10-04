@@ -1092,3 +1092,65 @@ fn whole_file_writes_keep_permissions_and_create_private_files() {
     );
     let _ = std::fs::remove_dir_all(&s);
 }
+
+/// L-21: fs_delete and fs_rename act inside the folders that were checked. With the folder open,
+/// a link swapped in at its path does not redirect the delete or the rename.
+#[cfg(unix)]
+#[test]
+fn delete_and_rename_act_in_the_folders_that_were_checked() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-mv-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let checked = s.join("granted");
+    let elsewhere = s.join("elsewhere");
+    let moved = s.join("moved-away");
+    std::fs::create_dir_all(&checked).expect("granted");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    for d in [&checked, &elsewhere] {
+        std::fs::write(d.join("a.txt"), b"a").expect("seed a");
+        std::fs::write(d.join("b.txt"), b"b").expect("seed b");
+    }
+    let checked = checked.canonicalize().expect("canonical");
+    let dir = open_dir_checked(&checked).expect("opens");
+    std::fs::rename(&checked, &moved).expect("move away");
+    std::os::unix::fs::symlink(&elsewhere, &checked).expect("link in its place");
+
+    remove_in_dir(&dir, std::ffi::OsStr::new("a.txt")).expect("deleted");
+    rename_between(
+        &dir,
+        std::ffi::OsStr::new("b.txt"),
+        &dir,
+        std::ffi::OsStr::new("c.txt"),
+    )
+    .expect("renamed");
+    assert!(elsewhere.join("a.txt").exists(), "the linked folder's file was not deleted");
+    assert!(elsewhere.join("b.txt").exists(), "the linked folder's file was not moved");
+    assert!(!moved.join("a.txt").exists());
+    assert!(!moved.join("b.txt").exists());
+    assert_eq!(std::fs::read(moved.join("c.txt")).expect("renamed"), b"b");
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// The path-level helpers refuse a folder reached through a link.
+#[cfg(unix)]
+#[test]
+fn delete_and_rename_refuse_a_folder_reached_through_a_link() {
+    let s = std::env::temp_dir().join(format!(
+        "citrate-sidecar-anchor-mvlink-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&s);
+    let real = s.join("real");
+    std::fs::create_dir_all(&real).expect("real");
+    std::fs::write(real.join("a.txt"), b"a").expect("seed");
+    std::os::unix::fs::symlink(&real, s.join("link")).expect("link");
+    let s = s.canonicalize().expect("canonical");
+    assert!(remove_checked(&s.join("link").join("a.txt")).is_err());
+    assert!(rename_checked(&s.join("link").join("a.txt"), &s.join("real").join("z.txt")).is_err());
+    assert!(real.join("a.txt").exists());
+    let _ = std::fs::remove_dir_all(&s);
+}
