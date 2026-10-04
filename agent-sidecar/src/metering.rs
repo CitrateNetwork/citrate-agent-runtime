@@ -19,13 +19,18 @@ use std::sync::{Arc, Mutex};
 use citrate_agent_loop::{
     AssistantTurn, CompletionRequest, Event, EventSink, LlmClient, LlmError, TokenUsage,
 };
-use citrate_agent_metering::{DailyReport, MeteringError, MeteringLog, MeteringSink, TurnRecord};
+use citrate_agent_metering::{
+    DailyReport, EscalationLog, EscalationReceipt, EscalationSummary, MeteringError, MeteringLog,
+    MeteringSink, TurnRecord,
+};
 use serde::Serialize;
 
 /// Directory for the metering log (set by citrate-core). Unset: records are kept in memory only.
 pub const METERING_DIR_ENV: &str = "CITRATE_HERMES_METERING_DIR";
 /// The log file inside that directory.
 pub const METERING_LOG_FILE: &str = "metering.jsonl";
+/// The escalation receipt log inside that directory (HUP-S1.5, US-1.5 AC3).
+pub const ESCALATION_LOG_FILE: &str = "escalations.jsonl";
 /// Records kept in memory when there is no log (oldest dropped first).
 pub const MEMORY_CAP: usize = 10_000;
 
@@ -40,10 +45,12 @@ pub const NOT_MEASURED: &[&str] = &[
     "self-review",
 ];
 
-/// Where finished turn records live.
+/// Where finished turn records and escalation receipts live.
 pub struct MeteringStore {
     log: Option<MeteringLog>,
     memory: Mutex<VecDeque<TurnRecord>>,
+    escalations: Option<EscalationLog>,
+    escalation_memory: Mutex<VecDeque<EscalationReceipt>>,
 }
 
 impl MeteringStore {
@@ -52,6 +59,8 @@ impl MeteringStore {
         MeteringStore {
             log: None,
             memory: Mutex::new(VecDeque::new()),
+            escalations: None,
+            escalation_memory: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -60,6 +69,8 @@ impl MeteringStore {
         MeteringStore {
             log: Some(MeteringLog::new(dir.join(METERING_LOG_FILE))),
             memory: Mutex::new(VecDeque::new()),
+            escalations: Some(EscalationLog::new(dir.join(ESCALATION_LOG_FILE))),
+            escalation_memory: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -113,15 +124,56 @@ impl MeteringStore {
         Ok(out)
     }
 
-    /// The daily report for `day` (`YYYY-MM-DD`, UTC).
+    fn escalation_memory(&self) -> std::sync::MutexGuard<'_, VecDeque<EscalationReceipt>> {
+        match self.escalation_memory.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Keep one escalation receipt. A receipt the log cannot take is kept in memory instead (the
+    /// failure is logged to stderr without content).
+    pub fn append_escalation(&self, rec: EscalationReceipt) {
+        let keep = match &self.escalations {
+            Some(log) => match log.append(&rec) {
+                Ok(()) => None,
+                Err(e) => {
+                    eprintln!("citrate-agent-sidecar: escalation receipt write failed: {e}");
+                    Some(rec)
+                }
+            },
+            None => Some(rec),
+        };
+        if let Some(rec) = keep {
+            let mut m = self.escalation_memory();
+            m.push_back(rec);
+            while m.len() > MEMORY_CAP {
+                m.pop_front();
+            }
+        }
+    }
+
+    /// Every escalation receipt: the log's, then any held in memory.
+    pub fn escalation_receipts(&self) -> Result<Vec<EscalationReceipt>, MeteringError> {
+        let mut out = match &self.escalations {
+            Some(log) => log.read_all()?,
+            None => Vec::new(),
+        };
+        out.extend(self.escalation_memory().iter().cloned());
+        Ok(out)
+    }
+
+    /// The daily report for `day` (`YYYY-MM-DD`, UTC), with the day's escalation receipts.
     pub fn daily(&self, day: &str) -> Result<DailyResponse, MeteringError> {
         let report = DailyReport::build(day, &self.records()?)?;
+        let escalations = EscalationSummary::build(day, &self.escalation_receipts()?)?;
         Ok(DailyResponse {
             day: day.to_string(),
             source: self.source(),
             persisted: self.log.is_some(),
-            markdown: report.to_markdown(),
+            markdown: format!("{}{}", report.to_markdown(), escalations.to_markdown()),
             report,
+            escalations,
             not_measured: NOT_MEASURED.to_vec(),
         })
     }
@@ -137,6 +189,8 @@ pub struct DailyResponse {
     /// Whether the records behind this report survive a sidecar restart.
     pub persisted: bool,
     pub report: DailyReport,
+    /// The day's escalation receipts, summed (HUP-S1.5, US-1.5 AC3).
+    pub escalations: EscalationSummary,
     pub markdown: String,
     /// D-27 measures not collected by this build (show as unknown).
     pub not_measured: Vec<&'static str>,

@@ -373,7 +373,13 @@ fn the_report_lists_the_browser_worker_as_not_built_and_an_off_toolchain_as_off(
     assert_eq!(tc["state"], "off");
     let br = report.iter().find(|r| r["kind"] == "browser").unwrap();
     assert_eq!(br["state"], "not_built");
-    assert!(br["detail"].as_str().unwrap().contains("HUP-S5.1"));
+    let detail = br["detail"].as_str().unwrap();
+    // HUP-S1.9 live run: the browser tools exist (HUP-S5.1, in the sidecar process, driving the
+    // managed Chromium as its own process). Only a separate browser worker is not built, and the
+    // report must not say there are no browser tools.
+    assert!(!detail.contains("no browser tools"), "{detail}");
+    assert!(detail.contains("Chromium"), "{detail}");
+    assert!(detail.contains("not built"), "{detail}");
 }
 
 #[test]
