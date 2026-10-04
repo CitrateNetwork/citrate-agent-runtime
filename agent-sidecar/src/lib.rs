@@ -355,6 +355,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/anchor/plan", post(chain_routes::anchor_plan))
         .route("/anchor/confirm", post(chain_routes::anchor_confirm))
         .route("/anchor/proof", get(chain_routes::anchor_proof))
+        .route("/anchor/records", get(chain_routes::anchor_records))
         // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
         // key per request), and the registry route's status (disabled in this build).
         .route("/escalations", post(escalation::escalate))
@@ -1814,6 +1815,8 @@ async fn start_track_workflow(
     ))
 }
 
+#[cfg(test)]
+mod anchor_records_route_tests;
 #[cfg(test)]
 mod anchor_route_tests;
 #[cfg(test)]
