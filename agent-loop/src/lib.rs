@@ -785,7 +785,8 @@ pub trait ToolSelector: Send + Sync {
 }
 
 /// Deterministic keyword scorer over tool names (weighted) and descriptions. Snake_case names are
-/// split into words. With no signal at all it falls back to the first `k` tools in catalog order.
+/// split into words. It returns the top `k`: matching tools by score, then the remaining tools in
+/// catalog order (with no signal at all, that is the first `k` tools in catalog order).
 /// (An embedding selector can implement the same trait once the knowledge graph is bundled.)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeywordSelector;
@@ -832,10 +833,12 @@ impl ToolSelector for KeywordSelector {
         if scored.iter().all(|(_, sc)| *sc == 0) {
             return specs.iter().take(k).cloned().collect();
         }
+        // Top K: the matches by score, then the rest of the catalog in its order. A query that
+        // matches only a few tools still gets K on offer (HUP-S1.9 live parity: "remember that ..."
+        // matched two unrelated tools and the memory write was never offered).
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         scored
             .into_iter()
-            .filter(|(_, sc)| *sc > 0)
             .take(k)
             .map(|(i, _)| specs[i].clone())
             .collect()
