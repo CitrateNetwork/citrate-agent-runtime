@@ -1821,6 +1821,8 @@ mod capsule_sandbox_tests;
 #[cfg(test)]
 mod grants_session_tests;
 #[cfg(test)]
+mod instruction_skills_route_tests;
+#[cfg(test)]
 mod learn_more_session_tests;
 #[cfg(test)]
 mod learn_session_tests;
@@ -1832,8 +1834,6 @@ mod metering_session_tests;
 mod sessions_tests;
 #[cfg(test)]
 mod sheets_session_tests;
-#[cfg(test)]
-mod instruction_skills_route_tests;
 #[cfg(test)]
 mod skills_lock_env_tests;
 #[cfg(test)]
