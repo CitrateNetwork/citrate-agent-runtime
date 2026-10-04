@@ -94,10 +94,31 @@ fn saved_entry(s: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Read the saved server list: a regular file (not a symlink), owner-only on Unix, at most
-/// [`MAX_REGISTRY_BYTES`]. The reason never quotes the file.
+/// [`MAX_REGISTRY_BYTES`]. The checks are made on the opened file (opened without following a
+/// symlink at the last component), so the file cannot be swapped between the check and the read.
+/// The reason never quotes the file.
 fn read_registry(path: &Path) -> Result<Vec<serde_json::Value>, String> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|_| "the saved server list could not be read".to_string())?;
+    use std::io::Read;
+    let unreadable = || "the saved server list could not be read".to_string();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match opts.open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            return Err(match std::fs::symlink_metadata(path) {
+                Ok(m) if !m.file_type().is_file() => {
+                    "the saved server list is not a regular file".to_string()
+                }
+                _ => unreadable(),
+            })
+        }
+    };
+    let meta = file.metadata().map_err(|_| unreadable())?;
     if !meta.file_type().is_file() {
         return Err("the saved server list is not a regular file".to_string());
     }
@@ -111,10 +132,14 @@ fn read_registry(path: &Path) -> Result<Vec<serde_json::Value>, String> {
     if meta.len() > MAX_REGISTRY_BYTES {
         return Err("the saved server list is too large".to_string());
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| "the saved server list could not be read".to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| "the saved server list could not be read".to_string())?;
+    let mut text = String::new();
+    file.take(MAX_REGISTRY_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| unreadable())?;
+    if text.len() as u64 > MAX_REGISTRY_BYTES {
+        return Err("the saved server list is too large".to_string());
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
     Ok(v.get("servers")
         .and_then(serde_json::Value::as_array)
         .cloned()
