@@ -82,7 +82,7 @@ async fn persona_and_workflow_routes_are_bearer_gated() {
 }
 
 #[tokio::test]
-async fn get_personas_lists_the_shipped_personas_with_fragments_and_pending_names() {
+async fn get_personas_lists_the_shipped_personas_with_fragments_and_approved_names() {
     let r = app(state())
         .oneshot(req("GET", "/personas", serde_json::Value::Null, true))
         .await
@@ -92,7 +92,7 @@ async fn get_personas_lists_the_shipped_personas_with_fragments_and_pending_name
     let ps = v.as_array().expect("array");
     assert!(ps.len() >= 5);
     for p in ps {
-        assert_eq!(p["name_pending_sign_off"], true, "{p}");
+        assert_eq!(p["name_pending_sign_off"], false, "{p}");
         assert_eq!(p["custom"], false);
         let frag = p["prompt_fragment"].as_str().expect("fragment");
         assert!(frag.contains(p["name"].as_str().expect("name")));
@@ -195,13 +195,20 @@ impl citrate_agent_loop::LlmClient for Seen {
     }
 }
 
-fn session_body(persona: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
+/// A session body naming its persona the way core does: `persona` (a shipped id) and/or
+/// `customPersona`, merged from `persona_fields`.
+fn session_body(persona_fields: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
         "model": "gemma-4",
         "systemPrompt": "You are Hermes.",
         "llm": {"baseUrl": "http://127.0.0.1:18080/v1", "bearer": "k"},
-        "persona": persona,
-    })
+    });
+    if let (Some(b), Some(extra)) = (body.as_object_mut(), persona_fields.as_object()) {
+        for (k, v) in extra {
+            b.insert(k.clone(), v.clone());
+        }
+    }
+    body
 }
 
 /// A session can name its persona instead of carrying a prompt fragment the app built: the
@@ -242,7 +249,7 @@ async fn a_session_persona_is_checked_and_rendered_by_the_sidecar() {
         .oneshot(req(
             "POST",
             "/sessions",
-            session_body(serde_json::json!({"custom": custom()})),
+            session_body(serde_json::json!({"customPersona": custom()})),
             true,
         ))
         .await
@@ -275,12 +282,32 @@ async fn a_session_persona_is_checked_and_rendered_by_the_sidecar() {
         .oneshot(req(
             "POST",
             "/sessions",
-            session_body(serde_json::json!({"id": shipped[0].persona.id})),
+            session_body(serde_json::json!({"persona": shipped[0].persona.id})),
             true,
         ))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::CREATED);
+    let id = json(r).await["id"].as_str().unwrap_or_default().to_string();
+    app(st.clone())
+        .oneshot(req(
+            "POST",
+            &format!("/sessions/{id}/messages"),
+            serde_json::json!({"text": "hi"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    let mut system = String::new();
+    for _ in 0..50 {
+        if let Some(s) = seen.0.lock().ok().and_then(|g| g.get(1).cloned()) {
+            system = s;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(system.starts_with("You are Hermes."), "{system}");
+    assert!(system.contains(&shipped[0].prompt_fragment), "{system}");
 }
 
 #[tokio::test]
@@ -288,10 +315,9 @@ async fn a_session_persona_that_fails_the_checks_is_refused() {
     let mut bad = custom();
     bad["style_rules"] = serde_json::json!([]);
     for persona in [
-        serde_json::json!({"custom": bad}),
-        serde_json::json!({"id": "no-such-persona"}),
-        serde_json::json!({"id": "x", "custom": custom()}),
-        serde_json::json!({}),
+        serde_json::json!({"customPersona": bad}),
+        serde_json::json!({"persona": "no-such-persona"}),
+        serde_json::json!({"persona": "maker", "customPersona": custom()}),
     ] {
         let r = app(state())
             .oneshot(req(

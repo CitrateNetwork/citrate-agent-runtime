@@ -4,7 +4,7 @@ summary = "Changes to a codebase, proven by tests."
 persona = "Builder"
 skills = ["agentile-red-green", "toolchain"]
 workflow = "code-change"
-workflow_available = false
+workflow_available = true
 ships_in = "HUP-S2"
 gates = [
   "A failing test first, then the change that makes it pass",

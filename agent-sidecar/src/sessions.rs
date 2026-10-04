@@ -54,23 +54,31 @@
 //! - HUP-S9.3: when trajectory recording is configured (`CITRATE_HERMES_TRAJECTORIES`, default
 //!   off), a session also carries a `TrajectoryRecorder`, exported (verified turns only, redacted)
 //!   when the session closes ([`crate::trajectory`]).
-//! - HUP-S2.9: when the file tools are enabled (`CITRATE_HERMES_FILES=1` with a grants file and a
-//!   checkpoint store, default off), every session also offers the sidecar-hosted `fs_write`,
-//!   `fs_edit`, `fs_delete` and `fs_rename` tools ([`crate::files`]). Each change is checked
-//!   against the folder grants and the default-deny list, then checkpointed under the session id,
-//!   so the member can undo it through the `/checkpoints` routes.
+//! - HUP-S2.9: a session opened with a grant document, when a checkpoint store is configured, also
+//!   offers the sidecar-hosted `fs_write`, `fs_edit`, `fs_delete` and `fs_rename` tools
+//!   ([`crate::files`]) on that document, and its `file_write` and `sheet_write` are checkpointed
+//!   too (without a store they write nothing). A session without a grant document gets the `fs_*`
+//!   tools only with `CITRATE_HERMES_FILES=1` and a grants file. Each change is checked against
+//!   the folder grants and the default-deny list, then checkpointed under the session id, so the
+//!   member can undo it through the `/checkpoints` routes.
+//! - US-2.2 AC2: when `shell_run` is enabled (`CITRATE_HERMES_SHELL_RUN=1`, default off), every
+//!   session opened with folder grants also offers the sidecar-hosted `shell_run` tool
+//!   ([`crate::shell_run`]): each command waits for the member's decision on the session's
+//!   `/shell` routes and runs only in the OS sandbox. The name is reserved while it is on.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
 use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
-use citrate_agent_loop::skills::{skill_load_spec, SkillHost, SkillLibrary, SKILL_LOAD_TOOL};
+use citrate_agent_loop::skills::{
+    skill_load_spec, SkillHost, SkillLibrary, SkillSource, SKILL_LOAD_TOOL,
+};
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
     LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
@@ -87,6 +95,9 @@ use crate::files::{FileTools, FileToolsHost};
 use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
 use crate::metering::{MeteredLlm, MeteringStore, TeeSink};
 use crate::sheets::SheetToolHost;
+use crate::shell_run::{
+    shell_run_spec, ShellPending, ShellRunConfig, ShellRunHost, ShellRunSession, SHELL_RUN_TOOL,
+};
 use crate::toolchain::ToolchainHost;
 use crate::trajectory::{export_session, ExportSummary, TrajectoryConfig};
 use crate::workers::WorkerSet;
@@ -277,43 +288,40 @@ pub struct CreateSessionReq {
     /// no file tools, and the toolchain keeps its env roots.
     #[serde(default)]
     pub grants: Option<serde_json::Value>,
+    /// HUP-S2.5: capsule folder mounts (resolved against `grants` at every call) and the member's
+    /// egress consent. Absent = capsules get no folder and no address.
+    #[serde(default)]
+    pub capsule_sandbox: Option<crate::capsule_sandbox::CapsuleSandboxDoc>,
     /// HUP-S10.3: a scheduled daemon run nobody is watching. The session starts tainted (source
     /// [`UNATTENDED_TAINT_SOURCE`]), so every effectful call needs a member's explicit decision
     /// from the first step, or is declined here when core is not `hic_aware`. Read-only calls run
     /// as usual. Absent = false: nothing changes. The taint is never cleared for such a session.
     #[serde(default)]
     pub unattended: bool,
-    /// HUP-S3.3: the persona for this session. The sidecar checks it (a custom persona with the
-    /// same rules as `POST /personas/check`) and appends the fragment it renders to the system
-    /// prompt, so a fragment never has to come from app state. Absent = nothing is appended.
+    /// HUP-S3.3: a shipped persona id. Its skill allowlist decides which skills the session
+    /// offers, and its tool emphasis pins up to four of the session's own tools into every request.
+    /// The persona's prompt fragment is composed by the client. Absent = no persona: nothing
+    /// changes.
     #[serde(default)]
-    pub persona: Option<SessionPersona>,
+    pub persona: Option<String>,
+    /// HUP-S3.3 (US-3.3 AC3): a member-defined persona instead of `persona` (checked here with
+    /// the same rules as `POST /personas/check`). Never both.
+    #[serde(default)]
+    pub custom_persona: Option<citrate_agent_loop::personas::CustomPersona>,
 }
 
-/// A session's persona: exactly one of a shipped persona `id` or a `custom` persona.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionPersona {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub custom: Option<citrate_agent_loop::personas::CustomPersona>,
-}
-
-impl SessionPersona {
-    /// The checked persona's prompt fragment, or why it was refused.
-    pub fn fragment(&self) -> Result<String, String> {
-        use citrate_agent_loop::personas;
-        match (&self.id, &self.custom) {
-            (Some(id), None) => personas::persona_views()?
-                .into_iter()
-                .find(|v| &v.persona.id == id)
-                .map(|v| v.prompt_fragment)
-                .ok_or_else(|| "no shipped persona has that id".to_string()),
-            (None, Some(c)) => c.check().map(|v| v.prompt_fragment),
-            _ => Err("a persona is either a shipped id or a custom persona".to_string()),
-        }
-    }
+/// HUP-S3.3: what a session did with its persona (`POST /sessions` answers it as `persona`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonaReport {
+    pub id: String,
+    /// Allowlisted skills this session offers (empty when the sidecar has no skills library).
+    pub skills_offered: Vec<String>,
+    /// Allowlisted skills that are not installed, so not offered.
+    pub skills_missing: Vec<String>,
+    /// False when the persona names no skills (a custom persona): the skills are then unchanged.
+    pub skills_restricted: bool,
+    /// The session's own tools pinned into every request, in emphasis order.
+    pub pinned_tools: Vec<String>,
 }
 
 /// `POST /sessions/:id/tool_results` body.
@@ -394,6 +402,8 @@ pub struct Session {
     trajectory: Option<(Arc<TrajectoryRecorder>, Arc<TrajectoryConfig>)>,
     /// HUP-S2.1: present when this session was opened with a grant document.
     grants: Option<Arc<SessionGrants>>,
+    /// HUP-S2.5: what this session's capsule calls may mount and reach.
+    capsule_sandbox: Arc<crate::capsule_sandbox::SessionSandbox>,
     /// HUP-S2.9: present when this session was opened with the file tools enabled.
     files: Option<Arc<FileTools>>,
     /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
@@ -401,9 +411,34 @@ pub struct Session {
     /// When the app last used this session (the manager's use counter): a full table replaces
     /// the idle session used least recently.
     last_used: AtomicU64,
+    /// HUP-S3.3: present when this session was opened with a persona.
+    persona: Option<PersonaReport>,
+    /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
+    shell: Option<Arc<ShellRunSession>>,
 }
 
 impl Session {
+    /// US-2.2 AC2: the commands waiting for the member (`None` when the session has no
+    /// `shell_run`).
+    pub fn shell_pending(&self) -> Option<Vec<ShellPending>> {
+        self.shell.as_ref().map(|s| s.approvals().pending())
+    }
+
+    /// US-2.2 AC2: the member's decision on a waiting command; it must carry the argv and cwd
+    /// that were shown.
+    pub fn shell_decide(
+        &self,
+        id: &str,
+        allow: bool,
+        argv: &[String],
+        cwd: &str,
+    ) -> Result<(), SessionError> {
+        let s = self.shell.as_ref().ok_or(SessionError::NotFound)?;
+        s.approvals()
+            .decide(id, allow, argv, cwd)
+            .map_err(SessionError::Invalid)
+    }
+
     fn push(&self, event: Event) {
         if let Ok(mut log) = self.log.lock() {
             log.next_seq += 1;
@@ -509,6 +544,16 @@ impl Session {
     }
 
     /// HUP-S2.1: this session's folder grants (`None` when it was opened without a document).
+    /// HUP-S3.3: what this session did with its persona, if it has one.
+    pub fn persona(&self) -> Option<&PersonaReport> {
+        self.persona.as_ref()
+    }
+
+    /// The names of every tool this session offers (core-hosted and sidecar-hosted).
+    pub fn tool_names(&self) -> Vec<String> {
+        self.specs.iter().map(|t| t.name.clone()).collect()
+    }
+
     pub fn grants(&self) -> Option<&Arc<SessionGrants>> {
         self.grants.as_ref()
     }
@@ -585,6 +630,8 @@ impl ToolHost for CoreHost {
 /// effects still park on the approval queue for a human).
 pub(crate) struct CapsuleHost {
     dispatch: Arc<CapsuleDispatch>,
+    /// HUP-S2.5: the session's sandbox, resolved at every call.
+    sandbox: Arc<crate::capsule_sandbox::SessionSandbox>,
 }
 
 impl ToolHost for CapsuleHost {
@@ -595,7 +642,10 @@ impl ToolHost for CapsuleHost {
             &call.arguments
         })
         .unwrap_or(serde_json::Value::Object(Default::default()));
-        match self.dispatch.call_json(&call.name, &args) {
+        match self
+            .dispatch
+            .call_json_sandboxed(&call.name, &args, self.sandbox.as_ref())
+        {
             Ok(v) => ToolOutcome::Ok(v.to_string()),
             Err(e) => ToolOutcome::Error(e.to_string()),
         }
@@ -621,10 +671,17 @@ pub(crate) struct SidecarHost {
     pub(crate) capsules: Option<CapsuleHost>,
     pub(crate) learn: Option<crate::learn::LearnToolHost>,
     pub(crate) browser: Option<BrowserToolHost>,
+    /// US-2.2 AC2: `shell_run`, when on and the session has grants.
+    pub(crate) shell: Option<ShellRunHost>,
 }
 
 impl ToolHost for SidecarHost {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        if call.name == SHELL_RUN_TOOL {
+            if let Some(s) = &self.shell {
+                return s.execute(call);
+            }
+        }
         if browser_tools::handles(&call.name) {
             if let Some(b) = &self.browser {
                 return b.execute(call);
@@ -712,7 +769,11 @@ pub struct SessionManager {
     llm_factory: LlmFactory,
     core_tool_deadline: Duration,
     ids: AtomicU64,
-    skills: Option<Arc<SkillLibrary>>,
+    /// HUP-S3.2: the skills library offered to new sessions. HUP-S3.4: reloaded from
+    /// `skill_sources` after the member accepts a learned skill, so it joins the next session
+    /// without a sidecar restart (sessions already open keep the library they started with).
+    skills: RwLock<Option<Arc<SkillLibrary>>>,
+    skill_sources: Vec<SkillSource>,
     toolchain: Option<Arc<dyn ToolchainBackend>>,
     mcp: Option<Arc<McpHost>>,
     browser: Option<Arc<BrowserService>>,
@@ -734,6 +795,10 @@ pub struct SessionManager {
     mcp_registry: Option<std::path::PathBuf>,
     /// Use counter for [`Session::last_used`].
     uses: AtomicU64,
+    /// US-2.2 AC2: `shell_run` for sessions opened with folder grants (default off).
+    shell_run: Option<Arc<ShellRunConfig>>,
+    /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
+    records: Option<Arc<citrate_agent_records::DecisionLog>>,
 }
 
 impl SessionManager {
@@ -743,7 +808,8 @@ impl SessionManager {
             llm_factory,
             core_tool_deadline,
             ids: AtomicU64::new(0),
-            skills: None,
+            skills: RwLock::new(None),
+            skill_sources: Vec::new(),
             toolchain: None,
             mcp: None,
             browser: None,
@@ -760,6 +826,8 @@ impl SessionManager {
             anchor: None,
             mcp_registry: None,
             uses: AtomicU64::new(0),
+            shell_run: None,
+            records: None,
         }
     }
 
@@ -772,6 +840,29 @@ impl SessionManager {
     /// HUP-S4.4: the saved MCP server list the probe checks against, if configured.
     pub fn mcp_registry(&self) -> Option<&std::path::Path> {
         self.mcp_registry.as_deref()
+    }
+
+    /// US-2.2 AC2: offer `shell_run` to every new session opened with folder grants.
+    pub fn with_shell_run(mut self, cfg: Arc<ShellRunConfig>) -> Self {
+        self.shell_run = Some(cfg);
+        self
+    }
+
+    /// Whether `shell_run` is on.
+    pub fn shell_run_enabled(&self) -> bool {
+        self.shell_run.is_some()
+    }
+
+    /// HUP-S2.6: record HIC decisions (ceremony bridge, browser actions, core's events) into this
+    /// log, the one in the records directory the anchor batches (default none: nothing recorded).
+    pub fn with_records(mut self, log: Arc<citrate_agent_records::DecisionLog>) -> Self {
+        self.records = Some(log);
+        self
+    }
+
+    /// HUP-S2.6: the decision records writer, when configured.
+    pub fn records(&self) -> Option<Arc<citrate_agent_records::DecisionLog>> {
+        self.records.clone()
     }
 
     /// HUP-S7.5: where finished metering records go (default: in memory for this process).
@@ -929,10 +1020,66 @@ impl SessionManager {
         self.mcp.as_ref().map(|h| h.status())
     }
 
+    /// HUP-S3.3: the skills library new sessions start from (before a persona's allowlist).
+    /// A snapshot: HUP-S3.4 reloads the library when the member accepts a learned skill.
+    pub fn skills_library(&self) -> Option<Arc<SkillLibrary>> {
+        self.skills()
+    }
+
+    /// HUP-S3.3: whether the toolchain tools (forge, slither, aderyn, medusa) are offered.
+    pub fn toolchain_enabled(&self) -> bool {
+        self.toolchain.is_some()
+    }
+
     /// HUP-S3.2: offer this skills library to every new session. An empty library offers nothing.
+    /// A library given this way is fixed: [`SessionManager::reload_skills`] has no sources to
+    /// read again.
     pub fn with_skills(mut self, lib: Arc<SkillLibrary>) -> Self {
-        self.skills = if lib.is_empty() { None } else { Some(lib) };
+        self.skills = RwLock::new(if lib.is_empty() { None } else { Some(lib) });
         self
+    }
+
+    /// HUP-S3.2 + S3.4: load the skills library from these sources (in precedence order) and
+    /// keep the sources, so [`SessionManager::reload_skills`] can read them again after the
+    /// member accepts a learned skill. Sources that hold no skills yet offer nothing until then.
+    pub fn with_skill_sources(mut self, sources: Vec<SkillSource>) -> Self {
+        let lib = SkillLibrary::load(&sources);
+        self.skills = RwLock::new(if lib.is_empty() {
+            None
+        } else {
+            Some(Arc::new(lib))
+        });
+        self.skill_sources = sources;
+        self
+    }
+
+    /// The library new sessions are offered now (a snapshot).
+    pub fn skills(&self) -> Option<Arc<SkillLibrary>> {
+        match self.skills.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// HUP-S3.4: read the skill sources again so a newly saved skill is offered to the next
+    /// session. Returns how many skills new sessions are offered, or `None` when the library was
+    /// not configured from sources (nothing to reload). Sessions already open are unchanged.
+    pub fn reload_skills(&self) -> Option<usize> {
+        if self.skill_sources.is_empty() {
+            return None;
+        }
+        let lib = SkillLibrary::load(&self.skill_sources);
+        let n = lib.len();
+        let next = if lib.is_empty() {
+            None
+        } else {
+            Some(Arc::new(lib))
+        };
+        match self.skills.write() {
+            Ok(mut g) => *g = next,
+            Err(p) => *p.into_inner() = next,
+        }
+        Some(n)
     }
 
     pub fn create(&self, req: CreateSessionReq) -> Result<String, SessionError> {
@@ -940,16 +1087,56 @@ impl SessionManager {
         if req.model.trim().is_empty() {
             return Err(SessionError::Invalid("model is required".into()));
         }
+        let persona = citrate_agent_loop::personas::session_persona(
+            req.persona.as_deref(),
+            req.custom_persona.as_ref(),
+        )
+        .map_err(SessionError::Invalid)?;
+        // HUP-S3.3: the persona's skill allowlist decides which skills this session offers. An
+        // allowlist with nothing installed offers no skills (and no `skill_load`), never others.
+        // One snapshot of the (reloadable) library for the allowlist, the prompt section and
+        // the session's `skill_load` host.
+        let base_skills = self.skills();
+        let (skills, persona_skills) = match (&persona, &base_skills) {
+            (Some(p), Some(lib)) if p.restricts_skills() => {
+                let (only, missing) = lib.restricted_to(&p.skills);
+                let offered: Vec<String> = only.names().into_iter().map(String::from).collect();
+                let lib = if only.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(only))
+                };
+                (lib, Some((offered, missing, true)))
+            }
+            (Some(p), None) if p.restricts_skills() => {
+                (None, Some((Vec::new(), p.skills.clone(), true)))
+            }
+            (Some(_), lib) => (
+                lib.clone(),
+                Some((
+                    lib.as_ref()
+                        .map(|l| l.names().into_iter().map(String::from).collect())
+                        .unwrap_or_default(),
+                    Vec::new(),
+                    false,
+                )),
+            ),
+            (None, lib) => (lib.clone(), None),
+        };
         let mut specs = req.tools;
         let mut system_prompt = req.system_prompt;
-        if let Some(p) = &req.persona {
-            let fragment = p
-                .fragment()
-                .map_err(|e| SessionError::Invalid(format!("the persona was refused: {e}")))?;
+        // L-23: the persona's prompt fragment is rendered here from the checked persona (a shipped
+        // id or a custom persona that passed `CustomPersona::check`), never taken from app state.
+        if let Some(fragment) = citrate_agent_loop::personas::session_persona_fragment(
+            req.persona.as_deref(),
+            req.custom_persona.as_ref(),
+        )
+        .map_err(SessionError::Invalid)?
+        {
             system_prompt = format!("{system_prompt}\n\n{fragment}");
         }
         let mut pinned_tools = Vec::new();
-        if let Some(lib) = &self.skills {
+        if let Some(lib) = &skills {
             if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{SKILL_LOAD_TOOL}' is reserved by the sidecar while skills are enabled"
@@ -1018,6 +1205,11 @@ impl SessionManager {
             }
             specs.push(crate::learn::learn_propose_spec());
         }
+        if self.shell_run.is_some() && specs.iter().any(|t| t.name == SHELL_RUN_TOOL) {
+            return Err(SessionError::Invalid(format!(
+                "the tool name '{SHELL_RUN_TOOL}' is reserved by the sidecar while shell_run is on"
+            )));
+        }
         let grants = match req.grants {
             None => None,
             Some(doc) => {
@@ -1035,19 +1227,75 @@ impl SessionManager {
                         t.name
                     )));
                 }
+                // HUP-S2.9: with an undo store, a grant session also gets the checkpointed fs_*
+                // tools, checked against this same grant document.
+                let fs_on_grants = self.checkpoints.is_some() && self.files.is_none();
+                if fs_on_grants {
+                    if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
+                        return Err(SessionError::Invalid(format!(
+                            "the tool name '{}' is reserved by the sidecar while folder grants are given",
+                            t.name
+                        )));
+                    }
+                }
                 let g = SessionGrants::empty(home);
                 g.replace(&doc).map_err(|e| {
                     SessionError::Invalid(format!("the grant document was refused: {e}"))
                 })?;
                 specs.extend(crate::grants::file_tool_specs());
                 specs.extend(crate::sheets::sheet_tool_specs());
+                if fs_on_grants {
+                    specs.extend(FileTools::specs());
+                }
                 Some(Arc::new(g))
             }
         };
+        let shell = match (&self.shell_run, &grants) {
+            (Some(cfg), Some(g)) => {
+                specs.push(shell_run_spec());
+                Some(Arc::new(
+                    ShellRunSession::new(cfg, g.clone()).map_err(SessionError::Invalid)?,
+                ))
+            }
+            _ => None,
+        };
+        let capsule_sandbox = Arc::new(
+            crate::capsule_sandbox::SessionSandbox::new(req.capsule_sandbox, grants.clone())
+                .map_err(|e| SessionError::Invalid(format!("capsuleSandbox was refused: {e}")))?,
+        );
+        // HUP-S3.3: the persona's tool emphasis pins the session's own tools (never adds one).
+        let persona = persona.map(|p| {
+            let offered: Vec<String> = specs.iter().map(|t| t.name.clone()).collect();
+            let pinned = p.pinned_tools(&offered);
+            for t in &pinned {
+                if !pinned_tools.contains(t) {
+                    pinned_tools.push(t.clone());
+                }
+            }
+            let (skills_offered, skills_missing, skills_restricted) =
+                persona_skills.clone().unwrap_or_default();
+            PersonaReport {
+                id: p.id,
+                skills_offered,
+                skills_missing,
+                skills_restricted,
+                pinned_tools: pinned,
+            }
+        });
         let toolchain: Option<Arc<dyn ToolHost>> = match (&self.toolchain, &grants) {
             (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
             (None, _) => None,
+        };
+        // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
+        // grant store), not a grants file.
+        let files = match (&grants, &self.checkpoints) {
+            (Some(g), Some(store)) => Some(Arc::new(FileTools::new(
+                store.clone(),
+                crate::files::GrantSource::Session(g.clone()),
+                g.home(),
+            ))),
+            _ => self.files.clone(),
         };
         let mut sessions = self
             .sessions
@@ -1131,15 +1379,18 @@ impl SessionManager {
             stop: StopFlag::default(),
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            skills: self.skills.clone(),
+            skills,
             toolchain,
             grants,
+            capsule_sandbox,
             metering,
             metering_store: self.metering.clone(),
             trajectory,
-            files: self.files.clone(),
+            files,
             runs: Mutex::new(VecDeque::new()),
             last_used: AtomicU64::new(self.uses.fetch_add(1, Ordering::SeqCst) + 1),
+            persona,
+            shell,
         });
         sessions.insert(id.clone(), session);
         drop(sessions);
@@ -1173,6 +1424,20 @@ impl SessionManager {
         })
     }
 
+    /// HUP-S2.3: the taint sources of every live session that is tainted (one list per session).
+    /// `None` when the session table or any session's taint cannot be read, which callers treat
+    /// as "unknown" (tainted).
+    pub fn tainted_session_sources(&self) -> Option<Vec<Vec<String>>> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().ok()?.values().cloned().collect();
+        let mut out = Vec::new();
+        for s in sessions {
+            if s.taint().is_tainted() {
+                out.push(s.taint().sources()?);
+            }
+        }
+        Some(out)
+    }
+
     /// The tools a turn or workflow in this session can call: core-hosted ones park on core, and
     /// the sidecar-hosted ones (skills, toolchain, MCP, learn, capsules) run here.
     fn registry_for(
@@ -1190,14 +1455,35 @@ impl SessionManager {
             .with_host(HostKind::Core, core)
             .with_taint(session.taint.clone());
         let skill_host = session.skills.clone().map(SkillHost::new);
-        let capsule_host = capsules.map(|d| CapsuleHost { dispatch: d });
+        let capsule_host = capsules.map(|d| CapsuleHost {
+            dispatch: d,
+            sandbox: session.capsule_sandbox.clone(),
+        });
         let toolchain = session.toolchain.clone();
         let files = session
             .files
             .clone()
             .and_then(|t| FileToolsHost::new(t, &session.id));
-        let file_host = session.grants.clone().map(FileToolHost::new);
-        let sheet_host = session.grants.clone().map(SheetToolHost::new);
+        // HUP-S2.9: file_write and sheet_write checkpoint under the session id; without an undo
+        // store they write nothing.
+        let undo = self
+            .checkpoints
+            .clone()
+            .and_then(|st| crate::files::UndoScope::new(st, &session.id));
+        let file_host = session.grants.clone().map(|g| {
+            let h = FileToolHost::new(g);
+            match &undo {
+                Some(u) => h.with_undo(u.clone()),
+                None => h,
+            }
+        });
+        let sheet_host = session.grants.clone().map(|g| {
+            let h = SheetToolHost::new(g);
+            match &undo {
+                Some(u) => h.with_undo(u.clone()),
+                None => h,
+            }
+        });
         let search = self.search.clone();
         let mcp_host = self
             .mcp
@@ -1211,7 +1497,12 @@ impl SessionManager {
             .browser
             .clone()
             .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        let shell_host = session
+            .shell
+            .as_ref()
+            .map(|s| s.host(session.taint.clone(), session.stop.clone()));
         if file_host.is_some()
+            || shell_host.is_some()
             || skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
@@ -1234,6 +1525,7 @@ impl SessionManager {
                     capsules: capsule_host,
                     learn: learn_host,
                     browser: browser_host,
+                    shell: shell_host,
                 }),
             );
         }

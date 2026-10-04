@@ -32,6 +32,7 @@ use crate::chromium::{self, ChromiumStatus, ManagedChrome};
 use crate::frames::{FrameBuffer, FrameView, Highlight};
 use crate::gate::{self, Verdict};
 use crate::scope::{Denylist, Origin, OriginScope, ScopeDecision};
+use crate::signin::{self, SignInAnswer, SignInBridge, SignInRequest};
 use crate::snapshot::{build_snapshot, Snapshot, SnapshotLimits};
 
 /// The env var that turns the browser tools on in the sidecar (`1`; default off).
@@ -171,6 +172,13 @@ pub struct BrowserStatus {
     pub excluded_categories: Vec<CategoryView>,
     pub consent_needed: Option<ConsentNeeded>,
     pub pending_action: Option<PendingAction>,
+    /// HUP-S2.3, managed mode only: the loopback DevTools port of the managed browser, so core
+    /// can read the tab's top-frame origin over its own connection (ADR D2 #1).
+    pub devtools_port: Option<u16>,
+    /// HUP-S2.3, managed mode only: the tab Hermes drives (its DevTools target id).
+    pub target_id: Option<String>,
+    /// HUP-S2.3: sign-in requests from the page waiting for core (managed mode only).
+    pub sign_in_requests: Vec<SignInRequest>,
 }
 
 /// A page the worker is on.
@@ -217,6 +225,10 @@ struct Shared {
     cdp: Mutex<Option<Weak<Cdp>>>,
     /// Why the gate last stopped a page load (read by the step that caused it).
     last_block: Arc<Mutex<Option<BrowserError>>>,
+    /// HUP-S2.3: the page's sign-in bridge (managed mode only).
+    signin: SignInBridge,
+    /// HUP-S2.3: the managed browser's loopback DevTools port.
+    devtools_port: Mutex<Option<u16>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -368,6 +380,16 @@ impl Shared {
             return None;
         }
         match ev.method.as_str() {
+            "Runtime.executionContextCreated"
+            | "Runtime.executionContextDestroyed"
+            | "Runtime.executionContextsCleared"
+            | "Runtime.bindingCalled" => {
+                if !matches!(*lock(&self.mode), Some(Mode::Managed)) {
+                    return None;
+                }
+                let top = lock(&self.target).clone();
+                self.signin.on_event(ev, top.as_deref())
+            }
             "Page.frameNavigated" => {
                 let frame = &ev.params["frame"];
                 if frame["parentId"].is_null() {
@@ -494,7 +516,73 @@ impl BrowserService {
                 .unwrap_or_default(),
             consent_needed: lock(&self.shared.consent_needed).clone(),
             pending_action: self.approvals.pending(),
+            devtools_port: match mode {
+                Some(Mode::Managed) => *lock(&self.shared.devtools_port),
+                _ => None,
+            },
+            target_id: match mode {
+                Some(Mode::Managed) => lock(&self.shared.target).clone(),
+                _ => None,
+            },
+            sign_in_requests: self.sign_in_requests(),
         }
+    }
+
+    // --- HUP-S2.3 sign-in bridge (managed mode only; keyless) --------------------------------
+
+    /// Sign-in requests waiting for core. Requests core left unanswered for
+    /// [`signin::REQUEST_TTL`] are refused to the page here.
+    pub fn sign_in_requests(&self) -> Vec<SignInRequest> {
+        let (live, expired) = self.shared.signin.pending();
+        for d in expired {
+            let _ = self.deliver(
+                d,
+                &SignInAnswer::Refused {
+                    code: signin::CODE_USER_REJECTED,
+                    message: "nobody answered the sign-in request in time".to_string(),
+                },
+            );
+        }
+        live
+    }
+
+    /// Deliver core's answer to the page context that asked. The answer must fit the request
+    /// (one address for `eth_requestAccounts`, a 65-byte signature for `personal_sign`).
+    pub fn answer_sign_in(
+        &self,
+        id: &str,
+        answer: &SignInAnswer,
+    ) -> std::result::Result<(), String> {
+        let d = self.shared.signin.take(id, answer)?;
+        self.deliver(d, answer)
+    }
+
+    fn deliver(
+        &self,
+        d: signin::Delivery,
+        answer: &SignInAnswer,
+    ) -> std::result::Result<(), String> {
+        let cdp = lock(&self.handle)
+            .clone()
+            .ok_or_else(|| "the browser is not running".to_string())?;
+        let session = lock(&self.shared.session)
+            .clone()
+            .ok_or_else(|| "the browser is not running".to_string())?;
+        cdp.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": signin::delivery_expression(d.page_id, answer),
+                "contextId": d.context_id,
+            }),
+            Some(&session),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("the page that asked is gone: {e}"))
+    }
+
+    /// Origins whose page content reached the model since the browser started (ADR D2 #19).
+    pub fn read_origins(&self) -> Vec<String> {
+        self.shared.signin.read_origins()
     }
 
     /// The screencast view when newer than `after`.
@@ -625,6 +713,7 @@ impl BrowserService {
         if matches!(live.mode, Mode::Attached(_)) {
             self.check_scope_url(&now)?;
         }
+        self.shared.signin.note_read(&now);
         let title = self.title(live);
         Ok(PageInfo { url: now, title })
     }
@@ -643,6 +732,7 @@ impl BrowserService {
         let r = self.call(live, "Accessibility.getFullAXTree", json!({}))?;
         let nodes = r["nodes"].as_array().cloned().unwrap_or_default();
         let snap = build_snapshot(&nodes, self.cfg.snapshot_limits);
+        self.shared.signin.note_read(&url);
         live.snapshot = Some(snap.clone());
         self.shared.page_version.fetch_add(1, Ordering::SeqCst);
         let title = self.title(live);
@@ -818,6 +908,8 @@ impl BrowserService {
         std::thread::sleep(Duration::from_millis(250));
         self.wait_ready(live, Duration::from_secs(5));
         let after = self.current_url(live)?;
+        self.shared.signin.note_read(&before);
+        self.shared.signin.note_read(&after);
         if after != before {
             live.snapshot = None;
         }
@@ -852,6 +944,7 @@ impl BrowserService {
             vp["clientHeight"].as_f64().unwrap_or(0.0),
         );
         self.shared.frames.push("image/jpeg", data, size, &url);
+        self.shared.signin.note_read(&url);
         let title = self.title(live);
         Ok((PageInfo { url, title }, bytes))
     }
@@ -1066,6 +1159,10 @@ impl BrowserService {
             }
         }
         *lock(&self.shared.mode) = Some(mode);
+        *lock(&self.shared.devtools_port) = match mode {
+            Mode::Managed => devtools_port_of(ws),
+            Mode::Attached(_) => None,
+        };
         *lock(&self.handle) = Some(cdp.clone());
         *lock(&self.shared.cdp) = Some(Arc::downgrade(&cdp));
         let live = Live {
@@ -1083,6 +1180,21 @@ impl BrowserService {
             "Fetch.enable",
             json!({"patterns": gate::fetch_patterns(is_attached)}),
         )?;
+        if mode == Mode::Managed {
+            // HUP-S2.3: the sign-in bridge. The binding and the provider script exist only in the
+            // managed browser; the member's own Chrome never gets them (ADR D2 #3).
+            self.call(
+                &live,
+                "Runtime.addBinding",
+                json!({"name": signin::BINDING}),
+            )?;
+            self.call(
+                &live,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": signin::provider_script()}),
+            )?;
+            self.call(&live, "Runtime.enable", json!({}))?;
+        }
         let (w, h) = self.cfg.viewport;
         self.call(
             &live,
@@ -1117,6 +1229,8 @@ impl BrowserService {
         drop(old);
         *lock(&self.shared.session) = None;
         *lock(&self.shared.mode) = None;
+        *lock(&self.shared.devtools_port) = None;
+        self.shared.signin.clear();
         *lock(&self.shared.consent_needed) = None;
         *lock(&self.shared.url) = String::new();
         if was_attached {
@@ -1126,6 +1240,13 @@ impl BrowserService {
         }
         self.shared.frames.clear();
     }
+}
+
+/// The port of a loopback DevTools WebSocket URL (`ws://127.0.0.1:PORT/devtools/...`).
+fn devtools_port_of(ws: &str) -> Option<u16> {
+    let rest = ws.strip_prefix("ws://127.0.0.1:")?;
+    let port = rest.split('/').next()?;
+    port.parse::<u16>().ok().filter(|p| *p > 0)
 }
 
 impl Drop for BrowserService {
@@ -1160,6 +1281,79 @@ mod tests {
         *lock(&s.url) = url.to_string();
         s.attached.store(true, Ordering::SeqCst);
         s
+    }
+
+    fn sign_in_events(s: &Shared) {
+        s.on_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".to_string(),
+            params: json!({"context": {"id": 5, "origin": "https://app.example.org", "name": "",
+                "auxData": {"isDefault": true, "type": "default", "frameId": "T1"}}}),
+            session_id: Some("S1".to_string()),
+        });
+        s.on_event(&CdpEvent {
+            method: "Runtime.bindingCalled".to_string(),
+            params: json!({"name": signin::BINDING, "executionContextId": 5,
+                "payload": json!({"id": 1, "method": "eth_requestAccounts"}).to_string()}),
+            session_id: Some("S1".to_string()),
+        });
+    }
+
+    #[test]
+    fn the_sign_in_bridge_listens_only_in_the_managed_browser() {
+        let s = shared_attached("https://app.example.org/");
+        *lock(&s.target) = Some("T1".to_string());
+        *lock(&s.mode) = Some(Mode::Attached(9222));
+        sign_in_events(&s);
+        assert!(
+            s.signin.pending().0.is_empty(),
+            "attach mode: no bridge (ADR D2 #3)"
+        );
+        *lock(&s.mode) = Some(Mode::Managed);
+        sign_in_events(&s);
+        let (p, _) = s.signin.pending();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].top_frame, "the target id is the tab's top frame");
+    }
+
+    #[test]
+    fn sign_in_events_of_other_sessions_are_ignored() {
+        let s = shared_attached("https://app.example.org/");
+        *lock(&s.target) = Some("T1".to_string());
+        *lock(&s.mode) = Some(Mode::Managed);
+        *lock(&s.session) = Some("OTHER".to_string());
+        sign_in_events(&s);
+        assert!(s.signin.pending().0.is_empty());
+    }
+
+    #[test]
+    fn the_devtools_port_comes_from_the_loopback_url_only() {
+        assert_eq!(
+            devtools_port_of("ws://127.0.0.1:41234/devtools/browser/x"),
+            Some(41234)
+        );
+        assert_eq!(
+            devtools_port_of("ws://10.0.0.2:41234/devtools/browser/x"),
+            None
+        );
+        assert_eq!(devtools_port_of("ws://127.0.0.1:0/devtools"), None);
+        assert_eq!(devtools_port_of("ws://127.0.0.1:x/devtools"), None);
+    }
+
+    #[test]
+    fn with_no_browser_running_an_answer_cannot_be_delivered() {
+        let svc = BrowserService::new(BrowserConfig::default());
+        let r = svc.answer_sign_in(
+            "signin-1",
+            &SignInAnswer::Refused {
+                code: 4001,
+                message: "no".into(),
+            },
+        );
+        assert!(r.is_err());
+        let st = svc.status();
+        assert_eq!(st.devtools_port, None);
+        assert_eq!(st.target_id, None);
+        assert!(st.sign_in_requests.is_empty());
     }
 
     #[test]

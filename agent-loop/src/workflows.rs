@@ -10,8 +10,9 @@
 //! Definitions name only tools in [`KNOWN_TOOLS`], so a typo fails the bundled-data test instead
 //! of producing a workflow that can never pass.
 //!
-//! Pure data + validation: no I/O. No session route runs these yet; the tracks keep
-//! `workflow_available = false` until one does.
+//! Pure data + validation: no I/O. The sidecar runs a catalog workflow in a session with
+//! `POST /sessions/:id/track_workflows` (it refuses one whose [`WorkflowSpec::required_tools`] the
+//! session does not offer), so every track says `workflow_available = true`.
 
 use crate::interview::bundled_tracks;
 use crate::verifiers_tooling::{
@@ -230,6 +231,17 @@ impl WorkflowSpec {
             .collect()
     }
 
+    /// The tools a passing run must have called: every tool a verifier reads a result of. A tool
+    /// that is only guarded (`tool_not_called`) is never required.
+    pub fn required_tools(&self) -> BTreeSet<String> {
+        self.steps
+            .iter()
+            .flat_map(|s| s.verifiers.iter())
+            .filter(|v| v.requires_call())
+            .filter_map(|v| v.tool().map(str::to_string))
+            .collect()
+    }
+
     pub fn evidence(&self) -> Evidence {
         if self
             .steps
@@ -343,6 +355,11 @@ pub fn bundled_workflows() -> Result<Vec<WorkflowSpec>, String> {
     parse_workflows(WORKFLOWS_SOURCE)
 }
 
+/// The catalog workflow with this id, if any.
+pub fn find_workflow(id: &str) -> Result<Option<WorkflowSpec>, String> {
+    Ok(bundled_workflows()?.into_iter().find(|w| w.id == id))
+}
+
 /// A track's family, default first.
 pub fn workflows_for_track(track: &str) -> Result<Vec<WorkflowSpec>, String> {
     Ok(bundled_workflows()?
@@ -371,6 +388,9 @@ pub struct WorkflowView {
     pub is_default: bool,
     pub evidence: Evidence,
     pub tools: Vec<String>,
+    /// The tools a passing run must call ([`WorkflowSpec::required_tools`]). A session that does
+    /// not offer one of them cannot run the workflow; the sidecar says which.
+    pub needs_tools: Vec<String>,
     pub verifier_names: Vec<String>,
     pub steps: Vec<StepView>,
 }
@@ -397,6 +417,7 @@ pub fn workflow_views() -> Result<Vec<WorkflowView>, String> {
         out.push(WorkflowView {
             evidence: w.evidence(),
             tools: w.tools().into_iter().collect(),
+            needs_tools: w.required_tools().into_iter().collect(),
             verifier_names: steps
                 .iter()
                 .flat_map(|s| s.verifier_names.iter().cloned())

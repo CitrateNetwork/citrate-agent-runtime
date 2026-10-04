@@ -250,38 +250,61 @@ impl MemberClear {
     }
 }
 
+/// The inside of a [`TaintState`]: the first source (what the member is shown) and every source
+/// since (HUP-S2.3: the budgeted sign-in path must see all of them, not only the first).
+#[derive(Debug, Default)]
+struct TaintInner {
+    record: Option<TaintRecord>,
+    sources: std::collections::BTreeSet<String>,
+}
+
 /// A session's taint (HUP-S2.7). Clones share one state, so it survives across steps, turns and
 /// rebuilt registries. Monotone: once set it stays set until [`TaintState::clear_by_member`].
 /// A poisoned lock reads as tainted (fail closed).
 #[derive(Debug, Clone, Default)]
-pub struct TaintState(Arc<Mutex<Option<TaintRecord>>>);
+pub struct TaintState(Arc<Mutex<TaintInner>>);
 
 impl TaintState {
     pub fn is_tainted(&self) -> bool {
-        self.0.lock().map(|g| g.is_some()).unwrap_or(true)
+        self.0.lock().map(|g| g.record.is_some()).unwrap_or(true)
     }
     /// The taint record. Agrees with [`TaintState::is_tainted`]: a poisoned lock yields a record
     /// even if none was written (fail closed), since `run_turn_with` gates on this.
     pub fn record(&self) -> Option<TaintRecord> {
         match self.0.lock() {
-            Ok(g) => g.clone(),
-            Err(p) => Some(p.into_inner().clone().unwrap_or_else(|| TaintRecord {
-                source: "an unknown source".to_string(),
-                reason: "the session's taint state could not be read".to_string(),
-            })),
+            Ok(g) => g.record.clone(),
+            Err(p) => Some(
+                p.into_inner()
+                    .record
+                    .clone()
+                    .unwrap_or_else(|| TaintRecord {
+                        source: "an unknown source".to_string(),
+                        reason: "the session's taint state could not be read".to_string(),
+                    }),
+            ),
         }
     }
-    /// Mark the session tainted. Returns true only when this call flipped it (the first source is
-    /// kept).
+    /// Every tool that has brought untrusted content into this session since it was last clean,
+    /// sorted and without repeats. `None` when the state cannot be read (callers treat that as
+    /// "unknown", which is tainted).
+    pub fn sources(&self) -> Option<Vec<String>> {
+        self.0
+            .lock()
+            .ok()
+            .map(|g| g.sources.iter().cloned().collect())
+    }
+    /// Mark the session tainted by `source`. Every source is remembered; returns true only when
+    /// this call flipped the session to tainted (the first source is kept as the record).
     pub fn taint(&self, source: &str, reason: &str) -> bool {
         let mut g = match self.0.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if g.is_some() {
+        g.sources.insert(source.to_string());
+        if g.record.is_some() {
             return false;
         }
-        *g = Some(TaintRecord {
+        g.record = Some(TaintRecord {
             source: source.to_string(),
             reason: reason.to_string(),
         });
@@ -294,7 +317,8 @@ impl TaintState {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        g.take()
+        g.sources.clear();
+        g.record.take()
     }
 }
 

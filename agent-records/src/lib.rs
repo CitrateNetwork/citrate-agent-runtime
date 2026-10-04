@@ -42,7 +42,10 @@
 //! two). SHA-256 was chosen over BLAKE3 because the EVM has a SHA-256 precompile, so a later
 //! on-chain inclusion check is cheap.
 //!
-//! Not wired yet: no sidecar session writes here today. Wiring is a later WP.
+//! Wiring (HUP-S2.6): the agent sidecar holds the one writer for the records directory
+//! (`CITRATE_HERMES_RECORDS_DIR`) and records the ceremony bridge, browser action decisions,
+//! learn decisions, and citrate-core's events (web signing, folder grants, full access,
+//! escalation spend, approval cards) into it; the nightly anchor batches that directory.
 
 mod error;
 pub mod merkle;

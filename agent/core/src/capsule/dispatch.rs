@@ -191,8 +191,8 @@ impl CapsuleDispatch {
                     Ok(c) => c,
                     Err(e) => {
                         let reason = format!(
-                            "failed signature or content-hash verification, so it will not \
-                             load: {e}"
+                            "failed load verification (signature, content hash or manifest \
+                             checks), so it will not load: {e}"
                         );
                         eprintln!("[capsule-dispatch] refusing {cps_path:?}: {reason}");
                         refused.insert(dir_name, reason);
@@ -225,7 +225,19 @@ impl CapsuleDispatch {
             }
             let manifest_str = std::fs::read_to_string(&manifest_path)
                 .map_err(|e| AgentError::Capsule(format!("read manifest: {e}")))?;
-            let manifest = Manifest::parse(&manifest_str)?;
+            // HUP-S2.5: a manifest that does not parse or validate (for
+            // example an egress list naming a private address, M-6) refuses
+            // that capsule only, with the reason; the rest of the fleet
+            // still loads.
+            let manifest = match Manifest::parse(&manifest_str) {
+                Ok(m) => m,
+                Err(e) => {
+                    let reason = format!("its manifest was refused, so it will not load: {e}");
+                    eprintln!("[capsule-dispatch] refusing {manifest_path:?}: {reason}");
+                    refused.insert(dir_name, reason);
+                    continue;
+                }
+            };
             let wasm = std::fs::read(&wasm_path)
                 .map_err(|e| AgentError::Capsule(format!("read wasm: {e}")))?;
             unverified.insert(manifest.capsule.name.clone());
@@ -259,12 +271,24 @@ impl CapsuleDispatch {
         self
     }
 
-    /// The sandbox plan a call to `capsule` runs under, resolved now.
-    fn sandbox_plan(&self, capsule: &Capsule) -> Result<SandboxPlan, AgentError> {
-        match &self.sandbox {
+    /// The sandbox plan a call to `capsule` runs under, resolved now: the
+    /// caller's provider when given, else the dispatch default.
+    fn sandbox_plan(
+        &self,
+        capsule: &Capsule,
+        provider: Option<&dyn SandboxProvider>,
+    ) -> Result<SandboxPlan, AgentError> {
+        match provider.or(self.sandbox.as_deref()) {
             Some(p) => p.plan_for(&capsule.manifest),
             None => SandboxPlan::without_grants(&capsule.manifest),
         }
+    }
+
+    /// Whether a call to `capsule_name` can run at all: loaded through the
+    /// verified path and not refused. A loose (unsigned) capsule is loaded
+    /// for listing only and is not runnable.
+    pub fn is_runnable(&self, capsule_name: &str) -> bool {
+        self.capsules.contains_key(capsule_name) && !self.unverified.contains(capsule_name)
     }
 
     /// Names of every loaded capsule, alphabetized. Used by the
@@ -308,6 +332,19 @@ impl CapsuleDispatch {
         func_name: &str,
         args: &[wasmtime::component::Val],
     ) -> Result<wasmtime::component::Val, AgentError> {
+        self.call_raw_in(capsule_name, iface_name, func_name, args, None)
+    }
+
+    /// [`Self::call_raw`] under `provider` (a session's own grants) instead
+    /// of the dispatch default, when one is given.
+    fn call_raw_in(
+        &self,
+        capsule_name: &str,
+        iface_name: &str,
+        func_name: &str,
+        args: &[wasmtime::component::Val],
+        provider: Option<&dyn SandboxProvider>,
+    ) -> Result<wasmtime::component::Val, AgentError> {
         let capsule = self
             .capsules
             .get(capsule_name)
@@ -329,7 +366,7 @@ impl CapsuleDispatch {
         // HUP-S2.5: resolved per call, so a revoked or expired grant stops
         // applying on the next call. A plan that cannot be satisfied refuses
         // the call with the reason before any capsule code runs.
-        let plan = self.sandbox_plan(capsule)?;
+        let plan = self.sandbox_plan(capsule, provider)?;
         let linker = capsule.prepare_linker(&self.engine)?.into_linker();
         let (mut store, instance) = capsule.instantiate_sandboxed(
             &self.engine,
@@ -466,6 +503,29 @@ impl CapsuleDispatch {
         capsule_name: &str,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
+        self.call_json_in(capsule_name, args, None)
+    }
+
+    /// HUP-S2.5: [`Self::call_json`] under `provider`, resolved for this
+    /// call only. The agent sidecar passes each session's provider (the
+    /// member's live grants, the session's mount bindings and egress
+    /// consent), so a grant revoked mid-session stops applying at the next
+    /// call.
+    pub fn call_json_sandboxed(
+        &self,
+        capsule_name: &str,
+        args: &serde_json::Value,
+        provider: &dyn SandboxProvider,
+    ) -> Result<serde_json::Value, AgentError> {
+        self.call_json_in(capsule_name, args, Some(provider))
+    }
+
+    fn call_json_in(
+        &self,
+        capsule_name: &str,
+        args: &serde_json::Value,
+        provider: Option<&dyn SandboxProvider>,
+    ) -> Result<serde_json::Value, AgentError> {
         let capsule = self
             .capsules
             .get(capsule_name)
@@ -500,7 +560,7 @@ impl CapsuleDispatch {
             vals.push(json_to_val(ty, v, name)?);
         }
         // Reuse the vetted call path (integrity gate + limits + epoch + panic guard + ApprovalGate).
-        let result = self.call_raw(capsule_name, &iface, &func, &vals)?;
+        let result = self.call_raw_in(capsule_name, &iface, &func, &vals, provider)?;
         Ok(val_to_json(&result))
     }
 
@@ -893,6 +953,121 @@ mod tests {
                 .contains("no grant covers the mount for hello"),
             "{err}"
         );
+    }
+
+    /// HUP-S2.5 wiring: a session passes its own provider per call (its
+    /// member's live grants), which replaces the dispatch default for that
+    /// call only.
+    #[test]
+    fn call_json_sandboxed_uses_the_callers_provider_hup_s2_5() {
+        struct Refuse(&'static str);
+        impl SandboxProvider for Refuse {
+            fn plan_for(
+                &self,
+                _manifest: &crate::capsule::manifest::Manifest,
+            ) -> Result<SandboxPlan, AgentError> {
+                Err(AgentError::Capsule(self.0.to_string()))
+            }
+        }
+        struct Nothing;
+        impl SandboxProvider for Nothing {
+            fn plan_for(
+                &self,
+                _manifest: &crate::capsule::manifest::Manifest,
+            ) -> Result<SandboxPlan, AgentError> {
+                Ok(SandboxPlan::deny_all())
+            }
+        }
+        let dispatch = CapsuleDispatch::load_from_dir(&capsules_root(), None, None, None)
+            .expect("loads")
+            .with_sandbox(Arc::new(Refuse("dispatch default")));
+        let args = serde_json::json!({ "name": "member" });
+        let out = dispatch
+            .call_json_sandboxed("hello", &args, &Nothing)
+            .expect("the session's plan admits the call");
+        assert_eq!(out, serde_json::json!("Hello, member"));
+        let err = dispatch
+            .call_json_sandboxed("hello", &args, &Refuse("session grants refused"))
+            .expect_err("the session's plan refuses");
+        assert!(err.to_string().contains("session grants refused"), "{err}");
+        let err = dispatch
+            .call_json("hello", &args)
+            .expect_err("the default still applies elsewhere");
+        assert!(err.to_string().contains("dispatch default"), "{err}");
+    }
+
+    /// Only a capsule the dispatch will actually run counts as runnable: a
+    /// loose (unsigned) dir is loaded for listing but is never runnable.
+    #[test]
+    fn is_runnable_excludes_unverified_and_refused_capsules_hup_s2_5() {
+        let tmp = fleet_with_hello(b"not a capsule archive");
+        let loose = tmp.path().join("loosecap");
+        std::fs::create_dir_all(&loose).expect("mkdir");
+        std::fs::write(
+            loose.join("manifest.toml"),
+            loose_manifest("loosecap", r#"network = "none""#),
+        )
+        .expect("write");
+        std::fs::write(loose.join("capsule.wasm"), b"\x00asm\x01\x00\x00\x00").expect("write");
+        let dispatch = CapsuleDispatch::load_from_dir(tmp.path(), None, None, None).expect("loads");
+        assert!(dispatch.is_runnable("echo-chain"));
+        assert!(dispatch.has("loosecap") && !dispatch.is_runnable("loosecap"));
+        assert!(!dispatch.is_runnable("hello"), "refused at load");
+        assert!(!dispatch.is_runnable("never-installed"));
+    }
+
+    /// M-6: a manifest whose egress allowlist names a loopback, link-local
+    /// or private address is refused at load with the reason, before any
+    /// member could be asked to consent to it.
+    #[test]
+    fn a_capsule_declaring_private_egress_is_refused_at_load_hup_s2_5() {
+        let tmp = fleet_with_hello(
+            &std::fs::read(capsules_root().join("hello").join("hello.cps")).expect("read"),
+        );
+        let cap = tmp.path().join("metadata-reader");
+        std::fs::create_dir_all(&cap).expect("mkdir");
+        std::fs::write(
+            cap.join("manifest.toml"),
+            loose_manifest(
+                "metadata-reader",
+                "network = \"egress-allowed\"\nnetwork_allow = [\"169.254.169.254:80\"]",
+            ),
+        )
+        .expect("write");
+        std::fs::write(cap.join("capsule.wasm"), b"\x00asm\x01\x00\x00\x00").expect("write");
+        let dispatch = CapsuleDispatch::load_from_dir(tmp.path(), None, None, None).expect("loads");
+        assert!(dispatch.has("hello"), "the rest of the fleet still loads");
+        assert!(!dispatch.has("metadata-reader"));
+        let reason = dispatch
+            .refused_capsules()
+            .get("metadata-reader")
+            .expect("listed as refused");
+        assert!(reason.contains("not a public address"), "{reason}");
+    }
+
+    fn loose_manifest(name: &str, network: &str) -> String {
+        format!(
+            r#"[capsule]
+name = "{name}"
+version = "0.1.0"
+content_hash = "sha256:{zeros}"
+[capability]
+{network}
+subagent_spawn = false
+[data_class]
+[risk]
+tier = "low"
+break_glass_eligible = false
+[overlay]
+[provenance]
+publisher = "did:citrate:test"
+build_reproducible = true
+agentile_sprint = "hup-s2.5"
+[signing]
+tier = "bundled"
+"#,
+            zeros = "0".repeat(64)
+        )
     }
 
     /// Loading the full BFR-INT-12 fleet from disk: all 7 capsules
