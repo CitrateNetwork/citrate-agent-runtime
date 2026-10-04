@@ -660,6 +660,18 @@ async fn mcp_card_decisions_are_recorded_for_the_anchor() {
     send(&st, &id, "echo then write").await;
     let card = mcp_card(&st, &id).await;
     let subject = card["subject"].as_str().unwrap_or_default().to_string();
+    // An allow for something other than what was shown is refused before anything is recorded.
+    assert_eq!(
+        mcp_decide(
+            &st,
+            &id,
+            card["id"].as_str().unwrap_or_default(),
+            true,
+            r#"{"text":"something else"}"#
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
     assert_eq!(
         mcp_decide(
             &st,
@@ -673,6 +685,14 @@ async fn mcp_card_decisions_are_recorded_for_the_anchor() {
     );
     until_done(&st, &id).await;
     let recs = citrate_agent_records::read::page(&dir, None, 10_000).expect("read");
+    let mcp_decisions = recs
+        .iter()
+        .filter(|r| matches!(&r.record.entry, Entry::Decision(d) if d.kind == "mcp.tool_call"))
+        .count();
+    assert_eq!(
+        mcp_decisions, 1,
+        "only the matching decision is recorded, never the refused one"
+    );
     let decision = recs
         .iter()
         .find_map(|r| match &r.record.entry {
