@@ -51,7 +51,7 @@ fn calldata_matches_cast_for_every_fixture_case() {
 }
 
 #[test]
-fn skill_hash_matches_the_contracts_keccak_of_owner_name_version() {
+fn skill_hash_matches_the_contracts_skill_hash_of() {
     let fx = fixture();
     for sh in fx["skill_hash"].as_array().unwrap() {
         let owner = parse_address(sh["owner"].as_str().unwrap()).unwrap();
@@ -62,6 +62,35 @@ fn skill_hash_matches_the_contracts_keccak_of_owner_name_version() {
         );
         assert_eq!(format!("0x{}", hex_lower(&h)), sh["hash"].as_str().unwrap());
     }
+}
+
+/// Mutant guard (HUP-S7.1): the redeployed SkillRegistry derives the id with `abi.encode`, not
+/// `abi.encodePacked`. The fixture also carries the packed id the old contract would assign; the
+/// projected id must never equal it, so a revert to the packed layout fails here.
+#[test]
+fn skill_hash_is_not_the_legacy_packed_layout() {
+    let fx = fixture();
+    for sh in fx["skill_hash"].as_array().unwrap() {
+        let owner = parse_address(sh["owner"].as_str().unwrap()).unwrap();
+        let h = skill_hash(
+            &owner,
+            sh["name"].as_str().unwrap(),
+            sh["version"].as_str().unwrap(),
+        );
+        let packed = sh["packed_hash"].as_str().unwrap();
+        assert_ne!(format!("0x{}", hex_lower(&h)), packed, "{}", sh["name"]);
+    }
+}
+
+/// Two (name, version) pairs whose concatenation is the same bytes get distinct ids, as they do
+/// on chain. Under the packed layout both would collide.
+#[test]
+fn concatenation_equal_pairs_get_distinct_skill_hashes() {
+    let owner = parse_address("0x00000000000000000000000000000000000000aa").unwrap();
+    assert_ne!(
+        skill_hash(&owner, "skill1", ".0"),
+        skill_hash(&owner, "skill", "1.0")
+    );
 }
 
 #[test]

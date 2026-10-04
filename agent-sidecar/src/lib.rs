@@ -513,8 +513,8 @@ async fn instruction_skills(
     })))
 }
 
-/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). Sessions already
-/// open keep their skills; the next session gets the new library.
+/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). New sessions get
+/// the new library, and open sessions that were opened with skills take it on their next turn.
 async fn reload_instruction_skills(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1550,7 +1550,7 @@ pub fn production_sessions_with(
         None => mgr,
     };
     // HUP-S3.2: the skills library. HUP-S3.4: kept with its sources, so a learned skill the
-    // member accepts is offered to the next session without a restart.
+    // member accepts is offered without a restart (new sessions, and open ones on their next turn).
     let sources = skill_sources_from_process_env();
     let mgr = if sources.is_empty() {
         mgr
@@ -2314,7 +2314,8 @@ async fn learn_accept(
     let out = svc.accept(&pid, decision).map_err(refusal)?;
     let mut body = serde_json::json!({ "ok": true, "persisted": out });
     if matches!(out, learn::AcceptedView::Skill { .. }) {
-        // HUP-S3.4: offer the saved skill to the next session without a restart.
+        // HUP-S3.4: offer the saved skill without a restart (next session, and open sessions'
+        // next turn).
         let reloaded = st.sessions.reload_skills();
         body["skills_reloaded"] = serde_json::Value::Bool(reloaded.is_some());
         if let Some(n) = reloaded {
