@@ -308,7 +308,7 @@ fn every_task_can_be_finished_with_the_offered_moves_live() {
             .iter()
             .find(|t| t.id == id)
             .unwrap_or_else(|| panic!("no task {id}"));
-        let svc = BrowserService::new(common::config(exe.clone()));
+        let svc = BrowserService::new(common::config_allowing(exe.clone(), &base));
         let run = run_task(&svc, &script, &base, task, true);
         assert!(
             run.success,
@@ -351,7 +351,7 @@ fn stopping_early_or_on_the_wrong_page_is_not_a_success_live() {
         ("click", "link \"Rust 2.0 ships\"", None),
         ("done", "", None),
     ]);
-    let svc = BrowserService::new(common::config(exe.clone()));
+    let svc = BrowserService::new(common::config_allowing(exe.clone(), &base));
     let run = run_task(&svc, &wrong, &base, task, false);
     assert!(
         run.declared_done && !run.success && !run.reached,
@@ -368,7 +368,7 @@ fn stopping_early_or_on_the_wrong_page_is_not_a_success_live() {
         ("click", "tab \"Profile\"", None),
         ("click", "tab \"Profile\"", None),
     ]);
-    let svc = BrowserService::new(common::config(exe));
+    let svc = BrowserService::new(common::config_allowing(exe, &base));
     let run = run_task(&svc, &stuck, &base, settings, false);
     assert!(!run.success);
     assert_eq!(run.steps.len(), 2, "{run:#?}");
@@ -410,7 +410,7 @@ fn console_and_network_tools_read_what_the_page_did_live() {
         return;
     };
     let base = serve_pages(vec![("/logs".to_string(), LOGS.to_string())]);
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     let host = BrowserToolHost::new(svc.clone(), StopFlag::default());
     // Before any page is open the read-only tools launch nothing.
     match host.execute(&call(tools::CONSOLE, "{}")) {
@@ -463,7 +463,7 @@ fn browser_pick_suggests_a_move_and_does_nothing_live() {
         return;
     };
     let base = serve_pages(Vec::new());
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     let host = BrowserToolHost::new(svc.clone(), StopFlag::default());
     match host.execute(&call(tools::PICK, r#"{"goal": "Open the guides"}"#)) {
         ToolOutcome::Error(e) => assert!(e.contains("not configured"), "{e}"),
