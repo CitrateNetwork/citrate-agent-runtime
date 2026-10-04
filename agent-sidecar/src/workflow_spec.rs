@@ -4,7 +4,9 @@
 //! A workflow is a list of steps, each judged by verifiers from a closed set. The set is the
 //! deterministic checks agent-loop already has (a tool succeeded or was not called, the answer
 //! mentions a text, a JSON field of a tool result equals a value) plus the toolchain verifiers
-//! (forge test report, SARIF threshold, medusa summary). There is no "the model says it is done"
+//! (forge test report, SARIF threshold, medusa summary), and (HUP-S1.3) an HTTP status check and a
+//! file content hash, which run through the session's scoped probes
+//! ([`crate::verify_probes`]). There is no "the model says it is done"
 //! verifier: a run is verified only when every verifier of every step passed
 //! (`citrate_agent_learn::run_verified_workflow`).
 
@@ -14,6 +16,7 @@ use citrate_agent_loop::verifiers_tooling::{
     ForgeTestsPass, MedusaNoFailures, SarifBelowThreshold, Severity, FORGE_TEST_TOOL,
     MEDUSA_FUZZ_TOOL,
 };
+use citrate_agent_loop::workflows::{VerifierEnv, VerifierSpec as LoopVerifierSpec};
 use citrate_agent_loop::{
     AnswerContains, JsonFieldEquals, Step, ToolNotCalled, ToolSucceeded, Verifier, Workflow,
 };
@@ -58,6 +61,16 @@ pub enum VerifierSpec {
         #[serde(default)]
         tool: Option<String>,
     },
+    /// HUP-S1.3: `GET url` answers exactly `status` (loopback or a consented origin only).
+    HttpStatusIs {
+        url: String,
+        status: u16,
+    },
+    /// HUP-S1.3: the file at `path` (inside the session's folder grants) has this SHA-256.
+    Sha256Equals {
+        path: String,
+        hex: String,
+    },
 }
 
 fn default_attempts() -> u32 {
@@ -96,7 +109,7 @@ fn short(what: &str, s: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn verifier(v: &VerifierSpec) -> Result<Arc<dyn Verifier>, String> {
+fn verifier(v: &VerifierSpec, env: &VerifierEnv) -> Result<Arc<dyn Verifier>, String> {
     Ok(match v {
         VerifierSpec::ToolSucceeded { tool } => {
             short("tool", tool)?;
@@ -144,12 +157,30 @@ fn verifier(v: &VerifierSpec) -> Result<Arc<dyn Verifier>, String> {
             short("tool", &tool)?;
             Arc::new(MedusaNoFailures { tool })
         }
+        // The shape checks and the probe wiring are agent-loop's, so a catalog and a posted
+        // workflow accept exactly the same HTTP and hash checks.
+        VerifierSpec::HttpStatusIs { url, status } => LoopVerifierSpec::HttpStatusIs {
+            url: url.clone(),
+            status: *status,
+        }
+        .build_in(env)?,
+        VerifierSpec::Sha256Equals { path, hex } => LoopVerifierSpec::Sha256Equals {
+            path: path.clone(),
+            hex: hex.clone(),
+        }
+        .build_in(env)?,
     })
 }
 
 impl WorkflowSpec {
-    /// Build the runnable workflow, or say why it cannot be judged.
+    /// Build the runnable workflow, or say why it cannot be judged. Without probes an HTTP or
+    /// hash check is refused; see [`WorkflowSpec::build_in`].
     pub fn build(&self) -> Result<Workflow, String> {
+        self.build_in(&VerifierEnv::default())
+    }
+
+    /// [`WorkflowSpec::build`] with the session's verifier hosts.
+    pub fn build_in(&self, env: &VerifierEnv) -> Result<Workflow, String> {
         short("workflow id", &self.id)?;
         if self.steps.len() > MAX_STEPS {
             return Err(format!("at most {MAX_STEPS} steps"));
@@ -176,7 +207,7 @@ impl WorkflowSpec {
             let verifiers = st
                 .verifiers
                 .iter()
-                .map(verifier)
+                .map(|v| verifier(v, env))
                 .collect::<Result<Vec<_>, _>>()?;
             // Two verifiers with the same name would make the recorded verdicts ambiguous.
             let mut names = std::collections::BTreeSet::new();

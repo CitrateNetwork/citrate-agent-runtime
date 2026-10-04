@@ -141,6 +141,12 @@ impl MeteringSink {
             }
             return;
         }
+        // US-1.3 AC2: the model's self-review is an opinion recorded in the session's event log.
+        // It arrives after the attempt's `done`, decides nothing and is not counted here, so it
+        // must not open a turn of its own.
+        if let Event::SelfReview { .. } = ev {
+            return;
+        }
         self.open_turn(&mut st);
         let now_mono = self.clock.monotonic_ms();
         let Some(o) = st.open.as_mut() else {
@@ -181,8 +187,11 @@ impl MeteringSink {
                 }
             }
             // Content-bearing or boundary-only events: nothing to count.
-            Event::StepEnd { .. } | Event::Final { .. } | Event::Error { .. } => {}
-            Event::Verifier { .. } => {}
+            Event::StepEnd { .. }
+            | Event::AssistantDelta { .. }
+            | Event::Final { .. }
+            | Event::Error { .. } => {}
+            Event::Verifier { .. } | Event::SelfReview { .. } => {}
             // Usage reaches the record through the metered client (`record_usage`); the plan is
             // workflow bookkeeping. Counting either here would double them.
             Event::Usage { .. } | Event::Plan { .. } => {}

@@ -140,6 +140,179 @@ fn generation_ms(v: &Value) -> Option<u64> {
     }
 }
 
+/// HUP-S1.1 (g1-render): the streaming form of [`to_wire_body`] (`stream: true`, and usage on the
+/// last chunk so metering still sees the provider's own token counts).
+pub fn to_stream_body(req: &CompletionRequest) -> Value {
+    let mut body = to_wire_body(req);
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    body
+}
+
+/// One tool call while its pieces are still arriving.
+#[derive(Debug, Default)]
+struct PartialCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+/// HUP-S1.1 (g1-render): rebuilds an assistant turn from an OpenAI-compatible server-sent-event
+/// stream (`data: {chunk}` lines, ending with `data: [DONE]`). Text deltas are returned as they
+/// arrive; tool-call pieces are joined by their `index`; `usage` is taken from whichever chunk
+/// carries it. The finished turn is what [`parse_turn`] would have returned for the same answer.
+#[derive(Debug, Default)]
+pub struct StreamAssembler {
+    content: String,
+    calls: Vec<PartialCall>,
+    usage: Option<TokenUsage>,
+    /// HUP-S7.6: `timings.predicted_ms` from whichever chunk carries it (llama-server sends it
+    /// on the last one).
+    generation_ms: Option<u64>,
+    /// `[DONE]` arrived or a choice reported a `finish_reason`.
+    finished: bool,
+}
+
+impl StreamAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one line of the stream. Returns the assistant text it carried (empty when none).
+    pub fn line(&mut self, raw: &str) -> Result<String, LlmError> {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        let Some(data) = line.strip_prefix("data:") else {
+            // Blank separators, comments (`:`), `event:`/`id:` fields: nothing to read.
+            return Ok(String::new());
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            self.finished = true;
+            return Ok(String::new());
+        }
+        let v: Value = serde_json::from_str(data)
+            .map_err(|_| LlmError::BadResponse("a stream chunk was not JSON".into()))?;
+        if v.get("error").is_some() {
+            return Err(LlmError::Provider(
+                "the model server reported an error mid-answer".into(),
+            ));
+        }
+        if let Some(u) = v.get("usage") {
+            if let (Some(p), Some(c)) = (
+                u.get("prompt_tokens").and_then(Value::as_u64),
+                u.get("completion_tokens").and_then(Value::as_u64),
+            ) {
+                self.usage = Some(TokenUsage {
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    generation_ms: None,
+                });
+            }
+        }
+        if let Some(ms) = generation_ms(&v) {
+            self.generation_ms = Some(ms);
+        }
+        let Some(choice) = v
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+        else {
+            return Ok(String::new());
+        };
+        if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
+            self.finished = true;
+        }
+        let Some(delta) = choice.get("delta") else {
+            return Ok(String::new());
+        };
+        if let Some(arr) = delta.get("tool_calls").and_then(Value::as_array) {
+            for (pos, tc) in arr.iter().enumerate() {
+                let idx = tc
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .unwrap_or(pos);
+                // A server that skips indexes is not trusted to allocate unbounded slots.
+                if idx > 64 {
+                    return Err(LlmError::BadResponse(
+                        "a tool call index is out of range".into(),
+                    ));
+                }
+                while self.calls.len() <= idx {
+                    self.calls.push(PartialCall::default());
+                }
+                let slot = &mut self.calls[idx];
+                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        slot.id = Some(id.to_string());
+                    }
+                }
+                if let Some(f) = tc.get("function") {
+                    if let Some(n) = f.get("name").and_then(Value::as_str) {
+                        slot.name.push_str(n);
+                    }
+                    match f.get("arguments") {
+                        Some(Value::String(a)) => slot.arguments.push_str(a),
+                        Some(Value::Null) | None => {}
+                        Some(other) => slot.arguments.push_str(&other.to_string()),
+                    }
+                }
+            }
+        }
+        match delta.get("content").and_then(Value::as_str) {
+            Some(t) if !t.is_empty() => {
+                self.content.push_str(t);
+                Ok(t.to_string())
+            }
+            _ => Ok(String::new()),
+        }
+    }
+
+    /// The whole turn. A stream that stopped before it finished is an error, never a short answer.
+    pub fn finish(self) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        if !self.finished {
+            return Err(LlmError::Transport("the answer stream ended early".into()));
+        }
+        let tool_calls: Vec<ToolCall> = self
+            .calls
+            .into_iter()
+            .enumerate()
+            .filter(|(_, c)| !c.name.is_empty())
+            .map(|(i, c)| ToolCall {
+                id: c.id.unwrap_or_else(|| format!("call_{i}")),
+                name: c.name,
+                arguments: if c.arguments.is_empty() {
+                    "{}".into()
+                } else {
+                    c.arguments
+                },
+            })
+            .collect();
+        if self.content.is_empty() && tool_calls.is_empty() {
+            return Err(LlmError::BadResponse("empty assistant message".into()));
+        }
+        Ok((
+            AssistantTurn {
+                content: self.content,
+                tool_calls,
+            },
+            self.usage.map(|u| TokenUsage {
+                generation_ms: self.generation_ms,
+                ..u
+            }),
+        ))
+    }
+}
+
+/// Environment switch for streamed answers (`0` turns streaming off; anything else, or unset,
+/// leaves it on).
+pub const LLM_STREAM_ENV: &str = "CITRATE_HERMES_LLM_STREAM";
+
+/// Whether [`LLM_STREAM_ENV`]'s value turns streaming on.
+pub fn streaming_from_value(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("0") | Some("false") | Some("off"))
+}
+
 /// Blocking OpenAI-compatible client. Holds only configuration: the `reqwest` blocking client (which
 /// owns an internal runtime) is built inside [`LlmClient::complete`], which always runs on the
 /// blocking pool. Building or dropping it inside an async handler panics and poisons shared locks.
@@ -147,6 +320,8 @@ pub struct OpenAiCompatClient {
     url: String,
     bearer: String,
     timeout: Duration,
+    /// HUP-S1.1 (g1-render): ask for a streamed answer in [`LlmClient::complete_streaming`].
+    streaming: bool,
 }
 
 impl OpenAiCompatClient {
@@ -156,25 +331,26 @@ impl OpenAiCompatClient {
             url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             bearer: bearer.to_string(),
             timeout,
+            streaming: true,
         }
     }
-}
 
-impl LlmClient for OpenAiCompatClient {
-    fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
-        self.complete_with_usage(req).map(|(t, _)| t)
+    /// Turn streamed answers on or off (on by default).
+    pub fn with_streaming(mut self, on: bool) -> Self {
+        self.streaming = on;
+        self
     }
 
-    fn complete_with_usage(
-        &self,
-        req: &CompletionRequest,
-    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
-        let http = reqwest::blocking::Client::builder()
+    fn http(&self) -> Result<reqwest::blocking::Client, LlmError> {
+        reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(self.timeout)
             .build()
-            .map_err(|_| LlmError::Transport("HTTP client unavailable".into()))?;
-        let mut rb = http.post(&self.url).json(&to_wire_body(req));
+            .map_err(|_| LlmError::Transport("HTTP client unavailable".into()))
+    }
+
+    fn send(&self, body: &Value) -> Result<reqwest::blocking::Response, LlmError> {
+        let mut rb = self.http()?.post(&self.url).json(body);
         if !self.bearer.is_empty() {
             rb = rb.bearer_auth(&self.bearer);
         }
@@ -188,13 +364,85 @@ impl LlmClient for OpenAiCompatClient {
             })
         })?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .map_err(|_| LlmError::Transport("could not read the response".into()))?;
         if !status.is_success() {
             return Err(LlmError::Provider(format!("HTTP {}", status.as_u16())));
         }
+        Ok(resp)
+    }
+}
+
+/// HUP-S1.1 (g1-render): read a streamed answer, handing each text delta to `on_delta`. A server
+/// that ignored `stream: true` and sent one JSON body is read as a normal answer (no deltas).
+pub fn read_streamed(
+    content_type: &str,
+    body: impl std::io::Read,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+    use std::io::{BufRead, Read};
+    if !content_type.contains("text/event-stream") {
+        let mut text = String::new();
+        std::io::BufReader::new(body)
+            .read_to_string(&mut text)
+            .map_err(|_| LlmError::Transport("could not read the response".into()))?;
+        let turn = parse_turn(&text)?;
+        return Ok((turn, parse_usage(&text)));
+    }
+    let mut asm = StreamAssembler::new();
+    let mut reader = std::io::BufReader::new(body);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|_| LlmError::Transport("the answer stream was cut off".into()))?;
+        if n == 0 {
+            break;
+        }
+        let d = asm.line(&line)?;
+        if !d.is_empty() {
+            on_delta(&d);
+        }
+    }
+    asm.finish()
+}
+
+impl LlmClient for OpenAiCompatClient {
+    fn complete(&self, req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
+        self.complete_with_usage(req).map(|(t, _)| t)
+    }
+
+    fn complete_with_usage(
+        &self,
+        req: &CompletionRequest,
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        let resp = self.send(&to_wire_body(req))?;
+        let text = resp
+            .text()
+            .map_err(|_| LlmError::Transport("could not read the response".into()))?;
         let turn = parse_turn(&text)?;
         Ok((turn, parse_usage(&text)))
     }
+
+    fn complete_streaming(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        if !self.streaming {
+            return self.complete_with_usage(req);
+        }
+        let resp = self.send(&to_stream_body(req))?;
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        read_streamed(&content_type, resp, on_delta)
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    include!("llm_stream_tests.rs");
 }

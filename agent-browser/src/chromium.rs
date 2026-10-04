@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -141,6 +142,48 @@ pub fn discover(managed: Option<&Path>, candidates: &[PathBuf]) -> ChromiumStatu
     ChromiumStatus::NotInstalled { searched }
 }
 
+static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Create a new, empty profile folder for one managed browser under `parent`, private to the
+/// member (0700 on Unix). The name joins the process id, a per-process counter and a clock
+/// reading, and the folder is created with `create_dir`, so an existing folder (another launch's,
+/// or one planted in the temp folder) is never reused: a name that exists is skipped. Two launches
+/// sharing a folder would become one Chrome, the second worker driving the first one's browser.
+pub fn new_profile_dir(parent: &Path) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for _ in 0..64 {
+        let seq = PROFILE_SEQ.fetch_add(1, Ordering::SeqCst);
+        let path = parent.join(format!(
+            "citrate-browser-{}-{seq:x}-{nanos:x}",
+            std::process::id()
+        ));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    // The umask may have narrowed the mode further; never wider than 0700.
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|e| format!("could not secure the browser profile folder: {e}"))?;
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create the browser profile folder: {e}")),
+        }
+    }
+    Err("could not find a free name for the browser profile folder".to_string())
+}
+
 /// A headless Chromium this process launched. Dropping it kills the browser and removes its
 /// temporary profile.
 pub struct ManagedChrome {
@@ -158,19 +201,7 @@ impl ManagedChrome {
         extra_args: &[String],
         timeout: Duration,
     ) -> Result<ManagedChrome, String> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let profile =
-            std::env::temp_dir().join(format!("citrate-browser-{}-{nanos:x}", std::process::id()));
-        std::fs::create_dir_all(&profile)
-            .map_err(|e| format!("could not create the browser profile folder: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700));
-        }
+        let profile = new_profile_dir(&std::env::temp_dir())?;
         let mut args = vec![
             "--headless=new".to_string(),
             "--remote-debugging-address=127.0.0.1".to_string(),

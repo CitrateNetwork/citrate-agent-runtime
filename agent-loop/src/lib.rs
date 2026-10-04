@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 pub mod decide;
 pub mod interview;
 pub mod personas;
+pub mod planner;
+pub mod retrieval;
 pub mod skills;
 pub mod verifiers_tooling;
 pub mod workflows;
@@ -428,6 +430,65 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
         self.complete(req).map(|t| (t, None))
     }
+
+    /// HUP-S1.1 (g1-render): [`LlmClient::complete_with_usage`] that also hands each piece of
+    /// assistant text to `on_delta` as the provider produces it. The returned turn is the whole
+    /// answer, exactly as the non-streaming call would return it. The default produces no deltas:
+    /// a client that cannot stream behaves as before.
+    fn complete_streaming(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        let _ = on_delta;
+        self.complete_with_usage(req)
+    }
+}
+
+/// HUP-S1.1 (g1-render): batches streamed assistant text into `assistant_delta` events, so a long
+/// answer becomes tens of events, not one per token (the session event log is bounded).
+pub struct DeltaCoalescer {
+    step: u32,
+    buf: String,
+    last: std::time::Instant,
+}
+
+impl DeltaCoalescer {
+    /// Bytes buffered before an event is emitted.
+    pub const MAX_BYTES: usize = 64;
+    /// Longest a piece of text waits before it is emitted.
+    pub const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    pub fn new(step: u32) -> Self {
+        DeltaCoalescer {
+            step,
+            buf: String::new(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Add streamed text; emits when enough text is waiting or it has waited long enough.
+    pub fn push(&mut self, sink: &dyn EventSink, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.buf.push_str(text);
+        if self.buf.len() >= Self::MAX_BYTES || self.last.elapsed() >= Self::MAX_WAIT {
+            self.flush(sink);
+        }
+    }
+
+    /// Emit whatever is waiting.
+    pub fn flush(&mut self, sink: &dyn EventSink) {
+        if self.buf.is_empty() {
+            return;
+        }
+        sink.emit(Event::AssistantDelta {
+            step: self.step,
+            text: std::mem::take(&mut self.buf),
+        });
+        self.last = std::time::Instant::now();
+    }
 }
 
 /// Token usage one model call reported (HUP-S7.5 metering). Taken from the provider's own
@@ -481,6 +542,13 @@ pub enum Event {
         source: String,
         reason: String,
     },
+    /// HUP-S1.1 (g1-render): a piece of the assistant's text while the model is still writing.
+    /// Informational only: the step's `final` event (when the step answers) carries the whole
+    /// answer, and a step that ends in tool calls has no `final`.
+    AssistantDelta {
+        step: u32,
+        text: String,
+    },
     Final {
         content: String,
     },
@@ -506,6 +574,15 @@ pub enum Event {
         passed: bool,
         detail: String,
     },
+    /// US-1.3 AC2: the model's own assessment of one workflow step attempt. Always labelled
+    /// [`SELF_REVIEW_LABEL`] ("opinion"); it is recorded next to the verdicts and never decides a
+    /// [`WorkflowOutcome`].
+    SelfReview {
+        step: String,
+        attempt: u32,
+        text: String,
+        label: &'static str,
+    },
     Error {
         message: String,
     },
@@ -523,10 +600,12 @@ impl Event {
             Event::ToolResult { .. } => "tool_result",
             Event::StepEnd { .. } => "step_end",
             Event::Tainted { .. } => "tainted",
+            Event::AssistantDelta { .. } => "assistant_delta",
             Event::Final { .. } => "final",
             Event::Usage { .. } => "usage",
             Event::Plan { .. } => "plan",
             Event::Verifier { .. } => "verifier",
+            Event::SelfReview { .. } => "self_review",
             Event::Error { .. } => "error",
             Event::Done { .. } => "done",
         }
@@ -645,6 +724,10 @@ pub fn run_turn_with(
             user,
             opts.max_tools_per_request,
             &opts.pinned_tools,
+            opts.selector
+                .as_deref()
+                .unwrap_or(&KeywordSelector as &dyn ToolSelector),
+            opts.max_tools_total,
         );
         if let Some((budget, counter)) = &opts.budget {
             let tool_tokens = counter.count(&serde_json::to_string(&offered).unwrap_or_default());
@@ -666,7 +749,10 @@ pub fn run_turn_with(
             tools: offered,
             max_tokens: cfg.max_tokens,
         };
-        let turn = match llm.complete_with_usage(&req) {
+        let mut deltas = DeltaCoalescer::new(step);
+        let streamed = llm.complete_streaming(&req, &mut |d| deltas.push(sink, d));
+        deltas.flush(sink);
+        let turn = match streamed {
             Ok((t, usage)) => {
                 if let Some(u) = usage {
                     sink.emit(Event::Usage {
@@ -837,6 +923,15 @@ pub struct TurnOptions {
     /// request (e.g. the five skills that match it). Computed once per turn, never stored in
     /// the history.
     pub turn_context: Vec<Arc<dyn TurnContext>>,
+    /// HUP-S1.2: ranks the tools offered on each request. `None` uses [`KeywordSelector`]; the
+    /// sidecar passes a [`retrieval::HybridRetriever`] (embedding plus keywords, which falls back
+    /// to keywords by itself when no embedding endpoint answers).
+    pub selector: Option<Arc<dyn ToolSelector>>,
+    /// US-1.4 AC1: a hard ceiling on the tool schemas in one request, pinned and in-use tools
+    /// included. When it binds, pinned tools come first, then the tools used most recently, then
+    /// retrieval. `None` keeps the plain `max_tools_per_request` rule (pinned tools and tools in
+    /// use ride outside it).
+    pub max_tools_total: Option<usize>,
 }
 
 /// HUP-S3.2: per-turn context for the system prompt. `section` sees the turn's user message and
@@ -872,7 +967,7 @@ pub trait ToolSelector: Send + Sync {
 
 /// Deterministic keyword scorer over tool names (weighted) and descriptions. Snake_case names are
 /// split into words. With no signal at all it falls back to the first `k` tools in catalog order.
-/// (An embedding selector can implement the same trait once the knowledge graph is bundled.)
+/// [`retrieval::HybridRetriever`] adds embedding similarity on top of this score.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeywordSelector;
 
@@ -896,24 +991,30 @@ pub(crate) fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// The keyword score of every spec for `query` (same order as `specs`): three points for each
+/// query word in the tool's name, one for each in its description.
+pub fn keyword_scores(query: &str, specs: &[ToolSpec]) -> Vec<usize> {
+    let q = words(query);
+    specs
+        .iter()
+        .map(|s| {
+            let name = words(&s.name);
+            let desc = words(&s.description);
+            q.iter()
+                .map(|w| {
+                    3 * name.iter().filter(|n| *n == w).count()
+                        + desc.iter().filter(|d| *d == w).count()
+                })
+                .sum()
+        })
+        .collect()
+}
+
 impl ToolSelector for KeywordSelector {
     fn select(&self, query: &str, specs: &[ToolSpec], k: usize) -> Vec<ToolSpec> {
-        let q = words(query);
-        let mut scored: Vec<(usize, usize)> = specs
-            .iter()
+        let mut scored: Vec<(usize, usize)> = keyword_scores(query, specs)
+            .into_iter()
             .enumerate()
-            .map(|(i, s)| {
-                let name = words(&s.name);
-                let desc = words(&s.description);
-                let score = q
-                    .iter()
-                    .map(|w| {
-                        3 * name.iter().filter(|n| *n == w).count()
-                            + desc.iter().filter(|d| *d == w).count()
-                    })
-                    .sum();
-                (i, score)
-            })
             .collect();
         if scored.iter().all(|(_, sc)| *sc == 0) {
             return specs.iter().take(k).cloned().collect();
@@ -928,33 +1029,55 @@ impl ToolSelector for KeywordSelector {
     }
 }
 
+/// The tool schemas for one request. Pinned tools first, then tools already used in this
+/// conversation (most recent first), then `selector`'s picks over the rest, up to `k` retrieved
+/// tools (or as many as are in use, if more). `total` caps the whole list (US-1.4 AC1).
+#[allow(clippy::too_many_arguments)]
 fn offered_tools(
     specs: &[ToolSpec],
     history: &[Message],
     user: &str,
     k: Option<usize>,
     pinned: &[String],
+    selector: &dyn ToolSelector,
+    total: Option<usize>,
 ) -> Vec<ToolSpec> {
-    let Some(k) = k else { return specs.to_vec() };
+    let cap = total.unwrap_or(usize::MAX);
+    let k = match (k, total) {
+        (Some(k), _) => k,
+        (None, Some(t)) => t,
+        (None, None) => return specs.to_vec(),
+    };
     let is_pinned = |s: &ToolSpec| pinned.iter().any(|p| p == &s.name);
     // Pinned tools first, then retrieval over the rest (so pinning never costs a retrieval slot).
-    let mut out: Vec<ToolSpec> = specs.iter().filter(|s| is_pinned(s)).cloned().collect();
+    let mut out: Vec<ToolSpec> = specs
+        .iter()
+        .filter(|s| is_pinned(s))
+        .take(cap)
+        .cloned()
+        .collect();
     let rest: Vec<ToolSpec> = specs.iter().filter(|s| !is_pinned(s)).cloned().collect();
     let base = out.len();
-    let specs = rest.as_slice();
-    let in_use: Vec<&str> = history
+    let mut in_use: Vec<&str> = Vec::new();
+    for name in history
         .iter()
-        .flat_map(|m| m.tool_calls.iter().map(|c| c.name.as_str()))
-        .filter(|n| !pinned.iter().any(|p| p == n))
-        .collect();
-    out.extend(
-        specs
-            .iter()
-            .filter(|s| in_use.contains(&s.name.as_str()))
-            .cloned(),
-    );
-    for s in KeywordSelector.select(user, specs, k) {
-        if out.len() - base >= k.max(in_use.len()) {
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev().map(|c| c.name.as_str()))
+    {
+        if !in_use.contains(&name) && rest.iter().any(|s| s.name == name) {
+            in_use.push(name);
+        }
+    }
+    for name in &in_use {
+        if out.len() >= cap {
+            break;
+        }
+        if let Some(s) = rest.iter().find(|s| s.name == *name) {
+            out.push(s.clone());
+        }
+    }
+    for s in selector.select(user, &rest, k) {
+        if out.len() - base >= k.max(in_use.len()) || out.len() >= cap {
             break;
         }
         if !out.iter().any(|o| o.name == s.name) {
@@ -1169,6 +1292,177 @@ impl Verifier for JsonFieldEquals {
     }
 }
 
+/// HUP-S1.3: how an [`HttpStatusIs`] verifier reaches a URL. The sidecar's probe allows only
+/// loopback and origins the member consented to, follows no redirects and bounds the wait; this
+/// crate does no I/O itself.
+pub trait HttpProbe: Send + Sync {
+    /// The status code of one `GET url`, or why the URL could not be checked.
+    fn status(&self, url: &str, timeout: std::time::Duration) -> Result<u16, String>;
+}
+
+/// The longest an [`HttpStatusIs`] check waits.
+pub const HTTP_VERIFIER_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long an [`HttpStatusIs`] check waits unless told otherwise.
+pub const HTTP_VERIFIER_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Passes when `GET url` answers with exactly `status` (e.g. a dev server's health route is 200).
+/// The verdict comes from the probe, never from the model.
+pub struct HttpStatusIs {
+    pub url: String,
+    pub status: u16,
+    timeout: std::time::Duration,
+    probe: Arc<dyn HttpProbe>,
+}
+
+impl HttpStatusIs {
+    pub fn new(url: impl Into<String>, status: u16, probe: Arc<dyn HttpProbe>) -> Self {
+        HttpStatusIs {
+            url: url.into(),
+            status,
+            timeout: HTTP_VERIFIER_DEFAULT_TIMEOUT,
+            probe,
+        }
+    }
+
+    /// Wait at most `timeout`, capped at [`HTTP_VERIFIER_MAX_TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout.min(HTTP_VERIFIER_MAX_TIMEOUT);
+        self
+    }
+}
+
+impl Verifier for HttpStatusIs {
+    fn name(&self) -> String {
+        format!("GET {} is {}", self.url, self.status)
+    }
+    fn verify(&self, _ctx: &VerifyContext) -> Verdict {
+        match self.probe.status(&self.url, self.timeout) {
+            Ok(got) if got == self.status => Verdict::Pass,
+            Ok(got) => Verdict::Fail(format!(
+                "GET {} answered {got}, expected {}",
+                self.url, self.status
+            )),
+            Err(why) => Verdict::Fail(format!("GET {} could not be checked: {why}", self.url)),
+        }
+    }
+}
+
+/// HUP-S1.3: how a [`Sha256Equals`] verifier reads a file. The sidecar's host reads only paths
+/// inside the session's live folder grants; this crate does no I/O itself.
+pub trait FileDigest: Send + Sync {
+    /// The lowercase hex SHA-256 of the file's bytes, or why it could not be read.
+    fn sha256_hex(&self, path: &str) -> Result<String, String>;
+}
+
+/// Passes when the file's SHA-256 equals `hex` (case-insensitive).
+pub struct Sha256Equals {
+    pub path: String,
+    pub hex: String,
+    files: Arc<dyn FileDigest>,
+}
+
+impl Sha256Equals {
+    pub fn new(path: impl Into<String>, hex: &str, files: Arc<dyn FileDigest>) -> Self {
+        Sha256Equals {
+            path: path.into(),
+            hex: hex.to_ascii_lowercase(),
+            files,
+        }
+    }
+}
+
+impl Verifier for Sha256Equals {
+    fn name(&self) -> String {
+        format!("sha256 of {} is {}", self.path, self.hex)
+    }
+    fn verify(&self, _ctx: &VerifyContext) -> Verdict {
+        match self.files.sha256_hex(&self.path) {
+            Ok(got) if got.eq_ignore_ascii_case(&self.hex) => Verdict::Pass,
+            Ok(got) => Verdict::Fail(format!(
+                "the sha256 of {} is {}, which does not match {}",
+                self.path,
+                got.to_ascii_lowercase(),
+                self.hex
+            )),
+            Err(why) => Verdict::Fail(format!("{} could not be hashed: {why}", self.path)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// US-1.3 AC2 — the model's self-review, recorded as an opinion
+// ---------------------------------------------------------------------------------------------
+
+/// The label every [`Event::SelfReview`] carries.
+pub const SELF_REVIEW_LABEL: &str = "opinion";
+/// The most characters of one recorded opinion.
+pub const SELF_REVIEW_MAX_CHARS: usize = 600;
+
+/// One step attempt, as the self-reviewer sees it. It never includes a verifier's verdict.
+#[derive(Debug, Clone)]
+pub struct ReviewRequest<'a> {
+    pub step: &'a str,
+    pub attempt: u32,
+    pub instruction: &'a str,
+    pub answer: &'a str,
+}
+
+/// Produces the model's self-assessment of a step attempt. The text is recorded as an opinion
+/// and nothing reads it to decide an outcome.
+pub trait SelfReviewer: Send + Sync {
+    fn review(&self, req: &ReviewRequest, history: &[Message]) -> Result<String, String>;
+}
+
+/// The self-reviewer that asks the session's own model, with no tools offered and without adding
+/// anything to the conversation.
+pub struct LlmSelfReviewer<'a> {
+    llm: &'a dyn LlmClient,
+    model: String,
+    max_tokens: u32,
+}
+
+impl<'a> LlmSelfReviewer<'a> {
+    pub fn new(llm: &'a dyn LlmClient, model: impl Into<String>, max_tokens: u32) -> Self {
+        LlmSelfReviewer {
+            llm,
+            model: model.into(),
+            max_tokens,
+        }
+    }
+}
+
+impl SelfReviewer for LlmSelfReviewer<'_> {
+    fn review(&self, req: &ReviewRequest, history: &[Message]) -> Result<String, String> {
+        let mut messages = history.to_vec();
+        messages.push(Message::user(format!(
+            "Before any check runs, give a short self-assessment of your last answer to step \"{}\" \
+             (attempt {}). Start with PASS or FAIL, then one or two sentences. This is recorded as \
+             your opinion only; it does not decide whether the step passed.\n\nStep: {}\nYour answer: {}",
+            req.step, req.attempt, req.instruction, req.answer
+        )));
+        let turn = self
+            .llm
+            .complete(&CompletionRequest {
+                model: self.model.clone(),
+                messages,
+                tools: vec![],
+                max_tokens: self.max_tokens,
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(turn.content)
+    }
+}
+
+fn bounded_opinion(text: &str) -> String {
+    let t = text.trim();
+    if t.chars().count() <= SELF_REVIEW_MAX_CHARS {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(SELF_REVIEW_MAX_CHARS - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// One workflow step: an instruction, the verifiers that judge it, and a retry budget.
 #[derive(Clone)]
 pub struct Step {
@@ -1257,6 +1551,25 @@ pub fn run_workflow(
     history: &mut Vec<Message>,
     wf: &Workflow,
 ) -> WorkflowOutcome {
+    run_workflow_reviewed(cfg, opts, llm, tools, sink, stop, history, wf, None)
+}
+
+/// [`run_workflow`], plus (US-1.3 AC2) the model's self-review of every step attempt, asked
+/// before the verifiers judge it and emitted as [`Event::SelfReview`] labelled "opinion". The
+/// opinion is never added to `history` and never read by the outcome: a "PASS" opinion with a
+/// failing verifier still fails the step. A failed review call is recorded as "no opinion".
+#[allow(clippy::too_many_arguments)]
+pub fn run_workflow_reviewed(
+    cfg: &LoopConfig,
+    opts: &TurnOptions,
+    llm: &dyn LlmClient,
+    tools: &ToolRegistry,
+    sink: &dyn EventSink,
+    stop: &StopFlag,
+    history: &mut Vec<Message>,
+    wf: &Workflow,
+    reviewer: Option<&dyn SelfReviewer>,
+) -> WorkflowOutcome {
     let mut answers = Vec::new();
     sink.emit(Event::Plan {
         steps: wf.steps.iter().map(|st| st.id.clone()).collect(),
@@ -1264,7 +1577,7 @@ pub fn run_workflow(
     for st in &wf.steps {
         let mut feedback: Vec<String> = Vec::new();
         let mut passed = false;
-        for _attempt in 1..=st.max_attempts {
+        for attempt in 1..=st.max_attempts {
             if stop.is_stopped() {
                 return WorkflowOutcome::Stopped;
             }
@@ -1290,6 +1603,26 @@ pub fn run_workflow(
                     continue;
                 }
             };
+            if let Some(r) = reviewer {
+                if !stop.is_stopped() {
+                    let req = ReviewRequest {
+                        step: &st.id,
+                        attempt,
+                        instruction: &st.instruction,
+                        answer: &answer,
+                    };
+                    let text = match r.review(&req, history) {
+                        Ok(t) => bounded_opinion(&t),
+                        Err(why) => bounded_opinion(&format!("no opinion: {why}")),
+                    };
+                    sink.emit(Event::SelfReview {
+                        step: st.id.clone(),
+                        attempt,
+                        text,
+                        label: SELF_REVIEW_LABEL,
+                    });
+                }
+            }
             let records = records_since(&history[start..]);
             let ctx = VerifyContext {
                 step: &st.id,
@@ -1328,8 +1661,10 @@ pub fn run_workflow(
     WorkflowOutcome::Succeeded { answers }
 }
 
-/// Chooses a workflow for a goal (the planner half of planner/executor). An LLM planner and the
-/// track-based interviewer (S1.4) implement this same trait.
+/// Chooses a registered workflow for a goal (the planner half of planner/executor). The
+/// model-driven planner, which writes a new workflow instead of choosing one, is
+/// [`planner::ModelPlanner`]; both hand the same executor ([`run_workflow`]) a workflow whose
+/// every step carries a verifier.
 pub trait Planner: Send + Sync {
     fn plan(&self, goal: &str) -> Option<&Workflow>;
 }

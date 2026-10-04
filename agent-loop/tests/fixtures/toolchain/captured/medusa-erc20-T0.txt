@@ -1,0 +1,34 @@
+[1m[32m⇾[0m[0m [1mReading the configuration file at: [1m/work/erc20/medusa.json[0m[0m
+⇾ Compiling targets with crytic-compile
+⇾ Running command:
+/home/member/.local/pipx/venvs/slither-analyzer/bin/crytic-compile . --export-format solc --foundry-compile-all
+⇾ Finished compiling targets in 19s
+⇾ artifacts: Medusa is running against a new set of build artifacts
+⇾ No Slither cached results found at slither_results.json
+⇾ Running Slither:
+/home/member/.local/pipx/venvs/slither-analyzer/bin/slither . --ignore-compile --print echidna --json -
+⇾ Finished running Slither in 14s
+⇾ Running with a timeout of 600 seconds
+⇾ Setting up test chain
+⇾ Finished setting up test chain
+⇾ Creating corpus...
+⇾ Fuzzing with 2 workers
+⇾ [NOT STARTED] Property Test: LemonDropsProperties.property_supply_is_fixed()
+⇾ [NOT STARTED] Property Test: LemonDropsProperties.property_balances_sum_to_supply()
+⇾ [NOT STARTED] Property Test: LemonDropsProperties.property_no_overdraft()
+⇾ [NOT STARTED] Assertion Test: LemonDropsProperties.transfer(uint8,uint8,uint256)
+⇾ [NOT STARTED] Assertion Test: LemonDropsProperties.transferMoreThanBalance(uint8,uint8)
+⇾ [NOT STARTED] Assertion Test: LemonDropsProperties.approveAndTransferFrom(uint8,uint8,uint8,uint256)
+⇾ fuzz: elapsed:       0s, calls:          0 (     0/sec), seq/s:      0, branches:     75, corpus:     0, failures: 0/0, gas/s:            0
+⇾ fuzz: elapsed:       3s, calls:      16099 (  5362/sec), seq/s:    106, branches:    284, corpus:    10, failures: 0/321, gas/s:    256250400
+⇾ Transaction test limit reached, halting now...
+⇾ Fuzzer stopped, test results follow below ...
+⇾ [PASSED] Assertion Test: LemonDropsProperties.approveAndTransferFrom(uint8,uint8,uint8,uint256)
+⇾ [PASSED] Assertion Test: LemonDropsProperties.transfer(uint8,uint8,uint256)
+⇾ [PASSED] Assertion Test: LemonDropsProperties.transferMoreThanBalance(uint8,uint8)
+⇾ [PASSED] Property Test: LemonDropsProperties.property_balances_sum_to_supply()
+⇾ [PASSED] Property Test: LemonDropsProperties.property_no_overdraft()
+⇾ [PASSED] Property Test: LemonDropsProperties.property_supply_is_fixed()
+⇾ Test summary: 6 test(s) passed, 0 test(s) failed
+⇾ html report(s) saved to: medusa-corpus/coverage/coverage_report.html
+⇾ lcov report(s) saved to: medusa-corpus/coverage/lcov.info
