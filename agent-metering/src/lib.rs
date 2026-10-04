@@ -18,6 +18,10 @@
 //!   ([`BenchmarkOptIn`]). It builds calldata and nothing else: no key, no signing, no network
 //!   (Rule 3). Submitting goes through citrate-core's SignatureCeremony.
 //!
+//! - [`EscalationLog`] / [`EscalationReport`] (HUP-S1.5, US-1.5 AC3): one content-free record per
+//!   escalation (member endpoint or registry provider), with the spend and, for the registry route,
+//!   the provider's x402 payment receipt.
+//!
 //! Honesty rules carried from the loop: an `answered` turn is **not** a success. Only verifier
 //! verdicts make a turn verified; a turn with no verifier is "unverified", counted separately.
 //!
@@ -30,6 +34,7 @@ mod benchmark;
 mod clock;
 mod day;
 mod decisions;
+mod escalations;
 mod log;
 mod record;
 mod report;
@@ -44,6 +49,10 @@ pub use clock::{Clock, SystemClock};
 pub use day::{utc_day_bounds_ms, utc_day_of_ms};
 pub use decisions::{
     BackendStats, DecisionLine, DecisionLog, DecisionReport, TaskRecord, DECISION_REPORT_SCHEMA,
+};
+pub use escalations::{
+    ChargeUnit, EscalationLog, EscalationOutcomeKind, EscalationRecord, EscalationReport,
+    EscalationRoute, ReceiptRecord, ESCALATION_RECORD_SCHEMA, ESCALATION_REPORT_SCHEMA,
 };
 pub use log::MeteringLog;
 pub use record::{ToolTally, TurnOutcome, TurnRecord, Verification, VerifierOutcome};

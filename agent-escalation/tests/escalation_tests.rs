@@ -1,5 +1,6 @@
 //! HUP-S1.5 (runtime half): pricing, request validation, the wire shape, settlement, the
-//! transport over a real loopback HTTP server, and the disabled registry route.
+//! transport over a real loopback HTTP server, and the ADR D3 payment-request shape. The paid
+//! registry route itself is tested in `registry_tests.rs`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -8,8 +9,8 @@ use std::time::Duration;
 
 use citrate_agent_escalation::{
     input_token_bound, parse_reply, run, settle, validate_base_url, wire_body,
-    x402_payment_request, ApiKey, DisabledRegistry, EscalationError, EscalationRequest,
-    HttpTransport, Price, RegistryError, RegistryEscalation, Transport, Usage, MAX_PROMPT_BYTES,
+    x402_payment_request, ApiKey, EscalationError, EscalationRequest, HttpTransport, Price,
+    Transport, Usage, MAX_PROMPT_BYTES,
     PER_MESSAGE_OVERHEAD_TOKENS,
 };
 use serde_json::{json, Value};
@@ -513,30 +514,8 @@ fn http_transport_does_not_follow_a_redirect() {
 }
 
 // ---------------------------------------------------------------------------
-// Registry route: interface present, shipped disabled
+// The ADR D3 payment-request shape (sidecar toward core)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn registry_route_is_disabled_with_an_honest_status() {
-    let reg = DisabledRegistry;
-    let s = reg.status();
-    assert!(!s.enabled);
-    assert!(s.reason.contains("not deployed"), "{}", s.reason);
-    assert!(s.missing.iter().any(|m| m.contains("InferenceRouter")));
-    assert!(s.missing.iter().any(|m| m.contains("x402")));
-    let pay = x402_payment_request(
-        "q-1",
-        "0x1111111111111111111111111111111111111111",
-        "0x2222222222222222222222222222222222222222",
-        "1000",
-        "cid:bafy",
-    )
-    .expect("well-formed");
-    match reg.escalate("bafy", &pay) {
-        Err(RegistryError::Disabled(r)) => assert!(r.contains("not deployed")),
-        other => panic!("expected Disabled, got {other:?}"),
-    }
-}
 
 #[test]
 fn x402_payment_request_is_structured_never_raw_typed_data() {

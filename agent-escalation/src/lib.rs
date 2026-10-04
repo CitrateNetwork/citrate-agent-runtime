@@ -12,8 +12,11 @@
 //!   whose reservation does not cover the worst case, sends one chat completion with the key it was
 //!   handed for that request, and settles: the provider's reported usage at the member's price,
 //!   never more than the reservation. The key is never written to disk, logged, or returned.
-//! - The **registry route** (InferenceRouter + x402) is an interface that ships disabled
-//!   ([`DisabledRegistry`]) with an honest status, until its contracts and asset exist.
+//! - The **registry route** (InferenceRouter + x402, [`run_registry`]): core reads the router on
+//!   chain, builds an EIP-3009 authorization, has the member approve it in the SignatureCeremony,
+//!   and passes the signed payment here; this crate sends one paid chat completion with the
+//!   `X-PAYMENT` header and returns the answer with the provider's `X-PAYMENT-RESPONSE` receipt.
+//!   Core decides whether the route is on (pinned router, allowlisted asset).
 //!
 //! Keyless (Rule 3): nothing here signs, holds a wallet key, or talks to a chain.
 
@@ -28,6 +31,9 @@ pub use endpoint::{
 };
 pub use price::{input_token_bound, Price, Usage, PER_MESSAGE_OVERHEAD_TOKENS};
 pub use registry::{
-    x402_payment_request, DisabledRegistry, RegistryError, RegistryEscalation, RegistryRouteStatus,
-    X402PaymentRequest, REGISTRY_DISABLED_REASON,
+    parse_payment_required, parse_payment_response, registry_route_status, run_registry,
+    x402_payment_request, PaidReply, PaidTransport, PaymentReceipt, PaymentRequired,
+    RegistryError, RegistryEscalationRequest, RegistryOutcome, RegistryRouteStatus, SignedPayment,
+    X402PaymentRequest, MAX_RECEIPT_HEADER_BYTES, SETTLE_MARGIN_SECS, X402_SCHEME, X402_VERSION,
+    X_PAYMENT, X_PAYMENT_RESPONSE,
 };

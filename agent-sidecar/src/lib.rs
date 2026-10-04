@@ -315,9 +315,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/anchor/confirm", post(chain_routes::anchor_confirm))
         .route("/anchor/proof", get(chain_routes::anchor_proof))
         // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
-        // key per request), and the registry route's status (disabled in this build).
+        // key per request); the registry route (status, and one paid request carrying the x402
+        // payment core built and the member approved); the day's escalation records.
         .route("/escalations", post(escalation::escalate))
-        .route("/escalations/registry", get(escalation::registry_status))
+        .route(
+            "/escalations/registry",
+            get(escalation::registry_status).post(escalation::escalate_registry),
+        )
+        .route("/metering/escalations", get(escalation::metering_escalations))
         // HUP-S4.4: dry-run probe of a user-added server (validates, lists tools, registers nothing).
         .route("/mcp/probe", post(mcp_probe_route))
         .with_state(state)

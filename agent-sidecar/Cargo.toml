@@ -42,6 +42,8 @@ toml = "0.8"
 libc = "0.2"
 
 [dev-dependencies]
+# HUP-S1.5 tests build an x402 receipt header (already in Cargo.lock).
+base64 = "0.22"
 citrate-agent-records = { path = "../agent-records" }
 tempfile = "3"
 tower = "0.5"

@@ -57,6 +57,7 @@ name = "agent-sidecar"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "base64",
  "citrate-agent-anchor",
  "citrate-agent-browser",
  "citrate-agent-checkpoints",
@@ -1175,6 +1176,7 @@ dependencies = [
 name = "citrate-agent-escalation"
 version = "0.4.0"
 dependencies = [
+ "base64",
  "reqwest",
  "serde",
  "serde_json",

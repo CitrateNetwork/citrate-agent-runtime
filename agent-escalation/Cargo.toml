@@ -5,11 +5,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Hermes escalation (HUP-S1.5, runtime half): run one planning request against a member-added OpenAI-compatible endpoint with the key citrate-core passes per request (never stored here), price it from the member's price card, and settle it against the reservation core made. The registry route (InferenceRouter + x402) is an interface that ships disabled with an honest status. Keyless: nothing here signs or holds a wallet key."
+description = "Hermes escalation (HUP-S1.5, runtime half): run one planning request against a member-added OpenAI-compatible endpoint with the key citrate-core passes per request (never stored here), price it from the member's price card, and settle it against the reservation core made. The registry route (InferenceRouter + x402) carries a payment core built and the member approved, as the X-PAYMENT header of one paid request, and returns the provider's receipt. Keyless: nothing here signs or holds a wallet key."
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 zeroize = "1"
+# HUP-S1.5: the x402 `X-PAYMENT` / `X-PAYMENT-RESPONSE` headers are base64 JSON (already in Cargo.lock).
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
