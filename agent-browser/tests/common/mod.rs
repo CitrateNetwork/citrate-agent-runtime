@@ -41,6 +41,13 @@ pub const FETCHER: &str = r#"<!doctype html><html><head><title>Fetcher</title></
 <script>var u = new URLSearchParams(location.search).get('u'); fetch(u).then(function(r){ return r.text(); }).then(function(t){ document.getElementById('out').textContent = 'got ' + t; }).catch(function(e){ document.getElementById('out').textContent = 'failed'; });</script>
 </body></html>"#;
 
+/// A page that opens a WebSocket to `?u=<ws url>` from its own script once loaded, and reports
+/// whether it opened, failed or closed.
+pub const WS_OPENER: &str = r#"<!doctype html><html><head><title>Socket</title></head>
+<body><h1>Socket</h1><p id="out">waiting</p>
+<script>var o = document.getElementById('out'); try { var w = new WebSocket(new URLSearchParams(location.search).get('u')); w.onopen = function(){ o.textContent = 'opened'; }; w.onerror = function(){ o.textContent = 'failed'; }; w.onclose = function(){ if (o.textContent === 'waiting') o.textContent = 'closed'; }; } catch (e) { o.textContent = 'failed'; }</script>
+</body></html>"#;
+
 /// The request paths a [`serve_logged`] server has received, in order.
 pub type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
@@ -126,6 +133,8 @@ pub fn serve_logged() -> (String, RequestLog) {
                     ("200 OK", NEXT)
                 } else if path.starts_with("/fetcher") {
                     ("200 OK", FETCHER)
+                } else if path.starts_with("/wsopener") {
+                    ("200 OK", WS_OPENER)
                 } else if path.starts_with("/secret") {
                     ("200 OK", "local secret")
                 } else if path.starts_with("/dapp") {

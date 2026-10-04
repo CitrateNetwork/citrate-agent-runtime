@@ -437,6 +437,49 @@ fn a_page_cannot_make_the_managed_browser_reach_another_local_service() {
     assert_eq!(common::hits(&other_log, "/secret"), 0);
 }
 
+/// A page's own WebSocket is a request too: an allowed page cannot open one to another local
+/// service (the DevTools request pause does not cover WebSocket handshakes, so they are stopped
+/// separately).
+#[test]
+fn a_page_cannot_open_a_websocket_to_another_local_service() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let base = common::serve();
+    let (other, other_log) = common::serve_logged();
+    let ws = other.replacen("http://", "ws://", 1);
+    let svc = BrowserService::new(common::config_allowing(exe, &base));
+    svc.navigate(&format!("{base}/wsopener?u={ws}/ws"))
+        .expect("the allowed page opens");
+    let done = wait_for(
+        || {
+            svc.snapshot()
+                .ok()
+                .map(|(_, s)| s.text)
+                .filter(|t| !t.contains("waiting"))
+        },
+        10,
+    )
+    .expect("the socket settles");
+    assert!(!done.contains("opened"), "{done}");
+    assert_eq!(
+        common::hits(&other_log, "/ws"),
+        0,
+        "the other local service never received the handshake"
+    );
+    // The developer-allowed origin's own WebSocket still reaches it.
+    let (base2, base2_log) = common::serve_logged();
+    let ws2 = base2.replacen("http://", "ws://", 1);
+    let svc2 = BrowserService::new(common::config_allowing(
+        common::chromium().expect("checked above"),
+        &base2,
+    ));
+    svc2.navigate(&format!("{base2}/wsopener?u={ws2}/ws"))
+        .expect("the allowed page opens");
+    let reached = wait_for(|| (common::hits(&base2_log, "/ws") > 0).then_some(()), 10);
+    assert!(reached.is_some(), "an allowed origin's WebSocket is not blocked");
+}
+
 /// HUP-S2.3: the managed browser's sign-in bridge, end to end in a real Chromium. The page's top
 /// frame gets a provider; its wallet methods wait for an answer from outside (core); the answer
 /// reaches the page; an embedded frame cannot reach the bridge at all.
