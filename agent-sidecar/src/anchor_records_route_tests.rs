@@ -309,3 +309,43 @@ async fn a_batched_day_is_not_anchored_until_core_confirms_it() {
     assert!(r0["anchorTx"].is_null());
     assert!(r0["anchorBlock"].is_null());
 }
+
+/// Review follow-up: a retained record edited after its day was batched is never vouched for.
+/// The proof route refuses it (the record's stored hash no longer covers its body), so neither a
+/// proof nor `recordMatches: true` comes back for edited content.
+#[tokio::test]
+async fn a_record_edited_after_batching_gets_no_proof() {
+    let d0 = today() - 3;
+    let f = fixture(d0);
+    let (_, p) = call(
+        &f.st,
+        "POST",
+        "/anchor/plan",
+        serde_json::json!({ "day": d0 }),
+    )
+    .await;
+    assert_eq!(p["plan"], "ready");
+    // Edit the retained record #2 in place (same length, so the segment still parses).
+    let mut edited = 0;
+    for e in std::fs::read_dir(f._records.path()).unwrap() {
+        let path = e.unwrap().path();
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if body.contains("\"deploy\"") {
+            std::fs::write(&path, body.replace("\"deploy\"", "\"deplox\"")).unwrap();
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 1, "the fixture keeps record #2 in one segment file");
+    let (s, pr) = call(&f.st, "GET", "/anchor/proof?seq=2", serde_json::Value::Null).await;
+    assert_ne!(s, StatusCode::OK, "{pr}");
+    assert!(pr.get("recordMatches").is_none(), "{pr}");
+    assert!(
+        pr["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not match"),
+        "{pr}"
+    );
+}
