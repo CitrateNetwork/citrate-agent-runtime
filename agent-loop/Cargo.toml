@@ -11,6 +11,7 @@ description = "Hermes's agent turn loop (HUP-S1.1a): bounded, stoppable, event-s
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+# HUP-S3.2: reviewed third-party skills are checked against the sha256 skills.lock pins.
+sha2 = "0.10"
 
 [dev-dependencies]
-sha2 = "0.10"
