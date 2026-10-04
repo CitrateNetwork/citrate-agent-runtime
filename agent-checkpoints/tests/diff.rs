@@ -184,3 +184,45 @@ fn an_unknown_step_is_not_found_and_reading_changes_nothing() {
         "keep"
     );
 }
+
+/// Every file under `dir` (recursively) whose bytes are exactly `content`.
+fn files_holding(dir: &std::path::Path, content: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).expect("read_dir").flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(files_holding(&p, content));
+        } else if fs::read(&p).map(|b| b == content).unwrap_or(false) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn a_tampered_or_missing_snapshot_is_unavailable_never_shown() {
+    let (t, store, root) = setup();
+    let p = root.join("t.txt");
+    fs::write(&p, "original snapshot text").expect("seed");
+    let s = sid("d6");
+    let step = store
+        .begin_step(&s, &root, &[Change::write("t.txt", b"after")])
+        .expect("begin");
+    fs::write(&p, "after").expect("write");
+    step.commit().expect("commit");
+    let blobs = files_holding(&t.path().join("cp"), b"original snapshot text");
+    assert_eq!(blobs.len(), 1, "one saved copy of the before side");
+    fs::write(&blobs[0], "tampered snapshot text").expect("tamper");
+    let d = store.step_diff(&s, 1, 1024).expect("diff");
+    match &d.files[0].before {
+        Side::Unavailable { reason } => assert!(reason.contains("checksum"), "{reason}"),
+        other => panic!("tampered content was shown: {other:?}"),
+    }
+    assert_eq!(d.files[0].after, text("after"));
+    fs::remove_file(&blobs[0]).expect("remove");
+    let d = store.step_diff(&s, 1, 1024).expect("diff");
+    match &d.files[0].before {
+        Side::Unavailable { reason } => assert!(reason.contains("missing"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+}
