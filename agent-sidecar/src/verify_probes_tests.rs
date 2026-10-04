@@ -139,10 +139,12 @@ fn only_loopback_or_consented_origins_are_contacted() {
         "file:///etc/passwd",
         "ftp://127.0.0.1/",
     ] {
-        assert!(p.allowed(refused).is_err(), "{refused}");
-        // Refused before any connection is attempted.
-        assert!(
-            p.status(refused, Duration::from_millis(1)).is_err(),
+        let why = p.allowed(refused).unwrap_err();
+        // Refused before any connection is attempted: the probe answers with the scope refusal,
+        // not a connection error or a timeout.
+        assert_eq!(
+            p.status(refused, Duration::from_secs(1)),
+            Err(why),
             "{refused}"
         );
     }
