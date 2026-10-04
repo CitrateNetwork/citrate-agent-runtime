@@ -1711,7 +1711,8 @@ type JsonErr = (StatusCode, Json<serde_json::Value>);
 
 // ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
 
-/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+/// `{enabled, searxng, reader, engines}`: `engines` names the third-party engines SearXNG may
+/// load (US-5.2 AC2). Never a key, a path, or a query.
 async fn search_status(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1721,7 +1722,7 @@ async fn search_status(
     }
     let Some(host) = st.sessions.search() else {
         return Ok(Json(serde_json::json!({
-            "enabled": false, "searxng": "off", "reader": "local"
+            "enabled": false, "searxng": "off", "reader": "local", "engines": []
         })));
     };
     let reader = if host.third_party_reader() {
@@ -1729,6 +1730,7 @@ async fn search_status(
     } else {
         "local"
     };
+    let engines = host.searxng().engines();
     let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
         citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
         citrate_agent_search::SearxngState::Idle => "idle",
@@ -1738,7 +1740,7 @@ async fn search_status(
     .await
     .unwrap_or("failed");
     Ok(Json(serde_json::json!({
-        "enabled": true, "searxng": searxng, "reader": reader
+        "enabled": true, "searxng": searxng, "reader": reader, "engines": engines
     })))
 }
 
