@@ -546,7 +546,11 @@ fn plan_call(tool: &str, args: &Args, project: &Path) -> Result<CallPlan, String
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     match tool {
         FORGE_TEST_TOOL => {
-            let mut argv = s(&["test", "--json"]);
+            // `--force` clears `out/` and the cache and rebuilds from the sources. Without it,
+            // forge skips an unchanged build and leaves whatever sits in `out/`, so an artifact
+            // written there by hand would be recorded as built by this run and bound to the
+            // deploy gate (HUP-S6.3 -> S6.4).
+            let mut argv = s(&["test", "--json", "--force"]);
             if let Some(t) = filter_arg(args, "match_test")? {
                 argv.extend(["--match-test".to_string(), t]);
             }
