@@ -62,6 +62,9 @@
 //!                               origin (CITRATE_HERMES_JEV_ORIGINS, CITRATE_HERMES_JEV_NON_WEB) and
 //!                               only with CITRATE_HERMES_JEV_KEY_FILE (optional)
 //!   CITRATE_HERMES_DECIDE_LOG   JSONL file for decide() metering (optional)
+//!   CITRATE_HERMES_SELF_REVIEW  US-1.3 AC2: `0` stops recording the model's self-review of each
+//!                               workflow step attempt (an opinion in the session's event log that
+//!                               never decides an outcome); anything else or unset = on (optional)
 //!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
 //!                               serves the /browser control routes; anything else = off (optional)
 //!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component

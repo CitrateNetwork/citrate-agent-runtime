@@ -433,6 +433,16 @@ impl BrowserService {
         .map_err(|e| format!("the page that asked is gone: {e}"))
     }
 
+    /// The origins the member consented to in this attach session (normalised, sorted). Empty
+    /// when nothing is attached. HUP-S1.3: the sidecar's `http_status_is` verifier may also
+    /// contact these.
+    pub fn consented_origins(&self) -> Vec<String> {
+        lock(&self.shared.scope)
+            .as_ref()
+            .map(|s| s.allowed())
+            .unwrap_or_default()
+    }
+
     /// Origins whose page content reached the model since the browser started (ADR D2 #19).
     pub fn read_origins(&self) -> Vec<String> {
         self.shared.signin.read_origins()

@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 pub mod decide;
 pub mod interview;
 pub mod personas;
+pub mod planner;
 pub mod skills;
 pub mod verifiers_tooling;
 pub mod workflows;
@@ -486,6 +487,15 @@ pub enum Event {
         passed: bool,
         detail: String,
     },
+    /// US-1.3 AC2: the model's own assessment of one workflow step attempt. Always labelled
+    /// [`SELF_REVIEW_LABEL`] ("opinion"); it is recorded next to the verdicts and never decides a
+    /// [`WorkflowOutcome`].
+    SelfReview {
+        step: String,
+        attempt: u32,
+        text: String,
+        label: &'static str,
+    },
     Error {
         message: String,
     },
@@ -505,6 +515,7 @@ impl Event {
             Event::Tainted { .. } => "tainted",
             Event::Final { .. } => "final",
             Event::Verifier { .. } => "verifier",
+            Event::SelfReview { .. } => "self_review",
             Event::Error { .. } => "error",
             Event::Done { .. } => "done",
         }
@@ -1107,6 +1118,177 @@ impl Verifier for JsonFieldEquals {
     }
 }
 
+/// HUP-S1.3: how an [`HttpStatusIs`] verifier reaches a URL. The sidecar's probe allows only
+/// loopback and origins the member consented to, follows no redirects and bounds the wait; this
+/// crate does no I/O itself.
+pub trait HttpProbe: Send + Sync {
+    /// The status code of one `GET url`, or why the URL could not be checked.
+    fn status(&self, url: &str, timeout: std::time::Duration) -> Result<u16, String>;
+}
+
+/// The longest an [`HttpStatusIs`] check waits.
+pub const HTTP_VERIFIER_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long an [`HttpStatusIs`] check waits unless told otherwise.
+pub const HTTP_VERIFIER_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Passes when `GET url` answers with exactly `status` (e.g. a dev server's health route is 200).
+/// The verdict comes from the probe, never from the model.
+pub struct HttpStatusIs {
+    pub url: String,
+    pub status: u16,
+    timeout: std::time::Duration,
+    probe: Arc<dyn HttpProbe>,
+}
+
+impl HttpStatusIs {
+    pub fn new(url: impl Into<String>, status: u16, probe: Arc<dyn HttpProbe>) -> Self {
+        HttpStatusIs {
+            url: url.into(),
+            status,
+            timeout: HTTP_VERIFIER_DEFAULT_TIMEOUT,
+            probe,
+        }
+    }
+
+    /// Wait at most `timeout`, capped at [`HTTP_VERIFIER_MAX_TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout.min(HTTP_VERIFIER_MAX_TIMEOUT);
+        self
+    }
+}
+
+impl Verifier for HttpStatusIs {
+    fn name(&self) -> String {
+        format!("GET {} is {}", self.url, self.status)
+    }
+    fn verify(&self, _ctx: &VerifyContext) -> Verdict {
+        match self.probe.status(&self.url, self.timeout) {
+            Ok(got) if got == self.status => Verdict::Pass,
+            Ok(got) => Verdict::Fail(format!(
+                "GET {} answered {got}, expected {}",
+                self.url, self.status
+            )),
+            Err(why) => Verdict::Fail(format!("GET {} could not be checked: {why}", self.url)),
+        }
+    }
+}
+
+/// HUP-S1.3: how a [`Sha256Equals`] verifier reads a file. The sidecar's host reads only paths
+/// inside the session's live folder grants; this crate does no I/O itself.
+pub trait FileDigest: Send + Sync {
+    /// The lowercase hex SHA-256 of the file's bytes, or why it could not be read.
+    fn sha256_hex(&self, path: &str) -> Result<String, String>;
+}
+
+/// Passes when the file's SHA-256 equals `hex` (case-insensitive).
+pub struct Sha256Equals {
+    pub path: String,
+    pub hex: String,
+    files: Arc<dyn FileDigest>,
+}
+
+impl Sha256Equals {
+    pub fn new(path: impl Into<String>, hex: &str, files: Arc<dyn FileDigest>) -> Self {
+        Sha256Equals {
+            path: path.into(),
+            hex: hex.to_ascii_lowercase(),
+            files,
+        }
+    }
+}
+
+impl Verifier for Sha256Equals {
+    fn name(&self) -> String {
+        format!("sha256 of {} is {}", self.path, self.hex)
+    }
+    fn verify(&self, _ctx: &VerifyContext) -> Verdict {
+        match self.files.sha256_hex(&self.path) {
+            Ok(got) if got.eq_ignore_ascii_case(&self.hex) => Verdict::Pass,
+            Ok(got) => Verdict::Fail(format!(
+                "the sha256 of {} is {}, which does not match {}",
+                self.path,
+                got.to_ascii_lowercase(),
+                self.hex
+            )),
+            Err(why) => Verdict::Fail(format!("{} could not be hashed: {why}", self.path)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// US-1.3 AC2 — the model's self-review, recorded as an opinion
+// ---------------------------------------------------------------------------------------------
+
+/// The label every [`Event::SelfReview`] carries.
+pub const SELF_REVIEW_LABEL: &str = "opinion";
+/// The most characters of one recorded opinion.
+pub const SELF_REVIEW_MAX_CHARS: usize = 600;
+
+/// One step attempt, as the self-reviewer sees it. It never includes a verifier's verdict.
+#[derive(Debug, Clone)]
+pub struct ReviewRequest<'a> {
+    pub step: &'a str,
+    pub attempt: u32,
+    pub instruction: &'a str,
+    pub answer: &'a str,
+}
+
+/// Produces the model's self-assessment of a step attempt. The text is recorded as an opinion
+/// and nothing reads it to decide an outcome.
+pub trait SelfReviewer: Send + Sync {
+    fn review(&self, req: &ReviewRequest, history: &[Message]) -> Result<String, String>;
+}
+
+/// The self-reviewer that asks the session's own model, with no tools offered and without adding
+/// anything to the conversation.
+pub struct LlmSelfReviewer<'a> {
+    llm: &'a dyn LlmClient,
+    model: String,
+    max_tokens: u32,
+}
+
+impl<'a> LlmSelfReviewer<'a> {
+    pub fn new(llm: &'a dyn LlmClient, model: impl Into<String>, max_tokens: u32) -> Self {
+        LlmSelfReviewer {
+            llm,
+            model: model.into(),
+            max_tokens,
+        }
+    }
+}
+
+impl SelfReviewer for LlmSelfReviewer<'_> {
+    fn review(&self, req: &ReviewRequest, history: &[Message]) -> Result<String, String> {
+        let mut messages = history.to_vec();
+        messages.push(Message::user(format!(
+            "Before any check runs, give a short self-assessment of your last answer to step \"{}\" \
+             (attempt {}). Start with PASS or FAIL, then one or two sentences. This is recorded as \
+             your opinion only; it does not decide whether the step passed.\n\nStep: {}\nYour answer: {}",
+            req.step, req.attempt, req.instruction, req.answer
+        )));
+        let turn = self
+            .llm
+            .complete(&CompletionRequest {
+                model: self.model.clone(),
+                messages,
+                tools: vec![],
+                max_tokens: self.max_tokens,
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(turn.content)
+    }
+}
+
+fn bounded_opinion(text: &str) -> String {
+    let t = text.trim();
+    if t.chars().count() <= SELF_REVIEW_MAX_CHARS {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(SELF_REVIEW_MAX_CHARS - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// One workflow step: an instruction, the verifiers that judge it, and a retry budget.
 #[derive(Clone)]
 pub struct Step {
@@ -1195,11 +1377,30 @@ pub fn run_workflow(
     history: &mut Vec<Message>,
     wf: &Workflow,
 ) -> WorkflowOutcome {
+    run_workflow_reviewed(cfg, opts, llm, tools, sink, stop, history, wf, None)
+}
+
+/// [`run_workflow`], plus (US-1.3 AC2) the model's self-review of every step attempt, asked
+/// before the verifiers judge it and emitted as [`Event::SelfReview`] labelled "opinion". The
+/// opinion is never added to `history` and never read by the outcome: a "PASS" opinion with a
+/// failing verifier still fails the step. A failed review call is recorded as "no opinion".
+#[allow(clippy::too_many_arguments)]
+pub fn run_workflow_reviewed(
+    cfg: &LoopConfig,
+    opts: &TurnOptions,
+    llm: &dyn LlmClient,
+    tools: &ToolRegistry,
+    sink: &dyn EventSink,
+    stop: &StopFlag,
+    history: &mut Vec<Message>,
+    wf: &Workflow,
+    reviewer: Option<&dyn SelfReviewer>,
+) -> WorkflowOutcome {
     let mut answers = Vec::new();
     for st in &wf.steps {
         let mut feedback: Vec<String> = Vec::new();
         let mut passed = false;
-        for _attempt in 1..=st.max_attempts {
+        for attempt in 1..=st.max_attempts {
             if stop.is_stopped() {
                 return WorkflowOutcome::Stopped;
             }
@@ -1225,6 +1426,26 @@ pub fn run_workflow(
                     continue;
                 }
             };
+            if let Some(r) = reviewer {
+                if !stop.is_stopped() {
+                    let req = ReviewRequest {
+                        step: &st.id,
+                        attempt,
+                        instruction: &st.instruction,
+                        answer: &answer,
+                    };
+                    let text = match r.review(&req, history) {
+                        Ok(t) => bounded_opinion(&t),
+                        Err(why) => bounded_opinion(&format!("no opinion: {why}")),
+                    };
+                    sink.emit(Event::SelfReview {
+                        step: st.id.clone(),
+                        attempt,
+                        text,
+                        label: SELF_REVIEW_LABEL,
+                    });
+                }
+            }
             let records = records_since(&history[start..]);
             let ctx = VerifyContext {
                 step: &st.id,
@@ -1263,8 +1484,10 @@ pub fn run_workflow(
     WorkflowOutcome::Succeeded { answers }
 }
 
-/// Chooses a workflow for a goal (the planner half of planner/executor). An LLM planner and the
-/// track-based interviewer (S1.4) implement this same trait.
+/// Chooses a registered workflow for a goal (the planner half of planner/executor). The
+/// model-driven planner, which writes a new workflow instead of choosing one, is
+/// [`planner::ModelPlanner`]; both hand the same executor ([`run_workflow`]) a workflow whose
+/// every step carries a verifier.
 pub trait Planner: Send + Sync {
     fn plan(&self, goal: &str) -> Option<&Workflow>;
 }

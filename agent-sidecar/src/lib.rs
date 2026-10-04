@@ -40,6 +40,7 @@ pub mod signin_routes;
 pub mod toolchain;
 mod toolchain_config;
 pub mod trajectory;
+pub mod verify_probes;
 pub mod web_signing_records;
 pub mod workers;
 pub mod workflow_spec;
@@ -1228,6 +1229,11 @@ pub fn production_sessions_with(
         None => mgr,
     };
     let mgr = with_files_from_env(mgr);
+    // US-1.3 AC2: record the model's self-review of each workflow step attempt as an opinion
+    // (on unless CITRATE_HERMES_SELF_REVIEW=0).
+    let mgr = mgr.with_self_review(self_review_from_env_var(
+        std::env::var("CITRATE_HERMES_SELF_REVIEW").ok().as_deref(),
+    ));
     // US-2.2 AC2: shell_run (off by default; always inside the OS sandbox).
     let mgr = match shell_run::ShellRunConfig::from_env() {
         Some(cfg) => {
@@ -1248,6 +1254,11 @@ pub fn production_sessions_with(
         Some(host) => mgr.with_mcp(host),
         None => mgr,
     })
+}
+
+/// US-1.3 AC2: workflow runs record the model's self-review unless the variable is exactly `0`.
+pub fn self_review_from_env_var(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("0")
 }
 
 /// HUP-S2.9: open the checkpoint store when `CITRATE_HERMES_CHECKPOINTS` names one (the undo
@@ -1701,6 +1712,8 @@ mod sheets_session_tests;
 mod skills_session_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_probes_tests;
 
 #[cfg(test)]
 mod browser_session_tests;
@@ -1737,8 +1750,14 @@ async fn start_workflow(
     }
     let spec: workflow_spec::WorkflowSpec = serde_json::from_slice(&body)
         .map_err(|e| json_err(StatusCode::BAD_REQUEST, &format!("bad workflow: {e}")))?;
+    // HUP-S1.3: HTTP checks reach loopback or consented origins only; hash checks read only
+    // inside this session's folder grants (none: refused).
+    let env = verify_probes::env_for(
+        st.sessions.browser().cloned(),
+        st.sessions.get(&id).and_then(|s| s.grants().cloned()),
+    );
     let wf = spec
-        .build()
+        .build_in(&env)
         .map_err(|e| json_err(StatusCode::BAD_REQUEST, &e))?;
     let run_id = st
         .sessions

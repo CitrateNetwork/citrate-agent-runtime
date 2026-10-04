@@ -28,6 +28,7 @@ citrate-agent-metering = { path = "../agent-metering" }
 citrate-agent-trajectory = { path = "../agent-trajectory" }
 citrate-agent-anchor = { path = "../agent-anchor" }
 hex = "0.4"
+sha2 = "0.10"
 citrate-agent-escalation = { path = "../agent-escalation" }
 citrate-agent-search = { path = "../agent-search" }
 citrate-agent-browser = { path = "../agent-browser" }

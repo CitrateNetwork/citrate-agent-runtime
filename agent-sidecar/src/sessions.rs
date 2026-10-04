@@ -75,15 +75,18 @@ use std::time::{Duration, Instant};
 use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
 use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
-use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
+use citrate_agent_learn::{run_verified_workflow_reviewed, Evidence, VerifiedRun};
 use citrate_agent_loop::skills::{
     skill_load_spec, SkillHost, SkillLibrary, SkillSource, SKILL_LOAD_TOOL,
 };
 use citrate_agent_loop::{
     run_turn_with, CharTokenCounter, ContextBudget, Event, EventSink, HostKind, LlmClient,
-    LoopConfig, Message, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry,
-    ToolSpec, TurnOptions, Workflow,
+    LlmSelfReviewer, LoopConfig, Message, SelfReviewer, StopFlag, TaintState, ToolCall, ToolHost,
+    ToolOutcome, ToolRegistry, ToolSpec, TurnOptions, Workflow,
 };
+
+/// US-1.3 AC2: the most tokens one recorded self-review may use.
+pub const SELF_REVIEW_MAX_TOKENS: u32 = 160;
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use citrate_agent_metering::{MeteringSink, SystemClock};
 use citrate_agent_trajectory::TrajectoryRecorder;
@@ -789,6 +792,9 @@ pub struct SessionManager {
     shell_run: Option<Arc<ShellRunConfig>>,
     /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
+    /// US-1.3 AC2: ask the model for a self-review of every workflow step attempt and record it
+    /// in the session's event log as an opinion (never part of the verdict).
+    self_review: bool,
 }
 
 impl SessionManager {
@@ -816,7 +822,19 @@ impl SessionManager {
             anchor: None,
             shell_run: None,
             records: None,
+            self_review: false,
         }
+    }
+
+    /// US-1.3 AC2: record the model's self-review of every workflow step attempt as an opinion.
+    pub fn with_self_review(mut self, on: bool) -> Self {
+        self.self_review = on;
+        self
+    }
+
+    /// Whether workflow runs record the model's self-review.
+    pub fn self_review_enabled(&self) -> bool {
+        self.self_review
     }
 
     /// US-2.2 AC2: offer `shell_run` to every new session opened with folder grants.
@@ -1477,10 +1495,13 @@ impl SessionManager {
         let registry = self.registry_for(&session, capsules);
         let s = session.clone();
         let rid = run_id.clone();
+        let self_review = self.self_review;
         tokio::task::spawn_blocking(move || {
             let sink = SessionSink(s.clone());
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            let out = run_verified_workflow(
+            let reviewer =
+                LlmSelfReviewer::new(s.llm.as_ref(), s.cfg.model.clone(), SELF_REVIEW_MAX_TOKENS);
+            let out = run_verified_workflow_reviewed(
                 &s.id,
                 &s.cfg,
                 &s.opts,
@@ -1490,6 +1511,11 @@ impl SessionManager {
                 &s.stop,
                 &mut history,
                 &wf,
+                if self_review {
+                    Some(&reviewer as &dyn SelfReviewer)
+                } else {
+                    None
+                },
             );
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
