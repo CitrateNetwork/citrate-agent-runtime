@@ -133,7 +133,14 @@ fn the_managed_browser_finishes_the_web_subset_with_decide_picking_every_move() 
     );
     // One browser for the whole run (the fixture pages keep no state between tasks); generous
     // timeouts because a loaded machine can take many seconds to start Chromium (A51).
+    // The fixture site is on loopback: allow exactly its origin (the managed browser otherwise
+    // opens public addresses only).
+    let allow_private = match citrate_agent_browser::gate::parse_allow_private(&base) {
+        Ok(a) => a,
+        Err(e) => panic!("{base}: {e}"),
+    };
     let svc = BrowserService::new(BrowserConfig {
+        allow_private,
         managed_path: Some(exe.clone()),
         candidates: Vec::new(),
         launch_timeout: std::time::Duration::from_secs(90),
