@@ -183,6 +183,9 @@ impl MeteringSink {
             // Content-bearing or boundary-only events: nothing to count.
             Event::StepEnd { .. } | Event::Final { .. } | Event::Error { .. } => {}
             Event::Verifier { .. } => {}
+            // Usage reaches the record through the metered client (`record_usage`); the plan is
+            // workflow bookkeeping. Counting either here would double them.
+            Event::Usage { .. } | Event::Plan { .. } => {}
         }
     }
 }

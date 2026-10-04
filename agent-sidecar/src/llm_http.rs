@@ -116,13 +116,28 @@ pub fn parse_turn(body: &str) -> Result<AssistantTurn, LlmError> {
 /// HUP-S7.5: the `usage` block of an OpenAI-compatible response (llama-server and gateways report
 /// it). Both `prompt_tokens` and `completion_tokens` must be non-negative integers; anything else
 /// is unknown (`None`), never zero.
+///
+/// HUP-S7.6: llama-server also reports `timings.predicted_ms` (time spent generating the
+/// completion). It rides along as `generation_ms` when it is a finite, non-negative number;
+/// otherwise it is unknown.
 pub fn parse_usage(body: &str) -> Option<TokenUsage> {
     let v: Value = serde_json::from_str(body).ok()?;
     let u = v.get("usage")?;
     Some(TokenUsage {
         prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
         completion_tokens: u.get("completion_tokens")?.as_u64()?,
+        generation_ms: generation_ms(&v),
     })
+}
+
+/// `timings.predicted_ms` rounded to whole milliseconds, when it is a finite number in range.
+fn generation_ms(v: &Value) -> Option<u64> {
+    let ms = v.get("timings")?.get("predicted_ms")?.as_f64()?;
+    if ms.is_finite() && (0.0..1.0e12).contains(&ms) {
+        Some(ms.round() as u64)
+    } else {
+        None
+    }
 }
 
 /// Blocking OpenAI-compatible client. Holds only configuration: the `reqwest` blocking client (which
