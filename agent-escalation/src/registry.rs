@@ -8,8 +8,13 @@
 //! - no InferenceRouter address is pinned for chain 40204 (the post-reroll redeploy, federation F-4);
 //! - the x402 asset allowlist is empty: SALT is native, and B-2 needs a token implementing
 //!   `TransferWithAuthorization` (for example a wrapped SALT; ADR owner decision O-1);
-//! - core's lean crypto build has no EIP-712 hasher yet (ADR D3 precondition);
+//! - the deployed InferenceRouter takes native SALT only (`requestInference` is payable), so a
+//!   registry request is a transaction the member approves in core (HIC-1), not an x402
+//!   authorization; core's `inference_router.rs` owns that route and the chain reads;
 //! - registry model routing waits on the model precompile integration (federation F-1).
+//!
+//! Core's kit now has the EIP-712 hasher and the pinned `TransferWithAuthorization` template
+//! (ADR D3 precondition), proven against the chain's WrappedSALT on a local anvil deploy.
 //!
 //! Per ADR D3 the sidecar never sends typed-data bytes. It sends core the structured
 //! [`X402PaymentRequest`] and core builds, caps and signs the authorization in its ceremony.
@@ -77,7 +82,7 @@ impl RegistryEscalation for DisabledRegistry {
             missing: vec![
                 "InferenceRouter address pinned for chain 40204 (post-reroll redeploy, federation F-4)".into(),
                 "x402 asset: a token with TransferWithAuthorization, such as a wrapped SALT (ADR O-1); the allowlist is empty".into(),
-                "EIP-712 hasher in core's lean crypto build (ADR D3 precondition)".into(),
+                "x402 entry point: the InferenceRouter takes native SALT only, so registry requests are approved one by one in core".into(),
                 "registry model routing after the model precompile integration (federation F-1)".into(),
             ],
         }

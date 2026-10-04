@@ -283,6 +283,34 @@ fn contract_workflows_are_backed_by_the_toolchain_reports() {
     }
 }
 
+/// The audit's scan step needs both scanners' reports to have been read (an unparsed run is not
+/// a scan); it does not need them to be clean, since the audit reports the findings.
+#[test]
+fn the_audit_scan_step_needs_reports_that_were_read() {
+    let w = bundled_workflows()
+        .expect("catalog")
+        .into_iter()
+        .find(|w| w.id == "audit-a-contract")
+        .expect("audit-a-contract");
+    let scan = &w.steps[0];
+    for t in [SLITHER_SCAN_TOOL, ADERYN_SCAN_TOOL] {
+        assert!(
+            scan.verifiers.iter().any(|v| matches!(
+                v,
+                VerifierSpec::ScanReportRead { tool } if tool == t
+            )),
+            "{t}"
+        );
+        assert!(
+            !scan.verifiers.iter().any(|v| matches!(
+                v,
+                VerifierSpec::ToolSucceeded { tool } if tool == t
+            )),
+            "{t}: a bare success is not enough"
+        );
+    }
+}
+
 #[test]
 fn answer_shape_workflows_say_so() {
     let w = default_workflow("creative");
