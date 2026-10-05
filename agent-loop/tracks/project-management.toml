@@ -4,7 +4,7 @@ summary = "Plans, sprints, checklists and status notes."
 persona = "Steward"
 skills = ["agentile-planset", "agentile-sprint", "journal"]
 workflow = "project-plan"
-workflow_available = false
+workflow_available = true
 ships_in = "HUP-S3"
 gates = [
   "You approve the plan before anything is written",

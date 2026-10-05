@@ -10,8 +10,8 @@
 use std::sync::Mutex;
 
 use citrate_agent_loop::{
-    run_workflow, Event, EventSink, LlmClient, LoopConfig, Message, Role, StopFlag, ToolRegistry,
-    TurnOptions, Workflow, WorkflowOutcome,
+    run_workflow_reviewed, Event, EventSink, LlmClient, LoopConfig, Message, Role, SelfReviewer,
+    StopFlag, ToolRegistry, TurnOptions, Workflow, WorkflowOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -219,12 +219,33 @@ pub fn run_verified_workflow(
     history: &mut Vec<Message>,
     wf: &Workflow,
 ) -> Result<VerifiedRun, Unverified> {
+    run_verified_workflow_reviewed(
+        session_id, cfg, opts, llm, tools, sink, stop, history, wf, None,
+    )
+}
+
+/// [`run_verified_workflow`] with the model's self-review of every attempt recorded as an
+/// opinion (US-1.3 AC2; [`citrate_agent_loop::run_workflow_reviewed`]). The opinions reach
+/// `sink` and never the evidence: a run is verified only by its verdicts.
+#[allow(clippy::too_many_arguments)]
+pub fn run_verified_workflow_reviewed(
+    session_id: &str,
+    cfg: &LoopConfig,
+    opts: &TurnOptions,
+    llm: &dyn LlmClient,
+    tools: &ToolRegistry,
+    sink: &dyn EventSink,
+    stop: &StopFlag,
+    history: &mut Vec<Message>,
+    wf: &Workflow,
+    reviewer: Option<&dyn SelfReviewer>,
+) -> Result<VerifiedRun, Unverified> {
     let start = history.len();
     let rec = Recorder {
         inner: sink,
         verdicts: Mutex::new(Vec::new()),
     };
-    let outcome = run_workflow(cfg, opts, llm, tools, &rec, stop, history, wf);
+    let outcome = run_workflow_reviewed(cfg, opts, llm, tools, &rec, stop, history, wf, reviewer);
     let answers = match outcome {
         WorkflowOutcome::Succeeded { answers } => answers,
         WorkflowOutcome::Failed { step, reason } => {

@@ -17,6 +17,7 @@ use citrate_agent_loop::{
     AssistantTurn, CompletionRequest, Effect, HostKind, LlmClient, LlmError, ToolCall, ToolHost,
     ToolOutcome, ToolRecord, Trust, Verdict, Verifier, VerifyContext,
 };
+use citrate_agent_shell::sandbox::SandboxMode;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,9 @@ impl Scratch {
             search_path: vec![self.bin()],
             solc: Some(PathBuf::from("/opt/solc/solc-0.8.36")),
             home: self.base.join("home"),
+            // The stand-ins write their argv beside the granted folder, which the OS sandbox
+            // forbids; the sandboxed path has its own tests below.
+            sandbox: SandboxMode::Off,
         }
     }
     fn host(&self) -> ToolchainHost {
@@ -216,6 +220,24 @@ fn the_default_search_path_adds_the_per_user_toolchain_dirs() {
         .contains(&PathBuf::from("/Users/x/.foundry/bin")));
     assert!(cfg.search_path.contains(&PathBuf::from("/usr/bin")));
     assert!(cfg.search_path.iter().all(|p| p.is_absolute()));
+}
+
+#[test]
+fn the_sandbox_mode_defaults_to_preferred_and_junk_fails_closed() {
+    let base = [("CITRATE_HERMES_TOOLCHAIN", "1"), ("HOME", "/h")];
+    let mode = |extra: Option<&str>| {
+        let mut pairs: Vec<(&str, &str)> = base.to_vec();
+        if let Some(v) = extra {
+            pairs.push((SANDBOX_ENV, v));
+        }
+        ToolchainConfig::from_env_vars(vars(&pairs))
+            .unwrap()
+            .sandbox
+    };
+    assert_eq!(mode(None), SandboxMode::Preferred);
+    assert_eq!(mode(Some("off")), SandboxMode::Off);
+    assert_eq!(mode(Some("required")), SandboxMode::Required);
+    assert_eq!(mode(Some("perhaps")), SandboxMode::Required);
 }
 
 #[test]
@@ -469,7 +491,13 @@ fn forge_test_runs_the_fixed_template_offline_and_reports_failures() {
     assert_eq!(env.run.as_ref().unwrap()["exit_code"], 1);
     assert_eq!(
         s.args_of("forge"),
-        vec!["test", "--json", "--match-contract", "CounterFailTest"]
+        vec![
+            "test",
+            "--json",
+            "--force",
+            "--match-contract",
+            "CounterFailTest"
+        ]
     );
     let envv = s.env_of("forge");
     assert_eq!(envv[0], "true", "FOUNDRY_OFFLINE");
@@ -485,6 +513,22 @@ fn forge_test_runs_the_fixed_template_offline_and_reports_failures() {
     ));
 }
 
+/// HUP-S6.3 -> S6.4: forge_test always rebuilds from the sources (`--force`), so an artifact
+/// placed in `out/` by hand is cleared rather than recorded as this run's build and bound to the
+/// deploy gate. Without `--force`, forge skips an unchanged build and keeps `out/` as it is.
+#[test]
+fn forge_test_always_rebuilds_so_out_cannot_be_planted() {
+    let s = Scratch::new();
+    s.fake("forge", Some("forge-test-pass.json"), "", 0);
+    let (_out, env) = run(
+        &s.host(),
+        FORGE_TEST_TOOL,
+        serde_json::json!({"project": s.proj()}),
+    );
+    assert_eq!(env.status, RunStatus::Completed);
+    assert_eq!(s.args_of("forge"), vec!["test", "--json", "--force"]);
+}
+
 #[test]
 fn forge_test_passing_run_passes_the_verifier() {
     let s = Scratch::new();
@@ -497,7 +541,13 @@ fn forge_test_passing_run_passes_the_verifier() {
     assert!(env.verdict.as_ref().unwrap().passed);
     assert_eq!(
         s.args_of("forge"),
-        vec!["test", "--json", "--match-test", "test_Increment"]
+        vec![
+            "test",
+            "--json",
+            "--force",
+            "--match-test",
+            "test_Increment"
+        ]
     );
     assert_eq!(
         verify(&ForgeTestsPass::default(), &[record(FORGE_TEST_TOOL, &out)]),
@@ -1038,6 +1088,56 @@ fn a_session_tool_may_not_claim_a_toolchain_name_when_the_toolchain_is_on() {
 // Live (real forge + slither): `cargo test -p agent-sidecar toolchain -- --ignored`
 // ------------------------------------------------------------------------------------------
 
+/// US-2.2 AC1 for the toolchain templates: on a machine with an OS sandbox the fixed templates
+/// run inside it: writes in the project folder work, a write beside it is denied, and the run
+/// facts say the run was isolated.
+#[cfg(target_os = "macos")]
+#[test]
+fn toolchain_templates_run_inside_the_os_sandbox_when_available() {
+    let s = Scratch::new();
+    let inside = s.proj().join("out-marker");
+    let outside = s.base.join("escape-marker");
+    let script = format!(
+        "#!/bin/sh\necho built > '{}'\necho x > '{}' 2>/dev/null\nprintf '%s' '{{}}'\nexit 0\n",
+        inside.display(),
+        outside.display()
+    );
+    let p = s.bin().join("forge");
+    std::fs::write(&p, script).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = s.config();
+    cfg.sandbox = SandboxMode::Required;
+    let host = ToolchainHost::new(cfg).unwrap();
+    let (_, env) = run(
+        &host,
+        FORGE_TEST_TOOL,
+        serde_json::json!({"project": s.proj()}),
+    );
+    let run_facts = env.run.expect("run facts");
+    assert_eq!(run_facts["sandbox"]["enforced"], true, "{run_facts}");
+    assert_eq!(run_facts["sandbox"]["backend"], "seatbelt");
+    assert_eq!(run_facts["sandbox"]["network"], "denied");
+    assert!(inside.exists(), "a write in the project folder is allowed");
+    assert!(
+        !outside.exists(),
+        "a write beside the project folder is denied"
+    );
+}
+
+#[test]
+fn toolchain_run_facts_say_when_a_run_was_not_isolated() {
+    let s = Scratch::new();
+    s.fake("forge", Some("forge-test-pass.json"), "", 0);
+    let (_, env) = run(
+        &s.host(),
+        FORGE_TEST_TOOL,
+        serde_json::json!({"project": s.proj()}),
+    );
+    let run_facts = env.run.expect("run facts");
+    assert_eq!(run_facts["sandbox"]["enforced"], false, "{run_facts}");
+    assert_eq!(run_facts["sandbox"]["backend"], "none");
+}
+
 fn live_project(s: &Scratch, vault: bool) {
     let p = s.proj();
     std::fs::create_dir_all(p.join("src")).unwrap();
@@ -1088,6 +1188,10 @@ fn live_forge_test_on_a_real_project() {
     );
     assert_eq!(env.status, RunStatus::Completed, "{}", env.summary);
     assert!(env.verdict.as_ref().unwrap().passed, "{}", env.summary);
+    // US-2.2 AC1: on macOS the real forge ran inside Seatbelt.
+    if cfg!(target_os = "macos") {
+        assert_eq!(env.run.as_ref().unwrap()["sandbox"]["enforced"], true);
+    }
     assert_eq!(
         verify(&ForgeTestsPass::default(), &[record(FORGE_TEST_TOOL, &out)]),
         Verdict::Pass
@@ -1105,6 +1209,9 @@ fn live_slither_scan_finds_the_reentrancy() {
         serde_json::json!({"project": s.proj()}),
     );
     assert_eq!(env.status, RunStatus::Completed, "{}", env.summary);
+    if cfg!(target_os = "macos") {
+        assert_eq!(env.run.as_ref().unwrap()["sandbox"]["enforced"], true);
+    }
     let v = env.verdict.unwrap();
     assert!(!v.passed, "{}", v.reason);
     assert!(v.reason.contains("reentrancy-eth"), "{}", v.reason);

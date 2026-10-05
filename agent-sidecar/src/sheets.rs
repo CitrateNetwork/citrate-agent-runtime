@@ -12,11 +12,13 @@
 //!   `citrate-agent-office`.
 //!
 //! A write replaces the whole file. It is built in memory and checked against the limits first,
-//! so a refused write leaves the file as it was.
+//! so a refused write leaves the file as it was. HUP-S2.9: the write is checkpointed under the
+//! session id ([`crate::files::checked_whole_file_write`]), so the member can undo it; without a
+//! checkpoint store nothing is written.
 //!
 //! Keyless: nothing here holds a key or signs (Rule 3).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,7 +28,7 @@ use citrate_agent_loop::{
 };
 use citrate_agent_office::{format_for, read_sheet, write_sheet, Cell, Limits, SheetFormat};
 
-use crate::grants::{hard_linked, open_nofollow, SessionGrants};
+use crate::grants::{hard_linked, open_checked, SessionGrants};
 
 pub const SHEET_READ_TOOL: &str = "sheet_read";
 pub const SHEET_WRITE_TOOL: &str = "sheet_write";
@@ -114,13 +116,21 @@ pub fn sheet_tool_specs() -> Vec<ToolSpec> {
 /// Runs the sheet tools for one session.
 pub struct SheetToolHost {
     grants: Arc<SessionGrants>,
+    /// HUP-S2.9: where `sheet_write` checkpoints. Without it `sheet_write` writes nothing.
+    undo: Option<crate::files::UndoScope>,
 }
 
 type Args = serde_json::Map<String, serde_json::Value>;
 
 impl SheetToolHost {
     pub fn new(grants: Arc<SessionGrants>) -> Self {
-        SheetToolHost { grants }
+        SheetToolHost { grants, undo: None }
+    }
+
+    /// HUP-S2.9: checkpoint every `sheet_write` in `undo` (the member can undo it).
+    pub fn with_undo(mut self, undo: crate::files::UndoScope) -> Self {
+        self.undo = Some(undo);
+        self
     }
 
     fn args(call: &ToolCall) -> Result<Args, String> {
@@ -179,7 +189,7 @@ impl SheetToolHost {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
         };
-        let mut f = match open_nofollow(&file, false) {
+        let mut f = match open_checked(&file, false) {
             Ok(f) => f,
             Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
         };
@@ -240,42 +250,31 @@ impl SheetToolHost {
             Ok(b) => b,
             Err(e) => return ToolOutcome::Error(e.to_string()),
         };
-        let (file, _) = match self.grants.check(path, Op::Write) {
-            Ok(x) => x,
-            Err(e) => return ToolOutcome::Denied(e),
-        };
-        match std::fs::symlink_metadata(&file) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return ToolOutcome::Denied(format!("{} is a symbolic link", file.display()))
-            }
-            Ok(m) if !m.is_file() => {
-                return ToolOutcome::Error(format!("{} is not a regular file", file.display()))
-            }
-            Ok(m) if hard_linked(&m) => {
-                return ToolOutcome::Denied(format!(
-                    "{} has other hard links, so writing it could change a file outside the grant",
-                    file.display()
-                ))
-            }
-            _ => {}
+        // HUP-S2.9: the one checkpointed write path (grants and the deny list, build
+        // configuration, symlink leaves and hard links are refused before any snapshot; folders
+        // are never created).
+        match crate::files::checked_whole_file_write(
+            &self.grants,
+            self.undo.as_ref(),
+            path,
+            &bytes,
+            false,
+        ) {
+            Ok(w) => ToolOutcome::Ok(
+                serde_json::json!({
+                    "path": w.path,
+                    "paths": [w.path],
+                    "format": format_name(format),
+                    "rows": rows.len(),
+                    "bytes": bytes.len(),
+                    "written": true,
+                    "checkpoint": {"session": w.session, "seq": w.seq},
+                    "undo": crate::files::UNDO_NOTE,
+                })
+                .to_string(),
+            ),
+            Err(r) => r.into_outcome(),
         }
-        let mut f = match open_nofollow(&file, true) {
-            Ok(f) => f,
-            Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
-        };
-        if let Err(e) = f.write_all(&bytes).and_then(|_| f.flush()) {
-            return ToolOutcome::Error(format!("cannot write {}: {e}", file.display()));
-        }
-        ToolOutcome::Ok(
-            serde_json::json!({
-                "path": file,
-                "format": format_name(format),
-                "rows": rows.len(),
-                "bytes": bytes.len(),
-                "written": true,
-            })
-            .to_string(),
-        )
     }
 }
 

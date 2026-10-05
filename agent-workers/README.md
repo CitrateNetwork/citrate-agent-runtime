@@ -13,7 +13,7 @@ The supervisor that runs Hermes's tool workers as separate child processes of th
 ```text
 citrate-core ── supervises ──> sidecar (agent loop; restarted by core's own supervisor)
                                  ├── toolchain worker  (`citrate-agent-sidecar --worker toolchain`)
-                                 └── browser worker    (reserved for HUP-S5.1; not built, reported as `not_built`)
+                                 └── browser worker    (reserved; the HUP-S5.1 browser tools run in the sidecar today; reported as `not_built`)
 ```
 
 - **Wire.** One JSON object per line over the child's stdin/stdout: `ping`, `call`, `shutdown`.

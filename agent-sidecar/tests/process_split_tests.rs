@@ -73,6 +73,9 @@ impl Scratch {
                 self.base.join("bin").display().to_string(),
             ),
             ("CITRATE_HERMES_SOLC".into(), "/opt/solc/solc-0.8.36".into()),
+            // The stand-in forge reads a fixture and writes beside the granted folder, which the
+            // OS sandbox forbids; the sandboxed worker path has its own test.
+            ("CITRATE_HERMES_SHELL_SANDBOX".into(), "off".into()),
         ]
     }
     fn worker(&self) -> Arc<Worker> {
@@ -140,6 +143,47 @@ fn the_toolchain_runs_in_a_separate_worker_process_with_the_same_result() {
     let env = ToolchainEnvelope::from_content(&content).unwrap();
     assert_eq!(env.status, RunStatus::Completed);
     assert!(env.verdict.unwrap().passed);
+}
+
+/// US-2.2 AC1: the worker process reads `CITRATE_HERMES_SHELL_SANDBOX` too, so with the default
+/// (`preferred`) on a machine with an OS sandbox its runs are isolated: a write beside the project
+/// is denied, and the run facts say so.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_worker_runs_the_toolchain_inside_the_os_sandbox() {
+    let s = Scratch::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../agent-loop/tests/fixtures/toolchain/forge-test-pass.json");
+    std::fs::copy(&fixture, s.proj().join("report.json")).unwrap();
+    let outside = s.base.join("escape-marker");
+    let script = format!(
+        "#!/bin/sh\necho x > '{}' 2>/dev/null\n/bin/cat report.json\nexit 0\n",
+        outside.display()
+    );
+    let p = s.base.join("bin/forge");
+    std::fs::write(&p, script).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env: Vec<(String, String)> = s
+        .env()
+        .into_iter()
+        .filter(|(k, _)| k != "CITRATE_HERMES_SHELL_SANDBOX")
+        .collect();
+    let w = Arc::new(Worker::start(
+        toolchain_worker_spec(PathBuf::from(SIDECAR), env),
+        fast_policy(),
+    ));
+    wait_for("running", Duration::from_secs(20), || running(&w));
+    let host = RemoteToolHost::new(w.clone(), Duration::from_secs(30));
+    let out = host.execute(&forge_call(&s.proj()));
+    let ToolOutcome::Ok(content) = out else {
+        panic!("expected ok, got {out:?}");
+    };
+    let env = ToolchainEnvelope::from_content(&content).unwrap();
+    assert!(env.verdict.unwrap().passed);
+    let run = env.run.unwrap();
+    assert_eq!(run["sandbox"]["enforced"], true, "{run}");
+    assert_eq!(run["sandbox"]["backend"], "seatbelt");
+    assert!(!outside.exists(), "a write beside the project is denied");
 }
 
 #[test]
@@ -329,7 +373,13 @@ fn the_report_lists_the_browser_worker_as_not_built_and_an_off_toolchain_as_off(
     assert_eq!(tc["state"], "off");
     let br = report.iter().find(|r| r["kind"] == "browser").unwrap();
     assert_eq!(br["state"], "not_built");
-    assert!(br["detail"].as_str().unwrap().contains("HUP-S5.1"));
+    let detail = br["detail"].as_str().unwrap();
+    // HUP-S1.9 live run: the browser tools exist (HUP-S5.1, in the sidecar process, driving the
+    // managed Chromium as its own process). Only a separate browser worker is not built, and the
+    // report must not say there are no browser tools.
+    assert!(!detail.contains("no browser tools"), "{detail}");
+    assert!(detail.contains("Chromium"), "{detail}");
+    assert!(detail.contains("not built"), "{detail}");
 }
 
 #[test]

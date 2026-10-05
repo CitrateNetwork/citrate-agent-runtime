@@ -78,16 +78,19 @@ ed25519-dalek = { version = "2.1", features = ["std"] }
 # The component-model feature is required for the WASM Component Model
 # that capsules use. wasmtime-wasi provides the standard WASI host
 # implementations we wire selectively per manifest in CIT-AGENT-3d.
-wasmtime = { version = "49", features = ["component-model"] }
-wasmtime-wasi = "49"
+wasmtime = { version = "49.0.2", features = ["component-model"] }
+wasmtime-wasi = "49.0.2"
 # wasmtime-wasi-io is a peer crate of wasmtime-wasi that hosts the
 # `wasi:io/error` binding. Required to wire io::error per-subsystem
 # in linker.rs (the wasmtime-wasi internal HasIo marker is private,
-# so we depend on the io crate directly). REM-12 wasmtime-26 → 45; 46 → 49 for RUSTSEC-2026-0314/0316.
-wasmtime-wasi-io = "49"
+# so we depend on the io crate directly). REM-12 wasmtime-26 → 45; 46 → 49 for RUSTSEC-2026-0314/0316;
+# floor 49.0.2 for RUSTSEC-2026-0321..0327 (wasmtime + wasmtime-wasi).
+wasmtime-wasi-io = "49.0.2"
 # HUP-S2.5 — capsule WASI preopens are scoped to live folder grants. In-repo
 # path crate (agent-grants -> agent-guard); keyless, nothing in it signs.
 citrate-agent-grants = { path = "../../agent-grants" }
+# Shared public-address predicate for capsule egress allowlists (keyless, tiny).
+citrate-agent-guard = { path = "../../agent-guard" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

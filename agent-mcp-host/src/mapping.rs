@@ -169,6 +169,7 @@ mod tests {
             description: "d".into(),
             input_schema: schema,
             annotations: ann,
+            header_params: Ok(Vec::new()),
         }
     }
 

@@ -4,7 +4,7 @@ summary = "A Solidity contract, tested, fuzzed and audited before any deploy."
 persona = "Builder"
 skills = ["solidity", "foundry", "openzeppelin", "solady", "trailofbits-audit"]
 workflow = "contract-build"
-workflow_available = false
+workflow_available = true
 ships_in = "HUP-S6"
 gates = [
   "forge test passes",
