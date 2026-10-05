@@ -1496,12 +1496,27 @@ pub fn production_tokenizer() -> sessions::TokenizerFactory {
 /// started with `--embeddings`). An https chat endpoint is never sent tool or skill text for
 /// embedding unless it is named here.
 pub fn production_embedder(embed_url: Option<String>) -> sessions::EmbedderFactory {
+    production_embedder_with_key(embed_url, None)
+}
+
+/// US-1.4: [`production_embedder`] for an endpoint that needs an API key, read from the file
+/// `key_file` names (`CITRATE_HERMES_EMBED_KEY_FILE`) each time a session is opened, so a key
+/// citrate-core rotates is picked up. The key goes only to the named endpoint. A key file that
+/// cannot be read leaves the session lexical, with the reason.
+pub fn production_embedder_with_key(
+    embed_url: Option<String>,
+    key_file: Option<std::path::PathBuf>,
+) -> sessions::EmbedderFactory {
     let embed_url = embed_url.filter(|u| !u.trim().is_empty());
     Arc::new(move |ep: &sessions::LlmEndpoint| match &embed_url {
         Some(url) => {
             sessions::validate_endpoint(url)
                 .map_err(|e| format!("{} was refused: {e}", retrieval_http::EMBED_URL_ENV))?;
-            Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, ""))
+            let key = match &key_file {
+                Some(p) => retrieval_http::read_embed_key(p)?,
+                None => String::new(),
+            };
+            Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, &key))
                 as Arc<dyn citrate_agent_loop::retrieval::Embedder>)
         }
         None if retrieval_http::is_loopback_http(&ep.base_url) => Ok(Arc::new(
@@ -1534,11 +1549,14 @@ pub fn production_sessions_with(
     );
     // HUP-S1.2 (US-1.4 AC1): token counts from the model's tokenizer, and tools and skills ranked
     // by embeddings plus keywords, each with an honest fallback the session reports.
-    let mgr = mgr
-        .with_tokenizer(production_tokenizer())
-        .with_embedder(production_embedder(
-            std::env::var(retrieval_http::EMBED_URL_ENV).ok(),
-        ));
+    let mgr =
+        mgr.with_tokenizer(production_tokenizer())
+            .with_embedder(production_embedder_with_key(
+                std::env::var(retrieval_http::EMBED_URL_ENV).ok(),
+                std::env::var_os(retrieval_http::EMBED_KEY_FILE_ENV)
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from),
+            ));
     // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
     let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
