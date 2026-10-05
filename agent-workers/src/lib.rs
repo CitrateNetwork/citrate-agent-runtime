@@ -24,8 +24,10 @@
 //! died without a clean shutdown.
 //!
 //! Honest scope: this supervises processes; it is not a sandbox. A worker runs with the sidecar's
-//! user and environment. Programs a worker itself started (a forge run, say) are that worker's
-//! responsibility; if the worker is killed mid-run they may outlive it until their own timeout.
+//! user, and with the sidecar's environment unless its spec names an inherit list. On Unix each
+//! worker starts a session of its own, and when it ends (crash, kill or shutdown) every process
+//! left in that session is killed, so programs it started in their own process groups (a forge
+//! run, say) do not outlive it. On Windows they may still outlive it until their own timeout.
 //! Nothing here holds a key or signs (Rule 3).
 
 pub mod protocol;
@@ -73,6 +75,22 @@ pub struct WorkerSpec {
     /// Removed from the inherited environment (least privilege: e.g. the control-plane bearer
     /// file path, which no worker needs).
     pub env_remove: Vec<String>,
+    /// When set, the worker inherits only these variables (exact names, or a prefix ending in
+    /// `*`), then `env` is added and `env_remove` applied. `None` = the whole environment.
+    pub env_inherit: Option<Vec<String>>,
+}
+
+impl WorkerSpec {
+    /// Whether `name` is on the inherit list (`true` for every name without a list).
+    pub fn inherits(&self, name: &str) -> bool {
+        match &self.env_inherit {
+            None => true,
+            Some(list) => list.iter().any(|a| match a.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => a == name,
+            }),
+        }
+    }
 }
 
 /// Restart, health and shutdown bounds.
@@ -471,6 +489,29 @@ fn spawn_child(spec: &WorkerSpec) -> std::io::Result<Child> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    if spec.env_inherit.is_some() {
+        cmd.env_clear();
+        for (k, v) in std::env::vars_os() {
+            if k.to_str().is_some_and(|name| spec.inherits(name)) {
+                cmd.env(k, v);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid(2) is async-signal-safe and touches no memory of the parent; it runs in
+        // the forked child before exec. The worker leads a new session, so everything it starts
+        // (even in process groups of its own) can be found and stopped by session id.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     for k in &spec.env_remove {
         cmd.env_remove(k);
     }
@@ -499,6 +540,74 @@ fn reader(inner: Arc<Inner>, stdout: std::process::ChildStdout) {
         }
     }
 }
+
+/// Every process id on the system (best effort; empty when they cannot be listed).
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<libc::pid_t> {
+    // SAFETY: proc_listallpids with a null buffer returns the count; with a buffer of `cap`
+    // pid_t it fills at most `cap` entries and returns how many it wrote.
+    unsafe {
+        let n = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return Vec::new();
+        }
+        let cap = n as usize + 64;
+        let mut buf: Vec<libc::pid_t> = vec![0; cap];
+        let bytes = (cap * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        let got = libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes);
+        if got <= 0 {
+            return Vec::new();
+        }
+        buf.truncate((got as usize).min(cap));
+        buf
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn all_pids() -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc")
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Kill every process left in the session the worker `sid` led (see [`spawn_child`]): the
+/// programs it started, whatever process group they are in. Run right after the worker is
+/// reaped. Best effort, a few passes in case one of them was forking.
+#[cfg(unix)]
+fn stop_session(sid: u32) {
+    let Ok(sid) = libc::pid_t::try_from(sid) else {
+        return;
+    };
+    // SAFETY: getpid/getsid/kill are plain syscalls on integer ids; no memory is shared.
+    let me = unsafe { libc::getpid() };
+    for _ in 0..3 {
+        let mut found = false;
+        for pid in all_pids() {
+            if pid <= 1 || pid == me {
+                continue;
+            }
+            // SAFETY: see above.
+            if unsafe { libc::getsid(pid) } == sid {
+                found = true;
+                // SAFETY: see above.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        if !found {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_session(_sid: u32) {}
 
 /// Kill the child (best effort) and reap it.
 fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
@@ -632,9 +741,12 @@ fn monitor(inner: Arc<Inner>) {
                         .name(format!("citrate-worker-{}-io", inner.spec.kind.as_str()))
                         .spawn(move || reader(r, out));
                 }
-                inner.lock().pid = Some(child.id());
+                let pid = child.id();
+                inner.lock().pid = Some(pid);
                 let end = watch(&inner, &mut child);
                 inner.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
+                // The worker is gone (and reaped); stop anything it left running.
+                stop_session(pid);
                 end
             }
         };

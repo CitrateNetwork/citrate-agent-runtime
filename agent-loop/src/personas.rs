@@ -432,6 +432,27 @@ impl SessionPersona {
     }
 }
 
+/// The prompt fragment for a `POST /sessions` persona, rendered here from the persona the sidecar
+/// checks: a shipped persona by id, or a custom persona that passes [`CustomPersona::check`]. The
+/// client never supplies the fragment text, so a fragment edited in app state cannot reach the
+/// prompt. `Ok(None)` when the request names no persona; the same refusals as
+/// [`session_persona`] otherwise.
+pub fn session_persona_fragment(
+    id: Option<&str>,
+    custom: Option<&CustomPersona>,
+) -> Result<Option<String>, String> {
+    match (id, custom) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err("give a persona id or a custom persona, not both".into()),
+        (Some(id), None) => bundled_personas()?
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| Some(p.prompt_fragment()))
+            .ok_or_else(|| format!("no shipped persona {id:?}")),
+        (None, Some(c)) => c.check().map(|v| Some(v.prompt_fragment)),
+    }
+}
+
 /// The session persona for a `POST /sessions` request: a shipped persona by id, or a custom one
 /// (checked here with [`CustomPersona::check`]), or none. Both at once, an unknown id, or a custom
 /// persona that fails its check are refused.

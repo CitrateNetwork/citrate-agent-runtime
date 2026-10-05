@@ -21,7 +21,7 @@ the model saying the tests pass.
 
 | Tool | Program and fixed argv | Verdict passes when |
 |---|---|---|
-| `forge_test` | `forge test --json [--match-test T] [--match-contract C]` | at least one test ran and none failed |
+| `forge_test` | `forge test --json --force [--match-test T] [--match-contract C]` (`--force` rebuilds from the sources, so `out/` only holds what this run built) | at least one test ran and none failed |
 | `slither_scan` | `slither . --sarif - --exclude-dependencies --disable-color` | no finding at or above `fail_on` (default high) |
 | `aderyn_scan` | `aderyn . --output aderyn-report.sarif --stdout --skip-update-check` | no finding at or above `fail_on` (default high) |
 | `medusa_fuzz` | `medusa fuzz --no-color --test-limit N --timeout S` | the run printed its summary, at least one test ran, none failed |

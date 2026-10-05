@@ -278,7 +278,7 @@ fn in_the_loop_reading_a_page_taints_and_the_next_click_waits_for_the_member() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     let stop = StopFlag::default();
     let registry = ToolRegistry::new(tools::specs()).with_host(
         HostKind::Sidecar,
@@ -382,7 +382,7 @@ fn an_approval_is_bound_to_the_snapshot_the_member_was_shown() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     let login = format!("{base}/login");
     svc.navigate(&login).expect("navigates");
     svc.snapshot().expect("snapshot");
@@ -421,7 +421,7 @@ fn an_approval_is_void_when_the_page_moves_on_by_itself() {
         return;
     };
     let base = common::serve();
-    let svc = Arc::new(BrowserService::new(common::config(exe)));
+    let svc = Arc::new(BrowserService::new(common::config_allowing(exe, &base)));
     svc.navigate(&format!("{base}/spa")).expect("navigates");
     let (_, snap) = svc.snapshot().expect("snapshot");
     assert!(
@@ -443,5 +443,45 @@ fn an_approval_is_void_when_the_page_moves_on_by_itself() {
     match t.join().expect("joins") {
         ToolOutcome::Error(e) => assert!(e.contains("changed"), "{e}"),
         other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn console_and_network_arguments_are_bounded_without_a_browser() {
+    use citrate_agent_browser::pagelog::ConsoleLevel;
+    assert_eq!(
+        tools::parse_console(&call(tools::CONSOLE, "")),
+        Ok((ConsoleLevel::Debug, tools::DEFAULT_LOG_ENTRIES))
+    );
+    assert_eq!(
+        tools::parse_console(&call(tools::CONSOLE, r#"{"level":"error","limit":100}"#)),
+        Ok((ConsoleLevel::Error, tools::MAX_LOG_ENTRIES))
+    );
+    for bad in [
+        r#"{"limit":0}"#,
+        r#"{"limit":101}"#,
+        r#"{"limit":-1}"#,
+        r#"{"limit":"5"}"#,
+        r#"{"level":"fatal"}"#,
+        "[]",
+    ] {
+        assert!(
+            tools::parse_console(&call(tools::CONSOLE, bad)).is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        tools::parse_network(&call(tools::NETWORK, r#"{"problems_only":true,"limit":1}"#)),
+        Ok((true, 1))
+    );
+    for bad in [
+        r#"{"limit":101}"#,
+        r#"{"limit":0}"#,
+        r#"{"problems_only":"yes"}"#,
+    ] {
+        assert!(
+            tools::parse_network(&call(tools::NETWORK, bad)).is_err(),
+            "{bad}"
+        );
     }
 }
