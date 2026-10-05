@@ -20,8 +20,8 @@
     "known_divergence": "{reason, verdict, ts|loop|sidecar: per-implementation overrides of expect}. verdict rust_correct means the sidecar behavior is the intended one and the TS behavior retires with harness.ts; owner_decision means the owner must choose."
   },
   "limits": {
-    "ts_max_turns": 6,
-    "rust_max_steps": 6,
+    "ts_max_turns": 8,
+    "rust_max_steps": 8,
     "rust_max_tool_calls_per_step": 4
   },
   "tools": [
@@ -58,8 +58,8 @@
   "config_divergences": [
     {
       "id": "default_turn_cap",
-      "ts": "AGENT_MAX_TURNS = 6 model requests per user turn",
-      "sidecar": "sessions.rs default max_steps = 8 (core's sidecar provider opens sessions without overriding it)",
+      "ts": "AGENT_MAX_TURNS = 8 model requests per user turn (owner default pending sign-off, 2026-10-04; the in-app loop now serves only a configured gateway provider)",
+      "sidecar": "sessions.rs default max_steps = 8 (core's sidecar provider opens sessions without overriding it); the same cap, so the scripted and live expectations agree",
       "verdict": "owner_decision"
     },
     {
@@ -259,11 +259,11 @@
       "expect": {
         "outcome": "step_limit",
         "terminal": "error",
-        "model_calls": 6,
-        "host_calls": ["memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search"],
-        "tool_events": 6,
-        "last_request_roles": ["user", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool"],
-        "error_contains": { "ts": "tool-turn limit", "loop": "step budget of 6 exhausted", "sidecar": "step budget of 6 exhausted" }
+        "model_calls": 8,
+        "host_calls": ["memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search"],
+        "tool_events": 8,
+        "last_request_roles": ["user", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool", "assistant", "tool"],
+        "error_contains": { "ts": "tool-turn limit", "loop": "step budget of 8 exhausted", "sidecar": "step budget of 8 exhausted" }
       }
     },
     {
@@ -277,17 +277,19 @@
         { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"3\"}" } }] } },
         { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c4", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"4\"}" } }] } },
         { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c5", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"5\"}" } }] } },
-        { "message": { "role": "assistant", "content": "Found it on the sixth try." } }
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c6", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"6\"}" } }] } },
+        { "message": { "role": "assistant", "content": null, "tool_calls": [{ "id": "c7", "type": "function", "function": { "name": "memory_search", "arguments": "{\"query\":\"7\"}" } }] } },
+        { "message": { "role": "assistant", "content": "Found it on the eighth try." } }
       ],
       "tool_results": [],
       "tool_result_default": { "ok": "partial" },
       "expect": {
         "outcome": "answered",
-        "final": "Found it on the sixth try.",
+        "final": "Found it on the eighth try.",
         "terminal": "done",
-        "model_calls": 6,
-        "host_calls": ["memory_search", "memory_search", "memory_search", "memory_search", "memory_search"],
-        "tool_events": 5
+        "model_calls": 8,
+        "host_calls": ["memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search", "memory_search"],
+        "tool_events": 7
       }
     },
     {

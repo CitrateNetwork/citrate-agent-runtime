@@ -206,3 +206,41 @@ fn dropping_the_gate_stops_it_listening() {
         .unwrap_or(true);
     assert!(refused, "a dropped gate does not relay");
 }
+
+// ---- HUP-S5.5: off the open web ---------------------------------------------------------------
+
+#[test]
+fn off_the_open_web_an_allowed_loopback_origin_is_relayed() {
+    let (local, hits) = echo_server();
+    let allow = parse_allow_private(&format!("http://{local}")).expect("allow");
+    let gate = EgressGate::start_with(allow, false).expect("gate");
+    let mut s = connect(&gate);
+    greet(&mut s);
+    assert_eq!(request(&mut s, "127.0.0.1", local.port()), 0, "succeeded");
+    s.write_all(b"fork").expect("send through the gate");
+    let mut back = [0u8; 4];
+    s.read_exact(&mut back).expect("echo through the gate");
+    assert_eq!(&back, b"fork");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn off_the_open_web_public_and_unallowed_targets_are_refused() {
+    let (local, hits) = echo_server();
+    let gate = EgressGate::start_with(Vec::new(), false).expect("gate");
+    // Public literals and names are refused by the rule set before any connection or lookup;
+    // loopback without an allow is refused too.
+    for (host, port) in [
+        ("1.1.1.1", 443),
+        ("2606:4700:4700::1111", 443),
+        ("example.com", 443),
+        ("127.0.0.1", local.port()),
+        ("localhost", local.port()),
+    ] {
+        let mut s = connect(&gate);
+        assert_eq!(greet(&mut s), [5, 0]);
+        assert_eq!(request(&mut s, host, port), REFUSED_BY_RULESET, "{host}");
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was reached");
+}

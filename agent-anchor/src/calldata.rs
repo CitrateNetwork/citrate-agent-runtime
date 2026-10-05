@@ -3,8 +3,12 @@
 //! ```solidity
 //! enum AnchorKind { PerCapsule, PerApproval, NightlyMerkle }
 //! function anchor(AnchorKind kind, bytes32 root) external;     // anchor(uint8,bytes32)
-//! function isAnchored(bytes32 root) external view returns (bool);
+//! function isAnchored(bytes32 root) external view returns (bool);     // by anyone
 //! ```
+//!
+//! `isAnchored` says only that someone anchored the value. To confirm a client's own anchor, use
+//! [`crate::OwnAnchorCheck`] (`isAnchoredBy(committer, root)`, or the first record's committer on
+//! the deployed registry version).
 //!
 //! A Solidity enum is `uint8` in the ABI signature and a left-padded 32-byte word in calldata.
 //! The selectors below are pinned in tests against keccak-256 of the signature and against
@@ -60,7 +64,8 @@ pub fn anchor_calldata(kind: AnchorKind, root: &[u8; 32]) -> Vec<u8> {
     out
 }
 
-/// `isAnchored(root)` calldata (36 bytes), for an `eth_call`.
+/// `isAnchored(root)` calldata (36 bytes), for an `eth_call`. True when anyone anchored `root`;
+/// not a confirmation of the caller's own anchor (see [`crate::OwnAnchorCheck`]).
 pub fn is_anchored_calldata(root: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(36);
     out.extend_from_slice(&IS_ANCHORED_SELECTOR);
