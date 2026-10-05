@@ -11,7 +11,11 @@
 //!   signed or sent here.
 //! - `POST /anchor/confirm {day, commitment, txHash, blockNumber}`: core reports a mined, successful
 //!   receipt. The day is marked anchored only when `commitment` is the one batched for that day.
-//! - `GET /anchor/proof?seq=N`: an inclusion proof for one decision record.
+//! - `GET /anchor/proof?seq=N`: an inclusion proof for one decision record, plus whether the
+//!   retained record itself hashes to the proven leaf (`recordMatches`) and the exact bytes that
+//!   hash covers (`recordCanonical`), so core can check that binding without trusting the sidecar.
+//! - `GET /anchor/records?before=N&limit=M`: the retained records, newest first, each with its day
+//!   and that day's anchor state, so the member can pick a past decision to prove (US-7.2 AC3).
 //!
 //! Both directories come from citrate-core (`CITRATE_HERMES_RECORDS_DIR`,
 //! `CITRATE_HERMES_ANCHOR_DIR`). Unset: the routes answer "not configured".
@@ -19,14 +23,19 @@
 use std::path::{Path, PathBuf};
 
 use citrate_agent_anchor::{
-    pending_days, plan_day, prove, verify_proof, AnchorLedger, EntryStatus, Error as AnchorError,
-    NightlyPlan, RecordOutcome,
+    pending_days, plan_day, prove, verify_proof, verify_record_proof, AnchorLedger, EntryStatus,
+    Error as AnchorError, LedgerEntry, NightlyPlan, RecordOutcome,
 };
+use citrate_agent_records::merkle::utc_day;
 use serde::Serialize;
 
 pub const RECORDS_DIR_ENV: &str = "CITRATE_HERMES_RECORDS_DIR";
 pub const ANCHOR_DIR_ENV: &str = "CITRATE_HERMES_ANCHOR_DIR";
 const DAY_MS: u64 = 86_400_000;
+/// Records per `/anchor/records` page when the caller names no limit.
+pub const DEFAULT_RECORDS_PAGE: usize = 20;
+/// The most records one `/anchor/records` page returns.
+pub const MAX_RECORDS_PAGE: usize = 100;
 
 /// The two directories the anchor service needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +328,67 @@ impl AnchorService {
             .map_err(map_err)
     }
 
-    /// An inclusion proof for record `seq`, checked against the batched commitment.
+    /// A page of retained records, newest first, `seq` strictly below `before` when given. Each
+    /// carries its UTC day and that day's anchor state from the ledger (batched, confirmed with
+    /// which transaction). Reads only; a missing records folder is an empty page.
+    pub fn records_page(
+        &self,
+        before: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, AnchorRouteError> {
+        let limit = limit
+            .unwrap_or(DEFAULT_RECORDS_PAGE)
+            .clamp(1, MAX_RECORDS_PAGE);
+        let records_present = self.records_present();
+        let page = if records_present {
+            citrate_agent_records::read::page(&self.records_dir, before, limit)
+                .map_err(|e| AnchorRouteError::Internal(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let ledger: Vec<LedgerEntry> = self.ledger.entries().map_err(map_err)?;
+        let entry_for = |day: u64| ledger.iter().find(|e| e.day == day);
+        let mut out = Vec::with_capacity(page.len());
+        for r in &page {
+            let day = utc_day(r.record.ts_ms);
+            let entry = entry_for(day);
+            let batched = entry.is_some_and(|e| {
+                e.status == EntryStatus::Batched
+                    && (e.first_seq..=e.last_seq).contains(&r.record.seq)
+            });
+            let confirmed = entry.filter(|_| batched).and_then(|e| e.confirmed.as_ref());
+            let record = serde_json::to_value(&r.record)
+                .map_err(|e| AnchorRouteError::Internal(e.to_string()))?;
+            out.push(serde_json::json!({
+                "seq": r.record.seq,
+                "tsMs": r.record.ts_ms,
+                "day": day,
+                "date": date_of_day(day),
+                "hash": r.hash,
+                "batched": batched,
+                "anchored": confirmed.is_some(),
+                "anchorTx": confirmed.map(|c| c.tx_hash.clone()),
+                "anchorBlock": confirmed.map(|c| c.block_number),
+                "record": record,
+            }));
+        }
+        // A full page may have older records behind it; a short one is the last.
+        let next_before = if page.len() == limit {
+            page.last().map(|r| r.record.seq).filter(|s| *s > 0)
+        } else {
+            None
+        };
+        Ok(serde_json::json!({
+            "configured": true,
+            "recordsPresent": records_present,
+            "limit": limit,
+            "records": out,
+            "nextBefore": next_before,
+        }))
+    }
+
+    /// An inclusion proof for record `seq`, checked against the batched commitment, plus whether
+    /// the retained record itself hashes to the proven leaf (`recordMatches`) and the record.
     pub fn proof(&self, seq: u64) -> Result<serde_json::Value, AnchorRouteError> {
         if !self.records_present() {
             return Err(AnchorRouteError::NotFound(format!(
@@ -331,12 +400,44 @@ impl AnchorService {
             .ok_or_else(|| AnchorRouteError::NotFound(format!("record {seq} is not retained")))?;
         let commitment = p.header.commitment();
         let entry = self.ledger.get(p.header.day).map_err(map_err)?;
+        let record = citrate_agent_records::read::get(&self.records_dir, seq)
+            .map_err(|e| AnchorRouteError::Internal(e.to_string()))?;
+        // The proof says the leaf is in the batch; this says the leaf is this record.
+        let record_matches = match &record {
+            Some(r) => verify_record_proof(r, &p, &commitment).unwrap_or(false),
+            None => false,
+        };
+        let record_json = match &record {
+            Some(r) => Some(
+                serde_json::to_value(&r.record)
+                    .map_err(|e| AnchorRouteError::Internal(e.to_string()))?,
+            ),
+            None => None,
+        };
+        // The exact bytes the record hash covers, so core can bind the content to the leaf
+        // without trusting this process: SHA-256("citrate.agent-records.v1\n" || bytes).
+        let record_canonical = match &record {
+            Some(r) => Some(
+                r.record
+                    .canonical_json()
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .ok_or_else(|| {
+                        AnchorRouteError::Internal("the record could not be encoded".into())
+                    })?,
+            ),
+            None => None,
+        };
         Ok(serde_json::json!({
             "seq": seq,
             "day": p.header.day,
             "date": date_of_day(p.header.day),
             "commitment": hex32(&commitment),
             "verifies": verify_proof(&p, &commitment),
+            "recordMatches": record_matches,
+            "recordHash": hex::encode(p.record_hash),
+            "record": record_json,
+            "recordCanonical": record_canonical,
             "anchored": entry.and_then(|e| e.confirmed),
             "proof": p,
         }))

@@ -451,6 +451,9 @@ pub struct Session {
     /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
     /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
     toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S6.3 → S6.4: the raw reports of this session's toolchain runs, for core's deploy gate
+    /// (present with the toolchain).
+    toolchain_reports: Option<Arc<crate::toolchain_reports::ToolchainReports>>,
     /// HUP-S7.5: derives one metering record per turn from the event stream.
     metering: Arc<MeteringSink>,
     /// Where this session's finished metering records go.
@@ -476,6 +479,9 @@ pub struct Session {
     retriever: Arc<HybridRetriever>,
     /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
     shell: Option<Arc<ShellRunSession>>,
+    /// HUP-S5.3: the session's own model endpoint, which `browser_pick` asks through the metered
+    /// `decide()` slot (local grammar backend unless the member opted into Jev for the origin).
+    decide_llm: LlmEndpoint,
     /// HUP-S4.1: the MCP specs this session was offered (calls to tools that changed since are
     /// refused), and its MCP approval cards (present only for an HIC-aware client).
     mcp_offered: Option<Arc<HashMap<String, ToolSpec>>>,
@@ -483,6 +489,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
+    /// given. `None` when this session has no toolchain.
+    pub fn toolchain_reports(
+        &self,
+        project: Option<&str>,
+    ) -> Option<Vec<crate::toolchain_reports::StoredReport>> {
+        self.toolchain_reports.as_ref().map(|r| r.list(project))
+    }
+
     /// HUP-S4.1: the MCP cards waiting for the member (`None` when the session has none).
     pub fn mcp_pending(&self) -> Option<Vec<crate::mcp_approvals::McpPending>> {
         self.mcp_approvals.as_ref().map(|a| a.pending())
@@ -1477,6 +1492,17 @@ impl SessionManager {
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
             (None, _) => None,
         };
+        // HUP-S6.3 → S6.4: keep each run's raw report for core's deploy gate; the model sees the
+        // result without it.
+        let toolchain_reports = toolchain
+            .as_ref()
+            .map(|_| Arc::new(crate::toolchain_reports::ToolchainReports::default()));
+        let toolchain: Option<Arc<dyn ToolHost>> = match (toolchain, &toolchain_reports) {
+            (Some(t), Some(r)) => Some(Arc::new(
+                crate::toolchain_reports::CapturingToolchain::new(t, r.clone()),
+            )),
+            (t, _) => t,
+        };
         // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
         // grant store), not a grants file.
         let files = match (&grants, &self.checkpoints) {
@@ -1567,6 +1593,7 @@ impl SessionManager {
                 c.clone(),
             )
         });
+        let decide_llm = req.llm.clone();
         let llm: Arc<dyn LlmClient> = Arc::new(MeteredLlm::new(
             (self.llm_factory)(&req.llm),
             metering.clone(),
@@ -1590,6 +1617,7 @@ impl SessionManager {
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills,
             toolchain,
+            toolchain_reports,
             grants,
             capsule_sandbox,
             metering,
@@ -1602,6 +1630,7 @@ impl SessionManager {
             token_counter,
             retriever,
             shell,
+            decide_llm,
             mcp_offered,
             mcp_approvals,
         });
@@ -1724,10 +1753,15 @@ impl SessionManager {
             .learn
             .clone()
             .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
-        let browser_host = self
-            .browser
-            .clone()
-            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        let browser_host = self.browser.clone().map(|b| {
+            BrowserToolHost::new(b, session.stop.clone()).with_picker(Arc::new(
+                crate::decide::SessionPicker::new(
+                    self.decide.clone(),
+                    session.decide_llm.clone(),
+                    &session.cfg.model,
+                ),
+            ))
+        });
         let shell_host = session
             .shell
             .as_ref()

@@ -41,6 +41,7 @@ pub mod shell_run;
 pub mod signin_routes;
 pub mod toolchain;
 mod toolchain_config;
+pub mod toolchain_reports;
 pub mod trajectory;
 pub mod verify_probes;
 pub mod web_signing_records;
@@ -292,6 +293,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/grants", post(replace_grants))
         .route("/sessions/:id/retrieval", get(session_retrieval))
         .route("/sessions/:id/shell/pending", get(shell_pending))
+        .route("/sessions/:id/toolchain/reports", get(toolchain_reports))
         .route("/sessions/:id/shell/decide", post(shell_decide))
         .route("/sessions/:id/mcp/pending", get(mcp_pending))
         .route("/sessions/:id/mcp/decide", post(mcp_decide))
@@ -348,6 +350,11 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/checkpoints/:session/undo",
             post(checkpoint_routes::undo_session),
         )
+        // HUP-S5.4: one step's diff for the Code and diff pop-out (read-only).
+        .route(
+            "/checkpoints/:session/steps/:seq/diff",
+            get(checkpoint_routes::step_diff),
+        )
         // HUP-S1.9: the worker processes (toolchain, browser) and their health
         .route("/workers", get(workers_status))
         // HUP-S7.5: the daily metering report + opt-in BenchmarkRegistry calldata (built, never sent)
@@ -361,6 +368,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/anchor/plan", post(chain_routes::anchor_plan))
         .route("/anchor/confirm", post(chain_routes::anchor_confirm))
         .route("/anchor/proof", get(chain_routes::anchor_proof))
+        .route("/anchor/records", get(chain_routes::anchor_records))
         // HUP-S1.5: one escalation to a member endpoint (core checked the budget and passes the
         // key per request), and the registry route's status (disabled in this build).
         .route("/escalations", post(escalation::escalate))
@@ -1137,6 +1145,34 @@ async fn mcp_decide(
             Err(json_err(StatusCode::CONFLICT, &msg))
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ToolchainReportsQuery {
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// HUP-S6.3 → S6.4: `GET /sessions/:id/toolchain/reports[?project=<abs path>]` — the latest raw
+/// report per (project, tool) of this session's toolchain runs, for core's deploy gate. 404 when
+/// the session is unknown or was opened without the toolchain.
+async fn toolchain_reports(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ToolchainReportsQuery>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let reports = session
+        .toolchain_reports(q.project.as_deref())
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "this session has no toolchain"))?;
+    Ok(Json(serde_json::json!({ "reports": reports })))
 }
 
 #[derive(Deserialize)]
@@ -2059,6 +2095,8 @@ async fn start_track_workflow(
 }
 
 #[cfg(test)]
+mod anchor_records_route_tests;
+#[cfg(test)]
 mod anchor_route_tests;
 #[cfg(test)]
 mod capsule_sandbox_tests;
@@ -2101,6 +2139,8 @@ mod search_session_tests;
 mod shell_run_tests;
 #[cfg(test)]
 mod signin_route_tests;
+#[cfg(test)]
+mod toolchain_reports_tests;
 #[cfg(test)]
 mod toolchain_tests;
 

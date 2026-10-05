@@ -155,7 +155,8 @@ fn usage_is_parsed_from_the_provider_response_when_present() {
         llm_http::parse_usage(body),
         Some(TokenUsage {
             prompt_tokens: 31,
-            completion_tokens: 7
+            completion_tokens: 7,
+            generation_ms: None,
         })
     );
 }
@@ -185,6 +186,7 @@ async fn a_turn_produces_a_metering_record_with_reported_tokens() {
         Some(TokenUsage {
             prompt_tokens: 12,
             completion_tokens: 3,
+            generation_ms: None,
         }),
     ));
     let id = create(&st, no_tools()).await;
@@ -229,6 +231,7 @@ async fn usage_from_every_step_of_a_turn_is_summed() {
         Some(TokenUsage {
             prompt_tokens: 10,
             completion_tokens: 2,
+            generation_ms: None,
         }),
     ));
     let id = create(&st, no_tools()).await;
@@ -421,4 +424,38 @@ fn trajectory_config_reads_only_an_explicit_directory() {
     let abs = std::env::temp_dir();
     let c = trajectory::TrajectoryConfig::from_value(Some(abs.to_str().unwrap())).unwrap();
     assert_eq!(c.dir(), abs.as_path());
+}
+
+// ---------------------------------------------------------------------------------------------
+// HUP-S7.6: llama-server's generation time rides along with the usage
+
+#[test]
+fn llama_server_generation_time_is_read_from_timings() {
+    let body = r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":31,"completion_tokens":7},"timings":{"prompt_n":31,"predicted_n":7,"predicted_ms":233.6,"predicted_per_second":29.97}}"#;
+    assert_eq!(
+        llm_http::parse_usage(body),
+        Some(TokenUsage {
+            prompt_tokens: 31,
+            completion_tokens: 7,
+            generation_ms: Some(234),
+        })
+    );
+}
+
+#[test]
+fn a_missing_or_nonsense_generation_time_is_unknown() {
+    for timings in [
+        r#""timings":{}"#,
+        r#""timings":{"predicted_ms":"fast"}"#,
+        r#""timings":{"predicted_ms":-4}"#,
+        r#""timings":{"predicted_ms":1e300}"#,
+        r#""timings":null"#,
+    ] {
+        let body = format!(r#"{{"usage":{{"prompt_tokens":1,"completion_tokens":2}},{timings}}}"#);
+        assert_eq!(
+            llm_http::parse_usage(&body).and_then(|u| u.generation_ms),
+            None,
+            "{body}"
+        );
+    }
 }

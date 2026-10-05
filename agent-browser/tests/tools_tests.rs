@@ -445,3 +445,43 @@ fn an_approval_is_void_when_the_page_moves_on_by_itself() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 }
+
+#[test]
+fn console_and_network_arguments_are_bounded_without_a_browser() {
+    use citrate_agent_browser::pagelog::ConsoleLevel;
+    assert_eq!(
+        tools::parse_console(&call(tools::CONSOLE, "")),
+        Ok((ConsoleLevel::Debug, tools::DEFAULT_LOG_ENTRIES))
+    );
+    assert_eq!(
+        tools::parse_console(&call(tools::CONSOLE, r#"{"level":"error","limit":100}"#)),
+        Ok((ConsoleLevel::Error, tools::MAX_LOG_ENTRIES))
+    );
+    for bad in [
+        r#"{"limit":0}"#,
+        r#"{"limit":101}"#,
+        r#"{"limit":-1}"#,
+        r#"{"limit":"5"}"#,
+        r#"{"level":"fatal"}"#,
+        "[]",
+    ] {
+        assert!(
+            tools::parse_console(&call(tools::CONSOLE, bad)).is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        tools::parse_network(&call(tools::NETWORK, r#"{"problems_only":true,"limit":1}"#)),
+        Ok((true, 1))
+    );
+    for bad in [
+        r#"{"limit":101}"#,
+        r#"{"limit":0}"#,
+        r#"{"problems_only":"yes"}"#,
+    ] {
+        assert!(
+            tools::parse_network(&call(tools::NETWORK, bad)).is_err(),
+            "{bad}"
+        );
+    }
+}

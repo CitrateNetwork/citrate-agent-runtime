@@ -192,6 +192,9 @@ impl MeteringSink {
             | Event::Final { .. }
             | Event::Error { .. } => {}
             Event::Verifier { .. } | Event::SelfReview { .. } => {}
+            // Usage reaches the record through the metered client (`record_usage`); the plan is
+            // workflow bookkeeping. Counting either here would double them.
+            Event::Usage { .. } | Event::Plan { .. } => {}
         }
     }
 }

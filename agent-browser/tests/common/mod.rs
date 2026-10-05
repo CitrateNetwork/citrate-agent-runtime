@@ -156,14 +156,22 @@ pub fn serve_logged() -> (String, RequestLog) {
     (format!("http://{addr}"), log)
 }
 
-/// The Chromium the live tests use, or None (the test prints that it skipped).
+/// The Chromium the live tests use, or None (the test prints that it skipped). A managed
+/// Chromium named by `CITRATE_BROWSER_CHROMIUM` (for example an unpacked Chrome for Testing) is
+/// preferred over a system one, as in production.
 pub fn chromium() -> Option<PathBuf> {
-    match discover(None, &system_candidates()) {
+    let managed = std::env::var_os(citrate_agent_browser::chromium::MANAGED_CHROMIUM_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    match discover(managed.as_deref(), &system_candidates()) {
         ChromiumStatus::NotInstalled { .. } => {
             eprintln!("SKIPPED: no Chromium-family browser is installed on this machine");
             None
         }
-        s => s.path(),
+        s => {
+            eprintln!("live browser: {s:?}");
+            s.path()
+        }
     }
 }
 

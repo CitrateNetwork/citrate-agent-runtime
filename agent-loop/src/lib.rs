@@ -497,6 +497,11 @@ impl DeltaCoalescer {
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// HUP-S7.6: how long the provider spent generating the completion, in milliseconds, when it
+    /// reports that (llama-server's `timings.predicted_ms`). `None` when it does not: tokens per
+    /// second is then unknown, never guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -547,6 +552,21 @@ pub enum Event {
     Final {
         content: String,
     },
+    /// HUP-S7.6 (US-7.4 AC1): the token usage the provider reported for the model call of `step`.
+    /// Emitted only when the provider reported usage; a call without it emits nothing (unknown,
+    /// never zero).
+    Usage {
+        step: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        generation_ms: Option<u64>,
+    },
+    /// HUP-S7.6 (US-7.4 AC1): a workflow run's plan, emitted once before its first step: the step
+    /// ids in the order they run. Verifier events then report each step's verdicts.
+    Plan {
+        steps: Vec<String>,
+    },
     /// HUP-S1.3: one verifier's verdict on a workflow step attempt.
     Verifier {
         step: String,
@@ -582,6 +602,8 @@ impl Event {
             Event::Tainted { .. } => "tainted",
             Event::AssistantDelta { .. } => "assistant_delta",
             Event::Final { .. } => "final",
+            Event::Usage { .. } => "usage",
+            Event::Plan { .. } => "plan",
             Event::Verifier { .. } => "verifier",
             Event::SelfReview { .. } => "self_review",
             Event::Error { .. } => "error",
@@ -731,7 +753,17 @@ pub fn run_turn_with(
         let streamed = llm.complete_streaming(&req, &mut |d| deltas.push(sink, d));
         deltas.flush(sink);
         let turn = match streamed {
-            Ok((t, _)) => t,
+            Ok((t, usage)) => {
+                if let Some(u) = usage {
+                    sink.emit(Event::Usage {
+                        step,
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                        generation_ms: u.generation_ms,
+                    });
+                }
+                t
+            }
             Err(e) => {
                 let msg = e.to_string();
                 sink.emit(Event::Error {
@@ -1539,6 +1571,9 @@ pub fn run_workflow_reviewed(
     reviewer: Option<&dyn SelfReviewer>,
 ) -> WorkflowOutcome {
     let mut answers = Vec::new();
+    sink.emit(Event::Plan {
+        steps: wf.steps.iter().map(|st| st.id.clone()).collect(),
+    });
     for st in &wf.steps {
         let mut feedback: Vec<String> = Vec::new();
         let mut passed = false;

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-branch: hup/n4-search-decide
+branch: hup/n4-search-decide (updated on hup/n6-web-browse, 2026-10-04)
 author: Larry Klosowski + Claude Opus 5.5
 status: active
 ---
@@ -52,7 +52,17 @@ are refused as unsupported.
 - A child that exits or never becomes healthy is killed and reported. After three failed starts
   the supervisor gives up (a new sidecar start resets it). Shutdown and drop stop the child.
 - The tests use a small fixture program (`fixtures/searxng_fixture.rs`) that speaks the same
-  settings file and HTTP surface, because SearXNG is not installed on CI or on the build machine.
+  settings file and HTTP surface, because SearXNG is not installed on CI.
+- **Live, 2026-10-04.** SearXNG at commit `d48c4b555` (2026.10.4) was installed with pip into a
+  Python 3.12 virtualenv and run by this supervisor from the sidecar, with a real model calling
+  `web_search` and then `read_url` (local reading). Transcript:
+  [`evals/live-run-2026-10-04.json`](evals/live-run-2026-10-04.json). The first attempt found a
+  real bug the fixture could not: the generated `settings.yml` had lost its indentation (a Rust
+  line continuation drops leading spaces), so SearXNG refused it. Fixed, with a test that pins
+  the nesting. Some upstream engines refused or timed out (brave rate-limited, duckduckgo a
+  CAPTCHA); results came from the others.
+- The component entry (`searxng`, AGPL-3.0-or-later) and its hash lock are in
+  `citrate-core/components/` (HUP-S5.5); packing and signing them is the release step.
 
 ## Pending owner sign-off
 
