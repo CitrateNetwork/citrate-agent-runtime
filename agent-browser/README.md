@@ -1,8 +1,8 @@
 ---
 created: 2026-10-01
-branch: hup/n4-browser
+branch: hup/n4-browser (updated on hup/n6-web-browse, 2026-10-04)
 author: Larry Klosowski + Claude Opus 5.5
-status: implemented and wired into sidecar sessions behind CITRATE_HERMES_BROWSER (default off); managed Chromium install is HUP-S5.5
+status: implemented and wired into sidecar sessions behind CITRATE_HERMES_BROWSER (default off; core's Settings switch sets it); installing the managed Chromium waits for the signed component manifest (HUP-S5.5)
 ---
 
 # citrate-agent-browser
@@ -29,6 +29,15 @@ sessions are unchanged.
 - **Acts by ref**: click, or type (optionally clearing the field first and pressing Enter).
 - **Screencast**: JPEG frames for the Browser pop-out, plus an outline of the element Hermes is
   about to act on (`pending`) or just acted on (`acted`).
+- **Console and network** (02 §5): Chrome's own console, exception, log and request events on
+  the worker's tab are kept (the latest 200 of each, `src/pagelog.rs`): level and text, or method,
+  address without its query string, fragment or user info, type and status or failure. Never
+  bodies, headers or cookies. Read through two read-only tools.
+- **Picks the next move with `decide()`** (S5.3, `src/pick.rs`): the snapshot becomes a fixed set
+  of moves (`click:e3`, `type:e5`, `enter:e5`, `done`, `blocked`) and the `decide()` slot picks
+  one (the local grammar backend unless the member opted into Jev for the origin). `browser_pick`
+  only suggests; Hermes then acts with `browser_act`, so approvals are unchanged. `run_task` is
+  the multi-step scoring harness for `agent-loop/evals/web-subset-v2.json`.
 - **Attach to my Chrome** (S5.6): Hermes opens its own tab in a Chrome the member started with
   remote debugging on, after the member consents for this session. Every origin then needs
   per-origin consent; origins in `data/sensitive-origins.toml` (banking, email, health by
@@ -44,6 +53,9 @@ sessions are unchanged.
 | `browser_snapshot {}` | none | untrusted |
 | `browser_act {ref, action: click/type, text?, clear?, submit?}` | write | untrusted |
 | `browser_screenshot {}` | none | untrusted |
+| `browser_console_messages {level?, limit?}` | none | untrusted |
+| `browser_network_requests {problems_only?, limit?}` | none | untrusted |
+| `browser_pick {goal}` | none | untrusted |
 
 Every page is untrusted: output is fenced as data and taints the session (HUP-S2.7). After
 taint, `browser_navigate` and `browser_act` wait for the member's explicit decision
@@ -93,11 +105,30 @@ Keyless: the worker never sees a key, never signs and never decides.
   On Linux they pass `--no-sandbox` (tests only; production never does).
 - `CITRATE_RECORD_FIXTURES=1 cargo test -p citrate-agent-browser --test live_chrome_tests`
   re-records `tests/fixtures/ax-login-form.json`.
+- `tests/web_subset_tests.rs`: the web-subset-v2 fixture checks (anywhere), and live: a scripted
+  picker finishes every task with the offered moves, early or wrong stops are not successes, a
+  control whose clicks change nothing is withheld, the console and network tools read a real
+  page, and `browser_pick` suggests without acting.
+- Set `CITRATE_BROWSER_CHROMIUM` to run the live tests against a managed Chromium (for example
+  an unpacked Chrome for Testing) instead of a system one. On 2026-10-04 all of them passed against
+  Chrome for Testing 154.0.8037.92 (macos-arm64), run with `--test-threads=1`: in parallel, on a
+  heavily loaded machine, Chrome can take more than the launch timeout to start (A51).
+- The scored run with a real model is `agent-sidecar/tests/browse_live.rs` (see
+  `agent-loop/DECIDE.md`).
+
+## Third-party patterns
+
+`src/pick.rs` adapts ideas (no code) from `ThinkFlowLab/system1-agents` (Apache-2.0,
+`s1a/browser/action_space.py`) and `typesafe-ai/skills` (MIT, `skills/typesafe-ai/SKILL.md`), with
+attribution in the module header. The TypeSafe skill itself is not vendored as a Hermes skill: it
+is an integration guide for TypeSafe's hosted API that tells the agent to read the vendor's live
+documentation, and the Jev vendor and terms decision is still open.
 
 ## Not done here
 
-- Installing or updating the managed Chromium (HUP-S5.5 component updater).
-- `console` and `network` browser tools from the architecture table. (The architecture's
-  `siwe_sign` is served by the sign-in bridge above: the page asks, core decides.)
-- The `decide()` System-1 element picker (HUP-S5.3).
+- Installing or updating the managed Chromium: the bundle entry is measured
+  (`citrate-core/components/toolchain-bundle.json`, `chromium`), but the component key ceremony
+  and a signed manifest are external, and the updater does not unpack zip yet.
+- The architecture's `siwe_sign` is served by the sign-in bridge above: the page asks, core
+  decides.
 - The default sensitive-origins list is pending owner sign-off.

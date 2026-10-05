@@ -1,0 +1,133 @@
+{
+ "suite": "web-subset-v2",
+ "note": "HUP-S5.3: ten multi-step tasks over local fixture sites, served from 127.0.0.1 by the test (pages below, matched by path; query strings are read by the pages' own scripts). Each task is a goal, the values it asks to enter, and an end-state check on the page. A run succeeds when the picker says done and the page meets the check at that moment. Not the WebVoyager benchmark: a small, harder-than-v1 floor with distractors, hidden panels, a cookie banner and multi-field forms.",
+ "tasks": [
+  {
+   "id": "search-open-result",
+   "start": "/search",
+   "goal": "Search this site for 'citrate blockdag' and open the result titled 'Citrate BlockDAG overview'.",
+   "values": [
+    "citrate blockdag"
+   ],
+   "success": {
+    "url_contains": "/docs/blockdag"
+   }
+  },
+  {
+   "id": "shop-size-cart",
+   "start": "/shop",
+   "goal": "Put the Trail Runner 4 shoe in size 10 into the shopping cart.",
+   "success": {
+    "url_contains": "/shop/cart",
+    "text_contains": "Cart: trail-runner, size 10"
+   }
+  },
+  {
+   "id": "login-email",
+   "start": "/login",
+   "goal": "Sign in with the email ada@example.org.",
+   "values": [
+    "ada@example.org"
+   ],
+   "success": {
+    "text_contains": "Signed in as ada@example.org"
+   }
+  },
+  {
+   "id": "cookies-then-article",
+   "start": "/news",
+   "goal": "Reject all cookies, then open the article 'Rust 2.0 ships'.",
+   "success": {
+    "url_contains": "/news/rust",
+    "text_contains": "Cookies: rejected"
+   }
+  },
+  {
+   "id": "pagination-page-3",
+   "start": "/list",
+   "goal": "Go to page 3 of the results list.",
+   "success": {
+    "text_contains": "Page 3 of 5"
+   }
+  },
+  {
+   "id": "filter-stock-price",
+   "start": "/catalog",
+   "goal": "Show only items that are in stock and under $50, with no other filter.",
+   "success": {
+    "text_contains": "Filters: instock, under50"
+   }
+  },
+  {
+   "id": "contact-form",
+   "start": "/contact",
+   "goal": "Send a message to support with name 'Ada', email 'ada@example.org' and message 'Hello from Hermes'.",
+   "values": [
+    "Ada",
+    "ada@example.org",
+    "Hello from Hermes"
+   ],
+   "success": {
+    "text_contains": "Thanks, Ada (ada@example.org): Hello from Hermes"
+   },
+   "max_steps": 10
+  },
+  {
+   "id": "settings-email-alerts",
+   "start": "/settings",
+   "goal": "Turn on email alerts in the notification settings and save them.",
+   "success": {
+    "text_contains": "Email alerts: on"
+   }
+  },
+  {
+   "id": "docs-deploy-guide",
+   "start": "/docs",
+   "goal": "Find the guide that explains how to deploy a contract and open it.",
+   "success": {
+    "url_contains": "/docs/guides/deploy"
+   }
+  },
+  {
+   "id": "package-changelog-2",
+   "start": "/pkg",
+   "goal": "Open the changelog of version 2.0 of this package.",
+   "success": {
+    "url_contains": "/pkg/2.0/changelog"
+   }
+  }
+ ],
+ "pages": {
+  "/search": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Find</title></head><body><h1>Find</h1><form action=\"/search/results\" method=\"get\"><label for=\"q\">Search</label><input id=\"q\" name=\"q\" type=\"search\"><button type=\"submit\">Search</button></form><p><a href=\"/about\">About</a> <a href=\"/help\">Help</a></p></body></html>",
+  "/search/results": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Results</title></head><body><h1 id=\"h\">Results</h1><ul id=\"r\"></ul><p><a href=\"/search\">New search</a></p><script>var q = new URLSearchParams(location.search);var t=(q.get('q')||'').toLowerCase();document.getElementById('h').textContent='Results for '+t;var items=t.indexOf('blockdag')>=0?[['Blockchain games roundup','/games'],['GhostDAG paper','/docs/ghostdag'],['Citrate BlockDAG overview','/docs/blockdag']]:[];var ul=document.getElementById('r');items.forEach(function(i){var li=document.createElement('li');var a=document.createElement('a');a.href=i[1];a.textContent=i[0];li.appendChild(a);ul.appendChild(li);});if(!items.length){ul.textContent='No results';}</script></body></html>",
+  "/docs/blockdag": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Citrate BlockDAG overview</title></head><body><h1>Citrate BlockDAG overview</h1><p>Blocks reference many parents.</p></body></html>",
+  "/docs/ghostdag": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>GhostDAG paper</title></head><body><h1>GhostDAG paper</h1></body></html>",
+  "/games": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Games</title></head><body><h1>Blockchain games roundup</h1></body></html>",
+  "/shop": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Shop</title></head><body><h1>Shop</h1><ul><li><a href=\"/shop/road-racer\">Road Racer 2</a></li><li><a href=\"/shop/trail-runner\">Trail Runner 4</a></li><li><a href=\"/shop/city-walker\">City Walker</a></li></ul><a href=\"/shop/cart\">Cart (0)</a></body></html>",
+  "/shop/trail-runner": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Trail Runner 4</title></head><body><h1>Trail Runner 4</h1><p>Light trail shoe.</p><form action=\"/shop/cart\" method=\"get\"><input type=\"hidden\" name=\"item\" value=\"trail-runner\"><fieldset><legend>Size</legend><label><input type=\"radio\" name=\"size\" value=\"9\"> Size 9</label><label><input type=\"radio\" name=\"size\" value=\"10\"> Size 10</label><label><input type=\"radio\" name=\"size\" value=\"11\"> Size 11</label></fieldset><button type=\"button\">Add to wishlist</button><button type=\"submit\">Add to cart</button></form><a href=\"/shop\">Back to shop</a></body></html>",
+  "/shop/road-racer": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Road Racer 2</title></head><body><h1>Road Racer 2</h1><form action=\"/shop/cart\" method=\"get\"><input type=\"hidden\" name=\"item\" value=\"road-racer\"><label><input type=\"radio\" name=\"size\" value=\"10\"> Size 10</label><button type=\"submit\">Add to cart</button></form></body></html>",
+  "/shop/cart": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Cart</title></head><body><h1>Cart</h1><p id=\"c\">Cart is empty</p><script>var q = new URLSearchParams(location.search);if(q.get('item')){document.getElementById('c').textContent='Cart: '+q.get('item')+', size '+(q.get('size')||'none');}</script></body></html>",
+  "/login": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Sign in</title></head><body><h1>Sign in</h1><form action=\"/welcome\" method=\"get\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"text\"><button type=\"submit\">Continue</button></form><a href=\"/forgot\">Forgot your email?</a><button type=\"button\" disabled>Use a passkey</button></body></html>",
+  "/welcome": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Welcome</title></head><body><h1>Welcome</h1><p id=\"w\"></p><script>var q = new URLSearchParams(location.search);document.getElementById('w').textContent='Signed in as '+(q.get('email')||'nobody');</script></body></html>",
+  "/news": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Daily news</title></head><body><div role=\"dialog\" aria-label=\"Cookie choices\" id=\"banner\"><p>We use cookies.</p><button id=\"acc\">Accept all</button><button id=\"rej\">Reject all</button></div><h1>Daily news</h1><ul><li><a class=\"art\" href=\"/news/rust\">Rust 2.0 ships</a></li><li><a class=\"art\" href=\"/news/weather\">Weather this week</a></li></ul><script>var q = new URLSearchParams(location.search);var c=q.get('cookies');if(c){document.getElementById('banner').style.display='none';document.querySelectorAll('a.art').forEach(function(a){a.href=a.getAttribute('href')+'?cookies='+c;});}document.getElementById('acc').onclick=function(){location.href='/news?cookies=accepted';};document.getElementById('rej').onclick=function(){location.href='/news?cookies=rejected';};</script></body></html>",
+  "/news/rust": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Rust 2.0 ships</title></head><body><h1>Rust 2.0 ships</h1><p id=\"c\"></p><script>var q = new URLSearchParams(location.search);document.getElementById('c').textContent='Cookies: '+(q.get('cookies')||'not chosen');</script></body></html>",
+  "/news/weather": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Weather</title></head><body><h1>Weather this week</h1></body></html>",
+  "/list": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Results list</title></head><body><h1>Results list</h1><p id=\"p\"></p><ul id=\"items\"></ul><nav aria-label=\"Pages\"><a id=\"prev\">Previous page</a> <a id=\"next\">Next page</a></nav><script>var q = new URLSearchParams(location.search);var n=parseInt(q.get('page')||'1',10);document.getElementById('p').textContent='Page '+n+' of 5';for(var i=1;i<=3;i++){var li=document.createElement('li');li.textContent='Item '+((n-1)*3+i);document.getElementById('items').appendChild(li);}if(n>1){document.getElementById('prev').href='/list?page='+(n-1);}if(n<5){document.getElementById('next').href='/list?page='+(n+1);}</script></body></html>",
+  "/catalog": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Catalog</title></head><body><h1>Catalog</h1><form action=\"/catalog/results\" method=\"get\"><fieldset><legend>Filters</legend><label><input type=\"checkbox\" name=\"freeship\"> Free shipping</label><label><input type=\"checkbox\" name=\"instock\"> In stock only</label><label><input type=\"checkbox\" name=\"under50\"> Under $50</label><label><input type=\"checkbox\" name=\"sale\"> On sale</label></fieldset><button type=\"submit\">Apply filters</button><button type=\"reset\">Clear</button></form></body></html>",
+  "/catalog/results": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Catalog results</title></head><body><h1>Catalog results</h1><p id=\"f\"></p><script>var q = new URLSearchParams(location.search);var on=['freeship','instock','under50','sale'].filter(function(k){return q.get(k)==='on';});document.getElementById('f').textContent='Filters: '+(on.length?on.join(', '):'none');</script></body></html>",
+  "/contact": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Contact support</title></head><body><h1>Contact support</h1><form action=\"/contact/sent\" method=\"get\"><label for=\"n\">Your name</label><input id=\"n\" name=\"name\" type=\"text\"><label for=\"e\">Your email</label><input id=\"e\" name=\"email\" type=\"text\"><label for=\"m\">Message</label><textarea id=\"m\" name=\"message\"></textarea><button type=\"submit\">Send</button></form></body></html>",
+  "/contact/sent": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Sent</title></head><body><h1>Message sent</h1><p id=\"s\"></p><script>var q = new URLSearchParams(location.search);document.getElementById('s').textContent='Thanks, '+q.get('name')+' ('+q.get('email')+'): '+q.get('message');</script></body></html>",
+  "/settings": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Settings</title></head><body><h1>Settings</h1><div role=\"tablist\" aria-label=\"Settings sections\"><button role=\"tab\" id=\"t1\" aria-selected=\"true\">Profile</button><button role=\"tab\" id=\"t2\" aria-selected=\"false\">Notifications</button></div><form id=\"p1\" action=\"/settings/saved\" method=\"get\"><label for=\"dn\">Display name</label><input id=\"dn\" name=\"display\" type=\"text\"><button type=\"submit\">Save profile</button></form><form id=\"p2\" action=\"/settings/saved\" method=\"get\" style=\"display:none\"><label><input type=\"checkbox\" name=\"alerts\"> Email alerts</label><label><input type=\"checkbox\" name=\"digest\"> Weekly digest</label><button type=\"submit\">Save notifications</button></form><script>function show(i){document.getElementById('p1').style.display=i===1?'':'none';document.getElementById('p2').style.display=i===2?'':'none';document.getElementById('t1').setAttribute('aria-selected',i===1);document.getElementById('t2').setAttribute('aria-selected',i===2);}document.getElementById('t1').onclick=function(){show(1);};document.getElementById('t2').onclick=function(){show(2);};</script></body></html>",
+  "/settings/saved": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Saved</title></head><body><h1>Saved</h1><p id=\"s\"></p><script>var q = new URLSearchParams(location.search);document.getElementById('s').textContent='Email alerts: '+(q.get('alerts')==='on'?'on':'off');</script></body></html>",
+  "/docs": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Docs</title></head><body><h1>Docs</h1><ul><li><a href=\"/docs/start\">Getting started</a></li><li><a href=\"/docs/guides\">Guides</a></li><li><a href=\"/docs/api\">API reference</a></li></ul></body></html>",
+  "/docs/guides": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Guides</title></head><body><h1>Guides</h1><ul><li><a href=\"/docs/guides/write\">Write a contract</a></li><li><a href=\"/docs/guides/test\">Test a contract</a></li><li><a href=\"/docs/guides/deploy\">Deploy a contract</a></li></ul><a href=\"/docs\">All docs</a></body></html>",
+  "/docs/guides/deploy": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Deploy a contract</title></head><body><h1>Deploy a contract</h1><p>Use the deploy gate.</p></body></html>",
+  "/docs/start": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Getting started</title></head><body><h1>Getting started</h1></body></html>",
+  "/docs/api": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>API reference</title></head><body><h1>API reference</h1></body></html>",
+  "/pkg": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>citrate-sdk</title></head><body><h1>citrate-sdk</h1><p>Versions</p><ul><li><a href=\"/pkg/0.9\">v0.9</a></li><li><a href=\"/pkg/1.2\">v1.2</a></li><li><a href=\"/pkg/2.0\">v2.0 (latest)</a></li></ul></body></html>",
+  "/pkg/1.2": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>citrate-sdk 1.2</title></head><body><h1>citrate-sdk 1.2</h1><ul><li><a href=\"/pkg/1.2/readme\">Readme</a></li><li><a href=\"/pkg/1.2/changelog\">Changelog</a></li></ul></body></html>",
+  "/pkg/2.0": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>citrate-sdk 2.0</title></head><body><h1>citrate-sdk 2.0</h1><ul><li><a href=\"/pkg/2.0/readme\">Readme</a></li><li><a href=\"/pkg/2.0/changelog\">Changelog</a></li><li><a href=\"/pkg/2.0/install\">Install</a></li></ul></body></html>",
+  "/pkg/2.0/changelog": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Changelog 2.0</title></head><body><h1>Changelog for 2.0</h1></body></html>",
+  "/pkg/1.2/changelog": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Changelog 1.2</title></head><body><h1>Changelog for 1.2</h1></body></html>"
+ }
+}

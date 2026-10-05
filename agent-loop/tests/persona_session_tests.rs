@@ -8,7 +8,8 @@
 
 use citrate_agent_loop::interview::bundled_tracks;
 use citrate_agent_loop::personas::{
-    bundled_personas, session_persona, CustomPersona, SessionPersona, MAX_PINNED_EMPHASIS,
+    bundled_personas, session_persona, session_persona_fragment, CustomPersona, SessionPersona,
+    MAX_PINNED_EMPHASIS,
 };
 use citrate_agent_loop::skills::{SkillLibrary, SkillSource};
 use citrate_agent_loop::verifiers_tooling::{
@@ -274,4 +275,35 @@ fn workflow_views_carry_the_tools_a_pass_needs() {
     assert!(!hello.needs_tools.contains(&"contract_deploy".to_string()));
     let creative = views.iter().find(|v| v.id == "creative-project").unwrap();
     assert!(creative.needs_tools.is_empty());
+}
+
+/// L-23: the fragment a session gets is rendered from the checked persona, never sent by the app.
+#[test]
+fn the_session_fragment_is_rendered_from_the_checked_persona() {
+    assert_eq!(session_persona_fragment(None, None), Ok(None));
+    for p in bundled_personas().expect("personas") {
+        assert_eq!(
+            session_persona_fragment(Some(&p.id), None),
+            Ok(Some(p.prompt_fragment())),
+            "{}",
+            p.id
+        );
+    }
+    let c = custom(vec![], vec![]);
+    let view = c.check().expect("the fixture passes the persona checks");
+    assert_eq!(
+        session_persona_fragment(None, Some(&c)),
+        Ok(Some(view.prompt_fragment))
+    );
+}
+
+#[test]
+fn a_session_fragment_is_refused_for_an_unknown_bad_or_doubled_persona() {
+    assert!(session_persona_fragment(Some("no-such-persona"), None).is_err());
+    let c = custom(vec![], vec![]);
+    let id = bundled_personas().expect("personas")[0].id.clone();
+    assert!(session_persona_fragment(Some(&id), Some(&c)).is_err());
+    let mut bad = custom(vec![], vec![]);
+    bad.style_rules.clear();
+    assert!(session_persona_fragment(None, Some(&bad)).is_err());
 }

@@ -237,3 +237,57 @@ fn the_delta_wire_shape_is_stable() {
         serde_json::json!({"type": "assistant_delta", "step": 2, "text": "Hi"})
     );
 }
+
+/// A streamed answer with usage.
+struct StreamingWithUsage;
+impl LlmClient for StreamingWithUsage {
+    fn complete(&self, _req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
+        Ok(AssistantTurn::text("streamed"))
+    }
+    fn complete_streaming(
+        &self,
+        _req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        on_delta("streamed");
+        Ok((
+            AssistantTurn::text("streamed"),
+            Some(TokenUsage {
+                prompt_tokens: 40,
+                completion_tokens: 8,
+                generation_ms: Some(200),
+            }),
+        ))
+    }
+}
+
+/// HUP-S7.6 with HUP-S1.1: a streamed answer still reports the provider's usage to the monitor.
+#[test]
+fn a_streamed_answer_still_emits_its_usage() {
+    let sink = Sink::default();
+    let mut history = vec![];
+    let out = run_turn(
+        &cfg(),
+        &StreamingWithUsage,
+        &ToolRegistry::new(vec![]),
+        &sink,
+        &StopFlag::default(),
+        &mut history,
+        "hi",
+    );
+    assert_eq!(out, RunOutcome::Answered("streamed".into()));
+    let ev = sink.0.lock().unwrap().clone();
+    let usage: Vec<_> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::Usage {
+                prompt_tokens,
+                completion_tokens,
+                generation_ms,
+                ..
+            } => Some((*prompt_tokens, *completion_tokens, *generation_ms)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage, vec![(40, 8, Some(200))]);
+}

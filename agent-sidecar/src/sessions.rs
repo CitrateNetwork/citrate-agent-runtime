@@ -75,7 +75,7 @@ use std::time::{Duration, Instant};
 use citrate_agent_browser::tools::{self as browser_tools, BrowserToolHost};
 use citrate_agent_browser::BrowserService;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
-use citrate_agent_learn::{run_verified_workflow, Evidence, VerifiedRun};
+use citrate_agent_learn::{run_verified_workflow_reviewed, Evidence, VerifiedRun};
 use citrate_agent_loop::retrieval::{
     Embedder, HybridRetriever, ModelTokenCounter, RetrievalMode, TokenCounting, Tokenizer,
 };
@@ -83,10 +83,13 @@ use citrate_agent_loop::skills::{
     skill_load_spec, SkillHost, SkillLibrary, SkillSource, SkillTurnIndex, SKILL_LOAD_TOOL,
 };
 use citrate_agent_loop::{
-    run_turn_with, ContextBudget, Event, EventSink, HostKind, LlmClient, LoopConfig, Message,
-    StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome, ToolRegistry, ToolSpec, TurnContext,
-    TurnOptions, Workflow,
+    run_turn_with, ContextBudget, Event, EventSink, HostKind, LlmClient, LlmSelfReviewer,
+    LoopConfig, Message, SelfReviewer, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome,
+    ToolRegistry, ToolSpec, TurnContext, TurnOptions, Workflow,
 };
+
+/// US-1.3 AC2: the most tokens one recorded self-review may use.
+pub const SELF_REVIEW_MAX_TOKENS: u32 = 160;
 use citrate_agent_mcp_host::{McpHost, McpToolHost, ServerStatus};
 use citrate_agent_metering::{MeteringSink, SystemClock};
 use citrate_agent_trajectory::TrajectoryRecorder;
@@ -125,6 +128,9 @@ impl ToolchainBackend for ToolchainHost {
 
 /// At most this many open sessions (a session is a conversation, not a request).
 pub const MAX_SESSIONS: usize = 8;
+// When the table is full, a new session replaces the idle session the app used least recently
+// (sessions mid-turn are never replaced). Sessions the app opened and never closed (a Stop, a
+// reload) therefore cannot fill the table for good.
 /// Events kept per session for replay; older ones are dropped (clients read by sequence).
 pub const EVENT_LOG_CAP: usize = 2000;
 /// Upper bounds a client may request.
@@ -445,6 +451,9 @@ pub struct Session {
     /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
     /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
     toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S6.3 → S6.4: the raw reports of this session's toolchain runs, for core's deploy gate
+    /// (present with the toolchain).
+    toolchain_reports: Option<Arc<crate::toolchain_reports::ToolchainReports>>,
     /// HUP-S7.5: derives one metering record per turn from the event stream.
     metering: Arc<MeteringSink>,
     /// Where this session's finished metering records go.
@@ -459,6 +468,9 @@ pub struct Session {
     files: Option<Arc<FileTools>>,
     /// HUP-S3.4: workflow runs, oldest first (at most [`MAX_RUNS_KEPT`]).
     runs: Mutex<VecDeque<(String, RunState)>>,
+    /// When the app last used this session (the manager's use counter): a full table replaces
+    /// the idle session used least recently.
+    last_used: AtomicU64,
     /// HUP-S3.3: present when this session was opened with a persona.
     persona: Option<PersonaReport>,
     /// HUP-S1.2: the session's token counter (present when it has a context budget).
@@ -467,9 +479,41 @@ pub struct Session {
     retriever: Arc<HybridRetriever>,
     /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
     shell: Option<Arc<ShellRunSession>>,
+    /// HUP-S5.3: the session's own model endpoint, which `browser_pick` asks through the metered
+    /// `decide()` slot (local grammar backend unless the member opted into Jev for the origin).
+    decide_llm: LlmEndpoint,
+    /// HUP-S4.1: the MCP specs this session was offered (calls to tools that changed since are
+    /// refused), and its MCP approval cards (present only for an HIC-aware client).
+    mcp_offered: Option<Arc<HashMap<String, ToolSpec>>>,
+    mcp_approvals: Option<Arc<crate::mcp_approvals::McpApprovals>>,
 }
 
 impl Session {
+    /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
+    /// given. `None` when this session has no toolchain.
+    pub fn toolchain_reports(
+        &self,
+        project: Option<&str>,
+    ) -> Option<Vec<crate::toolchain_reports::StoredReport>> {
+        self.toolchain_reports.as_ref().map(|r| r.list(project))
+    }
+
+    /// HUP-S4.1: the MCP cards waiting for the member (`None` when the session has none).
+    pub fn mcp_pending(&self) -> Option<Vec<crate::mcp_approvals::McpPending>> {
+        self.mcp_approvals.as_ref().map(|a| a.pending())
+    }
+
+    /// HUP-S4.1: the waiting card `id` (for its decision record).
+    pub fn mcp_waiting(&self, id: &str) -> Option<crate::mcp_approvals::McpPending> {
+        self.mcp_approvals.as_ref().and_then(|a| a.waiting(id))
+    }
+
+    /// HUP-S4.1: the member's decision on a waiting MCP card; it must carry the subject shown.
+    pub fn mcp_decide(&self, id: &str, allow: bool, subject: &str) -> Result<(), SessionError> {
+        let a = self.mcp_approvals.as_ref().ok_or(SessionError::NotFound)?;
+        a.decide(id, allow, subject).map_err(SessionError::Invalid)
+    }
+
     /// HUP-S1.2: how this session counts tokens and ranks tools and skills right now.
     pub fn retrieval_report(&self) -> RetrievalReport {
         RetrievalReport {
@@ -829,13 +873,23 @@ impl ToolHost for SidecarHost {
         }
     }
 
-    /// HUP-S5.1: only the browser can put an action in front of the member (its decision routes).
-    /// Without the browser this stays false, so the loop declines as before.
+    /// HUP-S5.1: the browser can put an action in front of the member (its decision routes);
+    /// HUP-S4.1: so can MCP, through the session's MCP approval cards (HIC-aware clients only).
+    /// Without either this stays false, so the loop declines as before.
     fn honors_explicit_approval(&self) -> bool {
         self.browser.is_some()
+            || self
+                .mcp
+                .as_ref()
+                .is_some_and(|m| m.honors_explicit_approval())
     }
 
     fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        if let Some(m) = &self.mcp {
+            if m.handles(&call.name) && m.honors_explicit_approval() {
+                return m.execute_with_explicit_approval(call, reason);
+            }
+        }
         match &self.browser {
             Some(b) if browser_tools::handles(&call.name) => {
                 b.execute_with_explicit_approval(call, reason)
@@ -889,10 +943,17 @@ pub struct SessionManager {
     metering: Arc<MeteringStore>,
     trajectories: Option<Arc<TrajectoryConfig>>,
     anchor: Option<Arc<AnchorService>>,
+    /// HUP-S4.4: core's saved MCP server list; the probe starts only entries saved there.
+    mcp_registry: Option<std::path::PathBuf>,
+    /// Use counter for [`Session::last_used`].
+    uses: AtomicU64,
     /// US-2.2 AC2: `shell_run` for sessions opened with folder grants (default off).
     shell_run: Option<Arc<ShellRunConfig>>,
     /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
+    /// US-1.3 AC2: ask the model for a self-review of every workflow step attempt and record it
+    /// in the session's event log as an opinion (never part of the verdict).
+    self_review: bool,
 }
 
 impl SessionManager {
@@ -920,9 +981,34 @@ impl SessionManager {
             metering: Arc::new(MeteringStore::in_memory()),
             trajectories: None,
             anchor: None,
+            mcp_registry: None,
+            uses: AtomicU64::new(0),
             shell_run: None,
             records: None,
+            self_review: false,
         }
+    }
+
+    /// HUP-S4.4: core's saved MCP server list (`mcp_probe::MCP_REGISTRY_ENV`).
+    pub fn with_mcp_registry(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.mcp_registry = Some(path.into());
+        self
+    }
+
+    /// HUP-S4.4: the saved MCP server list the probe checks against, if configured.
+    pub fn mcp_registry(&self) -> Option<&std::path::Path> {
+        self.mcp_registry.as_deref()
+    }
+
+    /// US-1.3 AC2: record the model's self-review of every workflow step attempt as an opinion.
+    pub fn with_self_review(mut self, on: bool) -> Self {
+        self.self_review = on;
+        self
+    }
+
+    /// Whether workflow runs record the model's self-review.
+    pub fn self_review_enabled(&self) -> bool {
+        self.self_review
     }
 
     /// HUP-S1.2: count each session's tokens with the model's tokenizer (default: none, so
@@ -1088,6 +1174,23 @@ impl SessionManager {
         self.workers.shutdown();
     }
 
+    /// Sidecar shutdown: stop every child process explicitly, not only by drop at exit (core
+    /// kills the sidecar after its grace period, and a killed process runs no destructors): the
+    /// workers, the browser (stopped and latched), SearXNG and the MCP servers. Idempotent.
+    pub fn shutdown_children(&self) {
+        self.stop_all();
+        self.workers.shutdown();
+        if let Some(b) = &self.browser {
+            b.stop();
+        }
+        if let Some(s) = &self.search {
+            s.shutdown();
+        }
+        if let Some(m) = &self.mcp {
+            m.shutdown();
+        }
+    }
+
     /// HUP-S4.1: offer this MCP host's tools to every new session. A host with no servers offers
     /// nothing and reserves nothing.
     pub fn with_mcp(mut self, host: Arc<McpHost>) -> Self {
@@ -1212,7 +1315,17 @@ impl SessionManager {
             },
         });
         let mut specs = req.tools;
-        let system_prompt = req.system_prompt;
+        let mut system_prompt = req.system_prompt;
+        // L-23: the persona's prompt fragment is rendered here from the checked persona (a shipped
+        // id or a custom persona that passed `CustomPersona::check`), never taken from app state.
+        if let Some(fragment) = citrate_agent_loop::personas::session_persona_fragment(
+            req.persona.as_deref(),
+            req.custom_persona.as_ref(),
+        )
+        .map_err(SessionError::Invalid)?
+        {
+            system_prompt = format!("{system_prompt}\n\n{fragment}");
+        }
         let mut pinned_tools = Vec::new();
         let mut turn_context: Vec<Arc<dyn TurnContext>> = Vec::new();
         if let Some(lib) = &skills {
@@ -1256,6 +1369,7 @@ impl SessionManager {
             }
             specs.extend(FileTools::specs());
         }
+        let mut mcp_offered = None;
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1263,8 +1377,18 @@ impl SessionManager {
                     t.name
                 )));
             }
-            specs.extend(mcp.specs());
+            let offered = mcp.specs();
+            mcp_offered = Some(Arc::new(
+                offered
+                    .iter()
+                    .map(|t| (t.name.clone(), t.clone()))
+                    .collect::<HashMap<_, _>>(),
+            ));
+            specs.extend(offered);
         }
+        // HUP-S4.1: MCP approval cards only for a client that shows `hic: required` to a person.
+        let mcp_approvals = (self.mcp.is_some() && req.hic_aware)
+            .then(|| Arc::new(crate::mcp_approvals::McpApprovals::default()));
         if self.browser.is_some() {
             if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1368,6 +1492,17 @@ impl SessionManager {
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
             (None, _) => None,
         };
+        // HUP-S6.3 → S6.4: keep each run's raw report for core's deploy gate; the model sees the
+        // result without it.
+        let toolchain_reports = toolchain
+            .as_ref()
+            .map(|_| Arc::new(crate::toolchain_reports::ToolchainReports::default()));
+        let toolchain: Option<Arc<dyn ToolHost>> = match (toolchain, &toolchain_reports) {
+            (Some(t), Some(r)) => Some(Arc::new(
+                crate::toolchain_reports::CapturingToolchain::new(t, r.clone()),
+            )),
+            (t, _) => t,
+        };
         // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
         // grant store), not a grants file.
         let files = match (&grants, &self.checkpoints) {
@@ -1382,8 +1517,15 @@ impl SessionManager {
             .sessions
             .lock()
             .map_err(|_| SessionError::Invalid("internal".into()))?;
+        let mut replaced = None;
         if sessions.len() >= MAX_SESSIONS {
-            return Err(SessionError::TooMany);
+            let victim = sessions
+                .values()
+                .filter(|s| !s.is_busy())
+                .min_by_key(|s| s.last_used.load(Ordering::SeqCst))
+                .map(|s| s.id.clone())
+                .ok_or(SessionError::TooMany)?;
+            replaced = sessions.remove(&victim);
         }
         let n = self.ids.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!(
@@ -1451,6 +1593,7 @@ impl SessionManager {
                 c.clone(),
             )
         });
+        let decide_llm = req.llm.clone();
         let llm: Arc<dyn LlmClient> = Arc::new(MeteredLlm::new(
             (self.llm_factory)(&req.llm),
             metering.clone(),
@@ -1474,6 +1617,7 @@ impl SessionManager {
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills,
             toolchain,
+            toolchain_reports,
             grants,
             capsule_sandbox,
             metering,
@@ -1481,17 +1625,45 @@ impl SessionManager {
             trajectory,
             files,
             runs: Mutex::new(VecDeque::new()),
+            last_used: AtomicU64::new(self.uses.fetch_add(1, Ordering::SeqCst) + 1),
             persona,
             token_counter,
             retriever,
             shell,
+            decide_llm,
+            mcp_offered,
+            mcp_approvals,
         });
         sessions.insert(id.clone(), session);
+        drop(sessions);
+        if let Some(old) = replaced {
+            Self::finish(&old);
+        }
         Ok(id)
     }
 
+    /// A session (marking it used now).
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+        let s = self.sessions.lock().ok().and_then(|s| s.get(id).cloned())?;
+        s.last_used.store(
+            self.uses.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        Some(s)
+    }
+
+    /// Wind down a session removed from the table: stop it and, with trajectory recording on,
+    /// export its verified turns.
+    fn finish(s: &Arc<Session>) -> Option<ExportSummary> {
+        s.stop.stop();
+        s.trajectory.as_ref().map(|(rec, cfg)| {
+            let history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            export_session(cfg, rec, &history, &s.id, now_ms)
+        })
     }
 
     /// HUP-S1.1: every open session, oldest id first.
@@ -1567,18 +1739,29 @@ impl SessionManager {
             }
         });
         let search = self.search.clone();
-        let mcp_host = self
-            .mcp
-            .clone()
-            .map(|h| McpToolHost::new(h, session.stop.clone()));
+        let mcp_host = self.mcp.clone().map(|h| {
+            let mut t = McpToolHost::new(h, session.stop.clone());
+            if let Some(o) = &session.mcp_offered {
+                t = t.with_offered(o.clone());
+            }
+            if let Some(a) = &session.mcp_approvals {
+                t = t.with_approver(a.clone());
+            }
+            t
+        });
         let learn_host = self
             .learn
             .clone()
             .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
-        let browser_host = self
-            .browser
-            .clone()
-            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        let browser_host = self.browser.clone().map(|b| {
+            BrowserToolHost::new(b, session.stop.clone()).with_picker(Arc::new(
+                crate::decide::SessionPicker::new(
+                    self.decide.clone(),
+                    session.decide_llm.clone(),
+                    &session.cfg.model,
+                ),
+            ))
+        });
         let shell_host = session
             .shell
             .as_ref()
@@ -1641,10 +1824,13 @@ impl SessionManager {
         let registry = self.registry_for(&session, capsules);
         let s = session.clone();
         let rid = run_id.clone();
+        let self_review = self.self_review;
         tokio::task::spawn_blocking(move || {
             let sink = SessionSink(s.clone());
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            let out = run_verified_workflow(
+            let reviewer =
+                LlmSelfReviewer::new(s.llm.as_ref(), s.cfg.model.clone(), SELF_REVIEW_MAX_TOKENS);
+            let out = run_verified_workflow_reviewed(
                 &s.id,
                 &s.cfg,
                 &s.opts,
@@ -1654,6 +1840,11 @@ impl SessionManager {
                 &s.stop,
                 &mut history,
                 &wf,
+                if self_review {
+                    Some(&reviewer as &dyn SelfReviewer)
+                } else {
+                    None
+                },
             );
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
@@ -1760,15 +1951,7 @@ impl SessionManager {
             .ok()
             .and_then(|mut m| m.remove(id))
             .ok_or(SessionError::NotFound)?;
-        s.stop.stop();
-        Ok(s.trajectory.as_ref().map(|(rec, cfg)| {
-            let history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
-            export_session(cfg, rec, &history, &s.id, now_ms)
-        }))
+        Ok(Self::finish(&s))
     }
 
     pub fn count(&self) -> usize {
