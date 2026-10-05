@@ -247,6 +247,10 @@ async fn run_track(
     let session = st.sessions.get(sid).unwrap();
     let mut after = 0;
     let mut core_calls = Vec::new();
+    // The `tool_call` event is logged before the core host registers the call as pending, so
+    // answer only calls that are pending; an answer sent earlier is dropped and the call would
+    // wait out its deadline.
+    let mut unanswered: std::collections::HashMap<String, String> = Default::default();
     for _ in 0..400 {
         let page = session.wait_events(after, Duration::from_millis(25)).await;
         for e in page.events {
@@ -255,13 +259,18 @@ async fn run_track(
             if ev["type"] == "tool_call" && ev["host"] == "core" {
                 let name = ev["call"]["name"].as_str().unwrap_or("").to_string();
                 let id = ev["call"]["id"].as_str().unwrap_or("").to_string();
+                unanswered.insert(id, name.clone());
+                core_calls.push(name);
+            }
+        }
+        for id in session.pending_core_calls() {
+            if let Some(name) = unanswered.remove(&id) {
                 let content = if name == "journal_read" {
                     "2026-09-30: shipped the brief screen".to_string()
                 } else {
                     "ok".to_string()
                 };
-                session.deliver(&id, ToolOutcome::Ok(content));
-                core_calls.push(name);
+                assert!(session.deliver(&id, ToolOutcome::Ok(content)), "{id}");
             }
         }
         let (s, view) = call(
