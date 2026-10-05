@@ -34,6 +34,7 @@ pub mod llm_http;
 pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
+pub mod resources;
 pub mod retrieval_http;
 pub mod search;
 pub mod sessions;
@@ -363,6 +364,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route(
             "/metering/benchmark",
             post(chain_routes::metering_benchmark),
+        )
+        // HUP-S7.5 (D-27): core reports each mined Hermes transaction (SALT spent and gas)
+        .route(
+            "/metering/chain-receipt",
+            post(chain_routes::metering_chain_receipt),
         )
         // HUP-S7.3: nightly anchor batch (core signs with the anchor key; nothing is sent here)
         .route("/anchor/status", get(chain_routes::anchor_status))

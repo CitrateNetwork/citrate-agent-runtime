@@ -523,6 +523,11 @@ pub struct TokenUsage {
     /// second is then unknown, never guessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_ms: Option<u64>,
+    /// HUP-S7.5 (D-27): how long the provider spent reading the prompt before it wrote the first
+    /// token, in milliseconds, when it reports that (llama-server's `timings.prompt_ms`). This is
+    /// the server's time to first token. `None` when it does not report it: unknown, never guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -582,6 +587,9 @@ pub enum Event {
         completion_tokens: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         generation_ms: Option<u64>,
+        /// HUP-S7.5 (D-27): the server's time to first token (llama-server `timings.prompt_ms`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_ms: Option<u64>,
     },
     /// HUP-S7.6 (US-7.4 AC1): a workflow run's plan, emitted once before its first step: the step
     /// ids in the order they run. Verifier events then report each step's verdicts.
@@ -781,6 +789,7 @@ pub fn run_turn_with(
                         prompt_tokens: u.prompt_tokens,
                         completion_tokens: u.completion_tokens,
                         generation_ms: u.generation_ms,
+                        prompt_ms: u.prompt_ms,
                     });
                 }
                 t
