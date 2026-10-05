@@ -1529,3 +1529,44 @@ fn a_day_without_the_d27_measures_omits_their_metrics() {
         );
     }
 }
+
+/// Review fix (HUP-S7.5): a workflow's plan is bookkeeping, not a turn. A plan that never reaches
+/// an attempt (a run stopped before its first step, or a workflow with no steps) must not leave a
+/// turn open: that turn would hold a sampling thread and swallow the next turn's start time.
+#[test]
+fn a_workflow_plan_alone_opens_no_turn_and_starts_no_sampling() {
+    let clock = FakeClock::at(T0);
+    let sampler = Arc::new(FixedSampler {
+        samples: vec![sample(1_000, 1, None)],
+        begun: AtomicU64::new(0),
+        finished: Arc::new(AtomicU64::new(0)),
+    });
+    let m = Arc::new(
+        MeteringSink::new("s", "m", ["balance_read".to_string()], clock.clone())
+            .sampling_with(sampler.clone()),
+    );
+    m.emit(Event::Plan {
+        steps: vec!["only".to_string()],
+    });
+    assert_eq!(
+        sampler.begun.load(Ordering::SeqCst),
+        0,
+        "no sampling for a plan"
+    );
+    assert!(m.records().is_empty());
+    clock.advance(5_000);
+    two_step_turn(&m, clock, vec![]);
+    let recs = m.records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].started_unix_ms,
+        T0 + 5_000,
+        "the turn starts when it starts"
+    );
+    assert_eq!(
+        recs[0].latency_ms, 200,
+        "the plan's wait is not the turn's latency"
+    );
+    assert_eq!(sampler.begun.load(Ordering::SeqCst), 1);
+    assert_eq!(sampler.finished.load(Ordering::SeqCst), 1);
+}

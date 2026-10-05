@@ -208,6 +208,12 @@ impl MeteringSink {
             }
             return;
         }
+        // A workflow's plan is bookkeeping emitted before its first attempt. It opens no turn: a
+        // run stopped before that attempt (or with no steps) would otherwise leave a turn open,
+        // with its sampling running, and the next turn would inherit its start time.
+        if let Event::Plan { .. } = ev {
+            return;
+        }
         self.open_turn(&mut st);
         let now_mono = self.clock.monotonic_ms();
         let Some(o) = st.open.as_mut() else {
@@ -257,10 +263,10 @@ impl MeteringSink {
             | Event::AssistantDelta { .. }
             | Event::Final { .. }
             | Event::Error { .. } => {}
-            Event::Verifier { .. } | Event::SelfReview { .. } => {}
-            // Usage reaches the record through the metered client (`record_usage`); the plan is
-            // workflow bookkeeping. Counting either here would double them.
-            Event::Usage { .. } | Event::Plan { .. } => {}
+            Event::Verifier { .. } | Event::SelfReview { .. } | Event::Plan { .. } => {}
+            // Usage reaches the record through the metered client (`record_usage`). Counting it
+            // here would double it.
+            Event::Usage { .. } => {}
         }
     }
 }

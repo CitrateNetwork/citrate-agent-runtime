@@ -181,6 +181,14 @@ struct SystemSampling {
     stop: Arc<AtomicBool>,
 }
 
+// A sampling dropped without `finish` (its sink went away with the turn still open) stops its
+// thread too, so no thread reads the machine for a turn nobody will close.
+impl Drop for SystemSampling {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
 impl TurnSampling for SystemSampling {
     fn finish(self: Box<Self>) -> Option<ResourcePeaks> {
         // Signal and return without joining: the thread exits on its next tick, and a turn's
@@ -194,8 +202,9 @@ impl TurnSampling for SystemSampling {
     }
 }
 
-impl ResourceSampler for SystemSampler {
-    fn begin(&self) -> Box<dyn TurnSampling> {
+impl SystemSampler {
+    /// Start one turn's sampling thread.
+    fn start(&self) -> SystemSampling {
         let samples = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (out, flag, gpu_ok, interval) = (
@@ -208,7 +217,13 @@ impl ResourceSampler for SystemSampler {
         let _ = std::thread::Builder::new()
             .name("hermes-metering-sampler".into())
             .spawn(move || sample_until_stopped(&out, &flag, &gpu_ok, interval));
-        Box::new(SystemSampling { samples, stop })
+        SystemSampling { samples, stop }
+    }
+}
+
+impl ResourceSampler for SystemSampler {
+    fn begin(&self) -> Box<dyn TurnSampling> {
+        Box::new(self.start())
     }
 }
 

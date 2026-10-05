@@ -100,3 +100,22 @@ fn a_turn_shorter_than_one_interval_is_unknown_not_zero() {
     let s = SystemSampler::with_interval(Duration::from_secs(5));
     assert_eq!(s.begin().finish(), None);
 }
+
+/// Review fix (HUP-S7.5): a turn's sampling that is dropped without `finish` (its sink went away
+/// with the turn still open) stops its thread instead of reading the machine for ever.
+#[test]
+fn dropping_an_unfinished_sampling_stops_its_thread() {
+    let s = SystemSampler::with_interval(Duration::from_millis(50));
+    let sampling = s.start();
+    let samples = sampling.samples.clone();
+    drop(sampling);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Arc::strong_count(&samples) > 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        Arc::strong_count(&samples),
+        1,
+        "the sampling thread is still running"
+    );
+}
