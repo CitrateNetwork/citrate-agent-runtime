@@ -266,6 +266,21 @@ fn deploy_requests_are_recognized_and_negations_are_not() {
 }
 
 #[test]
+fn a_request_to_fix_first_is_left_to_the_model() {
+    // The member asks for the proposed fix (and a deploy after it): the model must get the turn
+    // so it can apply the patch. A `contract_deploy` it then calls is still declined by the
+    // guard's call policy while the reports block.
+    for fix_first in [
+        "apply the fix and then deploy",
+        "Fix the cap check so we can deploy it",
+        "patch it, then redeploy",
+        "restore the SoldOut check and ship it",
+    ] {
+        assert!(!is_deploy_request(fix_first), "{fix_first}");
+    }
+}
+
+#[test]
 fn the_refusal_declines_names_every_finding_and_carries_the_patch() {
     let mut findings = findings_from_report(
         SLITHER_SCAN_TOOL,

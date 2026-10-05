@@ -215,13 +215,21 @@ pub const GATE_TOOLS: [&str; 4] = [
 
 /// Whether `text` asks Hermes to deploy (or to deploy despite the gate). Matches "deploy",
 /// "deploying", "redeploy", "ship it", "push it live", "go live" as words; a request that says
-/// not to deploy ("don't deploy", "do not deploy yet") is not one.
+/// not to deploy ("don't deploy", "do not deploy yet") is not one, and neither is a request that
+/// also asks for a fix ("apply the fix and then deploy"): the model gets that turn so it can make
+/// the change, and a `contract_deploy` it calls is still declined by the call policy.
 pub fn is_deploy_request(text: &str) -> bool {
     let t = text.to_ascii_lowercase().replace(['\u{2019}', '\''], "");
     let words: Vec<&str> = t
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
         .collect();
+    if words
+        .iter()
+        .any(|w| matches!(*w, "fix" | "patch" | "apply" | "repair" | "restore"))
+    {
+        return false;
+    }
     let negated_before = |i: usize| -> bool {
         let from = i.saturating_sub(3);
         words[from..i]

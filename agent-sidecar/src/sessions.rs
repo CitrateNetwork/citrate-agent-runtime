@@ -489,8 +489,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
-    /// given. `None` when this session has no toolchain.
     /// The conversation so far (what the model is sent next turn, after the system prompt).
     pub fn history_snapshot(&self) -> Vec<Message> {
         self.history.lock().map(|h| h.clone()).unwrap_or_default()
@@ -504,6 +502,8 @@ impl Session {
             .map(crate::deploy_guard::DeployGuard::new)
     }
 
+    /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
+    /// given. `None` when this session has no toolchain.
     pub fn toolchain_reports(
         &self,
         project: Option<&str>,
@@ -1984,7 +1984,6 @@ impl SessionManager {
     }
 }
 
-/// Parse a `tool_results` status into an outcome.
 /// A turn the sidecar answers itself (the deploy guard's refusal): the same events a model turn
 /// that answers in one step emits, and the same history.
 fn answer_without_model(
@@ -2007,6 +2006,7 @@ fn answer_without_model(
     });
 }
 
+/// Parse a `tool_results` status into an outcome.
 pub fn outcome_from(req: ToolResultReq) -> Result<ToolOutcome, SessionError> {
     let untrusted = match req.trust.as_deref() {
         None | Some("trusted") => false,
