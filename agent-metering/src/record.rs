@@ -1,10 +1,13 @@
 //! The per-turn metering record.
 
+use crate::measures::{EnergyEstimate, Generation, ResourcePeaks, SelfReview};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Record schema version (bumped on any incompatible change).
-pub const RECORD_SCHEMA: u32 = 1;
+/// Record schema version. Version 2 (HUP-S7.5, D-27) adds the optional measures (time to first
+/// token, generation, resource peaks, energy estimate, self-review). A version 1 line still reads:
+/// every added field defaults to unknown.
+pub const RECORD_SCHEMA: u32 = 2;
 
 /// How the loop ended a turn (the loop's own `done` label). `Answered` means the model produced a
 /// final message, not that the task succeeded.
@@ -98,6 +101,23 @@ pub struct TurnRecord {
     pub tainted: bool,
     pub verifiers: Vec<VerifierOutcome>,
     pub outcome: TurnOutcome,
+    /// D-27: the server's time to first token for the turn's first model call (llama-server
+    /// `timings.prompt_ms`). `None` when that call did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// D-27: completion tokens over the server's generation time, for tokens per second. `None`
+    /// when no model call of the turn reported a generation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<Generation>,
+    /// D-27: CPU, GPU and RAM load sampled while the turn ran. `None` when nothing sampled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcePeaks>,
+    /// D-27: an energy figure, labelled "estimate" (load times nominal watts, not measured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_estimate: Option<EnergyEstimate>,
+    /// D-27: the model's PASS/FAIL claim about this attempt, labelled "opinion". Never a verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_review: Option<SelfReview>,
 }
 
 impl TurnRecord {
@@ -117,6 +137,11 @@ impl TurnRecord {
             tainted: false,
             verifiers: Vec::new(),
             outcome: TurnOutcome::Unknown,
+            ttft_ms: None,
+            generation: None,
+            resources: None,
+            energy_estimate: None,
+            self_review: None,
         }
     }
 

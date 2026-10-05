@@ -15,6 +15,7 @@
 //! crate, BenchmarkRegistry is not in the 40204 address book (D-24 deploys it in the next
 //! redeploy), so the registry address is always supplied by the caller.
 
+use crate::chain_receipts::ChainSpendSummary;
 use crate::report::DailyReport;
 use crate::MeteringError;
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,18 @@ pub const METRICS: &[&str] = &[
     "hermes.daily.tool_calls",
     "hermes.daily.tokens_in",
     "hermes.daily.tokens_out",
+    // HUP-S7.5 (D-27). Each is omitted on a day nothing measured it.
+    "hermes.daily.ttft_p50_ms",
+    "hermes.daily.ttft_p95_ms",
+    "hermes.daily.tokens_per_s_milli",
+    "hermes.daily.cpu_peak_bps",
+    "hermes.daily.gpu_peak_bps",
+    "hermes.daily.ram_peak_mib",
+    "hermes.daily.energy_estimate_uwh",
+    "hermes.daily.self_review_opinion_pass",
+    "hermes.daily.self_review_opinion_fail",
+    "hermes.daily.gas_used",
+    "hermes.daily.salt_spent_wei",
 ];
 
 fn keccak(data: &[u8]) -> [u8; 32] {
@@ -162,6 +175,16 @@ pub fn build_benchmark_payload(
     report: &DailyReport,
     opt_in: Option<&BenchmarkOptIn>,
 ) -> Result<BenchmarkPayload, MeteringError> {
+    build_benchmark_payload_with(report, None, opt_in)
+}
+
+/// [`build_benchmark_payload`] plus (D-27) the day's chain spend: gas used and SALT spent by
+/// Hermes's own transactions. A day with no Hermes transaction omits both.
+pub fn build_benchmark_payload_with(
+    report: &DailyReport,
+    chain: Option<&ChainSpendSummary>,
+    opt_in: Option<&BenchmarkOptIn>,
+) -> Result<BenchmarkPayload, MeteringError> {
     let opt = opt_in.ok_or(MeteringError::NotOptedIn)?;
     if report.turns == 0 {
         return Err(MeteringError::EmptyReport);
@@ -208,6 +231,63 @@ pub fn build_benchmark_payload(
         (
             "hermes.daily.tokens_out",
             tokens.then_some(report.tokens.tokens_out.into()),
+        ),
+        (
+            "hermes.daily.ttft_p50_ms",
+            report.ttft_ms.as_ref().map(|t| t.p50.into()),
+        ),
+        (
+            "hermes.daily.ttft_p95_ms",
+            report.ttft_ms.as_ref().map(|t| t.p95.into()),
+        ),
+        (
+            "hermes.daily.tokens_per_s_milli",
+            report.speed.as_ref().map(|s| s.tokens_per_s_milli.into()),
+        ),
+        (
+            "hermes.daily.cpu_peak_bps",
+            report.resources.as_ref().map(|r| r.cpu_peak_bps.into()),
+        ),
+        (
+            "hermes.daily.gpu_peak_bps",
+            report
+                .resources
+                .as_ref()
+                .and_then(|r| r.gpu_peak_bps.map(u128::from)),
+        ),
+        (
+            "hermes.daily.ram_peak_mib",
+            report
+                .resources
+                .as_ref()
+                .map(|r| u128::from(r.ram_used_peak_bytes / (1024 * 1024))),
+        ),
+        (
+            "hermes.daily.energy_estimate_uwh",
+            report
+                .energy_estimate
+                .as_ref()
+                .map(|e| e.microwatt_hours.into()),
+        ),
+        (
+            "hermes.daily.self_review_opinion_pass",
+            (report.self_review.total() > 0).then_some(report.self_review.pass.into()),
+        ),
+        (
+            "hermes.daily.self_review_opinion_fail",
+            (report.self_review.total() > 0).then_some(report.self_review.fail.into()),
+        ),
+        (
+            "hermes.daily.gas_used",
+            chain
+                .filter(|c| c.transactions > 0)
+                .map(|c| c.gas_used.into()),
+        ),
+        (
+            "hermes.daily.salt_spent_wei",
+            chain
+                .filter(|c| c.transactions > 0)
+                .map(ChainSpendSummary::salt_spent),
         ),
     ];
     let capsule = hermes_capsule_id();

@@ -120,6 +120,9 @@ pub fn parse_turn(body: &str) -> Result<AssistantTurn, LlmError> {
 /// HUP-S7.6: llama-server also reports `timings.predicted_ms` (time spent generating the
 /// completion). It rides along as `generation_ms` when it is a finite, non-negative number;
 /// otherwise it is unknown.
+///
+/// HUP-S7.5 (D-27): `timings.prompt_ms` (time spent reading the prompt before the first token,
+/// the server's time to first token) rides along as `prompt_ms` under the same rule.
 pub fn parse_usage(body: &str) -> Option<TokenUsage> {
     let v: Value = serde_json::from_str(body).ok()?;
     let u = v.get("usage")?;
@@ -127,17 +130,28 @@ pub fn parse_usage(body: &str) -> Option<TokenUsage> {
         prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
         completion_tokens: u.get("completion_tokens")?.as_u64()?,
         generation_ms: generation_ms(&v),
+        prompt_ms: prompt_ms(&v),
     })
 }
 
-/// `timings.predicted_ms` rounded to whole milliseconds, when it is a finite number in range.
-fn generation_ms(v: &Value) -> Option<u64> {
-    let ms = v.get("timings")?.get("predicted_ms")?.as_f64()?;
+/// `timings.<field>` rounded to whole milliseconds, when it is a finite number in range.
+fn timing_ms(v: &Value, field: &str) -> Option<u64> {
+    let ms = v.get("timings")?.get(field)?.as_f64()?;
     if ms.is_finite() && (0.0..1.0e12).contains(&ms) {
         Some(ms.round() as u64)
     } else {
         None
     }
+}
+
+/// `timings.predicted_ms`: time spent writing the completion.
+fn generation_ms(v: &Value) -> Option<u64> {
+    timing_ms(v, "predicted_ms")
+}
+
+/// `timings.prompt_ms`: time spent reading the prompt, i.e. the server's time to first token.
+fn prompt_ms(v: &Value) -> Option<u64> {
+    timing_ms(v, "prompt_ms")
 }
 
 /// HUP-S1.1 (g1-render): the streaming form of [`to_wire_body`] (`stream: true`, and usage on the
@@ -169,6 +183,8 @@ pub struct StreamAssembler {
     /// HUP-S7.6: `timings.predicted_ms` from whichever chunk carries it (llama-server sends it
     /// on the last one).
     generation_ms: Option<u64>,
+    /// HUP-S7.5 (D-27): `timings.prompt_ms` from whichever chunk carries it.
+    prompt_ms: Option<u64>,
     /// `[DONE]` arrived or a choice reported a `finish_reason`.
     finished: bool,
 }
@@ -206,11 +222,15 @@ impl StreamAssembler {
                     prompt_tokens: p,
                     completion_tokens: c,
                     generation_ms: None,
+                    prompt_ms: None,
                 });
             }
         }
         if let Some(ms) = generation_ms(&v) {
             self.generation_ms = Some(ms);
+        }
+        if let Some(ms) = prompt_ms(&v) {
+            self.prompt_ms = Some(ms);
         }
         let Some(choice) = v
             .get("choices")
@@ -298,6 +318,7 @@ impl StreamAssembler {
             },
             self.usage.map(|u| TokenUsage {
                 generation_ms: self.generation_ms,
+                prompt_ms: self.prompt_ms,
                 ..u
             }),
         ))
