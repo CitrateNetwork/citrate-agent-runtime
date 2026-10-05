@@ -4,7 +4,7 @@ summary = "A dApp end to end: contract, site, deploy (the hello-mint path)."
 persona = "Builder"
 skills = ["solidity", "foundry", "openzeppelin", "frontend-design", "trailofbits-audit"]
 workflow = "hello-mint"
-workflow_available = false
+workflow_available = true
 ships_in = "HUP-S6"
 gates = [
   "forge test passes",

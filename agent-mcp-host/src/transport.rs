@@ -1,7 +1,14 @@
 //! MCP transports (HUP-S4.1): stdio (an env-filtered child process, newline-delimited JSON-RPC)
 //! and streamable HTTP (one POST per message; a JSON or SSE answer). Both enforce a per-request
 //! deadline, a response size cap and cancellation, and both answer server-to-client requests
-//! with "method not found" (this host advertises no client capabilities) except `ping`.
+//! with "method not found" (legacy servers only; this host advertises no legacy client
+//! capabilities) except `ping`.
+//!
+//! Both eras are carried (HUP-S4.1, revision 2026-07-28): after [`Transport::set_modern`], HTTP
+//! requests carry `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` (and any `Mcp-Param-*`
+//! headers the caller passes), never `Mcp-Session-Id`, and a stopped HTTP request is cancelled by
+//! closing its stream rather than by a `notifications/cancelled` POST. `subscriptions/listen`
+//! keeps one long-lived stream open for `notifications/tools/list_changed`.
 
 use crate::config::{child_env, ServerConfig, TransportConfig};
 use crate::error::McpError;
@@ -16,6 +23,58 @@ use std::time::{Duration, Instant};
 
 type Reply = Result<Value, McpError>;
 
+/// `UnsupportedProtocolVersionError` (2026-07-28).
+pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// The `Mcp-Name` source for a request (2026-07-28 standard headers, and the Tasks extension's
+/// routing rule for `tasks/*`).
+fn mcp_name_of(method: &str, params: &Value) -> Option<String> {
+    let key = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        m if m.starts_with("tasks/") => "taskId",
+        _ => return None,
+    };
+    params.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Standard base64 (RFC 4648, padded).
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        let idx = |shift: u32| T[((n >> shift) & 63) as usize] as char;
+        out.push(idx(18));
+        out.push(idx(12));
+        out.push(if chunk.len() > 1 { idx(6) } else { '=' });
+        out.push(if chunk.len() > 2 { idx(0) } else { '=' });
+    }
+    out
+}
+
+/// A header value per the 2026-07-28 value-encoding rule: plain when it is visible ASCII (inner
+/// spaces and tabs allowed) with no leading or trailing whitespace and does not look like the
+/// sentinel; otherwise `=?base64?<b64 of UTF-8>?=`.
+pub(crate) fn encode_header_value(v: &str) -> String {
+    let plain_ok = !v.is_empty()
+        && v.bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) || b == b' ' || b == b'\t')
+        && !v.starts_with([' ', '\t'])
+        && !v.ends_with([' ', '\t'])
+        && !(v.starts_with("=?base64?") && v.ends_with("?="));
+    if plain_ok {
+        v.to_string()
+    } else {
+        format!("=?base64?{}?=", base64_encode(v.as_bytes()))
+    }
+}
+
 /// One way of exchanging JSON-RPC messages with a server.
 pub(crate) trait Transport: Send + Sync {
     /// Send a request and wait for its result (the `result` member) or an error.
@@ -25,7 +84,30 @@ pub(crate) trait Transport: Send + Sync {
         params: Value,
         timeout: Duration,
         stop: Option<&StopFlag>,
+    ) -> Result<Value, McpError> {
+        self.request_with_headers(method, params, timeout, stop, &[])
+    }
+    /// [`Transport::request`] plus extra HTTP headers (`Mcp-Param-*`, already encoded). stdio
+    /// ignores them (the 2026-07-28 spec lets non-HTTP transports skip `x-mcp-header`).
+    fn request_with_headers(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        stop: Option<&StopFlag>,
+        headers: &[(String, String)],
     ) -> Result<Value, McpError>;
+    /// Switch to the 2026-07-28 (stateless) wire rules for this version.
+    fn set_modern(&self, _version: &str) {}
+    /// Open the long-lived `subscriptions/listen` stream (modern servers) with these params.
+    fn listen(&self, _params: Value) {}
+    /// Whether the server said its tool list changed since the last call; clears the flag.
+    fn take_tools_changed(&self) -> bool;
+    /// The connection cannot carry more requests (stdio: the process exited; HTTP: the server
+    /// ended the session or stopped accepting connections). The host reconnects.
+    fn broken(&self) -> bool {
+        self.exited()
+    }
     /// Send a notification (no answer).
     fn notify(&self, method: &str, params: Value) -> Result<(), McpError>;
     /// Record the negotiated protocol version (HTTP sends it as a header on later requests).
@@ -38,6 +120,8 @@ pub(crate) trait Transport: Send + Sync {
     fn bad_messages(&self) -> u64;
     /// The server said its tool list changed (recorded, not acted on).
     fn tools_changed(&self) -> bool;
+    /// Stop the server now (stdio: close its input and kill the process). Idempotent.
+    fn close(&self) {}
 }
 
 pub(crate) fn connect(cfg: &ServerConfig) -> Result<Box<dyn Transport>, McpError> {
@@ -73,6 +157,20 @@ fn answer_server_request(id: &Value, method: &str) -> Value {
 fn response_outcome(msg: &Value) -> Reply {
     if let Some(err) = msg.get("error") {
         let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        if code == UNSUPPORTED_PROTOCOL_VERSION {
+            let supported = err
+                .pointer("/data/supported")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .take(16)
+                        .map(|v| v.chars().take(40).collect())
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Err(McpError::UnsupportedVersion { supported });
+        }
         let message = err
             .get("message")
             .and_then(Value::as_str)
@@ -381,12 +479,13 @@ impl StdioTransport {
 }
 
 impl Transport for StdioTransport {
-    fn request(
+    fn request_with_headers(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
         stop: Option<&StopFlag>,
+        _headers: &[(String, String)],
     ) -> Result<Value, McpError> {
         if self.shared.exited.load(Ordering::SeqCst) {
             return Err(McpError::ServerExited("not running".into()));
@@ -443,10 +542,22 @@ impl Transport for StdioTransport {
     fn tools_changed(&self) -> bool {
         self.shared.list_changed.load(Ordering::SeqCst)
     }
-}
 
-impl Drop for StdioTransport {
-    fn drop(&mut self) {
+    fn take_tools_changed(&self) -> bool {
+        self.shared.list_changed.swap(false, Ordering::SeqCst)
+    }
+
+    /// stdio: the listen request shares the channel; its notifications are recognised by method
+    /// (each carries the subscription id in `_meta`) and its eventual response, if any, is
+    /// dropped like any answer nobody waits for.
+    fn listen(&self, params: Value) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self
+            .shared
+            .send_line(message(Some(id), "subscriptions/listen", params).to_string());
+    }
+
+    fn close(&self) {
         // Closing the writer closes the server's stdin; then make sure the process is gone.
         if let Ok(mut w) = self.shared.writer.lock() {
             w.take();
@@ -457,6 +568,12 @@ impl Drop for StdioTransport {
                 let _ = child.wait();
             }
         }
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -471,9 +588,12 @@ struct HttpCtx {
     loopback: bool,
     version: Option<String>,
     session: Option<String>,
+    /// 2026-07-28 wire rules: standard headers, no session.
+    modern: bool,
     max_bytes: usize,
     bad: Arc<AtomicU64>,
     list_changed: Arc<AtomicBool>,
+    broken: Arc<AtomicBool>,
 }
 
 struct HttpAnswer {
@@ -495,6 +615,16 @@ fn valid_session_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
+/// Most bytes of an error body read to look for a JSON-RPC error.
+const MAX_ERROR_BODY: u64 = 64 * 1024;
+
+/// The JSON-RPC error carried by a non-success HTTP body, if there is one.
+fn error_from_body(body: &[u8]) -> Option<McpError> {
+    let msg: Value = serde_json::from_slice(body).ok()?;
+    msg.get("error")?.get("code")?.as_i64()?;
+    response_outcome(&msg).err()
+}
+
 impl HttpCtx {
     fn client(&self, timeout: Duration) -> Result<reqwest::blocking::Client, McpError> {
         let mut b = reqwest::blocking::Client::builder()
@@ -507,15 +637,14 @@ impl HttpCtx {
             .map_err(|_| McpError::Transport("could not build the HTTP client".into()))
     }
 
-    /// POST one message. `expect` is the request id to wait for (None for notifications and
-    /// our answers to server requests).
-    fn exchange(
+    /// Build one POST with every header the era needs.
+    fn post(
         &self,
+        client: &reqwest::blocking::Client,
         body: String,
-        expect: Option<u64>,
-        timeout: Duration,
-    ) -> Result<HttpAnswer, McpError> {
-        let client = self.client(timeout)?;
+        meta: Option<(&str, Option<String>)>,
+        extra: &[(String, String)],
+    ) -> reqwest::blocking::RequestBuilder {
         let mut req = client
             .post(&self.url)
             .header("content-type", "application/json")
@@ -524,10 +653,45 @@ impl HttpCtx {
         if let Some(v) = &self.version {
             req = req.header("mcp-protocol-version", v);
         }
-        if let Some(s) = &self.session {
+        if self.modern {
+            if let Some((method, name)) = meta {
+                req = req.header("mcp-method", encode_header_value(method));
+                if let Some(n) = name {
+                    req = req.header("mcp-name", encode_header_value(&n));
+                }
+            }
+            for (k, v) in extra {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        } else if let Some(s) = &self.session {
             req = req.header("mcp-session-id", s);
         }
-        let resp = req.send().map_err(|e| coarse(&e))?;
+        req
+    }
+
+    /// POST one message. `expect` is the request id to wait for (None for notifications and
+    /// our answers to server requests). `cancel` closes an SSE answer early (2026-07-28: closing
+    /// the stream is the cancellation signal).
+    #[allow(clippy::too_many_arguments)]
+    fn exchange(
+        &self,
+        body: String,
+        expect: Option<u64>,
+        timeout: Duration,
+        meta: Option<(&str, Option<String>)>,
+        extra: &[(String, String)],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<HttpAnswer, McpError> {
+        let client = self.client(timeout)?;
+        let resp = match self.post(&client, body, meta, extra).send() {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_connect() {
+                    self.broken.store(true, Ordering::SeqCst);
+                }
+                return Err(coarse(&e));
+            }
+        };
         let status = resp.status();
         let session = resp
             .headers()
@@ -545,13 +709,20 @@ impl HttpCtx {
                 Err(McpError::Transport(format!("HTTP {}", status.as_u16())))
             };
         };
-        if status.as_u16() == 404 && self.session.is_some() {
+        if status.as_u16() == 404 && self.session.is_some() && !self.modern {
+            self.broken.store(true, Ordering::SeqCst);
             return Err(McpError::Transport(
                 "the server ended the session (HTTP 404)".into(),
             ));
         }
         if !status.is_success() {
-            return Err(McpError::Transport(format!("HTTP {}", status.as_u16())));
+            let code = status.as_u16();
+            if (400..500).contains(&code) {
+                let mut body = Vec::new();
+                let _ = resp.take(MAX_ERROR_BODY).read_to_end(&mut body);
+                return Err(error_from_body(&body).unwrap_or(McpError::HttpStatus(code)));
+            }
+            return Err(McpError::Transport(format!("HTTP {code}")));
         }
         let ctype = resp
             .headers()
@@ -560,7 +731,10 @@ impl HttpCtx {
             .unwrap_or("")
             .to_ascii_lowercase();
         let reply = if ctype.starts_with("text/event-stream") {
-            self.read_sse(resp, id, timeout)?
+            self.read_sse(resp, Some(id), timeout, cancel)?
+                .ok_or_else(|| {
+                    McpError::BadResponse("the event stream ended without a response".into())
+                })?
         } else {
             let mut body = Vec::new();
             resp.take(self.max_bytes as u64 + 1)
@@ -584,24 +758,34 @@ impl HttpCtx {
         })
     }
 
-    /// Read an SSE stream until the response to `id` arrives (bounded by the size cap).
+    /// Read an SSE stream until the response to `id` arrives (bounded by the size cap), or, with
+    /// `id` None (a listen stream), until the stream ends. Notifications are handled as they come.
     fn read_sse(
         &self,
         resp: reqwest::blocking::Response,
-        id: u64,
+        id: Option<u64>,
         timeout: Duration,
-    ) -> Result<Reply, McpError> {
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<Reply>, McpError> {
         let mut reader = BufReader::new(resp.take(self.max_bytes as u64 + 1));
         let mut total = 0usize;
         let mut data = String::new();
         let mut line = String::new();
         loop {
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                // Dropping the reader closes the stream: the server treats that as cancellation.
+                return Err(McpError::Cancelled);
+            }
             line.clear();
             let n = reader
                 .read_line(&mut line)
                 .map_err(|_| McpError::Transport("reading the event stream failed".into()))?;
             total += n;
-            if total > self.max_bytes {
+            // A listen stream is long-lived: its size cap applies per event, not in total.
+            if id.is_some() && total > self.max_bytes {
+                return Err(McpError::Oversize(self.max_bytes));
+            }
+            if data.len() > self.max_bytes {
                 return Err(McpError::Oversize(self.max_bytes));
             }
             let eof = n == 0;
@@ -609,14 +793,12 @@ impl HttpCtx {
             if eof || l.is_empty() {
                 if !data.is_empty() {
                     if let Some(reply) = self.on_event(&data, id, timeout) {
-                        return Ok(reply);
+                        return Ok(Some(reply));
                     }
                     data.clear();
                 }
                 if eof {
-                    return Err(McpError::BadResponse(
-                        "the event stream ended without a response".into(),
-                    ));
+                    return Ok(None);
                 }
                 continue;
             }
@@ -626,20 +808,31 @@ impl HttpCtx {
                 }
                 data.push_str(d.strip_prefix(' ').unwrap_or(d));
             }
-            // `event:`, `id:`, `retry:` and comments carry nothing this host needs.
+            // `event:`, `id:`, `retry:` and comments (keep-alives) carry nothing this host needs.
         }
     }
 
-    fn on_event(&self, data: &str, id: u64, timeout: Duration) -> Option<Reply> {
+    fn on_event(&self, data: &str, id: Option<u64>, timeout: Duration) -> Option<Reply> {
         let Ok(msg) = serde_json::from_str::<Value>(data) else {
             self.bad.fetch_add(1, Ordering::SeqCst);
             return None;
         };
         if let Some(method) = msg.get("method").and_then(Value::as_str) {
             match msg.get("id") {
-                Some(rid) => {
+                // Legacy only: a modern server never sends requests on a stream.
+                Some(rid) if !self.modern => {
                     let answer = answer_server_request(rid, method).to_string();
-                    let _ = self.exchange(answer, None, timeout.min(Duration::from_secs(10)));
+                    let _ = self.exchange(
+                        answer,
+                        None,
+                        timeout.min(Duration::from_secs(10)),
+                        None,
+                        &[],
+                        None,
+                    );
+                }
+                Some(_) => {
+                    self.bad.fetch_add(1, Ordering::SeqCst);
                 }
                 None => {
                     if method == "notifications/tools/list_changed" {
@@ -649,22 +842,33 @@ impl HttpCtx {
             }
             return None;
         }
-        if msg.get("id").and_then(Value::as_u64) == Some(id) {
+        if id.is_some() && msg.get("id").and_then(Value::as_u64) == id {
             return Some(response_outcome(&msg));
         }
         None
     }
 }
 
+/// How long one `subscriptions/listen` POST may stay open before it is re-issued.
+const LISTEN_MAX: Duration = Duration::from_secs(300);
+/// Backoff between listen attempts after a failure (doubles up to the cap).
+const LISTEN_BACKOFF_START: Duration = Duration::from_millis(500);
+const LISTEN_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
 pub(crate) struct HttpTransport {
     url: String,
     loopback: bool,
     version: Mutex<Option<String>>,
     session: Mutex<Option<String>>,
-    next_id: AtomicU64,
+    modern: AtomicBool,
+    next_id: Arc<AtomicU64>,
     max_bytes: usize,
     bad: Arc<AtomicU64>,
     list_changed: Arc<AtomicBool>,
+    broken: Arc<AtomicBool>,
+    /// Set when the transport is dropped: the listen thread stops.
+    closed: Arc<AtomicBool>,
+    listening: AtomicBool,
 }
 
 impl HttpTransport {
@@ -674,10 +878,14 @@ impl HttpTransport {
             loopback: url.starts_with("http://"),
             version: Mutex::new(None),
             session: Mutex::new(None),
-            next_id: AtomicU64::new(0),
+            modern: AtomicBool::new(false),
+            next_id: Arc::new(AtomicU64::new(0)),
             max_bytes: cfg.max_response_bytes,
             bad: Arc::new(AtomicU64::new(0)),
             list_changed: Arc::new(AtomicBool::new(false)),
+            broken: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            listening: AtomicBool::new(false),
         }
     }
 
@@ -687,9 +895,11 @@ impl HttpTransport {
             loopback: self.loopback,
             version: self.version.lock().ok().and_then(|v| v.clone()),
             session: self.session.lock().ok().and_then(|v| v.clone()),
+            modern: self.modern.load(Ordering::SeqCst),
             max_bytes: self.max_bytes,
             bad: self.bad.clone(),
             list_changed: self.list_changed.clone(),
+            broken: self.broken.clone(),
         }
     }
 
@@ -700,7 +910,9 @@ impl HttpTransport {
         let (tx, rx) = mpsc::channel();
         let t = wait_for.unwrap_or(Duration::from_secs(5));
         std::thread::spawn(move || {
-            let r = ctx.exchange(msg.to_string(), None, t).map(|_| ());
+            let r = ctx
+                .exchange(msg.to_string(), None, t, None, &[], None)
+                .map(|_| ());
             let _ = tx.send(r);
         });
         match wait_for {
@@ -714,19 +926,28 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
-    fn request(
+    fn request_with_headers(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
         stop: Option<&StopFlag>,
+        headers: &[(String, String)],
     ) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
         let ctx = self.ctx();
+        let modern = ctx.modern;
+        let name = mcp_name_of(method, &params);
         let body = message(Some(id), method, params).to_string();
+        let method_owned = method.to_string();
+        let extra = headers.to_vec();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(ctx.exchange(body, Some(id), timeout));
+            let meta = Some((method_owned.as_str(), name));
+            let _ =
+                tx.send(ctx.exchange(body, Some(id), timeout, meta, &extra, Some(&worker_cancel)));
         });
         let ended = match wait(&rx, timeout, stop) {
             Ok(Ok(answer)) => {
@@ -749,15 +970,20 @@ impl Transport for HttpTransport {
                 return Err(McpError::Transport("the request worker ended".into()))
             }
         };
-        let why = if matches!(ended, Err(McpError::Cancelled)) {
-            "stopped by the member"
-        } else {
-            "timed out"
-        };
-        let _ = self.post_notification(
-            message(None, "notifications/cancelled", cancel_params(id, why)),
-            None,
-        );
+        // Closing the stream is the modern cancellation signal (the worker drops it at its next
+        // read); a legacy server is also told with `notifications/cancelled`.
+        cancel.store(true, Ordering::SeqCst);
+        if !modern {
+            let why = if matches!(ended, Err(McpError::Cancelled)) {
+                "stopped by the member"
+            } else {
+                "timed out"
+            };
+            let _ = self.post_notification(
+                message(None, "notifications/cancelled", cancel_params(id, why)),
+                None,
+            );
+        }
         ended
     }
 
@@ -771,12 +997,73 @@ impl Transport for HttpTransport {
         }
     }
 
+    fn set_modern(&self, version: &str) {
+        self.set_protocol_version(version);
+        self.modern.store(true, Ordering::SeqCst);
+        if let Ok(mut s) = self.session.lock() {
+            *s = None;
+        }
+    }
+
+    /// One background thread keeps a `subscriptions/listen` POST open, re-issuing it when the
+    /// server ends it (backoff after failures), until the transport is dropped.
+    fn listen(&self, params: Value) {
+        if self.listening.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let closed = self.closed.clone();
+        let ids = self.next_id.clone();
+        let ctx = self.ctx();
+        std::thread::spawn(move || {
+            let mut backoff = LISTEN_BACKOFF_START;
+            while !closed.load(Ordering::SeqCst) {
+                let id = ids.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = message(Some(id), "subscriptions/listen", params.clone()).to_string();
+                let delivered = ctx
+                    .client(LISTEN_MAX)
+                    .and_then(|c| {
+                        ctx.post(&c, body, Some(("subscriptions/listen", None)), &[])
+                            .send()
+                            .map_err(|e| coarse(&e))
+                    })
+                    .and_then(|resp| {
+                        if !resp.status().is_success() {
+                            return Err(McpError::HttpStatus(resp.status().as_u16()));
+                        }
+                        ctx.read_sse(resp, None, LISTEN_MAX, Some(&closed))
+                    });
+                match delivered {
+                    Ok(_) => backoff = LISTEN_BACKOFF_START,
+                    Err(_) => backoff = (backoff * 2).min(LISTEN_BACKOFF_CAP),
+                }
+                let until = Instant::now() + backoff;
+                while Instant::now() < until && !closed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+    }
+
     fn bad_messages(&self) -> u64 {
         self.bad.load(Ordering::SeqCst)
     }
 
     fn tools_changed(&self) -> bool {
         self.list_changed.load(Ordering::SeqCst)
+    }
+
+    fn take_tools_changed(&self) -> bool {
+        self.list_changed.swap(false, Ordering::SeqCst)
+    }
+
+    fn broken(&self) -> bool {
+        self.broken.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
     }
 }
 

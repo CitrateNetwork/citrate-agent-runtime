@@ -12,8 +12,9 @@
 # json_field_equals {tool, pointer, value}, forge_tests_pass {}, sarif_below_threshold
 # {tool, threshold}, medusa_no_failures {}. Tool names must be in `KNOWN_TOOLS`.
 #
-# Workflows are definitions: no session route runs them yet, so each track's
-# `workflow_available` stays false until one does (Rule 1).
+# A session runs one with `POST /sessions/:id/track_workflows {"workflow": "<id>"}`; the sidecar
+# refuses a workflow whose required tools (`needs_tools` in GET /workflows) the session does not
+# offer, and says which. So every track says `workflow_available = true`.
 
 # ---- creative ---------------------------------------------------------------------------------
 
@@ -164,8 +165,8 @@ id = "scan"
 instruction = "Run slither_scan and aderyn_scan on the project."
 max_attempts = 2
 verifiers = [
-  { kind = "tool_succeeded", tool = "slither_scan" },
-  { kind = "tool_succeeded", tool = "aderyn_scan" },
+  { kind = "scan_report_read", tool = "slither_scan" },
+  { kind = "scan_report_read", tool = "aderyn_scan" },
   { kind = "tool_not_called", tool = "contract_deploy" },
 ]
 

@@ -16,7 +16,10 @@
 //!   write grant; full access never writes. Reads and listings never follow a symbolic link at
 //!   the last component and leave out files with other hard links. Build configuration
 //!   (`foundry.toml`, env files and the rest of [`crate::toolchain_config::build_config_file`])
-//!   is the member's to edit: `file_write` refuses it.
+//!   is the member's to edit: `file_write` refuses it. HUP-S2.9: `file_write` is checkpointed
+//!   under the session id ([`crate::files::checked_whole_file_write`]) so the member can undo it;
+//!   without a checkpoint store it writes nothing. With a store the session also gets the
+//!   checkpointed `fs_write`, `fs_edit`, `fs_delete` and `fs_rename` on this same document.
 //! * **Toolchain project folder** (HUP-S6.3). When the session has a grant document it replaces
 //!   `CITRATE_HERMES_TOOLCHAIN_ROOTS`: the project must be covered by live read **and** write
 //!   folder grants (forge reads the sources and writes `out/` and `cache/`).
@@ -27,7 +30,7 @@
 //!
 //! Keyless: nothing here holds a key or signs (Rule 3).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -169,6 +172,45 @@ impl SessionGrants {
         }
     }
 
+    /// HUP-S2.9: [`Self::check`] for a write that is about to be checkpointed: the resolved path
+    /// and the root of the folder grant that allows it (the checkpoint step is filed under that
+    /// root). Full access never writes, so the grant is always a folder grant.
+    pub fn check_write(&self, path: &Path) -> Result<(PathBuf, PathBuf), String> {
+        let g = self
+            .inner
+            .read()
+            .map_err(|_| "the grant set could not be read, so nothing is allowed".to_string())?;
+        match g.check(path, Op::Write, (self.clock)()) {
+            Decision::Allowed {
+                canonical,
+                grant_id,
+            } => {
+                let root = g
+                    .state()
+                    .grants
+                    .iter()
+                    .find(|x| x.id == grant_id)
+                    .map(|x| x.root.clone())
+                    .ok_or_else(|| "the grant that allowed this write is gone".to_string())?;
+                Ok((canonical.into_path_buf(), root))
+            }
+            Decision::Denied { reason } => Err(reason.to_string()),
+        }
+    }
+
+    /// HUP-S2.5: run `f` over the grant set in use now and the current time (unix seconds), for
+    /// checks that need the whole set (a capsule's folder mounts). A poisoned lock allows nothing.
+    pub fn with_folder_grants<R>(
+        &self,
+        f: impl FnOnce(&FolderGrants, u64) -> R,
+    ) -> Result<R, String> {
+        let g = self
+            .inner
+            .read()
+            .map_err(|_| "the grant set could not be read, so nothing is allowed".to_string())?;
+        Ok(f(&g, (self.clock)()))
+    }
+
     /// The toolchain project check: live read and write folder grants must both cover `dir`.
     pub fn check_project(&self, dir: &Path) -> Result<PathBuf, String> {
         let (read, rk) = self.check(dir, Op::Read)?;
@@ -177,6 +219,57 @@ impl SessionGrants {
             return Err("the project needs read and write folder grants".into());
         }
         Ok(read)
+    }
+
+    /// US-2.2 AC2 (`shell_run`): the folder a command run in `dir` may write. `dir` must be
+    /// covered by live read and write grants from the same folder grant, reaching its whole
+    /// subtree (a shallow grant does not cover what a command may create below it). Returns the
+    /// canonical `dir` and that grant's canonical root.
+    pub fn shell_scope(&self, dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+        self.with_folder_grants(|g, now| {
+            let write = match g.check(dir, Op::Write, now) {
+                Decision::Allowed {
+                    canonical,
+                    grant_id,
+                } => (canonical.into_path_buf(), grant_id),
+                Decision::Denied { reason } => return Err(reason.to_string()),
+            };
+            let find = |id: &str| {
+                g.state()
+                    .grants
+                    .iter()
+                    .find(|x| x.id == id)
+                    .ok_or_else(|| "the covering grant could not be found".to_string())
+            };
+            let subtree_folder = |x: &citrate_agent_grants::Grant| -> Result<(), String> {
+                if x.kind != GrantKind::Folder {
+                    return Err(
+                        "commands run only in a folder grant, never under full access".into(),
+                    );
+                }
+                if x.scope != citrate_agent_grants::GrantScope::Subtree {
+                    return Err(
+                        "commands need folder grants that cover everything below them, not only their direct entries"
+                            .into(),
+                    );
+                }
+                Ok(())
+            };
+            let grant = find(&write.1)?;
+            subtree_folder(grant)?;
+            // The sandbox lets the command read its whole writable folder, so a read grant
+            // must cover all of it as well.
+            match g.check(&grant.root, Op::Read, now) {
+                Decision::Allowed { grant_id, .. } => subtree_folder(find(&grant_id)?)?,
+                Decision::Denied { reason } => {
+                    return Err(format!(
+                        "the whole folder {} needs a read grant too: {reason}",
+                        grant.root.display()
+                    ))
+                }
+            }
+            Ok((write.0, grant.root.clone()))
+        })?
     }
 
     /// The member's home these grants resolve against.
@@ -282,11 +375,19 @@ pub fn file_tool_specs() -> Vec<ToolSpec> {
 /// Runs the file tools for one session.
 pub struct FileToolHost {
     grants: std::sync::Arc<SessionGrants>,
+    /// HUP-S2.9: where `file_write` checkpoints. Without it `file_write` writes nothing.
+    undo: Option<crate::files::UndoScope>,
 }
 
 impl FileToolHost {
     pub fn new(grants: std::sync::Arc<SessionGrants>) -> Self {
-        FileToolHost { grants }
+        FileToolHost { grants, undo: None }
+    }
+
+    /// HUP-S2.9: checkpoint every `file_write` in `undo` (the member can undo it).
+    pub fn with_undo(mut self, undo: crate::files::UndoScope) -> Self {
+        self.undo = Some(undo);
+        self
     }
 
     fn args(call: &ToolCall) -> Result<serde_json::Map<String, serde_json::Value>, String> {
@@ -387,7 +488,7 @@ impl FileToolHost {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
         };
-        let mut f = match open_nofollow(&file, false) {
+        let mut f = match open_checked(&file, false) {
             Ok(f) => f,
             Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
         };
@@ -441,42 +542,29 @@ impl FileToolHost {
                 content.len()
             ));
         }
-        if let Some(name) = crate::toolchain_config::build_config_file(path) {
-            return ToolOutcome::Denied(crate::toolchain_config::build_config_refusal(&name));
-        }
-        let (file, _) = match self.grants.check(path, Op::Write) {
-            Ok(x) => x,
-            Err(e) => return ToolOutcome::Denied(e),
-        };
-        if let Some(name) = crate::toolchain_config::build_config_file(&file) {
-            return ToolOutcome::Denied(crate::toolchain_config::build_config_refusal(&name));
-        }
-        match std::fs::symlink_metadata(&file) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return ToolOutcome::Denied(format!("{} is a symbolic link", file.display()))
-            }
-            Ok(m) if !m.is_file() => {
-                return ToolOutcome::Error(format!("{} is not a regular file", file.display()))
-            }
-            Ok(m) if hard_linked(&m) => {
-                return ToolOutcome::Denied(format!(
-                    "{} has other hard links, so writing it could change a file outside the grant",
-                    file.display()
-                ))
-            }
-            _ => {}
-        }
-        let mut f = match open_nofollow(&file, true) {
-            Ok(f) => f,
-            Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
-        };
-        if let Err(e) = f.write_all(content.as_bytes()).and_then(|_| f.flush()) {
-            return ToolOutcome::Error(format!("cannot write {}: {e}", file.display()));
-        }
-        ToolOutcome::Ok(
-            serde_json::json!({ "path": file, "bytes": content.len(), "written": true })
+        // HUP-S2.9: the one checkpointed write path (grants and the deny list, build
+        // configuration, symlink leaves and hard links are all refused before any snapshot).
+        let checked = crate::files::checked_whole_file_write(
+            &self.grants,
+            self.undo.as_ref(),
+            path,
+            content.as_bytes(),
+            false,
+        );
+        match checked {
+            Ok(w) => ToolOutcome::Ok(
+                serde_json::json!({
+                    "path": w.path,
+                    "paths": [w.path],
+                    "bytes": content.len(),
+                    "written": true,
+                    "checkpoint": {"session": w.session, "seq": w.seq},
+                    "undo": crate::files::UNDO_NOTE,
+                })
                 .to_string(),
-        )
+            ),
+            Err(r) => r.into_outcome(),
+        }
     }
 }
 
@@ -527,10 +615,13 @@ pub(crate) fn hard_linked(_m: &std::fs::Metadata) -> bool {
 
 /// Open without following a symlink at the leaf (where the OS allows), so a link swapped in after
 /// the check is refused instead of followed.
-pub(crate) fn open_nofollow(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+fn open_nofollow(path: &Path, write: bool, create_new: bool) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
     if write {
-        o.write(true).create(true).truncate(true);
+        o.write(true);
+        if create_new {
+            o.create_new(true);
+        }
     } else {
         o.read(true);
     }
@@ -540,4 +631,80 @@ pub(crate) fn open_nofollow(path: &Path, write: bool) -> std::io::Result<std::fs
         o.custom_flags(libc::O_NOFOLLOW);
     }
     o.open(path)
+}
+
+/// Where an open file actually is (macOS `F_GETPATH`, Linux `/proc/self/fd`).
+#[cfg(target_os = "macos")]
+fn opened_path(f: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated, into `buf`, which is
+    // PATH_MAX + 1 bytes long; the fd is open for the whole call.
+    let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn opened_path(f: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()
+}
+
+/// Whether the opened file is the one at `expected` (the grant check's resolved path). macOS
+/// volumes are usually case-insensitive, so case alone is not a mismatch there.
+#[cfg(unix)]
+pub(crate) fn opened_at(f: &std::fs::File, expected: &Path) -> bool {
+    match opened_path(f) {
+        Some(actual) if actual == expected => true,
+        Some(actual) if cfg!(target_os = "macos") => actual
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// Open the file the grant check resolved (`path`, already canonical), never through a symlink
+/// at the leaf, and confirm the opened file is still at that path: a folder on the way that was
+/// swapped for a link after the check makes the open land elsewhere, and it is refused (a file
+/// this call created there is removed). A write opens an existing file without truncating it,
+/// or creates a new one, and truncates only once the open is confirmed. On systems where the
+/// opened path cannot be read (not Unix) the open is not confirmed.
+pub(crate) fn open_checked(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+    let moved = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the path changed while it was being opened",
+        )
+    };
+    let (f, created) = if write {
+        match open_nofollow(path, true, false) {
+            Ok(f) => (f, false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (open_nofollow(path, true, true)?, true)
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        (open_nofollow(path, false, false)?, false)
+    };
+    #[cfg(unix)]
+    if !opened_at(&f, path) {
+        if created {
+            if let Some(actual) = opened_path(&f) {
+                let _ = std::fs::remove_file(actual);
+            }
+        }
+        return Err(moved());
+    }
+    #[cfg(not(unix))]
+    let _ = (created, moved);
+    if write {
+        f.set_len(0)?;
+    }
+    Ok(f)
 }

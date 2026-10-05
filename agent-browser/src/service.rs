@@ -9,13 +9,20 @@
 //!   screencast frames of an origin without consent are withheld. The worker only ever drives
 //!   the tab it opened.
 //!
+//! In both modes the browser pauses requests before they are sent and this worker answers each one
+//! ([`crate::gate`]): the managed browser reaches public internet addresses only (plus origins a
+//! developer allowed), and in attach mode a page load to an origin without consent is stopped
+//! before the member's cookies are sent there. Below that, every connection the managed browser
+//! makes goes through [`crate::egress`], which holds the same rule for WebSockets, workers and
+//! names that resolve to a local address.
+//!
 //! The member's Stop ([`BrowserService::stop`]) closes the connection at once (an in-flight step
 //! fails), denies any action waiting for a decision, tears the browser down, and latches: no
 //! browser tool runs again until the member resumes.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -24,8 +31,12 @@ use serde_json::{json, Value};
 use crate::approvals::{ActionApprovals, Decision, PendingAction};
 use crate::cdp::{Cdp, CdpEvent, EventHandler, Reply};
 use crate::chromium::{self, ChromiumStatus, ManagedChrome};
+use crate::egress::EgressGate;
 use crate::frames::{FrameBuffer, FrameView, Highlight};
+use crate::gate::{self, Verdict};
+use crate::pagelog::{ConsoleEntry, ConsoleLevel, NetworkEntry, PageLog};
 use crate::scope::{Denylist, Origin, OriginScope, ScopeDecision};
+use crate::signin::{self, SignInAnswer, SignInBridge, SignInRequest};
 use crate::snapshot::{build_snapshot, Snapshot, SnapshotLimits};
 
 /// The env var that turns the browser tools on in the sidecar (`1`; default off).
@@ -49,6 +60,9 @@ pub struct BrowserConfig {
     pub approval_timeout: Duration,
     pub denylist: Denylist,
     pub snapshot_limits: SnapshotLimits,
+    /// Local origins the managed browser may open anyway (developer use, e.g. a local test
+    /// chain). Empty by default: only public addresses ([`crate::gate`]).
+    pub allow_private: Vec<Origin>,
 }
 
 impl Default for BrowserConfig {
@@ -64,13 +78,15 @@ impl Default for BrowserConfig {
             approval_timeout: Duration::from_secs(120),
             denylist: Denylist::builtin(),
             snapshot_limits: SnapshotLimits::default(),
+            allow_private: Vec::new(),
         }
     }
 }
 
 impl BrowserConfig {
     /// `Some` only when `CITRATE_HERMES_BROWSER=1`. The managed Chromium path comes from
-    /// `CITRATE_BROWSER_CHROMIUM` when set.
+    /// `CITRATE_BROWSER_CHROMIUM` when set; developer-allowed local origins from
+    /// [`gate::ALLOW_PRIVATE_ENV`] (an unreadable list allows nothing).
     pub fn from_env() -> Option<BrowserConfig> {
         if std::env::var(BROWSER_ENV).ok().as_deref().map(str::trim) != Some("1") {
             return None;
@@ -78,8 +94,13 @@ impl BrowserConfig {
         let managed_path = std::env::var_os(chromium::MANAGED_CHROMIUM_ENV)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
+        let allow_private = std::env::var(gate::ALLOW_PRIVATE_ENV)
+            .ok()
+            .and_then(|raw| gate::parse_allow_private(&raw).ok())
+            .unwrap_or_default();
         Some(BrowserConfig {
             managed_path,
+            allow_private,
             ..BrowserConfig::default()
         })
     }
@@ -155,6 +176,13 @@ pub struct BrowserStatus {
     pub excluded_categories: Vec<CategoryView>,
     pub consent_needed: Option<ConsentNeeded>,
     pub pending_action: Option<PendingAction>,
+    /// HUP-S2.3, managed mode only: the loopback DevTools port of the managed browser, so core
+    /// can read the tab's top-frame origin over its own connection (ADR D2 #1).
+    pub devtools_port: Option<u16>,
+    /// HUP-S2.3, managed mode only: the tab Hermes drives (its DevTools target id).
+    pub target_id: Option<String>,
+    /// HUP-S2.3: sign-in requests from the page waiting for core (managed mode only).
+    pub sign_in_requests: Vec<SignInRequest>,
 }
 
 /// A page the worker is on.
@@ -195,6 +223,18 @@ struct Shared {
     /// snapshot, or the main frame moving to another address (including same-document moves).
     /// An approved action runs only if this is unchanged since the member was asked.
     page_version: AtomicU64,
+    /// Developer-allowed local origins (managed mode).
+    allow_private: Vec<Origin>,
+    /// The live connection, for answering a paused request off the I/O thread.
+    cdp: Mutex<Option<Weak<Cdp>>>,
+    /// Why the gate last stopped a page load (read by the step that caused it).
+    last_block: Arc<Mutex<Option<BrowserError>>>,
+    /// HUP-S2.3: the page's sign-in bridge (managed mode only).
+    signin: SignInBridge,
+    /// HUP-S2.3: the managed browser's loopback DevTools port.
+    devtools_port: Mutex<Option<u16>>,
+    /// 02 §5 `console` / `network`: what the tab logged and requested (read-only tools).
+    pagelog: PageLog,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -202,6 +242,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     }
+}
+
+fn continue_params(id: &Value) -> (&'static str, Value) {
+    ("Fetch.continueRequest", json!({"requestId": id}))
+}
+
+fn fail_params(id: &Value) -> (&'static str, Value) {
+    (
+        "Fetch.failRequest",
+        json!({"requestId": id, "errorReason": "BlockedByClient"}),
+    )
 }
 
 impl Shared {
@@ -219,12 +270,132 @@ impl Shared {
             .unwrap_or(false)
     }
 
+    /// Answer one paused request (see [`crate::gate`]). Every paused request gets an answer:
+    /// the returned reply, or (`None`) one from the resolver thread for a page load on a named
+    /// host.
+    fn on_paused(&self, ev: &CdpEvent) -> Option<Reply> {
+        let id = ev.params["requestId"].clone();
+        let url = ev.params["request"]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let document = ev.params["resourceType"].as_str() == Some("Document");
+        let main_frame = lock(&self.target).as_deref().is_some()
+            && ev.params["frameId"].as_str() == lock(&self.target).as_deref();
+        let verdict = if self.attached.load(Ordering::SeqCst) {
+            if document && main_frame {
+                self.attached_verdict(&url)
+            } else {
+                Verdict::Continue
+            }
+        } else {
+            gate::managed_verdict(&url, &self.allow_private, document)
+        };
+        let verdict = match verdict {
+            Verdict::Resolve { host, port } => {
+                match lock(&self.cdp).as_ref().and_then(Weak::upgrade) {
+                    Some(cdp) => {
+                        let allow = self.allow_private.clone();
+                        let session = ev.session_id.clone();
+                        let last = self.last_block.clone();
+                        let rid = id.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("citrate-browser-resolve".to_string())
+                            .spawn(move || {
+                                let (method, params) =
+                                    match gate::resolve_and_decide(&host, port, &allow) {
+                                        Verdict::Block(why) => {
+                                            if main_frame {
+                                                *lock(&last) = Some(BrowserError::NotWeb(why));
+                                            }
+                                            fail_params(&rid)
+                                        }
+                                        _ => continue_params(&rid),
+                                    };
+                                let _ = cdp.call_with_timeout(
+                                    method,
+                                    params,
+                                    session.as_deref(),
+                                    Duration::from_secs(5),
+                                );
+                            });
+                        match spawned {
+                            // Answered by the resolver thread.
+                            Ok(_) => return None,
+                            Err(_) => {
+                                Verdict::Block("the host name could not be checked".to_string())
+                            }
+                        }
+                    }
+                    None => Verdict::Block("the host name could not be checked".to_string()),
+                }
+            }
+            v => v,
+        };
+        let (method, params) = match verdict {
+            Verdict::Block(why) => {
+                if !self.attached.load(Ordering::SeqCst) && document && main_frame {
+                    *lock(&self.last_block) = Some(BrowserError::NotWeb(why));
+                }
+                fail_params(&id)
+            }
+            _ => continue_params(&id),
+        };
+        Some(Reply {
+            method: method.to_string(),
+            params,
+            session_id: ev.session_id.clone(),
+        })
+    }
+
+    /// Attach mode: a top-level page load needs the member's consent for its origin.
+    fn attached_verdict(&self, url: &str) -> Verdict {
+        let decision =
+            lock(&self.scope)
+                .as_ref()
+                .map(|s| s.check(url))
+                .unwrap_or(ScopeDecision::NotWeb {
+                    reason: "internal: no origin scope".to_string(),
+                });
+        let err = match decision {
+            ScopeDecision::Allowed => return Verdict::Continue,
+            ScopeDecision::NeedsConsent { origin } => {
+                *lock(&self.consent_needed) = Some(ConsentNeeded {
+                    origin: origin.clone(),
+                    category: None,
+                });
+                BrowserError::NeedsConsent { origin }
+            }
+            ScopeDecision::Sensitive { origin, category } => {
+                *lock(&self.consent_needed) = Some(ConsentNeeded {
+                    origin: origin.clone(),
+                    category: Some(category.clone()),
+                });
+                BrowserError::Sensitive { origin, category }
+            }
+            ScopeDecision::NotWeb { reason } => BrowserError::NotWeb(reason),
+        };
+        let why = err.to_string();
+        *lock(&self.last_block) = Some(err);
+        Verdict::Block(why)
+    }
+
     fn on_event(&self, ev: &CdpEvent) -> Option<Reply> {
         let ours = lock(&self.session).clone();
         if ev.session_id.is_none() || ev.session_id != ours {
             return None;
         }
         match ev.method.as_str() {
+            "Runtime.executionContextCreated"
+            | "Runtime.executionContextDestroyed"
+            | "Runtime.executionContextsCleared"
+            | "Runtime.bindingCalled" => {
+                if !matches!(*lock(&self.mode), Some(Mode::Managed)) {
+                    return None;
+                }
+                let top = lock(&self.target).clone();
+                self.signin.on_event(ev, top.as_deref())
+            }
             "Page.frameNavigated" => {
                 let frame = &ev.params["frame"];
                 if frame["parentId"].is_null() {
@@ -245,6 +416,7 @@ impl Shared {
                 }
                 None
             }
+            "Fetch.requestPaused" => self.on_paused(ev),
             "Page.screencastFrame" => {
                 let url = self.url();
                 if self.frames_allowed(&url) {
@@ -262,7 +434,11 @@ impl Shared {
                     session_id: ev.session_id.clone(),
                 })
             }
-            _ => None,
+            other => {
+                let page = self.url();
+                self.pagelog.on_event(other, &ev.params, &page);
+                None
+            }
         }
     }
 }
@@ -272,6 +448,8 @@ struct Live {
     cdp: Arc<Cdp>,
     session: String,
     _chrome: Option<ManagedChrome>,
+    /// The managed browser's connection gate; dropped after the browser it serves.
+    _egress: Option<EgressGate>,
     snapshot: Option<Snapshot>,
 }
 
@@ -288,7 +466,10 @@ pub struct BrowserService {
 
 impl BrowserService {
     pub fn new(cfg: BrowserConfig) -> Self {
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            allow_private: cfg.allow_private.clone(),
+            ..Shared::default()
+        });
         *lock(&shared.scope) = Some(OriginScope::new(cfg.denylist.clone()));
         BrowserService {
             cfg,
@@ -347,7 +528,83 @@ impl BrowserService {
                 .unwrap_or_default(),
             consent_needed: lock(&self.shared.consent_needed).clone(),
             pending_action: self.approvals.pending(),
+            devtools_port: match mode {
+                Some(Mode::Managed) => *lock(&self.shared.devtools_port),
+                _ => None,
+            },
+            target_id: match mode {
+                Some(Mode::Managed) => lock(&self.shared.target).clone(),
+                _ => None,
+            },
+            sign_in_requests: self.sign_in_requests(),
         }
+    }
+
+    // --- HUP-S2.3 sign-in bridge (managed mode only; keyless) --------------------------------
+
+    /// Sign-in requests waiting for core. Requests core left unanswered for
+    /// [`signin::REQUEST_TTL`] are refused to the page here.
+    pub fn sign_in_requests(&self) -> Vec<SignInRequest> {
+        let (live, expired) = self.shared.signin.pending();
+        for d in expired {
+            let _ = self.deliver(
+                d,
+                &SignInAnswer::Refused {
+                    code: signin::CODE_USER_REJECTED,
+                    message: "nobody answered the sign-in request in time".to_string(),
+                },
+            );
+        }
+        live
+    }
+
+    /// Deliver core's answer to the page context that asked. The answer must fit the request
+    /// (one address for `eth_requestAccounts`, a 65-byte signature for `personal_sign`).
+    pub fn answer_sign_in(
+        &self,
+        id: &str,
+        answer: &SignInAnswer,
+    ) -> std::result::Result<(), String> {
+        let d = self.shared.signin.take(id, answer)?;
+        self.deliver(d, answer)
+    }
+
+    fn deliver(
+        &self,
+        d: signin::Delivery,
+        answer: &SignInAnswer,
+    ) -> std::result::Result<(), String> {
+        let cdp = lock(&self.handle)
+            .clone()
+            .ok_or_else(|| "the browser is not running".to_string())?;
+        let session = lock(&self.shared.session)
+            .clone()
+            .ok_or_else(|| "the browser is not running".to_string())?;
+        cdp.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": signin::delivery_expression(d.page_id, answer),
+                "contextId": d.context_id,
+            }),
+            Some(&session),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("the page that asked is gone: {e}"))
+    }
+
+    /// The origins the member consented to in this attach session (normalised, sorted). Empty
+    /// when nothing is attached. HUP-S1.3: the sidecar's `http_status_is` verifier may also
+    /// contact these.
+    pub fn consented_origins(&self) -> Vec<String> {
+        lock(&self.shared.scope)
+            .as_ref()
+            .map(|s| s.allowed())
+            .unwrap_or_default()
+    }
+
+    /// Origins whose page content reached the model since the browser started (ADR D2 #19).
+    pub fn read_origins(&self) -> Vec<String> {
+        self.shared.signin.read_origins()
     }
 
     /// The screencast view when newer than `after`.
@@ -383,7 +640,7 @@ impl BrowserService {
         let ws =
             chromium::attach_ws_url(port, Duration::from_secs(5)).map_err(BrowserError::Failed)?;
         let mut live = lock(&self.live);
-        let l = self.connect(&ws, Mode::Attached(port), None)?;
+        let l = self.connect(&ws, Mode::Attached(port), None, None)?;
         *live = Some(l);
         Ok(PageInfo {
             url: self.shared.url(),
@@ -459,9 +716,15 @@ impl BrowserService {
             .ok_or_else(|| BrowserError::Failed("internal: no browser".to_string()))?;
         if matches!(live.mode, Mode::Attached(_)) {
             self.check_scope_url(url)?;
+        } else {
+            self.check_managed_target(url)?;
         }
+        *lock(&self.shared.last_block) = None;
         let r = self.call(live, "Page.navigate", json!({"url": url}))?;
         if let Some(err) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
+            if let Some(blocked) = lock(&self.shared.last_block).take() {
+                return Err(blocked);
+            }
             return Err(BrowserError::Failed(format!(
                 "the page did not load: {err}"
             )));
@@ -472,6 +735,7 @@ impl BrowserService {
         if matches!(live.mode, Mode::Attached(_)) {
             self.check_scope_url(&now)?;
         }
+        self.shared.signin.note_read(&now);
         let title = self.title(live);
         Ok(PageInfo { url: now, title })
     }
@@ -490,6 +754,7 @@ impl BrowserService {
         let r = self.call(live, "Accessibility.getFullAXTree", json!({}))?;
         let nodes = r["nodes"].as_array().cloned().unwrap_or_default();
         let snap = build_snapshot(&nodes, self.cfg.snapshot_limits);
+        self.shared.signin.note_read(&url);
         live.snapshot = Some(snap.clone());
         self.shared.page_version.fetch_add(1, Ordering::SeqCst);
         let title = self.title(live);
@@ -594,6 +859,7 @@ impl BrowserService {
             state: "acted".to_string(),
         }));
         let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        *lock(&self.shared.last_block) = None;
         let done = match action {
             Action::Click => {
                 for (kind, extra) in [
@@ -664,10 +930,16 @@ impl BrowserService {
         std::thread::sleep(Duration::from_millis(250));
         self.wait_ready(live, Duration::from_secs(5));
         let after = self.current_url(live)?;
+        self.shared.signin.note_read(&before);
+        self.shared.signin.note_read(&after);
         if after != before {
             live.snapshot = None;
         }
-        Ok(format!("{done} The page is now {after}."))
+        let stopped = lock(&self.shared.last_block)
+            .take()
+            .map(|e| format!(" The browser did not open the next page: {e}."))
+            .unwrap_or_default();
+        Ok(format!("{done} The page is now {after}.{stopped}"))
     }
 
     /// Capture the current page into the screencast (the model gets a short receipt, not pixels).
@@ -694,8 +966,105 @@ impl BrowserService {
             vp["clientHeight"].as_f64().unwrap_or(0.0),
         );
         self.shared.frames.push("image/jpeg", data, size, &url);
+        self.shared.signin.note_read(&url);
         let title = self.title(live);
         Ok((PageInfo { url, title }, bytes))
+    }
+
+    /// The open page, or why there is none. Read-only tools use this: they never launch a
+    /// browser, and in attach mode the page must be one the member consented to.
+    fn open_page(&self) -> Result<PageInfo> {
+        if self.is_stopped() {
+            return Err(BrowserError::Stopped);
+        }
+        let guard = lock(&self.live);
+        let live = guard.as_ref().ok_or_else(|| {
+            BrowserError::Failed(
+                "the browser has no page open yet; use browser_navigate first".to_string(),
+            )
+        })?;
+        let url = self.current_url(live)?;
+        if matches!(live.mode, Mode::Attached(_)) {
+            self.check_scope_url(&url)?;
+        }
+        let title = self.title(live);
+        Ok(PageInfo { url, title })
+    }
+
+    /// Whether an entry logged on `page` may be shown (attach mode: only consented origins).
+    fn shown_page(&self, page: &str) -> bool {
+        self.shared.frames_allowed(page)
+    }
+
+    /// 02 §5 `console`: the latest `limit` console messages at `min` level or above.
+    pub fn console_messages(
+        &self,
+        min: ConsoleLevel,
+        limit: usize,
+    ) -> Result<(PageInfo, Vec<ConsoleEntry>)> {
+        let page = self.open_page()?;
+        let entries = self
+            .shared
+            .pagelog
+            .console(min, limit, &|p: &str| self.shown_page(p));
+        self.shared.signin.note_read(&page.url);
+        Ok((page, entries))
+    }
+
+    /// 02 §5 `network`: the latest `limit` requests (only failed ones with `problems_only`).
+    pub fn network_requests(
+        &self,
+        problems_only: bool,
+        limit: usize,
+    ) -> Result<(PageInfo, Vec<NetworkEntry>)> {
+        let page = self.open_page()?;
+        let entries = self
+            .shared
+            .pagelog
+            .network(problems_only, limit, &|p: &str| self.shown_page(p));
+        self.shared.signin.note_read(&page.url);
+        Ok((page, entries))
+    }
+
+    /// The visible text of the open page (`document.body.innerText`), cut to 20000 characters.
+    /// Used by the web-subset runner to check a task's end state; never launches a browser.
+    pub fn page_text(&self) -> Result<String> {
+        self.open_page()?;
+        let guard = lock(&self.live);
+        let live = guard
+            .as_ref()
+            .ok_or_else(|| BrowserError::Failed("the browser has no page open".to_string()))?;
+        let v = self.call(
+            live,
+            "Runtime.evaluate",
+            json!({"expression": "document.body ? document.body.innerText : ''", "returnByValue": true}),
+        )?;
+        let text = v["result"]["value"].as_str().unwrap_or_default();
+        Ok(text.chars().take(20_000).collect())
+    }
+
+    /// The facts the `decide()` slot needs about the open page (ADR red-team correction 5): its
+    /// origin, taken from the top-level frame the worker tracks (never from page content), whether
+    /// the browser holds any cookie for it, and whether this is attach mode. `None` when no
+    /// http(s) page is open. When the cookie check cannot be made, the page is treated as having
+    /// a session cookie, which keeps third-party backends away from it.
+    pub fn decision_origin(&self) -> Option<citrate_agent_loop::decide::DecisionOrigin> {
+        if self.is_stopped() {
+            return None;
+        }
+        let guard = lock(&self.live);
+        let live = guard.as_ref()?;
+        let url = self.current_url(live).ok()?;
+        let origin = Origin::parse(&url).ok()?.to_string();
+        let has_session_cookie = self
+            .call(live, "Network.getCookies", json!({"urls": [url]}))
+            .map(|v| v["cookies"].as_array().is_none_or(|c| !c.is_empty()))
+            .unwrap_or(true);
+        Some(citrate_agent_loop::decide::DecisionOrigin {
+            origin,
+            has_session_cookie,
+            attach_mode: matches!(live.mode, Mode::Attached(_)),
+        })
     }
 
     // --- internals ----------------------------------------------------------------------------
@@ -713,6 +1082,20 @@ impl BrowserService {
                     BrowserError::Failed(e)
                 }
             })
+    }
+
+    /// Managed mode: refuse a local target before asking the browser (the gate would stop the
+    /// request anyway; this gives the honest reason up front).
+    fn check_managed_target(&self, url: &str) -> Result<()> {
+        let allow = &self.cfg.allow_private;
+        match gate::managed_verdict(url, allow, true) {
+            Verdict::Continue => Ok(()),
+            Verdict::Block(why) => Err(BrowserError::NotWeb(why)),
+            Verdict::Resolve { host, port } => match gate::resolve_and_decide(&host, port, allow) {
+                Verdict::Block(why) => Err(BrowserError::NotWeb(why)),
+                _ => Ok(()),
+            },
+        }
     }
 
     fn check_scope_url(&self, url: &str) -> Result<()> {
@@ -844,20 +1227,28 @@ impl BrowserService {
                 .path()
                 .ok_or_else(|| BrowserError::Failed("internal: no browser path".to_string()))?,
         };
-        let chrome = ManagedChrome::launch(
-            &exe,
-            self.cfg.viewport,
-            &self.cfg.extra_args,
-            self.cfg.launch_timeout,
-        )
-        .map_err(BrowserError::Failed)?;
+        // Every connection the managed browser makes goes through the egress gate (public
+        // addresses and developer-allowed origins only). Without it the browser is not started.
+        let egress = EgressGate::start(self.cfg.allow_private.clone()).map_err(|e| {
+            BrowserError::Failed(format!("could not start the browser's network gate: {e}"))
+        })?;
+        let mut args = egress.browser_args();
+        args.extend(self.cfg.extra_args.iter().cloned());
+        let chrome = ManagedChrome::launch(&exe, self.cfg.viewport, &args, self.cfg.launch_timeout)
+            .map_err(BrowserError::Failed)?;
         let ws = chrome.ws_url().to_string();
-        let live = self.connect(&ws, Mode::Managed, Some(chrome))?;
+        let live = self.connect(&ws, Mode::Managed, Some(chrome), Some(egress))?;
         *guard = Some(live);
         Ok(guard)
     }
 
-    fn connect(&self, ws: &str, mode: Mode, chrome: Option<ManagedChrome>) -> Result<Live> {
+    fn connect(
+        &self,
+        ws: &str,
+        mode: Mode,
+        chrome: Option<ManagedChrome>,
+        egress: Option<EgressGate>,
+    ) -> Result<Live> {
         let shared = self.shared.clone();
         let handler: EventHandler = Arc::new(move |ev: &CdpEvent| shared.on_event(ev));
         let cdp = Arc::new(
@@ -894,15 +1285,47 @@ impl BrowserService {
             }
         }
         *lock(&self.shared.mode) = Some(mode);
+        *lock(&self.shared.devtools_port) = match mode {
+            Mode::Managed => devtools_port_of(ws),
+            Mode::Attached(_) => None,
+        };
         *lock(&self.handle) = Some(cdp.clone());
+        *lock(&self.shared.cdp) = Some(Arc::downgrade(&cdp));
         let live = Live {
             mode,
             cdp,
             session,
             _chrome: chrome,
+            _egress: egress,
             snapshot: None,
         };
         self.call(&live, "Page.enable", json!({}))?;
+        // Requests are paused and judged before they are sent (crate::gate). Without this the
+        // browser is not used: fail closed.
+        self.call(
+            &live,
+            "Fetch.enable",
+            json!({"patterns": gate::fetch_patterns(is_attached)}),
+        )?;
+        if mode == Mode::Managed {
+            // HUP-S2.3: the sign-in bridge. The binding and the provider script exist only in the
+            // managed browser; the member's own Chrome never gets them (ADR D2 #3).
+            self.call(
+                &live,
+                "Runtime.addBinding",
+                json!({"name": signin::BINDING}),
+            )?;
+            self.call(
+                &live,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": signin::provider_script()}),
+            )?;
+        }
+        // Console messages and requests for the read-only console and network tools, in both
+        // modes (only the tab this worker opened is ever listened to).
+        self.call(&live, "Runtime.enable", json!({}))?;
+        self.call(&live, "Network.enable", json!({}))?;
+        self.call(&live, "Log.enable", json!({}))?;
         let (w, h) = self.cfg.viewport;
         self.call(
             &live,
@@ -916,6 +1339,7 @@ impl BrowserService {
     /// worker opened in an attached Chrome, then the managed browser. Forgets attach consent.
     fn teardown(&self) {
         let handle = lock(&self.handle).take();
+        *lock(&self.shared.cdp) = None;
         let target = lock(&self.shared.target).take();
         let was_attached = self.shared.attached.swap(false, Ordering::SeqCst);
         if let Some(cdp) = &handle {
@@ -936,6 +1360,8 @@ impl BrowserService {
         drop(old);
         *lock(&self.shared.session) = None;
         *lock(&self.shared.mode) = None;
+        *lock(&self.shared.devtools_port) = None;
+        self.shared.signin.clear();
         *lock(&self.shared.consent_needed) = None;
         *lock(&self.shared.url) = String::new();
         if was_attached {
@@ -944,7 +1370,15 @@ impl BrowserService {
             }
         }
         self.shared.frames.clear();
+        self.shared.pagelog.clear();
     }
+}
+
+/// The port of a loopback DevTools WebSocket URL (`ws://127.0.0.1:PORT/devtools/...`).
+fn devtools_port_of(ws: &str) -> Option<u16> {
+    let rest = ws.strip_prefix("ws://127.0.0.1:")?;
+    let port = rest.split('/').next()?;
+    port.parse::<u16>().ok().filter(|p| *p > 0)
 }
 
 impl Drop for BrowserService {
@@ -979,6 +1413,79 @@ mod tests {
         *lock(&s.url) = url.to_string();
         s.attached.store(true, Ordering::SeqCst);
         s
+    }
+
+    fn sign_in_events(s: &Shared) {
+        s.on_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".to_string(),
+            params: json!({"context": {"id": 5, "origin": "https://app.example.org", "name": "",
+                "auxData": {"isDefault": true, "type": "default", "frameId": "T1"}}}),
+            session_id: Some("S1".to_string()),
+        });
+        s.on_event(&CdpEvent {
+            method: "Runtime.bindingCalled".to_string(),
+            params: json!({"name": signin::BINDING, "executionContextId": 5,
+                "payload": json!({"id": 1, "method": "eth_requestAccounts"}).to_string()}),
+            session_id: Some("S1".to_string()),
+        });
+    }
+
+    #[test]
+    fn the_sign_in_bridge_listens_only_in_the_managed_browser() {
+        let s = shared_attached("https://app.example.org/");
+        *lock(&s.target) = Some("T1".to_string());
+        *lock(&s.mode) = Some(Mode::Attached(9222));
+        sign_in_events(&s);
+        assert!(
+            s.signin.pending().0.is_empty(),
+            "attach mode: no bridge (ADR D2 #3)"
+        );
+        *lock(&s.mode) = Some(Mode::Managed);
+        sign_in_events(&s);
+        let (p, _) = s.signin.pending();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].top_frame, "the target id is the tab's top frame");
+    }
+
+    #[test]
+    fn sign_in_events_of_other_sessions_are_ignored() {
+        let s = shared_attached("https://app.example.org/");
+        *lock(&s.target) = Some("T1".to_string());
+        *lock(&s.mode) = Some(Mode::Managed);
+        *lock(&s.session) = Some("OTHER".to_string());
+        sign_in_events(&s);
+        assert!(s.signin.pending().0.is_empty());
+    }
+
+    #[test]
+    fn the_devtools_port_comes_from_the_loopback_url_only() {
+        assert_eq!(
+            devtools_port_of("ws://127.0.0.1:41234/devtools/browser/x"),
+            Some(41234)
+        );
+        assert_eq!(
+            devtools_port_of("ws://10.0.0.2:41234/devtools/browser/x"),
+            None
+        );
+        assert_eq!(devtools_port_of("ws://127.0.0.1:0/devtools"), None);
+        assert_eq!(devtools_port_of("ws://127.0.0.1:x/devtools"), None);
+    }
+
+    #[test]
+    fn with_no_browser_running_an_answer_cannot_be_delivered() {
+        let svc = BrowserService::new(BrowserConfig::default());
+        let r = svc.answer_sign_in(
+            "signin-1",
+            &SignInAnswer::Refused {
+                code: 4001,
+                message: "no".into(),
+            },
+        );
+        assert!(r.is_err());
+        let st = svc.status();
+        assert_eq!(st.devtools_port, None);
+        assert_eq!(st.target_id, None);
+        assert!(st.sign_in_requests.is_empty());
     }
 
     #[test]
@@ -1046,6 +1553,105 @@ mod tests {
             "Page.navigatedWithinDocument",
         ));
         assert_eq!(s.url(), "https://a.example/#x");
+    }
+
+    fn paused(url: &str, resource: &str, frame: &str) -> CdpEvent {
+        // Shape of `Fetch.requestPaused` (flat session), as Chrome sends it.
+        CdpEvent {
+            method: "Fetch.requestPaused".to_string(),
+            params: json!({
+                "requestId": "interception-job-7.0",
+                "request": {"url": url, "method": "GET", "headers": {}},
+                "frameId": frame,
+                "resourceType": resource,
+            }),
+            session_id: Some("S1".to_string()),
+        }
+    }
+
+    fn verdict(reply: Option<Reply>) -> (String, Value) {
+        let r = reply.expect("every paused request is answered");
+        assert_eq!(r.session_id.as_deref(), Some("S1"));
+        assert_eq!(r.params["requestId"], "interception-job-7.0");
+        (r.method, r.params)
+    }
+
+    #[test]
+    fn managed_mode_fails_requests_to_local_addresses_before_they_are_sent() {
+        let s = shared_attached("https://example.com/");
+        s.attached.store(false, Ordering::SeqCst);
+        *lock(&s.target) = Some("T1".to_string());
+        for (url, kind) in [
+            ("http://127.0.0.1:8545/", "XHR"),
+            ("http://169.254.169.254/latest/meta-data/", "Fetch"),
+            ("http://localhost:11434/api/tags", "Document"),
+            ("http://192.168.1.1/", "Image"),
+        ] {
+            let (method, params) = verdict(s.on_event(&paused(url, kind, "T1")));
+            assert_eq!(method, "Fetch.failRequest", "{url}");
+            assert_eq!(params["errorReason"], "BlockedByClient");
+        }
+        let (method, _) = verdict(s.on_event(&paused("https://1.1.1.1/x.js", "Script", "T1")));
+        assert_eq!(method, "Fetch.continueRequest");
+    }
+
+    #[test]
+    fn a_page_load_on_a_named_host_with_no_connection_to_resolve_on_fails_closed() {
+        let s = shared_attached("https://example.com/");
+        s.attached.store(false, Ordering::SeqCst);
+        *lock(&s.target) = Some("T1".to_string());
+        let (method, _) = verdict(s.on_event(&paused("https://example.com/", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+    }
+
+    #[test]
+    fn a_developer_allowed_local_origin_continues_in_managed_mode() {
+        let mut s = shared_attached("about:blank");
+        s.attached.store(false, Ordering::SeqCst);
+        s.allow_private = crate::gate::parse_allow_private("http://127.0.0.1:8545").expect("allow");
+        let (method, _) = verdict(s.on_event(&paused("http://127.0.0.1:8545/", "Document", "T1")));
+        assert_eq!(method, "Fetch.continueRequest");
+        let (method, _) = verdict(s.on_event(&paused("http://127.0.0.1:8546/", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+    }
+
+    #[test]
+    fn attach_mode_stops_a_page_load_to_an_origin_without_consent_before_it_is_sent() {
+        let s = shared_attached("https://consented.example/");
+        *lock(&s.target) = Some("T1".to_string());
+        if let Some(sc) = lock(&s.scope).as_mut() {
+            sc.allow("https://consented.example", false)
+                .expect("consent");
+        }
+        // A redirect or click from the consented origin to one without consent.
+        let (method, params) =
+            verdict(s.on_event(&paused("https://other.example/account", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+        assert_eq!(params["errorReason"], "BlockedByClient");
+        assert_eq!(
+            lock(&s.consent_needed).as_ref().map(|c| c.origin.clone()),
+            Some("https://other.example".to_string())
+        );
+        // Sensitive origins are stopped the same way.
+        let (method, _) = verdict(s.on_event(&paused("https://www.chase.com/", "Document", "T1")));
+        assert_eq!(method, "Fetch.failRequest");
+        // The consented origin, a sub-frame and a sub-resource continue.
+        for (url, kind, frame) in [
+            ("https://consented.example/next", "Document", "T1"),
+            ("https://ads.example/frame", "Document", "F2"),
+            ("https://cdn.example/app.js", "Script", "T1"),
+        ] {
+            let (method, _) = verdict(s.on_event(&paused(url, kind, frame)));
+            assert_eq!(method, "Fetch.continueRequest", "{url}");
+        }
+    }
+
+    #[test]
+    fn paused_requests_of_other_sessions_are_not_answered() {
+        let s = shared_attached("https://example.com/");
+        let mut ev = paused("http://127.0.0.1/", "Document", "T1");
+        ev.session_id = Some("OTHER".to_string());
+        assert!(s.on_event(&ev).is_none());
     }
 
     #[test]

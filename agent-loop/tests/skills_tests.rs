@@ -717,3 +717,23 @@ fn skill_load_is_not_effectful_and_its_output_is_untrusted() {
     assert!(!spec.annotations.is_effectful());
     assert!(spec.annotations.output_untrusted());
 }
+
+/// US-3.2 AC2 (one format, one loader): the exact bytes citrate-core writes when the member saves
+/// a skill (`src-tauri/src/skills_local.rs`, pinned there as `MORNING_CHECK_MD`) load through this
+/// strict loader from the member's skills folder.
+#[test]
+fn core_written_skill_md_parses_strictly() {
+    const MORNING_CHECK_MD: &str = "---\nname: morning-check\ndescription: \"Read node status, then the \\\"staking\\\" status.\"\nmetadata:\n  display-name: \"Morning check\"\n  origin: citrate-core-skill-write\n---\n\n1. node_status\n2. staking_status\n";
+    let (fm, body) = parse_skill_md(MORNING_CHECK_MD).unwrap();
+    assert_eq!(fm.name, "morning-check");
+    assert_eq!(
+        fm.description,
+        "Read node status, then the \"staking\" status."
+    );
+    assert_eq!(fm.metadata["display-name"], "Morning check");
+    assert_eq!(body, "\n1. node_status\n2. staking_status\n");
+    let s = Scratch::new("core-written");
+    write(&s.path().join("morning-check/SKILL.md"), MORNING_CHECK_MD);
+    let lib = SkillLibrary::load(&[SkillSource::new("2:agent-skills", s.path())]);
+    assert_eq!(lib.names(), vec!["morning-check"]);
+}

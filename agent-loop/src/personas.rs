@@ -393,3 +393,94 @@ impl CustomPersona {
         })
     }
 }
+
+/// Most emphasised tools pinned into every request of a session (pinning never costs a retrieval
+/// slot, so this bounds how much a persona can grow the per-request tool list).
+pub const MAX_PINNED_EMPHASIS: usize = 4;
+
+/// What a session does with its persona beyond the prompt fragment (which the client composes):
+/// the skill allowlist decides which skills the session offers, and the tool emphasis decides which
+/// of the session's own tools are offered on every request. Neither grants anything: a skill
+/// outside the allowlist is not offered, and an emphasised tool the session does not already have
+/// is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionPersona {
+    pub id: String,
+    pub skills: Vec<String>,
+    pub tool_emphasis: Vec<String>,
+}
+
+impl SessionPersona {
+    /// An empty allowlist (a custom persona that names no skills) leaves the skills as they are.
+    pub fn restricts_skills(&self) -> bool {
+        !self.skills.is_empty()
+    }
+
+    /// The emphasised tools this session offers, in emphasis order, at most
+    /// [`MAX_PINNED_EMPHASIS`], without repeats.
+    pub fn pinned_tools(&self, offered: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in &self.tool_emphasis {
+            if out.len() >= MAX_PINNED_EMPHASIS {
+                break;
+            }
+            if offered.contains(t) && !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
+}
+
+/// The prompt fragment for a `POST /sessions` persona, rendered here from the persona the sidecar
+/// checks: a shipped persona by id, or a custom persona that passes [`CustomPersona::check`]. The
+/// client never supplies the fragment text, so a fragment edited in app state cannot reach the
+/// prompt. `Ok(None)` when the request names no persona; the same refusals as
+/// [`session_persona`] otherwise.
+pub fn session_persona_fragment(
+    id: Option<&str>,
+    custom: Option<&CustomPersona>,
+) -> Result<Option<String>, String> {
+    match (id, custom) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err("give a persona id or a custom persona, not both".into()),
+        (Some(id), None) => bundled_personas()?
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| Some(p.prompt_fragment()))
+            .ok_or_else(|| format!("no shipped persona {id:?}")),
+        (None, Some(c)) => c.check().map(|v| Some(v.prompt_fragment)),
+    }
+}
+
+/// The session persona for a `POST /sessions` request: a shipped persona by id, or a custom one
+/// (checked here with [`CustomPersona::check`]), or none. Both at once, an unknown id, or a custom
+/// persona that fails its check are refused.
+pub fn session_persona(
+    id: Option<&str>,
+    custom: Option<&CustomPersona>,
+) -> Result<Option<SessionPersona>, String> {
+    match (id, custom) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err("give a persona id or a custom persona, not both".into()),
+        (Some(id), None) => {
+            let p = bundled_personas()?
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| format!("no shipped persona {id:?}"))?;
+            Ok(Some(SessionPersona {
+                id: p.id,
+                skills: p.skills,
+                tool_emphasis: p.tool_emphasis,
+            }))
+        }
+        (None, Some(c)) => {
+            let view = c.check()?;
+            Ok(Some(SessionPersona {
+                id: view.persona.id,
+                skills: view.persona.skills,
+                tool_emphasis: view.persona.tool_emphasis,
+            }))
+        }
+    }
+}

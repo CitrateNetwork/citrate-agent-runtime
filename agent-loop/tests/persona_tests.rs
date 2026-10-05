@@ -1,10 +1,10 @@
 //! HUP-S3.3 + S3.7 (US-3.3): personas. A persona is a voice (writing-style rules that become a
 //! system-prompt fragment), a default track, a tool emphasis and an optional TTS voice. The names
-//! are placeholders pending owner sign-off and live in one data file (`personas/personas.toml`).
+//! are owner-approved (2026-10-01) and live in one data file (`personas/personas.toml`).
 
 use citrate_agent_loop::interview::bundled_tracks;
 use citrate_agent_loop::personas::{
-    bundled_personas, persona_views, CustomPersona, Persona, NAME_STATUS_PENDING, PERSONAS_SOURCE,
+    bundled_personas, persona_views, CustomPersona, Persona, NAME_STATUS_APPROVED, PERSONAS_SOURCE,
 };
 use std::collections::BTreeSet;
 
@@ -75,11 +75,13 @@ fn ids_and_names_are_unique_case_insensitively() {
 }
 
 #[test]
-fn shipped_names_are_placeholders_pending_owner_sign_off() {
-    for p in bundled_personas().expect("parse") {
-        assert_eq!(p.name_status, NAME_STATUS_PENDING, "{}", p.id);
+fn shipped_names_are_owner_approved_and_operator_ships() {
+    let shipped = bundled_personas().expect("parse");
+    for p in &shipped {
+        assert_eq!(p.name_status, NAME_STATUS_APPROVED, "{}", p.id);
+        assert!(!p.name_pending_sign_off(), "{}", p.id);
     }
-    assert!(NAME_STATUS_PENDING.contains("pending owner sign-off"));
+    assert!(shipped.iter().any(|p| p.id == "operator"));
     // One data file: every name is a single `name = "..."` line in it, so a rename is one line.
     for p in bundled_personas().expect("parse") {
         let line = format!("name = \"{}\"", p.name);
@@ -190,11 +192,11 @@ fn a_persona_file_with_an_unknown_default_track_or_duplicate_name_is_refused() {
 }
 
 #[test]
-fn views_carry_the_rendered_fragment_and_the_pending_flag() {
+fn views_carry_the_rendered_fragment_and_the_approved_flag() {
     let views = persona_views().expect("views");
     assert_eq!(views.len(), bundled_personas().expect("parse").len());
     for v in &views {
-        assert!(v.name_pending_sign_off);
+        assert!(!v.name_pending_sign_off);
         assert!(!v.custom);
         assert!(v.prompt_fragment.contains(&v.persona.name));
     }

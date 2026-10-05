@@ -81,6 +81,9 @@ impl Fx {
                 self.base.join("bin").display().to_string(),
             ),
             ("CITRATE_HERMES_SOLC".into(), "/opt/solc/solc-0.8.36".into()),
+            // The stand-in forge reads a fixture and writes beside the granted folder, which the
+            // OS sandbox forbids; the sandboxed worker path has its own test.
+            ("CITRATE_HERMES_SHELL_SANDBOX".into(), "off".into()),
         ];
         let w = Arc::new(Worker::start(
             toolchain_worker_spec(PathBuf::from(SIDECAR), env),

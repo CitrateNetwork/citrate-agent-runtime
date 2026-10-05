@@ -10,6 +10,7 @@ status: active
 | Module | Models | Invariants | WP |
 |---|---|---|---|
 | `LearnRestart.tla` | One skill proposal across sidecar crashes and restarts: the proposals file, the write-ahead decision log, lost saves, log crash recovery, and reconciling the file with the log on open (HUP-S3.4 wiring) | `AtMostOneWrite`, `WriteImpliesRecorded`, `RejectFinal`, `AckedNotLost`, `PersistedIsTrue` (plus `TypeOK`) | HUP-S3.4 wiring |
+| `ContradictionResolve.tla` | Learned memories on one key that disagree: accept (core's ledger marks every side `both`), the member's resolve (keep one, retract another), core applying it from the route answer or a later sync, lost saves, crashes and reconciling with the log (HUP-S3.4, fan-out 5) | `RetractRecorded`, `OneStanding`, `ResolveFinal`, `NoSilentMerge`, `LedgerFalseIsRetracted`, `LedgerTrueIsStanding` (plus `TypeOK`) | HUP-S3.4 |
 | `SkillPersistence.tla` | Proposal, verifiers, member accept or reject, conflicts, the write (which can fail), publish approval, the publish build, and outside edits to the saved file, for independent proposals | `NothingProposedWithoutVerifiers`, `PersistImpliesVerifiedAndAccepted`, `NoSilentMerge`, `RejectRecordedAndFinal`, `PublishImpliesHIC1` (plus `TypeOK`) | HUP-S3.4 |
 
 The planset (03_TLA_SPECS) names two invariants for this module, `PersistImpliesVerifiedAndAccepted`
@@ -97,3 +98,58 @@ Mutation check (each a single edit, then restored):
 | reconcile treats any recorded accept as persisted | `PersistedIsTrue` |
 | the accept is not recorded before the write | `WriteImpliesRecorded` |
 | the reject is not written to the log | `RejectFinal` |
+
+## ContradictionResolve (2026-10-01, branch hup/n5-learn-rest)
+
+Rust counterparts: `Learner::resolve` (`ResolveGuard`, record first, then `Retracted`),
+`reconcile_with_log` (`Reconcile`), `memory_conflicts` (which memories count as accepted), and
+citrate-core `hermes_learn.rs` `Ledger::apply_resolution` (`CoreApply`, `CoreGuard`).
+
+```sh
+cd agent-learn/formal
+"$(brew --prefix openjdk)/bin/java" -XX:+UseParallelGC -cp ~/.tla/tla2tools.jar tlc2.TLC \
+  -workers auto ContradictionResolve.tla -config ContradictionResolve.cfg
+```
+
+| Config | States generated | Distinct | Depth | Result |
+|---|---|---|---|---|
+| `Mems = {m1, m2, m3}, MaxCrashes = 2` (checked in) | 38,627 | 12,900 | 17 | no error (1 s) |
+| `Mems = {m1, m2, m3}, MaxCrashes = 3` | 64,754 | 22,296 | 18 | no error (1 s) |
+
+The model found three things before any of them shipped, each now a Rust test:
+
+1. A file that lost both the accept and the resolve of a memory brought it back as `proposed`
+   after a restart (reconcile only handled a `persisted` file). Now a recorded resolution
+   retracts whatever the file says
+   (`store_tests::a_resolution_is_applied_even_when_the_accept_before_it_was_lost_too`).
+2. Core must only promote the KEPT memory to `true` when it applies one resolution: promoting
+   any memory left with no contradiction marks one `true` whose own retraction core has not
+   applied yet (its answer was lost). Any other memory left `both` with nothing to contradict is
+   settled by core's sync (`CoreSettle`), and only when the sidecar shows it standing. Core's
+   `apply_resolution` and `sync_with_sidecar` follow the model.
+3. A memory offered again after a lost save (`persist_failed`) did not count as accepted, so a
+   later memory that disagreed was stored as plain `true` next to it. It counts now
+   (`store_tests::a_memory_offered_again_after_a_lost_save_still_counts_as_accepted_for_contradictions`).
+
+Mutation check (each a single edit, then restored):
+
+| Mutant | Caught by |
+|---|---|
+| the kept memory may be in any state | `OneStanding` |
+| a memory may be kept and retracted at once | `OneStanding` |
+| the resolve is not recorded | `RetractRecorded` |
+| reconcile retracts only a `persisted` file (finding 1) | `ResolveFinal` |
+| reconcile ignores resolve records | `ResolveFinal` |
+| core applies a resolution before the sidecar shows it | `NoSilentMerge` |
+| core promotes any memory left without a contradiction (finding 2) | `NoSilentMerge` |
+| core promotes the kept memory even when it is already `false` | `LedgerTrueIsStanding` |
+| a memory offered again does not count as accepted (finding 3) | `LedgerTrueIsStanding` |
+| core's sync settles a memory without asking whether the sidecar shows it standing | `NoSilentMerge` |
+| core's sync settles a memory that still has contradictions | `NoSilentMerge` |
+
+Rust mutants on `Learner::resolve` and the reconcile/conflict changes: dropping the `persisted`
+check, the key check, the decision record, the widened reconcile arm, the `persist_failed`
+counting, or counting a retracted memory as known each fail a test. The "same value" and "same
+id" refusals guard each other (the same id is also the same value), and two accepted memories
+with the same value cannot be built through the API (`already_known`), so those two mutants
+survive as equivalent; both refusals stay as defence in depth.

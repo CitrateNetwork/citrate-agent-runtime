@@ -457,7 +457,7 @@ tier = "bundled"
     fn egress_allowed_with_exact_socket_addresses_loads() {
         let ok = WORKED_EXAMPLE.replace(
             r#"network = "none""#,
-            "network = \"egress-allowed\"\nnetwork_allow = [\"203.0.113.7:443\", \"[2001:db8::1]:8443\"]",
+            "network = \"egress-allowed\"\nnetwork_allow = [\"1.1.1.1:443\", \"[2606:4700:4700::1111]:8443\"]",
         );
         let m = Manifest::parse(&ok).expect("egress with an allowlist loads");
         assert_eq!(m.capability.network, NetworkPolicy::EgressAllowed);
@@ -469,7 +469,7 @@ tier = "bundled"
         for policy in ["none", "broker-only"] {
             let bad = WORKED_EXAMPLE.replace(
                 r#"network = "none""#,
-                &format!("network = \"{policy}\"\nnetwork_allow = [\"203.0.113.7:443\"]"),
+                &format!("network = \"{policy}\"\nnetwork_allow = [\"1.1.1.1:443\"]"),
             );
             let err = Manifest::parse(&bad).expect_err(policy);
             assert!(err.to_string().contains("network_allow"), "{policy}: {err}");
@@ -481,8 +481,8 @@ tier = "bundled"
         for bad in [
             "example.com:443",
             "0.0.0.0:443",
-            "203.0.113.7:0",
-            "203.0.113.7",
+            "1.1.1.1:0",
+            "1.1.1.1",
             "[::]:443",
         ] {
             let m = WORKED_EXAMPLE.replace(
@@ -491,6 +491,33 @@ tier = "bundled"
             );
             let err = Manifest::parse(&m).expect_err(bad);
             assert!(err.to_string().contains("network_allow"), "{bad}: {err}");
+        }
+    }
+
+    /// A signed manifest alone cannot point a capsule at this machine, the local network, or a
+    /// cloud metadata service: only public addresses may be allowlisted.
+    #[test]
+    fn network_allowlist_entries_must_be_public_addresses() {
+        for bad in [
+            "127.0.0.1:8545",
+            "169.254.169.254:80",
+            "10.0.0.5:443",
+            "172.16.1.1:443",
+            "192.168.1.1:80",
+            "100.64.0.1:443",
+            "203.0.113.7:443",
+            "[::1]:443",
+            "[fd00::1]:443",
+            "[fe80::1]:443",
+            "[::ffff:127.0.0.1]:80",
+            "[2002:7f00:1::1]:80",
+        ] {
+            let m = WORKED_EXAMPLE.replace(
+                r#"network = "none""#,
+                &format!("network = \"egress-allowed\"\nnetwork_allow = [\"{bad}\"]"),
+            );
+            let err = Manifest::parse(&m).expect_err(bad);
+            assert!(err.to_string().contains("public"), "{bad}: {err}");
         }
     }
 

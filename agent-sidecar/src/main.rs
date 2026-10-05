@@ -6,6 +6,13 @@
 //!   CITRATE_HERMES_CAPSULES     capsule (skill) directory to load; default ./capsules (optional)
 //!   CITRATE_HERMES_SKILLS       HUP-S3.2: SKILL.md instruction-skill directories, a path list in
 //!                               precedence order (first wins); unset = no skills (optional)
+//!   CITRATE_HERMES_EMBED_URL    HUP-S1.2: an OpenAI-compatible embeddings endpoint (llama-server
+//!                               with --embeddings, e.g. a BGE model; loopback http or https) that
+//!                               ranks tools and skills with keywords; unset, sessions try their
+//!                               own loopback chat server and rank lexically if it does not embed
+//!   CITRATE_HERMES_SKILLS_LOCK  HUP-S3.2: path of the skills.lock citrate-core ships; with
+//!   CITRATE_HERMES_SKILLS_THIRD_PARTY (the staged reviewed-skills tree) the reviewed third-party
+//!                               skills load last, each file checked against the lock (optional)
 //!   CITRATE_HERMES_TOOLCHAIN    HUP-S6.3: `1` offers forge_test / slither_scan / aderyn_scan /
 //!                               medusa_fuzz in every session; anything else = off (optional)
 //!   CITRATE_HERMES_TOOLCHAIN_ROOTS  granted project folders for those tools, a path list;
@@ -13,13 +20,27 @@
 //!   CITRATE_HERMES_TOOLCHAIN_PATH   toolchain search path override, a path list (optional)
 //!   CITRATE_HERMES_SOLC         absolute path of the solc forge should use; default: the pinned
 //!                               0.8.36 in the per-user svm dir when present (optional)
+//!   CITRATE_HERMES_SHELL_SANDBOX  US-2.2 AC1: `preferred` (default) runs the toolchain inside
+//!                               the OS sandbox (macOS Seatbelt, Linux bubblewrap) when one works
+//!                               here; `required` refuses runs without one; `off` never wraps;
+//!                               any other value counts as `required` (optional)
+//!   CITRATE_HERMES_SHELL_RUN    US-2.2 AC2: `1` offers shell_run (an exact command the member
+//!                               approves, run in the OS sandbox, never without it) in every
+//!                               session opened with folder grants; anything else = off (optional)
+//!   CITRATE_HERMES_SHELL_PATH   shell_run search path override, a path list (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_MCP_REGISTRY HUP-S4.4: core's owner-only saved MCP server list
+//!                               (mcp-servers.json); POST /mcp/probe starts only entries saved
+//!                               there exactly as sent; unset = every probe is refused (optional)
 //!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
-//!                               the /checkpoints undo routes are served (optional)
-//!   CITRATE_HERMES_FILES        HUP-S2.9: `1` offers fs_write / fs_edit / fs_delete / fs_rename in
-//!                               every session; needs CITRATE_HERMES_GRANTS and the checkpoint
-//!                               store, else off (optional)
+//!                               the /checkpoints undo routes are served, and sessions opened with
+//!                               a grant document get checkpointed file_write / sheet_write plus
+//!                               fs_write / fs_edit / fs_delete / fs_rename on that document; unset
+//!                               = no agent file write at all (optional)
+//!   CITRATE_HERMES_FILES        HUP-S2.9: `1` also offers the fs_* tools in sessions opened
+//!                               without a grant document; needs CITRATE_HERMES_GRANTS and the
+//!                               checkpoint store, else off (optional)
 //!   CITRATE_HERMES_GRANTS       absolute path of the folder-grants JSON core stores; read on every
 //!                               file-tool call (optional)
 //!   CITRATE_HERMES_METERING_DIR HUP-S7.5: absolute folder for the metering log (metering.jsonl);
@@ -29,6 +50,12 @@
 //!   CITRATE_HERMES_RECORDS_DIR  HUP-S7.3: absolute folder of the HIC decision records to batch
 //!   CITRATE_HERMES_ANCHOR_DIR   HUP-S7.3: absolute folder for the anchor ledger; both must be set
 //!                               for the /anchor/* routes, else they answer "not configured"
+//!                               (HUP-S2.3: POST /records/web-signing writes core's web-signing
+//!                               decisions into CITRATE_HERMES_RECORDS_DIR; unset, it answers 404.
+//!                               HUP-S2.6: set, the sidecar also records ceremony-bridge resolves,
+//!                               browser action decisions, learn decisions and POST /records/core
+//!                               (core's grant, full-access, escalation and approval-card events)
+//!                               there, through one writer)
 //!   CITRATE_HERMES_LEARN_DIR    HUP-S3.4: learn data folder (decision log + proposals file);
 //!                               with CITRATE_HERMES_LEARN_SKILLS_DIR, turns on the learn routes
 //!                               and the `learn_propose` tool; unset = learning off (optional)
@@ -45,15 +72,22 @@
 //!                               origin (CITRATE_HERMES_JEV_ORIGINS, CITRATE_HERMES_JEV_NON_WEB) and
 //!                               only with CITRATE_HERMES_JEV_KEY_FILE (optional)
 //!   CITRATE_HERMES_DECIDE_LOG   JSONL file for decide() metering (optional)
+//!   CITRATE_HERMES_SELF_REVIEW  US-1.3 AC2: `0` stops recording the model's self-review of each
+//!                               workflow step attempt (an opinion in the session's event log that
+//!                               never decides an outcome); anything else or unset = on (optional)
 //!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
 //!                               serves the /browser control routes; anything else = off (optional)
 //!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
 //!                               updater); unset = a system Chromium if one exists (optional)
+//!   CITRATE_BROWSER_ALLOW_PRIVATE  developer use: local origins the managed browser may open
+//!                               (comma separated, e.g. http://127.0.0.1:8545); unset = public
+//!                               web addresses only (optional)
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it
 //! reads the same `CITRATE_HERMES_TOOLCHAIN*` variables). On SIGTERM or Ctrl-C the control plane
-//! stops accepting requests and shuts its workers down cleanly before exiting.
+//! stops accepting requests and stops its child processes (workers, browser, SearXNG, MCP
+//! servers) before exiting.
 
 use std::sync::Arc;
 
@@ -118,12 +152,9 @@ async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
     // The dispatch carries the QueuedApprovalGate over `queue`, so a skill's chain effect surfaces on
     // the same queue /approvals + /status read.
     let dispatch = load_dispatch(capsule_path, queue.clone());
-    // PBA-L6b-015: list only skills the dispatch will actually run (a refused or unverified
-    // capsule is not a skill).
-    let skills: Vec<_> = match &dispatch {
-        Some(d) => skills.into_iter().filter(|s| d.has(&s.name)).collect(),
-        None => skills,
-    };
+    // PBA-L6b-015 / HUP-S2.5: list only skills the dispatch will actually run (a refused or
+    // unverified capsule is not a skill; with no dispatch nothing runs).
+    let skills = agent_sidecar::runnable_skills(skills, dispatch.as_deref());
 
     // MCP servers are started and handshaken off the async runtime (blocking I/O).
     let mcp = tokio::task::spawn_blocking(agent_sidecar::mcp_from_env)
@@ -156,19 +187,20 @@ async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the worker processes first (each gets a shutdown
-    // request and a grace period, well inside core's 5 s stop grace), then let the server drain.
-    // Off the async runtime: it joins the supervisor threads.
+    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the child processes first (workers get a shutdown
+    // request and a grace period, well inside core's 5 s stop grace; the browser, SearXNG and MCP
+    // servers are stopped explicitly), then let the server drain. Off the async runtime: it joins
+    // the supervisor threads.
     let sessions = state.sessions.clone();
     let served = axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_children()).await;
         })
         .await;
     // Idempotent: covers a server that ended without a signal.
     let sessions = state.sessions.clone();
-    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_children()).await;
     served?;
     Ok(())
 }

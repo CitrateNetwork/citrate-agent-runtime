@@ -33,13 +33,14 @@ pub mod registry;
 mod store;
 
 pub use evidence::{
-    run_verified_workflow, sha256_hex, trajectory_digest, Evidence, TrajectoryRef, Unverified,
-    VerifiedRun, VerifierVerdict,
+    run_verified_workflow, run_verified_workflow_reviewed, sha256_hex, trajectory_digest, Evidence,
+    TrajectoryRef, Unverified, VerifiedRun, VerifierVerdict,
 };
 pub use learner::{
     Belnap, Conflict, ConflictKind, KnownMemory, LearnConfig, LearnError, Learner, MemberAccept,
-    MemoryRecord, Persisted, Proposal, ProposalContent, ProposalKind, ProposalState, Provenance,
-    PublishApproval, PublishParams, SkillPublishPayload, MAX_MEMORY_KEY_LEN, MAX_MEMORY_VALUE_LEN,
-    MAX_PENDING, MAX_USER_TAGS, MEMORY_SCHEMA,
+    MemberResolve, MemoryRecord, Persisted, Proposal, ProposalContent, ProposalKind, ProposalState,
+    Provenance, PublishApproval, PublishParams, Resolution, SkillPublishPayload,
+    MAX_MEMORY_KEY_LEN, MAX_MEMORY_VALUE_LEN, MAX_PENDING, MAX_USER_TAGS, MEMORY_SCHEMA,
+    RESOLUTION_SCHEMA,
 };
 pub use store::{LoadReport, MAX_KEPT_DECIDED, STORE_SCHEMA};

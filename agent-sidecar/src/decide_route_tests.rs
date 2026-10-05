@@ -337,3 +337,23 @@ async fn without_an_llm_and_without_jev_there_is_no_backend() {
         .expect("decide");
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// A decision backend (local or the third-party Jev endpoint) cannot make the sidecar buffer an
+/// unbounded reply: anything over the cap is refused, without its text.
+#[test]
+fn an_oversized_decision_reply_is_refused_not_buffered() {
+    use citrate_agent_loop::decide::DecideTransport;
+    let big = format!("\"{}\"", "x".repeat(decide::MAX_DECIDE_RESPONSE_BYTES + 16));
+    let (base, _) = json_server(big);
+    let t = decide::HttpDecideTransport::new(&base, "", std::time::Duration::from_secs(10));
+    let err = t
+        .post_json(&serde_json::json!({"q": 1}))
+        .expect_err("refused");
+    assert!(err.contains("larger than"), "{err}");
+    assert!(!err.contains("xxxx"), "the body is never echoed");
+    // A reply at the cap is read in full.
+    let ok = "y".repeat(decide::MAX_DECIDE_RESPONSE_BYTES);
+    let (base, _) = json_server(ok.clone());
+    let t = decide::HttpDecideTransport::new(&base, "", std::time::Duration::from_secs(10));
+    assert_eq!(t.post_json(&serde_json::json!({"q": 1})).expect("read"), ok);
+}
