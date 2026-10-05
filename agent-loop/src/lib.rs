@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod decide;
+pub mod deploy_guard;
 pub mod interview;
 pub mod personas;
 pub mod planner;
@@ -329,6 +330,16 @@ pub struct ToolRegistry {
     specs: Vec<ToolSpec>,
     hosts: HashMap<HostKind, Arc<dyn ToolHost>>,
     taint: TaintState,
+    policies: Vec<Arc<dyn CallPolicy>>,
+}
+
+/// A policy that may decline a call before the loop announces or dispatches it (HUP-S6 US-6.2:
+/// the sidecar's deploy guard). A declined call reaches no host: its `tool_call` event names no
+/// host, so a remote host acting on those events (core) never runs it, and the model reads the
+/// reason as a declined result. A policy only ever takes calls away; it never runs one.
+pub trait CallPolicy: Send + Sync {
+    /// `Some(reason)` declines `call`.
+    fn decline(&self, call: &ToolCall) -> Option<String>;
 }
 
 impl ToolRegistry {
@@ -337,7 +348,17 @@ impl ToolRegistry {
             specs,
             hosts: HashMap::new(),
             taint: TaintState::default(),
+            policies: Vec::new(),
         }
+    }
+    /// Add a call policy (builder). Every policy is asked; the first decline wins.
+    pub fn with_policy(mut self, policy: Arc<dyn CallPolicy>) -> Self {
+        self.policies.push(policy);
+        self
+    }
+    /// The first policy's reason to decline `call`, if any.
+    pub fn declined(&self, call: &ToolCall) -> Option<String> {
+        self.policies.iter().find_map(|p| p.decline(call))
     }
     /// Share a session's taint state (builder). A fresh registry starts untainted.
     pub fn with_taint(mut self, taint: TaintState) -> Self {
@@ -821,9 +842,18 @@ pub fn run_turn_with(
                     }
                 }
             };
+            // US-6.2: a call policy (the deploy guard) may decline the call outright, before it
+            // is announced, so no host (and no core gate behind it) ever sees it.
+            let declined = if refusal.is_none() {
+                tools.declined(call)
+            } else {
+                None
+            };
             // HUP-S2.7: after taint, an effectful call needs a member's explicit decision.
             let hic_reason = match spec {
-                Some(s) if refusal.is_none() && s.annotations.is_effectful() => {
+                Some(s)
+                    if refusal.is_none() && declined.is_none() && s.annotations.is_effectful() =>
+                {
                     tools.taint().record().map(|r| {
                         format!(
                             "this session read untrusted content (from {}), so this action needs your explicit approval",
@@ -837,7 +867,7 @@ pub fn run_turn_with(
             let refused_hic =
                 hic_reason.is_some() && host.is_some_and(|h| !h.honors_explicit_approval());
             let dispatch = match (&refusal, spec, host) {
-                (None, Some(s), Some(h)) if !refused_hic => Some((s.host, h)),
+                (None, Some(s), Some(h)) if !refused_hic && declined.is_none() => Some((s.host, h)),
                 _ => None,
             };
             sink.emit(Event::ToolCall {
@@ -857,6 +887,9 @@ pub fn run_turn_with(
                     }
                 }
                 (None, Some(why)) => ToolOutcome::Error(why),
+                (None, None) if declined.is_some() => {
+                    ToolOutcome::Denied(declined.clone().unwrap_or_default())
+                }
                 (None, None) if refused_hic => ToolOutcome::Denied(
                     "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
                         .into(),

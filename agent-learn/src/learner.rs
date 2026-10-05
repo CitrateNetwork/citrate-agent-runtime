@@ -31,6 +31,10 @@ pub const MEMORY_SCHEMA: &str = "citrate.learn.memory.v1";
 pub const RESOLUTION_SCHEMA: &str = "citrate.learn.resolve.v1";
 /// The decision-log kind of a contradiction resolution.
 const RESOLVE_KIND: &str = "learn.memory.resolve";
+/// The prefix of a memory core holds that was not learned here (a [`KnownMemory`] id).
+pub const KNOWN_MEMORY_PREFIX: &str = "memory:";
+/// Longest known-memory id accepted in a resolution, in bytes (after the prefix).
+const MAX_KNOWN_MEMORY_ID: usize = 128;
 /// Longest reject reason kept, in characters (in the proposal and in the decision log).
 const MAX_REASON_CHARS: usize = 1000;
 /// Tag added to every publish so readers can tell learned skills apart.
@@ -160,6 +164,10 @@ pub struct Proposal {
     pub created_at_ms: u64,
     pub conflicts: Vec<Conflict>,
     pub state: ProposalState,
+    /// Known memories (`memory:<id>`, not learned here) the member set aside in favour of this
+    /// memory when resolving a contradiction. Each one is a recorded HIC-1 decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set_aside: Vec<String>,
 }
 
 /// The member's accept.
@@ -215,7 +223,8 @@ pub enum Persisted {
 
 /// The member resolves a contradiction between two accepted memories: keep one, retract the
 /// other. Both must be persisted memories on the same key (case and spacing ignored) with
-/// different values.
+/// different values. One side may instead be a memory core holds that was not learned here
+/// (`memory:<id>`), when the learned memory's accept acknowledged that contradiction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemberResolve {
@@ -492,7 +501,22 @@ fn stored_problem(p: &Proposal) -> Option<String> {
     if ev.trajectory.sha256.len() != 64 {
         return Some("malformed trajectory digest".into());
     }
+    if !p.set_aside.is_empty()
+        && (p.kind != ProposalKind::Memory || !p.set_aside.iter().all(|x| valid_known_ref(x)))
+    {
+        return Some("malformed set-aside memory".into());
+    }
     None
+}
+
+/// `memory:<id>`: a known memory core holds, 1..=[`MAX_KNOWN_MEMORY_ID`] printable ASCII bytes
+/// with no spaces.
+fn valid_known_ref(r: &str) -> bool {
+    r.strip_prefix(KNOWN_MEMORY_PREFIX).is_some_and(|id| {
+        !id.is_empty()
+            && id.len() <= MAX_KNOWN_MEMORY_ID
+            && id.bytes().all(|b| b.is_ascii_graphic())
+    })
 }
 
 impl Learner {
@@ -579,10 +603,28 @@ impl Learner {
         // proposal id -> latest (seq, kind, decision, actor, reason, kept)
         type Latest = (u64, String, Decision, String, String, Option<String>);
         let mut latest: BTreeMap<String, Latest> = BTreeMap::new();
+        // (kept learned proposal, known memory set aside), from recorded resolutions.
+        let mut set_asides: Vec<(String, String)> = Vec::new();
         for r in &records {
             let Entry::Decision(d) = &r.record.entry else {
                 continue;
             };
+            if d.kind == RESOLVE_KIND && d.decision == Decision::Approved {
+                let aside = d
+                    .evidence
+                    .iter()
+                    .find_map(|e| e.uri.strip_prefix("learn:set-aside/"));
+                let kept = d
+                    .evidence
+                    .iter()
+                    .find_map(|e| e.uri.strip_prefix("learn:kept/"));
+                if let (Some(aside), Some(kept)) = (aside, kept) {
+                    if valid_known_ref(aside) {
+                        set_asides.push((kept.to_string(), aside.to_string()));
+                    }
+                    continue;
+                }
+            }
             if !matches!(
                 d.kind.as_str(),
                 "learn.skill" | "learn.memory" | "skill.publish" | RESOLVE_KIND
@@ -668,6 +710,15 @@ impl Learner {
             if let (Some(next), Some(p)) = (next, self.proposals.get_mut(&id)) {
                 p.state = next;
                 moved += 1;
+            }
+        }
+        // A recorded set-aside of a known memory holds whatever the file says.
+        for (kept, aside) in set_asides {
+            if let Some(p) = self.proposals.get_mut(&kept) {
+                if p.kind == ProposalKind::Memory && !p.set_aside.contains(&aside) {
+                    p.set_aside.push(aside);
+                    moved += 1;
+                }
             }
         }
         Ok(moved)
@@ -952,6 +1003,7 @@ impl Learner {
             created_at_ms,
             conflicts,
             state: ProposalState::Proposed,
+            set_aside: Vec::new(),
         };
         self.proposals.insert(id.clone(), p.clone());
         if let Err(e) = self.save() {
@@ -1268,6 +1320,9 @@ impl Learner {
         if r.member.trim().is_empty() {
             return Err(LearnError::MemberRequired);
         }
+        if r.keep.starts_with(KNOWN_MEMORY_PREFIX) || r.retract.starts_with(KNOWN_MEMORY_PREFIX) {
+            return self.resolve_known(r);
+        }
         let keep = self.lookup(&r.keep)?.clone();
         let drop = self.lookup(&r.retract)?.clone();
         if keep.id == drop.id {
@@ -1353,6 +1408,153 @@ impl Learner {
             key: kk.clone(),
             kept_value: kv.clone(),
             retracted_value: dv.clone(),
+            decided_by: r.member,
+            decided_at_ms: receipt.ts_ms,
+            decision_seq: receipt.seq,
+        })
+    }
+
+    /// Resolve a contradiction between a learned memory and a memory core holds that was not
+    /// learned here (`memory:<id>`, acknowledged when the learned memory was accepted). Keeping
+    /// the known memory retracts the learned one, as between two learned memories. Keeping the
+    /// learned memory sets the known one aside: the learned memory records it in
+    /// [`Proposal::set_aside`], and core retires it in its own store. The learner never held the
+    /// known memory's value, so the [`Resolution`] carries it empty. HIC-1, recorded first.
+    fn resolve_known(&mut self, r: MemberResolve) -> Result<Resolution, LearnError> {
+        let keep_known = r.keep.starts_with(KNOWN_MEMORY_PREFIX);
+        let drop_known = r.retract.starts_with(KNOWN_MEMORY_PREFIX);
+        if keep_known && drop_known {
+            return Err(LearnError::NotAContradiction(
+                "two memories that were not learned here are not resolved here".into(),
+            ));
+        }
+        let (known, learned_id) = if drop_known {
+            (r.retract.as_str(), r.keep.as_str())
+        } else {
+            (r.keep.as_str(), r.retract.as_str())
+        };
+        if !valid_known_ref(known) {
+            return Err(LearnError::NotAContradiction(format!(
+                "{known:?} is not a memory id"
+            )));
+        }
+        let learned = self.lookup(learned_id)?.clone();
+        let ProposalContent::Memory { key, value } = &learned.content else {
+            return Err(LearnError::NotAContradiction(
+                "only two memories can be resolved".into(),
+            ));
+        };
+        if !matches!(learned.state, ProposalState::Persisted) {
+            return Err(Self::wrong_state(&learned));
+        }
+        let acknowledged = learned
+            .conflicts
+            .iter()
+            .any(|c| c.kind == ConflictKind::Contradiction && c.existing_id == known);
+        if !acknowledged {
+            return Err(LearnError::NotAContradiction(format!(
+                "the learned memory {} does not contradict {known}",
+                learned.id
+            )));
+        }
+        if learned.set_aside.iter().any(|x| x == known) {
+            return Err(LearnError::NotAContradiction(format!(
+                "{known} was already set aside in favour of {}",
+                learned.id
+            )));
+        }
+        let evidence = if drop_known {
+            // The learned memory stays: it is the kept side, never the subject of a retraction.
+            let mut ev = vec![
+                EvidenceRef {
+                    kind: "set_aside".into(),
+                    uri: format!("learn:set-aside/{known}"),
+                    digest: None,
+                },
+                EvidenceRef {
+                    kind: "kept".into(),
+                    uri: format!("learn:kept/{}", learned.id),
+                    digest: Some(learned.content_sha256.clone()),
+                },
+            ];
+            ev.extend(
+                Self::evidence_refs(&learned)
+                    .into_iter()
+                    .filter(|x| !x.uri.starts_with("learn:proposal/")),
+            );
+            ev.truncate(MAX_EVIDENCE);
+            ev
+        } else {
+            let mut ev = Self::evidence_refs(&learned);
+            ev.truncate(MAX_EVIDENCE.saturating_sub(1));
+            ev.insert(
+                1,
+                EvidenceRef {
+                    kind: "kept".into(),
+                    uri: format!("learn:kept/{known}"),
+                    digest: None,
+                },
+            );
+            ev.truncate(MAX_EVIDENCE);
+            ev
+        };
+        let short_key: String = collapse(key).chars().take(200).collect();
+        let actor = Actor::member(r.member.as_str());
+        let receipt = self
+            .log
+            .record_decision(
+                actor.clone(),
+                DecisionEvent {
+                    tier: HicTier::Hic1,
+                    kind: RESOLVE_KIND.into(),
+                    subject: format!(
+                        "resolve memory {short_key}: keep {}, retract {}",
+                        r.keep, r.retract
+                    ),
+                    decision: Decision::Approved,
+                    reason: "member resolved a contradiction between a learned memory and one the app already held".into(),
+                    evidence,
+                },
+            )
+            .map_err(|e| LearnError::Record(e.to_string()))?;
+        if let Some(stored) = self.proposals.get_mut(&learned.id) {
+            if drop_known {
+                stored.set_aside.push(known.to_string());
+            } else {
+                stored.state = ProposalState::Retracted {
+                    by: r.member.clone(),
+                    kept: known.to_string(),
+                };
+            }
+        }
+        self.save_after_decision();
+        let detail = if drop_known {
+            format!("{known} set aside in favour of {}", learned.id)
+        } else {
+            format!("{} retracted in favour of {known}", learned.id)
+        };
+        self.log
+            .record_outcome(
+                actor,
+                OutcomeEvent {
+                    decision_seq: receipt.seq,
+                    outcome: Outcome::Completed,
+                    detail,
+                },
+            )
+            .map_err(|e| LearnError::Record(e.to_string()))?;
+        let (kept_value, retracted_value) = if drop_known {
+            (value.clone(), String::new())
+        } else {
+            (String::new(), value.clone())
+        };
+        Ok(Resolution {
+            schema: RESOLUTION_SCHEMA.into(),
+            kept: r.keep,
+            retracted: r.retract,
+            key: key.clone(),
+            kept_value,
+            retracted_value,
             decided_by: r.member,
             decided_at_ms: receipt.ts_ms,
             decision_seq: receipt.seq,
@@ -1537,6 +1739,7 @@ mod tests {
             created_at_ms: n,
             conflicts: vec![],
             state,
+            set_aside: Vec::new(),
         }
     }
 
