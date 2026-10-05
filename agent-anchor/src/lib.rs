@@ -19,6 +19,10 @@
 //!    no record in two batches, partly pruned days reported as incomplete instead of anchored.
 //! 6. **Calldata.** [`UnsignedAnchorCall`]: `AnchorRegistry.anchor(AnchorKind.NightlyMerkle,
 //!    commitment)` (selector `0x9e621f4c`, kind `2`), plus `isAnchored` for a read-only check.
+//! 7. **Confirmation.** [`OwnAnchorCheck`]: whether *this* committer anchored a value, asked with
+//!    `isAnchoredBy(committer, root)` on the next registry version and with the first record's
+//!    committer (`getAnchor`) on the deployed one. `isAnchored(root)` alone never confirms an
+//!    anchor: anyone can send the same value. See [`confirm`].
 //!
 //! Counts: zero records is no batch ([`NightlyPlan::Empty`]); one record is a tree whose root is
 //! that record's leaf hash and whose proof path is empty; odd counts promote.
@@ -35,6 +39,7 @@
 
 mod batch;
 mod calldata;
+pub mod confirm;
 mod error;
 mod hex32;
 mod ledger;
@@ -48,6 +53,10 @@ pub use batch::{
 pub use calldata::{
     anchor_calldata, decode_anchor_calldata, is_anchored_calldata, AnchorKind, UnsignedAnchorCall,
     ANCHOR_SELECTOR, ANCHOR_SIGNATURE, CITRATE_CHAIN_ID, IS_ANCHORED_SELECTOR,
+};
+pub use confirm::{
+    decode_anchor_committer, decode_bool, get_anchor_calldata, is_anchored_by_calldata, CheckStep,
+    OwnAnchorCheck, RegistryAnswer, GET_ANCHOR_SELECTOR, IS_ANCHORED_BY_SELECTOR,
 };
 pub use error::{Error, Result};
 pub use ledger::{AnchorLedger, Confirmation, EntryStatus, LedgerEntry, RecordOutcome};

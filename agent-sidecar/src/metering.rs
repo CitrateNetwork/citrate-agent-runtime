@@ -7,8 +7,13 @@
 //! - Finished turns go to a [`MeteringStore`]: the local JSONL log under
 //!   `CITRATE_HERMES_METERING_DIR` when citrate-core configures one, otherwise a bounded in-memory
 //!   list that lasts as long as the sidecar process (the report says which).
-//! - `GET /metering/daily?day=YYYY-MM-DD` serves the day's [`DailyReport`] plus the D-27 measures
-//!   this build does not collect yet, named so a surface can show them as unknown.
+//! - `GET /metering/daily?day=YYYY-MM-DD` serves the day's [`DailyReport`] (with the D-27 measures:
+//!   time to first token, tokens per second, CPU/GPU/RAM peaks, the energy estimate and the
+//!   self-review opinions), the day's escalation receipts and its chain spend.
+//! - D-27 resource peaks come from [`crate::resources::SystemSampler`], one sampling per turn.
+//! - `POST /metering/chain-receipt` takes one mined Hermes transaction from citrate-core (which
+//!   signed it): hash, purpose, status, gas used, gas price and value. Public facts only; it is how
+//!   SALT spent and gas reach the report.
 //! - `POST /metering/benchmark` builds the opt-in BenchmarkRegistry calldata for a day. It builds
 //!   bytes only: no key, no signing, no network (Rule 3). Submitting is citrate-core's ceremony.
 
@@ -20,8 +25,9 @@ use citrate_agent_loop::{
     AssistantTurn, CompletionRequest, Event, EventSink, LlmClient, LlmError, TokenUsage,
 };
 use citrate_agent_metering::{
-    DailyReport, EscalationLog, EscalationReceipt, EscalationSummary, MeteringError, MeteringLog,
-    MeteringSink, TurnRecord,
+    ChainReceipt, ChainReceiptLog, ChainSpendSummary, DailyReport, EnergyModel, EscalationLog,
+    EscalationReceipt, EscalationSummary, MeteringError, MeteringLog, MeteringSink,
+    ResourceSampler, TurnRecord, DEFAULT_ENERGY_MODEL,
 };
 use serde::Serialize;
 
@@ -31,19 +37,15 @@ pub const METERING_DIR_ENV: &str = "CITRATE_HERMES_METERING_DIR";
 pub const METERING_LOG_FILE: &str = "metering.jsonl";
 /// The escalation receipt log inside that directory (HUP-S1.5, US-1.5 AC3).
 pub const ESCALATION_LOG_FILE: &str = "escalations.jsonl";
+/// The chain receipt log inside that directory (HUP-S7.5, D-27: SALT spent and gas).
+pub const CHAIN_LOG_FILE: &str = "chain_receipts.jsonl";
 /// Records kept in memory when there is no log (oldest dropped first).
 pub const MEMORY_CAP: usize = 10_000;
 
-/// D-27 measures this build does not collect. A surface shows each as unknown.
-pub const NOT_MEASURED: &[&str] = &[
-    "time to first token",
-    "tokens per second",
-    "SALT spent",
-    "gas",
-    "CPU, GPU and RAM peak",
-    "energy estimate",
-    "self-review",
-];
+/// D-27 measures this build does not collect. Every D-27 measure is collected now (HUP-S7.5), so
+/// the list is empty; the field stays for surfaces built against the earlier report. A measure no
+/// turn reported on a given day is `null` in the report and shown as unknown.
+pub const NOT_MEASURED: &[&str] = &[];
 
 /// Where finished turn records and escalation receipts live.
 pub struct MeteringStore {
@@ -51,6 +53,11 @@ pub struct MeteringStore {
     memory: Mutex<VecDeque<TurnRecord>>,
     escalations: Option<EscalationLog>,
     escalation_memory: Mutex<VecDeque<EscalationReceipt>>,
+    chain: Option<ChainReceiptLog>,
+    chain_memory: Mutex<VecDeque<ChainReceipt>>,
+    /// D-27: samples the machine during each turn (`None`: peaks and energy stay unknown).
+    sampler: Option<Arc<dyn ResourceSampler>>,
+    energy: EnergyModel,
 }
 
 impl MeteringStore {
@@ -61,6 +68,10 @@ impl MeteringStore {
             memory: Mutex::new(VecDeque::new()),
             escalations: None,
             escalation_memory: Mutex::new(VecDeque::new()),
+            chain: None,
+            chain_memory: Mutex::new(VecDeque::new()),
+            sampler: None,
+            energy: DEFAULT_ENERGY_MODEL,
         }
     }
 
@@ -71,6 +82,37 @@ impl MeteringStore {
             memory: Mutex::new(VecDeque::new()),
             escalations: Some(EscalationLog::new(dir.join(ESCALATION_LOG_FILE))),
             escalation_memory: Mutex::new(VecDeque::new()),
+            chain: Some(ChainReceiptLog::new(dir.join(CHAIN_LOG_FILE))),
+            chain_memory: Mutex::new(VecDeque::new()),
+            sampler: None,
+            energy: DEFAULT_ENERGY_MODEL,
+        }
+    }
+
+    /// D-27: sample the machine during each turn, and estimate energy with `energy` (builder).
+    pub fn with_measures(
+        mut self,
+        sampler: Option<Arc<dyn ResourceSampler>>,
+        energy: EnergyModel,
+    ) -> Self {
+        self.sampler = sampler;
+        self.energy = energy;
+        self
+    }
+
+    /// A session's metering sink, with this store's sampler and energy model attached.
+    pub fn sink(
+        &self,
+        session_id: impl Into<String>,
+        model: impl Into<String>,
+        known_tools: impl IntoIterator<Item = String>,
+        clock: Arc<dyn citrate_agent_metering::Clock>,
+    ) -> MeteringSink {
+        let sink =
+            MeteringSink::new(session_id, model, known_tools, clock).with_energy_model(self.energy);
+        match &self.sampler {
+            Some(s) => sink.sampling_with(s.clone()),
+            None => sink,
         }
     }
 
@@ -163,17 +205,66 @@ impl MeteringStore {
         Ok(out)
     }
 
-    /// The daily report for `day` (`YYYY-MM-DD`, UTC), with the day's escalation receipts.
+    fn chain_memory(&self) -> std::sync::MutexGuard<'_, VecDeque<ChainReceipt>> {
+        match self.chain_memory.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Keep one chain receipt (D-27). A malformed receipt is refused; one the log cannot take is
+    /// kept in memory instead (the failure is logged to stderr without content).
+    pub fn append_chain_receipt(&self, rec: ChainReceipt) -> Result<(), MeteringError> {
+        rec.validate()?;
+        let keep = match &self.chain {
+            Some(log) => match log.append(&rec) {
+                Ok(()) => None,
+                Err(e) => {
+                    eprintln!("citrate-agent-sidecar: chain receipt write failed: {e}");
+                    Some(rec)
+                }
+            },
+            None => Some(rec),
+        };
+        if let Some(rec) = keep {
+            let mut m = self.chain_memory();
+            m.push_back(rec);
+            while m.len() > MEMORY_CAP {
+                m.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    /// Every chain receipt: the log's, then any held in memory.
+    pub fn chain_receipts(&self) -> Result<Vec<ChainReceipt>, MeteringError> {
+        let mut out = match &self.chain {
+            Some(log) => log.read_all()?,
+            None => Vec::new(),
+        };
+        out.extend(self.chain_memory().iter().cloned());
+        Ok(out)
+    }
+
+    /// The daily report for `day` (`YYYY-MM-DD`, UTC), with the day's escalation receipts and its
+    /// chain spend.
     pub fn daily(&self, day: &str) -> Result<DailyResponse, MeteringError> {
         let report = DailyReport::build(day, &self.records()?)?;
         let escalations = EscalationSummary::build(day, &self.escalation_receipts()?)?;
+        let chain = ChainSpendSummary::build(day, &self.chain_receipts()?)?;
         Ok(DailyResponse {
             day: day.to_string(),
             source: self.source(),
             persisted: self.log.is_some(),
-            markdown: format!("{}{}", report.to_markdown(), escalations.to_markdown()),
+            markdown: format!(
+                "{}{}{}",
+                report.to_markdown(),
+                escalations.to_markdown(),
+                chain.to_markdown()
+            ),
             report,
             escalations,
+            chain,
             not_measured: NOT_MEASURED.to_vec(),
         })
     }
@@ -191,8 +282,10 @@ pub struct DailyResponse {
     pub report: DailyReport,
     /// The day's escalation receipts, summed (HUP-S1.5, US-1.5 AC3).
     pub escalations: EscalationSummary,
+    /// D-27: the day's Hermes transactions on chain: gas used and SALT spent.
+    pub chain: ChainSpendSummary,
     pub markdown: String,
-    /// D-27 measures not collected by this build (show as unknown).
+    /// D-27 measures not collected by this build (empty now; kept for older surfaces).
     pub not_measured: Vec<&'static str>,
 }
 
@@ -214,11 +307,19 @@ pub fn metering_from_value(value: Option<&str>) -> MeteringStore {
     }
 }
 
-/// [`metering_from_value`] over the process environment.
+/// [`metering_from_value`] over the process environment, with the D-27 machine sampler (unless
+/// `CITRATE_HERMES_RESOURCE_SAMPLING` turns it off) and the energy model it names.
 pub fn metering_from_env() -> Arc<MeteringStore> {
-    Arc::new(metering_from_value(
-        std::env::var(METERING_DIR_ENV).ok().as_deref(),
-    ))
+    Arc::new(
+        metering_from_value(std::env::var(METERING_DIR_ENV).ok().as_deref()).with_measures(
+            crate::resources::SystemSampler::from_env(),
+            crate::resources::energy_model_from_value(
+                std::env::var(crate::resources::ENERGY_WATTS_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+        ),
+    )
 }
 
 /// A model client that reports the provider's token usage to the session's metering sink.
@@ -243,8 +344,8 @@ impl LlmClient for MeteredLlm {
         req: &CompletionRequest,
     ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
         let (turn, usage) = self.inner.complete_with_usage(req)?;
-        if let Some(u) = usage {
-            self.sink.record_usage(u.prompt_tokens, u.completion_tokens);
+        if let Some(u) = &usage {
+            self.sink.record_model_call(u);
         }
         Ok((turn, usage))
     }
@@ -256,8 +357,8 @@ impl LlmClient for MeteredLlm {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
         let (turn, usage) = self.inner.complete_streaming(req, on_delta)?;
-        if let Some(u) = usage {
-            self.sink.record_usage(u.prompt_tokens, u.completion_tokens);
+        if let Some(u) = &usage {
+            self.sink.record_model_call(u);
         }
         Ok((turn, usage))
     }

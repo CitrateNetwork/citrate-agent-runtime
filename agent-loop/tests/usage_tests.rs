@@ -25,6 +25,7 @@ impl LlmClient for Reporting {
                 prompt_tokens: 12,
                 completion_tokens: 3,
                 generation_ms: None,
+                prompt_ms: None,
             }),
         ))
     }
@@ -55,6 +56,7 @@ fn a_reporting_client_passes_usage_through() {
             prompt_tokens: 12,
             completion_tokens: 3,
             generation_ms: None,
+            prompt_ms: None,
         })
     );
 }

@@ -30,6 +30,8 @@ pub enum Error {
     PrunedDay { day: u64 },
     #[error("malformed anchor calldata: {0}")]
     BadCalldata(String),
+    #[error("unexpected AnchorRegistry answer: {0}")]
+    Registry(String),
     #[error("the anchor ledger is corrupt: {0}")]
     Corrupt(String),
 }
