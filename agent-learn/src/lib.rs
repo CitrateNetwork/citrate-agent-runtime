@@ -33,8 +33,8 @@ pub mod registry;
 mod store;
 
 pub use evidence::{
-    run_verified_workflow, sha256_hex, trajectory_digest, Evidence, TrajectoryRef, Unverified,
-    VerifiedRun, VerifierVerdict,
+    run_verified_workflow, run_verified_workflow_reviewed, sha256_hex, trajectory_digest, Evidence,
+    TrajectoryRef, Unverified, VerifiedRun, VerifierVerdict,
 };
 pub use learner::{
     Belnap, Conflict, ConflictKind, KnownMemory, LearnConfig, LearnError, Learner, MemberAccept,

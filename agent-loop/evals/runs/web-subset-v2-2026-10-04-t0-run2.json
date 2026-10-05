@@ -1,0 +1,455 @@
+{
+ "backend": "local",
+ "browser": "Managed (Chrome for Testing 154.0.8037.92, macos-arm64, unpacked in the scratchpad)",
+ "model": "gemma-4-e4b",
+ "runs": [
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Find\"\nheading[1] \"Find\"\ntext \"Search\"\n[e1] searchbox \"Search\"\n[e2] button \"Search\"\n[e3] link \"About\"\n[e4] link \"Help\"",
+    "page \"Find\"\nheading[1] \"Find\"\ntext \"Search\"\n[e1] searchbox \"Search\" value=\"citrate blockdag\"\n  text \"citrate blockdag\"\n[e2] button \"Search\"\n[e3] link \"About\"\n[e4] link \"Help\"",
+    "page \"Results\"\nheading[1] \"Results for citrate blockdag\"\nListMarker \"•\"\n[e1] link \"Blockchain games roundup\"\nListMarker \"•\"\n[e2] link \"GhostDAG paper\"\nListMarker \"•\"\n[e3] link \"Citrate BlockDAG overview\"\n[e4] link \"New search\"",
+    "page \"Citrate BlockDAG overview\"\nheading[1] \"Citrate BlockDAG overview\"\ntext \"Blocks reference many parents.\""
+   ],
+   "steps": [
+    {
+     "chosen": "type:e1",
+     "confidence": 0.9981168786484144,
+     "latency_ms": 4373,
+     "page_changed": true,
+     "step": 1,
+     "target": "searchbox \"Search\"",
+     "value": "citrate blockdag"
+    },
+    {
+     "chosen": "click:e2",
+     "confidence": 0.8251629996833192,
+     "latency_ms": 476,
+     "page_changed": true,
+     "step": 2,
+     "target": "button \"Search\""
+    },
+    {
+     "chosen": "click:e3",
+     "confidence": 0.999631311901161,
+     "latency_ms": 497,
+     "page_changed": true,
+     "step": 3,
+     "target": "link \"Citrate BlockDAG overview\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9777975304387396,
+     "latency_ms": 399,
+     "page_changed": false,
+     "step": 4,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "search-open-result"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Shop\"\nheading[1] \"Shop\"\nListMarker \"•\"\n[e1] link \"Road Racer 2\"\nListMarker \"•\"\n[e2] link \"Trail Runner 4\"\nListMarker \"•\"\n[e3] link \"City Walker\"\n[e4] link \"Cart (0)\"",
+    "page \"Trail Runner 4\"\nheading[1] \"Trail Runner 4\"\ntext \"Light trail shoe.\"\ntext \"Size\"\n[e1] radio \"Size 9\"\n[e2] radio \"Size 10\"\n[e3] radio \"Size 11\"\n[e4] button \"Add to wishlist\"\n[e5] button \"Add to cart\"\n[e6] link \"Back to shop\"",
+    "page \"Trail Runner 4\"\nheading[1] \"Trail Runner 4\"\ntext \"Light trail shoe.\"\ntext \"Size\"\n[e1] radio \"Size 9\"\n[e2] radio \"Size 10\" (checked)\n[e3] radio \"Size 11\"\n[e4] button \"Add to wishlist\"\n[e5] button \"Add to cart\"\n[e6] link \"Back to shop\"",
+    "page \"Cart\"\nheading[1] \"Cart\"\ntext \"Cart: trail-runner, size 10\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9995823135728606,
+     "latency_ms": 551,
+     "page_changed": true,
+     "step": 1,
+     "target": "link \"Trail Runner 4\""
+    },
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9990622190313482,
+     "latency_ms": 633,
+     "page_changed": true,
+     "step": 2,
+     "target": "radio \"Size 10\""
+    },
+    {
+     "chosen": "click:e5",
+     "confidence": 0.9831248565402325,
+     "latency_ms": 509,
+     "page_changed": true,
+     "step": 3,
+     "target": "button \"Add to cart\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9924076709372889,
+     "latency_ms": 487,
+     "page_changed": false,
+     "step": 4,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "shop-size-cart"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Sign in\"\nheading[1] \"Sign in\"\ntext \"Email\"\n[e1] textbox \"Email\"\n[e2] button \"Continue\"\n[e3] link \"Forgot your email?\"\n[e4] button \"Use a passkey\" (disabled)",
+    "page \"Sign in\"\nheading[1] \"Sign in\"\ntext \"Email\"\n[e1] textbox \"Email\" value=\"ada@example.org\"\n  text \"ada@example.org\"\n[e2] button \"Continue\"\n[e3] link \"Forgot your email?\"\n[e4] button \"Use a passkey\" (disabled)",
+    "page \"Welcome\"\nheading[1] \"Welcome\"\ntext \"Signed in as ada@example.org\""
+   ],
+   "steps": [
+    {
+     "chosen": "type:e1",
+     "confidence": 0.99980106052296,
+     "latency_ms": 567,
+     "page_changed": true,
+     "step": 1,
+     "target": "textbox \"Email\"",
+     "value": "ada@example.org"
+    },
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9918922854132259,
+     "latency_ms": 618,
+     "page_changed": true,
+     "step": 2,
+     "target": "button \"Continue\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.998027976151988,
+     "latency_ms": 432,
+     "page_changed": false,
+     "step": 3,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "login-email"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Daily news\"\ndialog \"Cookie choices\"\n  text \"We use cookies.\"\n  [e1] button \"Accept all\"\n  [e2] button \"Reject all\"\nheading[1] \"Daily news\"\nListMarker \"•\"\n[e3] link \"Rust 2.0 ships\"\nListMarker \"•\"\n[e4] link \"Weather this week\"",
+    "page \"Daily news\"\nheading[1] \"Daily news\"\nListMarker \"•\"\n[e1] link \"Rust 2.0 ships\"\nListMarker \"•\"\n[e2] link \"Weather this week\"",
+    "page \"Rust 2.0 ships\"\nheading[1] \"Rust 2.0 ships\"\ntext \"Cookies: rejected\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9976044118225837,
+     "latency_ms": 556,
+     "page_changed": true,
+     "step": 1,
+     "target": "button \"Reject all\""
+    },
+    {
+     "chosen": "click:e1",
+     "confidence": 0.9985565831254154,
+     "latency_ms": 467,
+     "page_changed": true,
+     "step": 2,
+     "target": "link \"Rust 2.0 ships\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9879984660370925,
+     "latency_ms": 429,
+     "page_changed": false,
+     "step": 3,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "cookies-then-article"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Results list\"\nheading[1] \"Results list\"\ntext \"Page 1 of 5\"\nListMarker \"•\"\ntext \"Item 1\"\nListMarker \"•\"\ntext \"Item 2\"\nListMarker \"•\"\ntext \"Item 3\"\nnavigation \"Pages\"\n  text \"Previous page\"\n  [e1] link \"Next page\"",
+    "page \"Results list\"\nheading[1] \"Results list\"\ntext \"Page 2 of 5\"\nListMarker \"•\"\ntext \"Item 4\"\nListMarker \"•\"\ntext \"Item 5\"\nListMarker \"•\"\ntext \"Item 6\"\nnavigation \"Pages\"\n  [e1] link \"Previous page\"\n  [e2] link \"Next page\"",
+    "page \"Results list\"\nheading[1] \"Results list\"\ntext \"Page 3 of 5\"\nListMarker \"•\"\ntext \"Item 7\"\nListMarker \"•\"\ntext \"Item 8\"\nListMarker \"•\"\ntext \"Item 9\"\nnavigation \"Pages\"\n  [e1] link \"Previous page\"\n  [e2] link \"Next page\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e1",
+     "confidence": 0.9991093746031308,
+     "latency_ms": 756,
+     "page_changed": true,
+     "step": 1,
+     "target": "link \"Next page\""
+    },
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9980604138926386,
+     "latency_ms": 504,
+     "page_changed": true,
+     "step": 2,
+     "target": "link \"Next page\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9772888810674448,
+     "latency_ms": 401,
+     "page_changed": false,
+     "step": 3,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "pagination-page-3"
+  },
+  {
+   "declared_done": true,
+   "reached": false,
+   "snapshots": [
+    "page \"Catalog\"\nheading[1] \"Catalog\"\ntext \"Filters\"\n[e1] checkbox \"Free shipping\"\n[e2] checkbox \"In stock only\"\n[e3] checkbox \"Under $50\"\n[e4] checkbox \"On sale\"\n[e5] button \"Apply filters\"\n[e6] button \"Clear\"",
+    "page \"Catalog\"\nheading[1] \"Catalog\"\ntext \"Filters\"\n[e1] checkbox \"Free shipping\"\n[e2] checkbox \"In stock only\" (checked)\n[e3] checkbox \"Under $50\"\n[e4] checkbox \"On sale\"\n[e5] button \"Apply filters\"\n[e6] button \"Clear\"",
+    "page \"Catalog\"\nheading[1] \"Catalog\"\ntext \"Filters\"\n[e1] checkbox \"Free shipping\"\n[e2] checkbox \"In stock only\" (checked)\n[e3] checkbox \"Under $50\" (checked)\n[e4] checkbox \"On sale\"\n[e5] button \"Apply filters\"\n[e6] button \"Clear\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e2",
+     "confidence": 0.7983406898918686,
+     "latency_ms": 616,
+     "page_changed": true,
+     "step": 1,
+     "target": "checkbox \"In stock only\""
+    },
+    {
+     "chosen": "click:e3",
+     "confidence": 0.9931519766034461,
+     "latency_ms": 466,
+     "page_changed": true,
+     "step": 2,
+     "target": "checkbox \"Under $50\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9517549733999484,
+     "latency_ms": 461,
+     "page_changed": false,
+     "step": 3,
+     "target": ""
+    }
+   ],
+   "success": false,
+   "task_id": "filter-stock-price"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Contact support\"\nheading[1] \"Contact support\"\ntext \"Your name\"\n[e1] textbox \"Your name\"\ntext \"Your email\"\n[e2] textbox \"Your email\"\ntext \"Message\"\n[e3] textbox \"Message\"\n[e4] button \"Send\"",
+    "page \"Contact support\"\nheading[1] \"Contact support\"\ntext \"Your name\"\n[e1] textbox \"Your name\" value=\"Ada\"\n  text \"Ada\"\ntext \"Your email\"\n[e2] textbox \"Your email\"\ntext \"Message\"\n[e3] textbox \"Message\"\n[e4] button \"Send\"",
+    "page \"Contact support\"\nheading[1] \"Contact support\"\ntext \"Your name\"\n[e1] textbox \"Your name\" value=\"Ada\"\n  text \"Ada\"\ntext \"Your email\"\n[e2] textbox \"Your email\" value=\"ada@example.org\"\n  text \"ada@example.org\"\ntext \"Message\"\n[e3] textbox \"Message\"\n[e4] button \"Send\"",
+    "page \"Contact support\"\nheading[1] \"Contact support\"\ntext \"Your name\"\n[e1] textbox \"Your name\" value=\"Ada\"\n  text \"Ada\"\ntext \"Your email\"\n[e2] textbox \"Your email\" value=\"ada@example.org\"\n  text \"ada@example.org\"\ntext \"Message\"\n[e3] textbox \"Message\" value=\"Hello from Hermes\"\n  text \"Hello from Hermes\"\n[e4] button \"Send\"",
+    "page \"Sent\"\nheading[1] \"Message sent\"\ntext \"Thanks, Ada (ada@example.org): Hello from Hermes\""
+   ],
+   "steps": [
+    {
+     "chosen": "type:e1",
+     "confidence": 0.9974103213744621,
+     "latency_ms": 805,
+     "page_changed": true,
+     "step": 1,
+     "target": "textbox \"Your name\"",
+     "value": "Ada"
+    },
+    {
+     "chosen": "type:e2",
+     "confidence": 0.9691064791112161,
+     "latency_ms": 711,
+     "page_changed": true,
+     "step": 2,
+     "target": "textbox \"Your email\"",
+     "value": "ada@example.org"
+    },
+    {
+     "chosen": "type:e3",
+     "confidence": 0.9916829060595036,
+     "latency_ms": 789,
+     "page_changed": true,
+     "step": 3,
+     "target": "textbox \"Message\"",
+     "value": "Hello from Hermes"
+    },
+    {
+     "chosen": "click:e4",
+     "confidence": 0.9996769631170149,
+     "latency_ms": 622,
+     "page_changed": true,
+     "step": 4,
+     "target": "button \"Send\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9998385142298477,
+     "latency_ms": 498,
+     "page_changed": false,
+     "step": 5,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "contact-form"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Settings\"\nheading[1] \"Settings\"\ntablist \"Settings sections\"\n  [e1] tab \"Profile\" (selected)\n  [e2] tab \"Notifications\"\ntext \"Display name\"\n[e3] textbox \"Display name\"\n[e4] button \"Save profile\"",
+    "page \"Settings\"\nheading[1] \"Settings\"\ntablist \"Settings sections\"\n  [e1] tab \"Profile\"\n  [e2] tab \"Notifications\" (selected)\n[e3] checkbox \"Email alerts\"\n[e4] checkbox \"Weekly digest\"\n[e5] button \"Save notifications\"",
+    "page \"Settings\"\nheading[1] \"Settings\"\ntablist \"Settings sections\"\n  [e1] tab \"Profile\"\n  [e2] tab \"Notifications\" (selected)\n[e3] checkbox \"Email alerts\" (checked)\n[e4] checkbox \"Weekly digest\"\n[e5] button \"Save notifications\"",
+    "page \"Saved\"\nheading[1] \"Saved\"\ntext \"Email alerts: on\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9781189744997546,
+     "latency_ms": 470,
+     "page_changed": true,
+     "step": 1,
+     "target": "tab \"Notifications\""
+    },
+    {
+     "chosen": "click:e3",
+     "confidence": 0.9622735249388183,
+     "latency_ms": 433,
+     "page_changed": true,
+     "step": 2,
+     "target": "checkbox \"Email alerts\""
+    },
+    {
+     "chosen": "click:e5",
+     "confidence": 0.9971773512422941,
+     "latency_ms": 467,
+     "page_changed": true,
+     "step": 3,
+     "target": "button \"Save notifications\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.999081734839006,
+     "latency_ms": 473,
+     "page_changed": false,
+     "step": 4,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "settings-email-alerts"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"Docs\"\nheading[1] \"Docs\"\nListMarker \"•\"\n[e1] link \"Getting started\"\nListMarker \"•\"\n[e2] link \"Guides\"\nListMarker \"•\"\n[e3] link \"API reference\"",
+    "page \"Guides\"\nheading[1] \"Guides\"\nListMarker \"•\"\n[e1] link \"Write a contract\"\nListMarker \"•\"\n[e2] link \"Test a contract\"\nListMarker \"•\"\n[e3] link \"Deploy a contract\"\n[e4] link \"All docs\"",
+    "page \"Deploy a contract\"\nheading[1] \"Deploy a contract\"\ntext \"Use the deploy gate.\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e2",
+     "confidence": 0.5615874330572673,
+     "latency_ms": 470,
+     "page_changed": true,
+     "step": 1,
+     "target": "link \"Guides\""
+    },
+    {
+     "chosen": "click:e3",
+     "confidence": 0.9811811677591016,
+     "latency_ms": 541,
+     "page_changed": true,
+     "step": 2,
+     "target": "link \"Deploy a contract\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.641061264996466,
+     "latency_ms": 462,
+     "page_changed": false,
+     "step": 3,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "docs-deploy-guide"
+  },
+  {
+   "declared_done": true,
+   "reached": true,
+   "snapshots": [
+    "page \"citrate-sdk\"\nheading[1] \"citrate-sdk\"\ntext \"Versions\"\nListMarker \"•\"\n[e1] link \"v0.9\"\nListMarker \"•\"\n[e2] link \"v1.2\"\nListMarker \"•\"\n[e3] link \"v2.0 (latest)\"",
+    "page \"citrate-sdk 2.0\"\nheading[1] \"citrate-sdk 2.0\"\nListMarker \"•\"\n[e1] link \"Readme\"\nListMarker \"•\"\n[e2] link \"Changelog\"\nListMarker \"•\"\n[e3] link \"Install\"",
+    "page \"Changelog 2.0\"\nheading[1] \"Changelog for 2.0\""
+   ],
+   "steps": [
+    {
+     "chosen": "click:e3",
+     "confidence": 0.9985134187620546,
+     "latency_ms": 512,
+     "page_changed": true,
+     "step": 1,
+     "target": "link \"v2.0 (latest)\""
+    },
+    {
+     "chosen": "click:e2",
+     "confidence": 0.9977224643170512,
+     "latency_ms": 511,
+     "page_changed": true,
+     "step": 2,
+     "target": "link \"Changelog\""
+    },
+    {
+     "chosen": "done",
+     "confidence": 0.9998887652078535,
+     "latency_ms": 438,
+     "page_changed": false,
+     "step": 3,
+     "target": ""
+    }
+   ],
+   "success": true,
+   "task_id": "package-changelog-2"
+  }
+ ],
+ "stats": {
+  "jevEnabled": false,
+  "jevNonWeb": false,
+  "jevOrigins": 0,
+  "logging": false,
+  "report": {
+   "backends": {
+    "local": {
+     "decisions": 38,
+     "egress_bytes": 0,
+     "errors": 0,
+     "errors_by_kind": {},
+     "latency_ms": {
+      "max": 4373,
+      "p50": 487,
+      "p95": 756
+     },
+     "mean_confidence": 0.9615815382270364,
+     "task_success_bps": 9000,
+     "tasks_attempted": 10,
+     "tasks_succeeded": 9
+    }
+   },
+   "schema": 1
+  }
+ },
+ "suite": "web-subset-v2",
+ "recorded": "2026-10-04, Apple-silicon laptop under heavy load (load average 20-30, swap nearly full); llama-server build 10909 serving gemma-4-E4B-it-Q4_0.gguf (T0) on loopback"
+}

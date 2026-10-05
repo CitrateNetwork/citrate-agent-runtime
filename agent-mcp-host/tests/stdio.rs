@@ -2,6 +2,7 @@
 
 use citrate_agent_loop::{Effect, HostKind, StopFlag, ToolCall, ToolOutcome, Trust};
 use citrate_agent_mcp_host::config::{McpConfig, ServerConfig, TransportConfig};
+use citrate_agent_mcp_host::host::RECONNECT_BACKOFF_START;
 use citrate_agent_mcp_host::{McpClient, McpError, McpHost, ServerState};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -430,6 +431,52 @@ fn servers_are_connected_in_parallel_so_one_hung_server_does_not_add_up() {
     assert!(host.handles("mcp__fx__echo"));
     // Serially this would take at least 3 s (two 1.5 s init deadlines back to back).
     assert!(took < Duration::from_millis(2800), "connect took {took:?}");
+}
+
+/// The sidecar's shutdown stops every stdio server at once (it does not rely on the host being
+/// dropped before the process is killed), and a later call says the server is gone.
+#[test]
+fn shutdown_stops_every_stdio_server_now() {
+    let cfg = McpConfig {
+        servers: vec![server("one", &[]), server("two", &[])],
+    };
+    let host = Arc::new(McpHost::connect(&cfg));
+    assert!(host.status().iter().all(|s| s.state == ServerState::Ready));
+    host.shutdown();
+    let t0 = Instant::now();
+    while !host.status().iter().all(|s| s.state == ServerState::Exited) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", host.status());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let name = host.specs()[0].name.clone();
+    let out = host.call(&call(&name, json!({"text": "hi"})), &StopFlag::default());
+    assert!(matches!(out, ToolOutcome::Error(_)), "{out:?}");
+    host.shutdown(); // idempotent
+}
+
+/// After shutdown, the reconnect pass leaves every server stopped (the sidecar is exiting).
+#[test]
+fn a_shut_down_host_never_reconnects_a_server() {
+    let cfg = McpConfig {
+        servers: vec![server("one", &[])],
+    };
+    let host = Arc::new(McpHost::connect(&cfg));
+    assert!(host.status().iter().all(|s| s.state == ServerState::Ready));
+    host.shutdown();
+    let t0 = Instant::now();
+    while !host.status().iter().all(|s| s.state == ServerState::Exited) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", host.status());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    host.maintain_now();
+    // Past the first reconnect backoff: a running host would reconnect now.
+    std::thread::sleep(RECONNECT_BACKOFF_START + Duration::from_millis(200));
+    host.maintain_now();
+    assert!(
+        host.status().iter().all(|s| s.state != ServerState::Ready),
+        "{:?}",
+        host.status()
+    );
 }
 
 /// A fresh, empty folder under the system temp dir for one test.

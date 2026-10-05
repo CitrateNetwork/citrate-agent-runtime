@@ -199,6 +199,10 @@ impl TrajectoryRecorder {
                 meta.outcome = outcome.clone();
                 st.done.push(meta);
             }
+            // US-1.3 AC2: the self-review is an opinion that follows the attempt's `done`. It
+            // judges nothing and must not open a turn, or the verdicts that follow it would be
+            // filed under the next attempt.
+            Event::SelfReview { .. } => {}
             _ => {
                 st.open.get_or_insert_with(TurnMeta::default);
             }
