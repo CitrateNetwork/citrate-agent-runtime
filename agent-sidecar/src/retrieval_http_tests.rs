@@ -474,3 +474,173 @@ async fn a_default_session_offers_at_most_eight_tool_schemas_with_skill_load_pin
     assert_eq!(names[0], SKILL_LOAD_TOOL);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---- US-1.4: the keyed embedding server citrate-core starts --------------------------------------
+
+const EMBED_KEY: &str = "embed-key-0123456789abcdef";
+
+/// A loopback embeddings endpoint that, like llama-server started with an API key, answers 401
+/// without `Authorization: Bearer <EMBED_KEY>`. Counts the requests it answered with vectors.
+async fn keyed_embedder() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::post;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h2 = hits.clone();
+    let embeddings = move |headers: axum::http::HeaderMap,
+                           axum::Json(v): axum::Json<serde_json::Value>| {
+        let hits = h2.clone();
+        async move {
+            let auth = headers
+                .get("authorization")
+                .and_then(|a| a.to_str().ok())
+                .unwrap_or("");
+            if auth != format!("Bearer {EMBED_KEY}") {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"error": {"message": "Invalid API Key"}})),
+                );
+            }
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = v["input"].as_array().map(Vec::len).unwrap_or(0);
+            let data: Vec<serde_json::Value> = (0..n)
+                .map(|i| serde_json::json!({"index": i, "embedding": [0.5, 0.25, 1.0]}))
+                .collect();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"data": data})),
+            )
+        }
+    };
+    let app = axum::Router::new().route("/v1/embeddings", post(embeddings));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), hits)
+}
+
+fn state_with_embedder(embedder: sessions::EmbedderFactory) -> Arc<AppState> {
+    let rec = Arc::new(Recorder(Mutex::new(vec![])));
+    let mgr = sessions::SessionManager::new(
+        Arc::new(move |_ep: &sessions::LlmEndpoint| rec.clone() as Arc<dyn LlmClient>),
+        Duration::from_secs(5),
+    )
+    .with_tokenizer(production_tokenizer())
+    .with_embedder(embedder);
+    Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue: Arc::new(ApprovalQueue::new()),
+        skills: vec![],
+        dispatch: None,
+        bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: Arc::new(mgr),
+    })
+}
+
+fn key_file(tag: &str, contents: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("citrate-embed-key-{tag}-{}", std::process::id()));
+    std::fs::write(&p, contents).unwrap();
+    p
+}
+
+#[test]
+fn the_embed_key_file_is_read_as_one_trimmed_line() {
+    let p = key_file("ok", &format!("{EMBED_KEY}\n"));
+    assert_eq!(read_embed_key(&p).unwrap(), EMBED_KEY);
+    for (tag, bad) in [("empty", ""), ("blank", "  \n"), ("inner", "two words\n")] {
+        let p = key_file(tag, bad);
+        let err = read_embed_key(&p).unwrap_err();
+        assert!(err.contains(EMBED_KEY_FILE_ENV), "{err}");
+    }
+    let long = key_file("long", &"k".repeat(600));
+    assert!(read_embed_key(&long).unwrap_err().contains("too long"));
+    let missing = std::env::temp_dir().join("citrate-embed-key-missing-file");
+    let err = read_embed_key(&missing).unwrap_err();
+    assert!(
+        !err.contains("citrate-embed-key-missing-file"),
+        "errors never carry the path: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_reaches_the_keyed_embedding_server_and_turns_retrieval_on() {
+    // US-1.4: core starts llama-server --embeddings --pooling cls with an API key, and hands the
+    // sidecar CITRATE_HERMES_EMBED_URL plus the key file. The session embeds through it.
+    let (url, hits) = keyed_embedder().await;
+    let kf = key_file("session", EMBED_KEY);
+    let st = state_with_embedder(production_embedder_with_key(Some(url), Some(kf)));
+    let tools = serde_json::json!([
+        {"name": "node_status", "description": "Read this node's status", "parameters": {"type": "object"}, "host": "core"},
+        {"name": "groups_list", "description": "List the member's groups", "parameters": {"type": "object"}, "host": "core"}
+    ]);
+    let chat = llama_stand_in(None).await;
+    let v = create(&st, body(&chat, tools, Some(8192))).await;
+    assert_eq!(
+        v["retrieval"],
+        serde_json::json!({"mode": "embedding"}),
+        "{v}"
+    );
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the embedding endpoint was hit with the key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_key_the_keyed_server_refuses_and_the_session_says_so() {
+    let (url, hits) = keyed_embedder().await;
+    let st = state_with_embedder(production_embedder_with_key(Some(url), None));
+    let chat = llama_stand_in(None).await;
+    let v = create(&st, body(&chat, serde_json::json!([]), Some(8192))).await;
+    assert_eq!(v["retrieval"]["mode"], "lexical", "{v}");
+    assert!(
+        v["retrieval"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP 401"),
+        "{v}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_key_file_leaves_the_session_lexical_with_the_reason() {
+    let (url, hits) = keyed_embedder().await;
+    let missing = std::env::temp_dir().join("citrate-embed-key-not-there");
+    let st = state_with_embedder(production_embedder_with_key(Some(url), Some(missing)));
+    let chat = llama_stand_in(None).await;
+    let v = create(&st, body(&chat, serde_json::json!([]), Some(8192))).await;
+    assert_eq!(v["retrieval"]["mode"], "lexical", "{v}");
+    assert!(
+        v["retrieval"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(EMBED_KEY_FILE_ENV),
+        "{v}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Live: the bundled llama-server started the way citrate-core starts it (`--embeddings --pooling
+/// cls`, the pinned BGE GGUF, an API key). Run with `CITRATE_TEST_EMBED_URL=http://127.0.0.1:<p>`
+/// and `CITRATE_TEST_EMBED_KEY_FILE=<file>`: `cargo test -p citrate-agent-sidecar --lib
+/// live_bge -- --ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a running embedding llama-server (CITRATE_TEST_EMBED_URL)"]
+async fn live_bge_embedding_server_turns_retrieval_on() {
+    let url = std::env::var("CITRATE_TEST_EMBED_URL").expect("CITRATE_TEST_EMBED_URL");
+    let kf = std::env::var_os("CITRATE_TEST_EMBED_KEY_FILE").map(std::path::PathBuf::from);
+    let st = state_with_embedder(production_embedder_with_key(Some(url), kf));
+    let tools = serde_json::json!([
+        {"name": "node_status", "description": "Read this node's status: state, height, peers and sync", "parameters": {"type": "object"}, "host": "core"},
+        {"name": "groups_list", "description": "List the member's encrypted groups", "parameters": {"type": "object"}, "host": "core"}
+    ]);
+    let chat = llama_stand_in(None).await;
+    let v = create(&st, body(&chat, tools, Some(8192))).await;
+    assert_eq!(
+        v["retrieval"],
+        serde_json::json!({"mode": "embedding"}),
+        "{v}"
+    );
+}

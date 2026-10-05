@@ -34,5 +34,6 @@ pub use host::{
 };
 pub use net::{is_public_ip, JINA_DEFAULT_ENDPOINT};
 pub use searxng::{
-    parse_search_results, SearchHit, SearxngConfig, SearxngState, SearxngSupervisor,
+    engine_name_ok, parse_search_results, SearchHit, SearxngConfig, SearxngState,
+    SearxngSupervisor, DEFAULT_ENGINES, MAX_ENGINES,
 };

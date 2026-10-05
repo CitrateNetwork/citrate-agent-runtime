@@ -1,5 +1,5 @@
 {
- "generated_by": "cast 1.5.1-stable: cast calldata \"registerSkill(string,string,string,string,string[])\" <name> <version> <manifestCID> <description> <tags>; cast keccak $(cast abi-encode --packed \"f(address,string,string)\" <owner> <name> <version>)",
+ "generated_by": "cast 1.5.1-stable: cast calldata \"registerSkill(string,string,string,string,string[])\" <name> <version> <manifestCID> <description> <tags>; skill_hash: cast call <SkillRegistry> \"skillHashOf(address,string,string)(bytes32)\" <owner> <name> <version> against citrate-chain contracts/src/SkillRegistry.sol at 07486fcc (hup/n5-chain-redeploy, PR #272) deployed on a local anvil, cross-checked with cast keccak $(cast abi-encode \"f(address,string,string)\" <owner> <name> <version>)",
  "generated_at": "2026-10-01",
  "selector": "0x2a996145",
  "calldata": [
@@ -40,14 +40,47 @@
    "owner": "0x00000000000000000000000000000000000000aa",
    "name": "solidity-audit-checklist",
    "version": "1.0.0",
-   "hash": "0xf1b7fd54531d77bf7f259c511040177562760ea6ce6c39a843168e744195cf5c"
+   "hash": "0xb15a868f9600299554036eafb381a278c7982c59db6168477ba043c2386adb84",
+   "packed_hash": "0xf1b7fd54531d77bf7f259c511040177562760ea6ce6c39a843168e744195cf5c"
   },
   {
    "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
    "name": "solidity-audit-checklist",
    "version": "1.0.0",
-   "hash": "0x19cabe434407fa37e61ff7c5d8d8c1f265d564e274c501cceee65bec168df8e3",
-   "note": "anvil account 0; on 2026-10-01 a local anvil run deployed SkillRegistry.sol, sent calldata[0] from this account, and getSkill(hash) returned the registered skill"
+   "hash": "0xebd7f4734de1f2d21bfd205d6f6f68d199bd142454e61736f942ca83085f1830",
+   "packed_hash": "0x19cabe434407fa37e61ff7c5d8d8c1f265d564e274c501cceee65bec168df8e3",
+   "note": "anvil account 0; on 2026-10-04 a local anvil run deployed the #272 SkillRegistry.sol, sent calldata[0] from this account, the SkillRegistered event carried this hash, and getSkill(hash) returned the registered skill"
+  },
+  {
+   "owner": "0x00000000000000000000000000000000000000aa",
+   "name": "skill1",
+   "version": ".0",
+   "hash": "0x799c43d2d0e201ff15774bc51233b8ff1f967252188e4497330777614e2af96c",
+   "packed_hash": "0x7bb3db01d1568f142edf4be3310717841a334057689874d04bb197b4920d964d",
+   "note": "the two pairs concatenate to the same bytes; abi.encode gives distinct ids, the packed layout gives one id for both"
+  },
+  {
+   "owner": "0x00000000000000000000000000000000000000aa",
+   "name": "skill",
+   "version": "1.0",
+   "hash": "0x60bcf3807898537c8ee11a5251c3bd67b1943e99e9ebbeee37a993dd8af69f0f",
+   "packed_hash": "0x7bb3db01d1568f142edf4be3310717841a334057689874d04bb197b4920d964d",
+   "note": "the two pairs concatenate to the same bytes; abi.encode gives distinct ids, the packed layout gives one id for both"
+  },
+  {
+   "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+   "name": "x",
+   "version": "1.2.3",
+   "hash": "0x77dfd062c32fa5cc38977ef11dc99d44778d18d9297213f02474f4504f2b52fc",
+   "packed_hash": "0xeb8f548b49cff97e5c9716d4d2884d4a2a2854eb6699721d88d15262d991cfae"
+  },
+  {
+   "owner": "0x00000000000000000000000000000000000000aa",
+   "name": "ééé-unicode-name-that-is-longer-than-thirty-two-bytes",
+   "version": "10.20.30",
+   "hash": "0x5630f79f0e36db430f95bcdab71a84269bb93dea4349e1f30cfdcebe5d00fe45",
+   "packed_hash": "0xd1da0f2eeaf6ecf8c33f107445a99308c4e7973c64d85497241d8ef83b1e00e7"
   }
- ]
+ ],
+ "skill_hash_generated_at": "2026-10-04"
 }

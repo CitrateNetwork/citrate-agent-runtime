@@ -514,8 +514,8 @@ async fn instruction_skills(
     })))
 }
 
-/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). Sessions already
-/// open keep their skills; the next session gets the new library.
+/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). New sessions get
+/// the new library, and open sessions that were opened with skills take it on their next turn.
 async fn reload_instruction_skills(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1497,12 +1497,27 @@ pub fn production_tokenizer() -> sessions::TokenizerFactory {
 /// started with `--embeddings`). An https chat endpoint is never sent tool or skill text for
 /// embedding unless it is named here.
 pub fn production_embedder(embed_url: Option<String>) -> sessions::EmbedderFactory {
+    production_embedder_with_key(embed_url, None)
+}
+
+/// US-1.4: [`production_embedder`] for an endpoint that needs an API key, read from the file
+/// `key_file` names (`CITRATE_HERMES_EMBED_KEY_FILE`) each time a session is opened, so a key
+/// citrate-core rotates is picked up. The key goes only to the named endpoint. A key file that
+/// cannot be read leaves the session lexical, with the reason.
+pub fn production_embedder_with_key(
+    embed_url: Option<String>,
+    key_file: Option<std::path::PathBuf>,
+) -> sessions::EmbedderFactory {
     let embed_url = embed_url.filter(|u| !u.trim().is_empty());
     Arc::new(move |ep: &sessions::LlmEndpoint| match &embed_url {
         Some(url) => {
             sessions::validate_endpoint(url)
                 .map_err(|e| format!("{} was refused: {e}", retrieval_http::EMBED_URL_ENV))?;
-            Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, ""))
+            let key = match &key_file {
+                Some(p) => retrieval_http::read_embed_key(p)?,
+                None => String::new(),
+            };
+            Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, &key))
                 as Arc<dyn citrate_agent_loop::retrieval::Embedder>)
         }
         None if retrieval_http::is_loopback_http(&ep.base_url) => Ok(Arc::new(
@@ -1535,11 +1550,14 @@ pub fn production_sessions_with(
     );
     // HUP-S1.2 (US-1.4 AC1): token counts from the model's tokenizer, and tools and skills ranked
     // by embeddings plus keywords, each with an honest fallback the session reports.
-    let mgr = mgr
-        .with_tokenizer(production_tokenizer())
-        .with_embedder(production_embedder(
-            std::env::var(retrieval_http::EMBED_URL_ENV).ok(),
-        ));
+    let mgr =
+        mgr.with_tokenizer(production_tokenizer())
+            .with_embedder(production_embedder_with_key(
+                std::env::var(retrieval_http::EMBED_URL_ENV).ok(),
+                std::env::var_os(retrieval_http::EMBED_KEY_FILE_ENV)
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from),
+            ));
     // HUP-S2.1: grants are resolved against the member's home (the sidecar runs as the member).
     let mgr = match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         Some(home) => mgr.with_grants_home(std::path::PathBuf::from(home)),
@@ -1551,7 +1569,7 @@ pub fn production_sessions_with(
         None => mgr,
     };
     // HUP-S3.2: the skills library. HUP-S3.4: kept with its sources, so a learned skill the
-    // member accepts is offered to the next session without a restart.
+    // member accepts is offered without a restart (new sessions, and open ones on their next turn).
     let sources = skill_sources_from_process_env();
     let mgr = if sources.is_empty() {
         mgr
@@ -1712,7 +1730,8 @@ type JsonErr = (StatusCode, Json<serde_json::Value>);
 
 // ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
 
-/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+/// `{enabled, searxng, reader, engines}`: `engines` names the third-party engines SearXNG may
+/// load (US-5.2 AC2). Never a key, a path, or a query.
 async fn search_status(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1722,7 +1741,7 @@ async fn search_status(
     }
     let Some(host) = st.sessions.search() else {
         return Ok(Json(serde_json::json!({
-            "enabled": false, "searxng": "off", "reader": "local"
+            "enabled": false, "searxng": "off", "reader": "local", "engines": []
         })));
     };
     let reader = if host.third_party_reader() {
@@ -1730,6 +1749,7 @@ async fn search_status(
     } else {
         "local"
     };
+    let engines = host.searxng().engines();
     let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
         citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
         citrate_agent_search::SearxngState::Idle => "idle",
@@ -1739,7 +1759,7 @@ async fn search_status(
     .await
     .unwrap_or("failed");
     Ok(Json(serde_json::json!({
-        "enabled": true, "searxng": searxng, "reader": reader
+        "enabled": true, "searxng": searxng, "reader": reader, "engines": engines
     })))
 }
 
@@ -2317,7 +2337,8 @@ async fn learn_accept(
     let out = svc.accept(&pid, decision).map_err(refusal)?;
     let mut body = serde_json::json!({ "ok": true, "persisted": out });
     if matches!(out, learn::AcceptedView::Skill { .. }) {
-        // HUP-S3.4: offer the saved skill to the next session without a restart.
+        // HUP-S3.4: offer the saved skill without a restart (next session, and open sessions'
+        // next turn).
         let reloaded = st.sessions.reload_skills();
         body["skills_reloaded"] = serde_json::Value::Bool(reloaded.is_some());
         if let Some(n) = reloaded {

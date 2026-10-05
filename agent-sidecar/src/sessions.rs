@@ -80,7 +80,8 @@ use citrate_agent_loop::retrieval::{
     Embedder, HybridRetriever, ModelTokenCounter, RetrievalMode, TokenCounting, Tokenizer,
 };
 use citrate_agent_loop::skills::{
-    skill_load_spec, SkillHost, SkillLibrary, SkillSource, SkillTurnIndex, SKILL_LOAD_TOOL,
+    skill_load_spec, SkillHost, SkillLibrary, SkillRanker, SkillSource, SkillTurnIndex,
+    SKILL_LOAD_TOOL,
 };
 use citrate_agent_loop::{
     run_turn_with, ContextBudget, Event, EventSink, HostKind, LlmClient, LlmSelfReviewer,
@@ -431,6 +432,63 @@ fn initial_taint(unattended: bool) -> TaintState {
     taint
 }
 
+/// HUP-S3.4 (fan-out 7): an open session's view of the skills library. The manager refreshes it
+/// on every reload ([`SessionManager::reload_skills`]), so a skill the member accepts reaches a
+/// session that is already open on its next turn, in the per-turn index and through `skill_load`.
+/// A persona's allowlist still decides what the session sees: a refresh never widens it.
+pub struct LiveSkills {
+    lib: RwLock<Arc<SkillLibrary>>,
+    /// The persona allowlist, when the session's persona restricts skills.
+    allow: Option<Vec<String>>,
+}
+
+impl LiveSkills {
+    pub fn new(lib: Arc<SkillLibrary>, allow: Option<Vec<String>>) -> Self {
+        LiveSkills {
+            lib: RwLock::new(lib),
+            allow,
+        }
+    }
+
+    /// The library this session offers now (a snapshot).
+    pub fn current(&self) -> Arc<SkillLibrary> {
+        match self.lib.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    /// Take the manager's reloaded library (`None` when no skills are left), restricted to the
+    /// session's allowlist.
+    pub fn refresh(&self, base: Option<&Arc<SkillLibrary>>) {
+        let next = match (base, &self.allow) {
+            (None, _) => Arc::new(SkillLibrary::empty()),
+            (Some(b), Some(allow)) => Arc::new(b.restricted_to(allow).0),
+            (Some(b), None) => b.clone(),
+        };
+        match self.lib.write() {
+            Ok(mut g) => *g = next,
+            Err(p) => *p.into_inner() = next,
+        }
+    }
+}
+
+/// The per-turn skill index over a session's [`LiveSkills`]: each turn ranks the library the
+/// session offers at that moment.
+struct LiveSkillTurnIndex {
+    live: Arc<LiveSkills>,
+    k: usize,
+    ranker: Arc<dyn SkillRanker>,
+}
+
+impl TurnContext for LiveSkillTurnIndex {
+    fn section(&self, user: &str, history: &[Message]) -> Option<String> {
+        SkillTurnIndex::new(self.live.current(), self.k)
+            .with_ranker(self.ranker.clone())
+            .section(user, history)
+    }
+}
+
 /// One conversation.
 pub struct Session {
     pub id: String,
@@ -447,7 +505,8 @@ pub struct Session {
     busy: AtomicBool,
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
-    skills: Option<Arc<SkillLibrary>>,
+    /// HUP-S3.4: refreshed when the manager reloads its library (see [`LiveSkills`]).
+    skills: Option<Arc<LiveSkills>>,
     /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
     /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
     toolchain: Option<Arc<dyn ToolHost>>,
@@ -935,8 +994,10 @@ pub struct SessionManager {
     core_tool_deadline: Duration,
     ids: AtomicU64,
     /// HUP-S3.2: the skills library offered to new sessions. HUP-S3.4: reloaded from
-    /// `skill_sources` after the member accepts a learned skill, so it joins the next session
-    /// without a sidecar restart (sessions already open keep the library they started with).
+    /// `skill_sources` after the member accepts a learned skill, so it joins without a sidecar
+    /// restart: new sessions start from it, and every open session that was opened with skills
+    /// takes it on its next turn (a session opened with no skills at all gets them in the next
+    /// session, since its tool list has no `skill_load`).
     skills: RwLock<Option<Arc<SkillLibrary>>>,
     skill_sources: Vec<SkillSource>,
     toolchain: Option<Arc<dyn ToolchainBackend>>,
@@ -1257,9 +1318,10 @@ impl SessionManager {
         }
     }
 
-    /// HUP-S3.4: read the skill sources again so a newly saved skill is offered to the next
-    /// session. Returns how many skills new sessions are offered, or `None` when the library was
-    /// not configured from sources (nothing to reload). Sessions already open are unchanged.
+    /// HUP-S3.4: read the skill sources again so a newly saved skill is offered without a restart.
+    /// Returns how many skills new sessions are offered, or `None` when the library was not
+    /// configured from sources (nothing to reload). Every open session that was opened with skills
+    /// takes the new library (restricted to its persona's allowlist) on its next turn.
     pub fn reload_skills(&self) -> Option<usize> {
         if self.skill_sources.is_empty() {
             return None;
@@ -1272,8 +1334,17 @@ impl SessionManager {
             Some(Arc::new(lib))
         };
         match self.skills.write() {
-            Ok(mut g) => *g = next,
-            Err(p) => *p.into_inner() = next,
+            Ok(mut g) => *g = next.clone(),
+            Err(p) => *p.into_inner() = next.clone(),
+        }
+        let open: Vec<Arc<Session>> = match self.sessions.lock() {
+            Ok(g) => g.values().cloned().collect(),
+            Err(p) => p.into_inner().values().cloned().collect(),
+        };
+        for session in open {
+            if let Some(live) = &session.skills {
+                live.refresh(next.as_ref());
+            }
         }
         Some(n)
     }
@@ -1293,6 +1364,10 @@ impl SessionManager {
         // One snapshot of the (reloadable) library for the allowlist, the prompt section and
         // the session's `skill_load` host.
         let base_skills = self.skills();
+        let allow = persona
+            .as_ref()
+            .filter(|p| p.restricts_skills())
+            .map(|p| p.skills.clone());
         let (skills, persona_skills) = match (&persona, &base_skills) {
             (Some(p), Some(lib)) if p.restricts_skills() => {
                 let (only, missing) = lib.restricted_to(&p.skills);
@@ -1341,7 +1416,9 @@ impl SessionManager {
         }
         let mut pinned_tools = Vec::new();
         let mut turn_context: Vec<Arc<dyn TurnContext>> = Vec::new();
-        if let Some(lib) = &skills {
+        let skills: Option<Arc<LiveSkills>> =
+            skills.map(|lib| Arc::new(LiveSkills::new(lib, allow.clone())));
+        if let Some(live) = &skills {
             if specs.iter().any(|t| t.name == SKILL_LOAD_TOOL) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{SKILL_LOAD_TOOL}' is reserved by the sidecar while skills are enabled"
@@ -1349,9 +1426,11 @@ impl SessionManager {
             }
             // US-3.2 AC1: each turn carries the at most SKILLS_PER_TURN skills that match it,
             // ranked over the (persona-restricted) library; never the whole index.
-            turn_context.push(Arc::new(
-                SkillTurnIndex::new(lib.clone(), SKILLS_PER_TURN).with_ranker(retriever.clone()),
-            ));
+            turn_context.push(Arc::new(LiveSkillTurnIndex {
+                live: live.clone(),
+                k: SKILLS_PER_TURN,
+                ranker: retriever.clone(),
+            }));
             specs.push(skill_load_spec());
             pinned_tools.push(SKILL_LOAD_TOOL.to_string());
         }
@@ -1726,7 +1805,7 @@ impl SessionManager {
         if let Some(guard) = session.deploy_guard() {
             registry = registry.with_policy(Arc::new(guard));
         }
-        let skill_host = session.skills.clone().map(SkillHost::new);
+        let skill_host = session.skills.as_ref().map(|l| SkillHost::new(l.current()));
         let capsule_host = capsules.map(|d| CapsuleHost {
             dispatch: d,
             sandbox: session.capsule_sandbox.clone(),

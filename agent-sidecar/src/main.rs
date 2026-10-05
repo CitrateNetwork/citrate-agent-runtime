@@ -10,6 +10,8 @@
 //!                               with --embeddings, e.g. a BGE model; loopback http or https) that
 //!                               ranks tools and skills with keywords; unset, sessions try their
 //!                               own loopback chat server and rank lexically if it does not embed
+//!   CITRATE_HERMES_EMBED_KEY_FILE  US-1.4: path to the 0600 file holding that endpoint's API key
+//!                               (sent only to CITRATE_HERMES_EMBED_URL); unset = no key (optional)
 //!   CITRATE_HERMES_SKILLS_LOCK  HUP-S3.2: path of the skills.lock citrate-core ships; with
 //!   CITRATE_HERMES_SKILLS_THIRD_PARTY (the staged reviewed-skills tree) the reviewed third-party
 //!                               skills load last, each file checked against the lock (optional)
@@ -82,6 +84,10 @@
 //!   CITRATE_BROWSER_ALLOW_PRIVATE  developer use: local origins the managed browser may open
 //!                               (comma separated, e.g. http://127.0.0.1:8545); unset = public
 //!                               web addresses only (optional)
+//!   CITRATE_BROWSER_OPEN_WEB    HUP-S5.5: set by core from the component updater's freshness
+//!                               (`browserMayOpenWeb`) when the managed Chromium is in use; unset
+//!                               or `1` = open, anything else = the managed browser opens only
+//!                               developer-allowed origins on this machine (optional)
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it
