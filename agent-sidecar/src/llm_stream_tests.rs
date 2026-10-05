@@ -40,7 +40,7 @@ fn text_deltas_arrive_in_order_and_the_turn_is_the_whole_answer() {
     let (turn, usage) = r.unwrap();
     assert_eq!(turn.content, "Height is 6,310.");
     assert!(turn.tool_calls.is_empty());
-    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 12, completion_tokens: 5 }), "metering keeps the provider's counts");
+    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 12, completion_tokens: 5, generation_ms: None }), "metering keeps the provider's counts");
 }
 
 #[test]
@@ -194,4 +194,19 @@ fn with_streaming_off_the_client_sends_a_plain_request() {
     assert_eq!(turn.content, "plain");
     let sent: Value = serde_json::from_str(&seen.recv().unwrap()).unwrap();
     assert_eq!(sent["stream"], false);
+}
+
+/// HUP-S7.6 with HUP-S1.1: llama-server's `timings.predicted_ms` on the last chunk reaches the
+/// streamed usage, so the monitor can show tokens per second for streamed answers too.
+#[test]
+fn a_streamed_answer_keeps_the_generation_time() {
+    let mut s = chunk(json!({"content": "hi"}));
+    s.push_str(&format!(
+        "data: {}\n\n",
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 7, "completion_tokens": 2}, "timings": {"predicted_ms": 41.6}})
+    ));
+    s.push_str("data: [DONE]\n\n");
+    let (_, r) = feed(&s);
+    let (_, usage) = r.unwrap();
+    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 7, completion_tokens: 2, generation_ms: Some(42) }));
 }

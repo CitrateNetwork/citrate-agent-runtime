@@ -48,7 +48,12 @@
     { "name": "contract_view", "host": "core", "read_only": true },
     { "name": "fl_round_plan", "host": "core", "read_only": true },
     { "name": "fl_round_start", "host": "core", "read_only": false },
-    { "name": "belnap_codec", "host": "core", "read_only": true }
+    { "name": "belnap_codec", "host": "core", "read_only": true },
+    { "name": "gsheets_read", "host": "core", "read_only": true },
+    { "name": "gsheets_append", "host": "core", "read_only": false },
+    { "name": "schedule_list", "host": "core", "read_only": true },
+    { "name": "schedule_add", "host": "core", "read_only": false },
+    { "name": "calendar_list", "host": "core", "read_only": true }
   ],
   "config_divergences": [
     {
