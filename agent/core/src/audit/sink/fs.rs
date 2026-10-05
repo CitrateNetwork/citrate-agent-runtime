@@ -23,7 +23,7 @@ use crate::audit::sink::AuditSink;
 use crate::error::AgentError;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -44,11 +44,25 @@ impl FilesystemSink {
     pub fn open(path: &Path) -> Result<Self, AgentError> {
         let mut options = OpenOptions::new();
         options.create(true).append(true).read(true);
+        Self::open_with_options(path, options)
+    }
+
+    /// Create a new audit log without following or replacing an existing path.
+    /// The returned sink keeps that exact file open for both appends and reads.
+    pub fn create_new(path: &Path) -> Result<Self, AgentError> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).append(true).read(true);
+        Self::open_with_options(path, options)
+    }
+
+    fn open_with_options(path: &Path, options: OpenOptions) -> Result<Self, AgentError> {
         #[cfg(unix)]
-        {
+        let options = {
             use std::os::unix::fs::OpenOptionsExt;
+            let mut options = options;
             options.mode(0o600);
-        }
+            options
+        };
         let file = options
             .open(path)
             .map_err(|e| AgentError::Audit(format!("open audit file {path:?}: {e}")))?;
@@ -56,6 +70,21 @@ impl FilesystemSink {
             path: path.to_path_buf(),
             writer: Mutex::new(file),
         })
+    }
+
+    /// Flush this sink through the operating system before a caller publishes
+    /// a completion marker that refers to the audit log.
+    pub fn sync_all(&self) -> Result<(), AgentError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| AgentError::Audit("mutex poisoned".to_string()))?;
+        writer
+            .flush()
+            .map_err(|e| AgentError::Audit(format!("flush: {e}")))?;
+        writer
+            .sync_all()
+            .map_err(|e| AgentError::Audit(format!("sync audit file: {e}")))
     }
 
     pub fn path(&self) -> &Path {
@@ -92,14 +121,24 @@ impl AuditSink for FilesystemSink {
 
     fn iter(
         &self,
-    ) -> Result<Box<dyn Iterator<Item = Result<AuditRecord, AgentError>> + '_>, AgentError>
-    {
-        let file = File::open(&self.path)
-            .map_err(|e| AgentError::Audit(format!("re-open for read: {e}")))?;
+    ) -> Result<Box<dyn Iterator<Item = Result<AuditRecord, AgentError>> + '_>, AgentError> {
+        let mut file = {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| AgentError::Audit("mutex poisoned".to_string()))?;
+            writer
+                .flush()
+                .map_err(|e| AgentError::Audit(format!("flush before read: {e}")))?;
+            writer
+                .try_clone()
+                .map_err(|e| AgentError::Audit(format!("clone audit file for read: {e}")))?
+        };
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| AgentError::Audit(format!("seek audit file for read: {e}")))?;
         let reader = BufReader::new(file);
         Ok(Box::new(reader.lines().map(|line_result| {
-            let line = line_result
-                .map_err(|e| AgentError::Audit(format!("read line: {e}")))?;
+            let line = line_result.map_err(|e| AgentError::Audit(format!("read line: {e}")))?;
             let envelope: serde_json::Value = serde_json::from_str(&line)
                 .map_err(|e| AgentError::Audit(format!("parse envelope: {e}")))?;
             let cbor_b64 = envelope
@@ -191,6 +230,48 @@ mod tests {
         let count = sink.iter().expect("iter").count();
         assert_eq!(count, 0);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn create_new_refuses_an_existing_path() {
+        let p = tmp_path("create-new-existing");
+        let _ = std::fs::remove_file(&p);
+        let _sink = FilesystemSink::create_new(&p).expect("first create");
+        assert!(FilesystemSink::create_new(&p).is_err());
+        drop(_sink);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn iteration_stays_bound_to_the_open_file() {
+        let p = tmp_path("held-handle");
+        let moved = tmp_path("held-handle-moved");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&moved);
+        let sink = FilesystemSink::create_new(&p).expect("create");
+        sink.append(&mkrecord(0)).expect("append");
+
+        match std::fs::rename(&p, &moved) {
+            Ok(()) => {
+                std::fs::write(&p, b"replacement\n").expect("replacement path");
+                let records = sink
+                    .iter()
+                    .expect("iterate held file")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("decode held file");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].sequence, 0);
+            }
+            Err(_) => {
+                // Some platforms deny renaming an open file, which also prevents
+                // path substitution while the sink is alive.
+                assert!(p.exists());
+            }
+        }
+
+        drop(sink);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&moved);
     }
 
     #[test]
