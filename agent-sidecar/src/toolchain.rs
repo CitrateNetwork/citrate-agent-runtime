@@ -230,6 +230,21 @@ fn check_project(roots: &[PathBuf], home: &Path, cwd: &Path) -> Result<(), Strin
     check_path(cwd, &ctx).map(|_| ()).map_err(|d| d.to_string())
 }
 
+/// The scratch-HOME links that make the configured solc visible to tools that look for it in
+/// `~/.svm/<version>/solc-<version>` (aderyn): the pinned version only.
+pub fn svm_links(solc: Option<&Path>) -> Vec<(PathBuf, PathBuf)> {
+    solc.filter(|p| p.is_absolute())
+        .map(|p| {
+            vec![(
+                PathBuf::from(".svm")
+                    .join(PINNED_SOLC)
+                    .join(format!("solc-{PINNED_SOLC}")),
+                p.to_path_buf(),
+            )]
+        })
+        .unwrap_or_default()
+}
+
 fn build_runner(
     cfg: &ToolchainConfig,
     grants: Option<Arc<SessionGrants>>,
@@ -253,7 +268,15 @@ fn build_runner(
                     .filter_map(|p| p.parent().map(Path::to_path_buf))
                     .collect(),
             ),
-        );
+        )
+        // HUP-S6: aderyn ignores FOUNDRY_SOLC and looks for its compiler in `~/.svm`, so in the
+        // scratch HOME (and with no network) it found none and printed no report. The configured
+        // compiler is linked where it looks, under the pinned version.
+        // HUP-S6: medusa compiles through crytic-compile (a Python entry point it starts itself),
+        // whose virtual environment must be readable under the OS sandbox too.
+        .with_helper_programs(&["crytic-compile"])
+        .with_home_links(svm_links(cfg.solc.as_deref()))
+        .map_err(|e| e.to_string())?;
     if let Some(g) = grants {
         return Ok(ShellRunner::new(policy, move |cwd: &Path| {
             g.check_project(cwd).map(|_| ())
