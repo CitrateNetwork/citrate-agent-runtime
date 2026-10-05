@@ -87,6 +87,8 @@ fn real_signed_hello_returns_exact_output_and_reopens_as_a_verified_chain() {
     assert_eq!(summary["chain_anchored"], false);
     assert_eq!(summary["external_network_used"], false);
     assert_eq!(summary["audit_chain_verified"], true);
+    assert!(!evidence.join(".audit.jsonl.tmp").exists());
+    assert!(!evidence.join(".summary.json.tmp").exists());
 
     let sink = Arc::new(FilesystemSink::open(&evidence.join("audit.jsonl")).expect("sink"));
     let chain = AuditChain::open_existing(sink)
@@ -112,15 +114,12 @@ fn loose_unsigned_hello_is_refused_without_a_summary() {
 
     let error = execute(&args(evidence.clone(), temp.path().join("fleet")))
         .expect_err("unsigned capsule must fail closed");
-    assert!(
-        error.contains("signed hello capsule is required"),
-        "{error}"
-    );
+    assert!(error.contains("unverified capsule \"hello\""), "{error}");
     assert!(!evidence.join("summary.json").exists());
 }
 
 #[test]
-fn signed_capsule_with_external_capabilities_is_refused_before_execution() {
+fn a_different_signed_capsule_cannot_substitute_for_hello() {
     let temp = TempTree::new("capabilities");
     let fleet_hello = temp.path().join("fleet").join("hello");
     let evidence = temp.path().join("evidence");
@@ -134,7 +133,7 @@ fn signed_capsule_with_external_capabilities_is_refused_before_execution() {
 
     let error = execute(&args(evidence.clone(), temp.path().join("fleet")))
         .expect_err("a capability-bearing capsule must not run as the offline demo");
-    assert!(error.contains("no chain calls"), "{error}");
+    assert!(error.contains("capsule \"hello\" not loaded"), "{error}");
     assert!(!evidence.join("audit.jsonl").exists());
     assert!(!evidence.join("summary.json").exists());
 }
@@ -155,4 +154,28 @@ fn missing_or_nonempty_evidence_directory_is_refused_without_overwrite() {
         b"keep"
     );
     assert!(!nonempty.join("summary.json").exists());
+
+    let file_path = temp.path().join("not-a-directory");
+    std::fs::write(&file_path, b"keep").expect("file path");
+    assert!(execute(&args(file_path.clone(), capsules_root())).is_err());
+    assert_eq!(std::fs::read(&file_path).expect("preserved file"), b"keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_evidence_directory_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempTree::new("symlink");
+    let target = temp.path().join("target");
+    let link = temp.path().join("link");
+    std::fs::create_dir(&target).expect("target dir");
+    symlink(&target, &link).expect("symlink");
+
+    let error = execute(&args(link, capsules_root())).expect_err("symlink must be refused");
+    assert!(error.contains("must not be a symlink"), "{error}");
+    assert!(std::fs::read_dir(&target)
+        .expect("target remains readable")
+        .next()
+        .is_none());
 }

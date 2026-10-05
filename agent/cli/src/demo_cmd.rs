@@ -1,12 +1,10 @@
 //! Deterministic offline demonstration of the signed `hello` capsule.
 
 use citrate_agent_core::audit::{AuditChain, EventType, FilesystemSink, GenesisInfo};
-use citrate_agent_core::capsule::bundled_key;
 use citrate_agent_core::capsule::dispatch::CapsuleDispatch;
 use citrate_agent_core::capsule::manifest::{Manifest, NetworkPolicy};
-use citrate_agent_core::capsule::Capsule;
 use serde::Serialize;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,12 +93,14 @@ pub fn run(args: DemoArgs) -> i32 {
 }
 
 fn execute(args: &DemoArgs) -> Result<String, String> {
-    require_empty_evidence_dir(&args.evidence_dir)?;
+    let evidence_dir = require_empty_evidence_dir(&args.evidence_dir)?;
 
     let dispatch = CapsuleDispatch::load_from_dir(&args.capsules_dir, None, None, None)
         .map_err(|error| format!("load signed capsule fleet: {error}"))?;
-    let hello = load_verified_hello(&args.capsules_dir)?;
-    confirm_offline_manifest(&hello.manifest)?;
+    let hello = dispatch
+        .verified_manifest(CAPSULE_NAME)
+        .map_err(|error| format!("load verified hello manifest: {error}"))?;
+    confirm_offline_manifest(hello)?;
 
     let output_value = dispatch
         .call_json(CAPSULE_NAME, &serde_json::json!({ "name": INPUT_NAME }))
@@ -114,55 +114,74 @@ fn execute(args: &DemoArgs) -> Result<String, String> {
         ));
     }
 
-    let audit_path = args.evidence_dir.join("audit.jsonl");
-    reserve_new_file(&audit_path, "audit evidence")?;
-    let policy_bundle_hash = decode_content_hash(&hello.manifest.capsule.content_hash)?;
-    let payload = encode_payload(&hello.manifest, output)?;
+    let audit_path = evidence_dir.join("audit.jsonl");
+    let audit_staging_path = evidence_dir.join(".audit.jsonl.tmp");
+    let payload = encode_payload(hello, output)?;
 
     // The existing core audit implementation is intentionally the only persistence and
     // verification framework used here. This demo evidence is local, unsigned, and unanchored.
     let sink = Arc::new(
-        FilesystemSink::open(&audit_path)
+        FilesystemSink::create_new(&audit_staging_path)
             .map_err(|error| format!("open audit evidence: {error}"))?,
     );
-    let mut chain = AuditChain::open_or_init(
-        sink,
-        GenesisInfo {
-            agent_did: ACTOR.to_string(),
-            harness_version: env!("CARGO_PKG_VERSION").to_string(),
-            policy_bundle_hash,
-            doctor_report_hash: [0; 32],
-        },
-        GENESIS_TIMESTAMP_NS,
-    )
-    .map_err(|error| format!("initialize audit chain: {error}"))?;
-    chain
-        .append(
-            EventType::AuditExport,
-            payload,
-            ACTOR.to_string(),
-            Vec::new(),
-            None,
-            EXECUTION_TIMESTAMP_NS,
+    let audit_result = (|| {
+        let mut chain = AuditChain::open_or_init(
+            Arc::clone(&sink) as Arc<dyn citrate_agent_core::audit::AuditSink>,
+            GenesisInfo {
+                agent_did: ACTOR.to_string(),
+                harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                // This local demo has no policy bundle or doctor report. Zero hashes are
+                // explicit absent-value sentinels; capsule identity lives in the event payload.
+                policy_bundle_hash: [0; 32],
+                doctor_report_hash: [0; 32],
+            },
+            GENESIS_TIMESTAMP_NS,
         )
-        .map_err(|error| format!("append demo audit record: {error}"))?;
-    drop(chain);
+        .map_err(|error| format!("initialize audit chain: {error}"))?;
+        chain
+            .append(
+                EventType::AuditExport,
+                payload,
+                ACTOR.to_string(),
+                Vec::new(),
+                None,
+                EXECUTION_TIMESTAMP_NS,
+            )
+            .map_err(|error| format!("append demo audit record: {error}"))?;
+        drop(chain);
+        sink.sync_all()
+            .map_err(|error| format!("synchronize audit evidence: {error}"))?;
 
-    let reopened_sink = Arc::new(
-        FilesystemSink::open(&audit_path)
-            .map_err(|error| format!("reopen audit evidence: {error}"))?,
-    );
-    let reopened = AuditChain::open_existing(reopened_sink)
+        let reopened = AuditChain::open_existing(
+            Arc::clone(&sink) as Arc<dyn citrate_agent_core::audit::AuditSink>
+        )
         .map_err(|error| format!("reopen audit chain: {error}"))?
         .ok_or_else(|| "reopened audit chain is empty".to_string())?;
-    let record_count = reopened
-        .verify_integrity()
-        .map_err(|error| format!("verify reopened audit chain: {error}"))?;
+        let record_count = reopened
+            .verify_integrity()
+            .map_err(|error| format!("verify reopened audit chain: {error}"))?;
+        if record_count != 2 {
+            return Err(format!(
+                "verified audit chain has {record_count} records; expected exactly 2"
+            ));
+        }
+        Ok((record_count, hex::encode(reopened.last_hash())))
+    })();
+    let (record_count, audit_head_sha256) = match audit_result {
+        Ok(result) => result,
+        Err(error) => {
+            drop(sink);
+            return Err(cleanup_failure(error, &[&audit_staging_path]));
+        }
+    };
+    drop(sink);
+    publish_new(&audit_staging_path, &audit_path)
+        .map_err(|error| cleanup_failure(error, &[&audit_staging_path]))?;
 
     let summary = DemoSummary {
         schema_version: "citrate-agent-demo-summary/v1",
         command: "citrate-agent demo",
-        capsule: capsule_evidence(&hello.manifest),
+        capsule: capsule_evidence(hello),
         input: DemoInput { name: INPUT_NAME },
         output,
         capsule_signature_verified: true,
@@ -171,24 +190,50 @@ fn execute(args: &DemoArgs) -> Result<String, String> {
         external_network_used: false,
         audit_chain_verified: true,
         audit_record_count: record_count,
-        audit_head_sha256: hex::encode(reopened.last_hash()),
+        audit_head_sha256,
     };
     let mut summary_bytes = serde_json::to_vec_pretty(&summary)
         .map_err(|error| format!("encode summary evidence: {error}"))?;
     summary_bytes.push(b'\n');
-    write_new_summary(&args.evidence_dir.join("summary.json"), &summary_bytes)?;
+    let summary_path = evidence_dir.join("summary.json");
+    let summary_staging_path = evidence_dir.join(".summary.json.tmp");
+    if let Err(error) = write_new_file(&summary_staging_path, &summary_bytes)
+        .and_then(|()| publish_new(&summary_staging_path, &summary_path))
+    {
+        return Err(cleanup_failure(
+            error,
+            &[&summary_staging_path, &summary_path, &audit_path],
+        ));
+    }
 
     Ok(output.to_string())
 }
 
-fn require_empty_evidence_dir(path: &Path) -> Result<(), String> {
-    let metadata = std::fs::metadata(path)
+fn require_empty_evidence_dir(path: &Path) -> Result<PathBuf, String> {
+    let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("evidence directory must already exist at {path:?}: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "evidence directory must not be a symlink: {path:?}"
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "evidence directory must not be a reparse point: {path:?}"
+            ));
+        }
+    }
     if !metadata.is_dir() {
         return Err(format!("evidence path is not a directory: {path:?}"));
     }
-    let mut entries = std::fs::read_dir(path)
-        .map_err(|error| format!("read evidence directory {path:?}: {error}"))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("canonicalize evidence directory {path:?}: {error}"))?;
+    let mut entries = std::fs::read_dir(&canonical)
+        .map_err(|error| format!("read evidence directory {canonical:?}: {error}"))?;
     if entries
         .next()
         .transpose()
@@ -196,18 +241,10 @@ fn require_empty_evidence_dir(path: &Path) -> Result<(), String> {
         .is_some()
     {
         return Err(format!(
-            "evidence directory must be empty; refusing to overwrite anything in {path:?}"
+            "evidence directory must be empty; refusing to overwrite anything in {canonical:?}"
         ));
     }
-    Ok(())
-}
-
-fn load_verified_hello(capsules_dir: &Path) -> Result<Capsule, String> {
-    let path = capsules_dir.join(CAPSULE_NAME).join("hello.cps");
-    let file = File::open(&path)
-        .map_err(|error| format!("signed hello capsule is required at {path:?}: {error}"))?;
-    Capsule::from_archive_verified(file, &bundled_key::registry())
-        .map_err(|error| format!("verify signed hello capsule: {error}"))
+    Ok(canonical)
 }
 
 fn confirm_offline_manifest(manifest: &Manifest) -> Result<(), String> {
@@ -254,38 +291,55 @@ fn capsule_evidence(manifest: &Manifest) -> CapsuleEvidence<'_> {
     }
 }
 
-fn decode_content_hash(value: &str) -> Result<[u8; 32], String> {
-    let encoded = value
-        .strip_prefix("sha256:")
-        .ok_or_else(|| "hello content hash lacks sha256 prefix".to_string())?;
-    let bytes =
-        hex::decode(encoded).map_err(|error| format!("decode hello content hash: {error}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| "hello content hash is not 32 bytes".to_string())
-}
-
-fn reserve_new_file(path: &Path, label: &str) -> Result<(), String> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map(|_| ())
-        .map_err(|error| format!("reserve {label} {path:?} without overwrite: {error}"))
-}
-
-fn write_new_summary(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| format!("create summary evidence {path:?} without overwrite: {error}"))?;
+        .map_err(|error| format!("create evidence file {path:?} without overwrite: {error}"))?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(format!("write summary evidence {path:?}: {error}"));
+        let cleanup = std::fs::remove_file(path);
+        return Err(match cleanup {
+            Ok(()) => format!("write evidence file {path:?}: {error}"),
+            Err(cleanup_error) => format!(
+                "write evidence file {path:?}: {error}; cleanup also failed: {cleanup_error}"
+            ),
+        });
     }
     Ok(())
+}
+
+fn publish_new(staging: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::hard_link(staging, destination).map_err(|error| {
+        format!("publish evidence {destination:?} without replacement: {error}")
+    })?;
+    if let Err(error) = std::fs::remove_file(staging) {
+        let rollback = std::fs::remove_file(destination);
+        return Err(match rollback {
+            Ok(()) => format!("remove staging evidence {staging:?}: {error}"),
+            Err(rollback_error) => format!(
+                "remove staging evidence {staging:?}: {error}; rollback of {destination:?} also failed: {rollback_error}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn cleanup_failure(error: String, paths: &[&Path]) -> String {
+    let mut cleanup_errors = Vec::new();
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => cleanup_errors.push(format!("{path:?}: {cleanup_error}")),
+        }
+    }
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        format!("{error}; cleanup failed for {}", cleanup_errors.join(", "))
+    }
 }
 
 #[cfg(test)]
