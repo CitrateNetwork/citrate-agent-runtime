@@ -40,7 +40,7 @@ fn text_deltas_arrive_in_order_and_the_turn_is_the_whole_answer() {
     let (turn, usage) = r.unwrap();
     assert_eq!(turn.content, "Height is 6,310.");
     assert!(turn.tool_calls.is_empty());
-    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 12, completion_tokens: 5, generation_ms: None }), "metering keeps the provider's counts");
+    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 12, completion_tokens: 5, generation_ms: None, prompt_ms: None }), "metering keeps the provider's counts");
 }
 
 #[test]
@@ -208,5 +208,5 @@ fn a_streamed_answer_keeps_the_generation_time() {
     s.push_str("data: [DONE]\n\n");
     let (_, r) = feed(&s);
     let (_, usage) = r.unwrap();
-    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 7, completion_tokens: 2, generation_ms: Some(42) }));
+    assert_eq!(usage, Some(TokenUsage { prompt_tokens: 7, completion_tokens: 2, generation_ms: Some(42), prompt_ms: None }));
 }

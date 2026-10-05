@@ -1,0 +1,94 @@
+{
+ "test/Invariants.t.sol:LemonDropsInvariantTest": {
+  "duration": "199ms 924\u00b5s 83ns",
+  "test_results": {
+   "invariant_minted_tokens_are_held()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "invariant_only_owner_withdraws()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "invariant_owner_is_stable()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "invariant_payments_are_accounted()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "invariant_price_is_fixed()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "invariant_supply_never_exceeds_cap()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "invariant_wrong_payment_never_accepted()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   }
+  },
+  "warnings": []
+ },
+ "test/Token.t.sol:LemonDropsTest": {
+  "duration": "42ms 746\u00b5s 291ns",
+  "test_results": {
+   "testFuzz_mint_charges_exactly_price_times_quantity(uint8)": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_mint_assigns_sequential_ids_from_one()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_mint_rejects_a_wrong_payment()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_mint_rejects_zero_and_oversized_quantities()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_mint_stops_at_the_cap()": {
+    "counterexample": null,
+    "reason": "next call did not revert as expected",
+    "status": "Failure"
+   },
+   "test_only_the_owner_sets_the_base_uri()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_only_the_owner_withdraws_the_balance()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_parameters_are_baked_in()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   },
+   "test_reentrant_mint_from_the_receiver_reverts()": {
+    "counterexample": null,
+    "reason": null,
+    "status": "Success"
+   }
+  },
+  "warnings": []
+ }
+}

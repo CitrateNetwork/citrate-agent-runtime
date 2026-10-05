@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-branch: hup/n4-search-decide (updated on hup/n6-web-browse, 2026-10-04)
+branch: hup/n4-search-decide (updated on hup/n6-web-browse and hup/n7-components-unpack-searxng, 2026-10-04)
 author: Larry Klosowski + Claude Opus 5.5
 status: active
 ---
@@ -49,6 +49,16 @@ are refused as unsupported.
   off and JSON output on, and starts SearXNG with a scrubbed environment. It waits for
   `/healthz`, then queries `/search?format=json`. Results keep only http(s) URLs, and every field
   is bounded.
+- **Engines (US-5.2 AC2).** The settings never inherit SearXNG's own default engine list (81
+  third-party engines at 2026.10.4, for images, news, maps, translation and more). They name
+  the engines to load with `use_default_settings: engines: keep_only`: by default
+  `DEFAULT_ENGINES` (brave, duckduckgo, google cse, wikipedia, wikidata, the general web
+  engines upstream enables by default; pending owner sign-off), or the comma-separated list in
+  `CITRATE_HERMES_SEARXNG_ENGINES` (empty = no engine at all). Names are checked before they are
+  written. SearXNG is configured only after the member turns web search on, so without that
+  opt-in there are no settings and no process. `GET /search/status` lists the engines.
+- **Loopback only.** `the_first_search_starts_searxng_listening_on_loopback_only` checks that
+  the child answers on 127.0.0.1 and not on the machine's other address.
 - A child that exits or never becomes healthy is killed and reported. After three failed starts
   the supervisor gives up (a new sidecar start resets it). Shutdown and drop stop the child.
 - The tests use a small fixture program (`fixtures/searxng_fixture.rs`) that speaks the same
@@ -62,7 +72,16 @@ are refused as unsupported.
   the nesting. Some upstream engines refused or timed out (brave rate-limited, duckduckgo a
   CAPTCHA); results came from the others.
 - The component entry (`searxng`, AGPL-3.0-or-later) and its hash lock are in
-  `citrate-core/components/` (HUP-S5.5); packing and signing them is the release step.
+  `citrate-core/components/` (HUP-S5.5). `citrate-core/scripts/pack-searxng.sh` packs it
+  (pinned Python runtime, hashed wheels, unmodified source, `bin/searxng-run`); signing and
+  hosting it is the release step. When the component is installed, core passes its
+  `bin/searxng-run` as `CITRATE_HERMES_SEARXNG` (the member's own path wins).
+- **Live, installed component, 2026-10-04.** The packed artifact, unpacked by the component
+  updater, was started by this supervisor
+  (`the_installed_searxng_component_starts_on_loopback_with_only_the_listed_engines`, run with
+  `CITRATE_SEARXNG_COMPONENT=<dir> -- --ignored`): it listened on 127.0.0.1 only, its `/config`
+  listed exactly the five default engines and nothing else loaded, a search returned 5 results,
+  and with an empty list SearXNG loaded no engine and returned none.
 
 ## Pending owner sign-off
 

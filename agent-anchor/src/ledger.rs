@@ -12,8 +12,10 @@
 //! - a day whose records were partly pruned before batching is recorded as
 //!   [`EntryStatus::Incomplete`] (reported, never anchored).
 //!
-//! The ledger is a local note, not the source of truth for "anchored": `AnchorRegistry.isAnchored`
-//! is. Confirmation is written by core after its ceremony sends the anchor transaction.
+//! The ledger is a local note, not the source of truth for "anchored": the registry's record for
+//! this install's own anchor key is (`isAnchoredBy(key, root)`, see [`crate::OwnAnchorCheck`]; not
+//! `isAnchored(root)`, which anyone can satisfy by sending the same value). Confirmation is written
+//! by core after its ceremony sends the anchor transaction and reads its own receipt.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;

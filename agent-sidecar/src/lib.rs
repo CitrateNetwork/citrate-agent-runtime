@@ -24,6 +24,7 @@ pub mod capsule_sandbox;
 mod chain_routes;
 mod checkpoint_routes;
 pub mod decide;
+pub mod deploy_guard;
 pub mod escalation;
 pub mod files;
 pub mod grants;
@@ -33,6 +34,7 @@ pub mod llm_http;
 pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
+pub mod resources;
 pub mod retrieval_http;
 pub mod search;
 pub mod sessions;
@@ -363,6 +365,11 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/metering/benchmark",
             post(chain_routes::metering_benchmark),
         )
+        // HUP-S7.5 (D-27): core reports each mined Hermes transaction (SALT spent and gas)
+        .route(
+            "/metering/chain-receipt",
+            post(chain_routes::metering_chain_receipt),
+        )
         // HUP-S7.3: nightly anchor batch (core signs with the anchor key; nothing is sent here)
         .route("/anchor/status", get(chain_routes::anchor_status))
         .route("/anchor/plan", post(chain_routes::anchor_plan))
@@ -513,8 +520,8 @@ async fn instruction_skills(
     })))
 }
 
-/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). Sessions already
-/// open keep their skills; the next session gets the new library.
+/// HUP-S3.2: read the skill sources again (the member saved or removed a skill). New sessions get
+/// the new library, and open sessions that were opened with skills take it on their next turn.
 async fn reload_instruction_skills(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1568,7 +1575,7 @@ pub fn production_sessions_with(
         None => mgr,
     };
     // HUP-S3.2: the skills library. HUP-S3.4: kept with its sources, so a learned skill the
-    // member accepts is offered to the next session without a restart.
+    // member accepts is offered without a restart (new sessions, and open ones on their next turn).
     let sources = skill_sources_from_process_env();
     let mgr = if sources.is_empty() {
         mgr
@@ -1729,7 +1736,8 @@ type JsonErr = (StatusCode, Json<serde_json::Value>);
 
 // ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
 
-/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+/// `{enabled, searxng, reader, engines}`: `engines` names the third-party engines SearXNG may
+/// load (US-5.2 AC2). Never a key, a path, or a query.
 async fn search_status(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1739,7 +1747,7 @@ async fn search_status(
     }
     let Some(host) = st.sessions.search() else {
         return Ok(Json(serde_json::json!({
-            "enabled": false, "searxng": "off", "reader": "local"
+            "enabled": false, "searxng": "off", "reader": "local", "engines": []
         })));
     };
     let reader = if host.third_party_reader() {
@@ -1747,6 +1755,7 @@ async fn search_status(
     } else {
         "local"
     };
+    let engines = host.searxng().engines();
     let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
         citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
         citrate_agent_search::SearxngState::Idle => "idle",
@@ -1756,7 +1765,7 @@ async fn search_status(
     .await
     .unwrap_or("failed");
     Ok(Json(serde_json::json!({
-        "enabled": true, "searxng": searxng, "reader": reader
+        "enabled": true, "searxng": searxng, "reader": reader, "engines": engines
     })))
 }
 
@@ -2152,6 +2161,8 @@ mod browser_session_tests;
 #[cfg(test)]
 mod decide_route_tests;
 #[cfg(test)]
+mod deploy_guard_session_tests;
+#[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]
 mod shell_run_tests;
@@ -2332,7 +2343,8 @@ async fn learn_accept(
     let out = svc.accept(&pid, decision).map_err(refusal)?;
     let mut body = serde_json::json!({ "ok": true, "persisted": out });
     if matches!(out, learn::AcceptedView::Skill { .. }) {
-        // HUP-S3.4: offer the saved skill to the next session without a restart.
+        // HUP-S3.4: offer the saved skill without a restart (next session, and open sessions'
+        // next turn).
         let reloaded = st.sessions.reload_skills();
         body["skills_reloaded"] = serde_json::Value::Bool(reloaded.is_some());
         if let Some(n) = reloaded {

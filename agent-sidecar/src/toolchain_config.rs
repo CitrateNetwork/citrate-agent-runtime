@@ -13,9 +13,16 @@
 //!   must be `read` (or `none`) on a relative path inside the project; `solc` / `solc_version`
 //!   must be a version number, not a program path. A file that does not parse is refused.
 //! * `.env` and `.env.*`: forge loads them into its own environment, so they are refused.
-//! * `slither.config.json`, `medusa.json`, `hardhat.config.*`, `truffle-config.*`, `truffle.js`:
-//!   settings for other build front ends; refused while present (pending owner review of a
-//!   narrower rule).
+//! * `slither.config.json`, `hardhat.config.*`, `truffle-config.*`, `truffle.js`: settings for
+//!   other build front ends; refused while present (pending owner review of a narrower rule).
+//! * `medusa.json` (HUP-S6, the narrower rule, pending owner sign-off): the Citrate templates
+//!   ship one, and medusa_fuzz needs it, so it is accepted only in the template's shape and
+//!   refused otherwise: top-level keys `fuzzing`, `compilation`, `logging` only; medusa's FFI
+//!   cheat code off (`fuzzing.chainConfig.cheatCodes.enableFFI` absent or `false`); compilation
+//!   through `crytic-compile` on target `.`, with no extra arguments beyond
+//!   `--foundry-compile-all`, a version-number `solcVersion` (or empty) and no other platform
+//!   settings; `fuzzing.corpusDirectory`, `compilation.platformConfig.exportDirectory` and
+//!   `logging.logDirectory` empty or relative paths inside the project.
 //!
 //! Nothing here returns file contents to the model: a refusal names the file and the setting.
 //!
@@ -30,13 +37,16 @@ use std::path::{Component, Path, PathBuf};
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 const FOUNDRY_TOML: &str = "foundry.toml";
+const MEDUSA_JSON: &str = "medusa.json";
+/// The only extra crytic-compile argument a medusa.json may pass (the templates' own).
+const MEDUSA_COMPILE_ARGS: [&str; 1] = ["--foundry-compile-all"];
 
 /// Whether `name` (a file name, any case) is a build front-end config the toolchain refuses to
 /// run beside.
 fn other_build_config(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == "slither.config.json"
-        || n == "medusa.json"
+        || n == MEDUSA_JSON
         || n == "truffle.js"
         || n.starts_with("hardhat.config.")
         || n.starts_with("truffle-config.")
@@ -106,6 +116,10 @@ fn check_folder_entries(dir: &Path) -> Result<(), String> {
             return Err(format!(
                 "the project has a {name} file, which forge loads into its environment; the agent toolchain does not run beside env files. The member can review and move it, then try again"
             ));
+        }
+        if name.eq_ignore_ascii_case(MEDUSA_JSON) {
+            check_medusa_json(&dir.join(&name))?;
+            continue;
         }
         if other_build_config(&name) {
             return Err(format!(
@@ -241,4 +255,93 @@ fn project_relative(p: &str) -> bool {
     Path::new(p)
         .components()
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// HUP-S6: accept a `medusa.json` only in the templates' shape (see the module docs). Pending
+/// owner sign-off; anything outside it is refused with the setting named.
+pub(crate) fn check_medusa_json(path: &Path) -> Result<(), String> {
+    let shown = path.display().to_string();
+    let refuse = |what: &str| {
+        Err(format!(
+            "{shown} {what}, which the agent toolchain does not run with; the member can review it (or render the template again), then try again"
+        ))
+    };
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("cannot check {shown}: {e}"))?;
+    if !meta.file_type().is_file() {
+        return refuse("is not a regular file");
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        return refuse("is too large to check");
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {shown}: {e}"))?;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return refuse("could not be parsed as JSON");
+    };
+    let Some(top) = v.as_object() else {
+        return refuse("is not a JSON object");
+    };
+    if let Some(k) = top
+        .keys()
+        .find(|k| !matches!(k.as_str(), "fuzzing" | "compilation" | "logging"))
+    {
+        return refuse(&format!(
+            "has a setting outside fuzzing, compilation and logging ({k:?})"
+        ));
+    }
+    match v.pointer("/fuzzing/chainConfig/cheatCodes/enableFFI") {
+        None | Some(serde_json::Value::Bool(false)) => {}
+        Some(_) => return refuse("turns on medusa's FFI cheat code (enableFFI)"),
+    }
+    let rel_ok = |p: Option<&serde_json::Value>| match p {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty() || project_relative(s),
+        _ => false,
+    };
+    if !rel_ok(v.pointer("/fuzzing/corpusDirectory")) {
+        return refuse("puts the corpus outside the project (corpusDirectory)");
+    }
+    if !rel_ok(v.pointer("/logging/logDirectory")) {
+        return refuse("puts logs outside the project (logDirectory)");
+    }
+    let Some(c) = v.get("compilation") else {
+        return refuse("names no compilation settings");
+    };
+    {
+        let Some(c) = c.as_object() else {
+            return refuse("has a compilation setting that is not an object");
+        };
+        if let Some(k) = c
+            .keys()
+            .find(|k| !matches!(k.as_str(), "platform" | "platformConfig"))
+        {
+            return refuse(&format!("has an unknown compilation setting ({k:?})"));
+        }
+        if c.get("platform").and_then(|p| p.as_str()) != Some("crytic-compile") {
+            return refuse("compiles with something other than crytic-compile");
+        }
+        let pc = c.get("platformConfig").and_then(|p| p.as_object());
+        let Some(pc) = pc else {
+            return refuse("has no crytic-compile settings");
+        };
+        for (k, val) in pc {
+            let ok = match k.as_str() {
+                "target" => val.as_str() == Some("."),
+                "solcVersion" => val
+                    .as_str()
+                    .is_some_and(|s| s.is_empty() || version_like(s)),
+                "exportDirectory" => rel_ok(Some(val)),
+                "args" => val.as_array().is_some_and(|a| {
+                    a.iter()
+                        .all(|x| x.as_str().is_some_and(|x| MEDUSA_COMPILE_ARGS.contains(&x)))
+                }),
+                _ => false,
+            };
+            if !ok {
+                return refuse(&format!(
+                    "sets the compilation's {k} beyond the template's own"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
