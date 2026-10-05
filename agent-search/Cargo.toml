@@ -9,6 +9,7 @@ description = "Hermes private search (HUP-S5.2): read_url (capped fetch, public-
 
 [dependencies]
 citrate-agent-loop = { path = "../agent-loop" }
+citrate-agent-guard = { path = "../agent-guard" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }

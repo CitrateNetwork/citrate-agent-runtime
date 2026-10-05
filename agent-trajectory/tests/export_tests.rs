@@ -387,3 +387,54 @@ fn the_written_training_set_is_readable_only_by_the_member() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+/// US-1.3 AC2: the model's self-review arrives after an attempt's `done`, like a verdict. It is
+/// an opinion: it must not open a turn of its own, or every later verdict would be filed under
+/// the next attempt and a failed attempt could be exported as verified.
+#[test]
+fn a_self_review_opinion_does_not_shift_verdicts_onto_the_next_attempt() {
+    struct AlwaysPass;
+    impl SelfReviewer for AlwaysPass {
+        fn review(&self, _r: &ReviewRequest, _h: &[Message]) -> Result<String, String> {
+            Ok("PASS: looks done to me.".into())
+        }
+    }
+    let llm = Script(Mutex::new(vec![
+        AssistantTurn::text("All tests pass!"),
+        call("t", "forge_test", "{}"),
+        AssistantTurn::text("2 passed."),
+    ]));
+    let tools = ToolRegistry::new(vec![spec("forge_test", Trust::Trusted)]).with_host(
+        HostKind::Core,
+        Arc::new(Host(ToolOutcome::Ok("{\"passed\":2}".into()))),
+    );
+    let inner = Arc::new(Capture::default());
+    let rec = TrajectoryRecorder::new("sess-1", "gemma-4-e4b", TaintState::default())
+        .with_workflow("hello-mint")
+        .forwarding_to(inner.clone());
+    let mut history = vec![];
+    let out = run_workflow_reviewed(
+        &cfg(),
+        &TurnOptions::default(),
+        &llm,
+        &tools,
+        &rec,
+        &StopFlag::default(),
+        &mut history,
+        &deploy_workflow(),
+        Some(&AlwaysPass),
+    );
+    assert!(matches!(out, WorkflowOutcome::Succeeded { .. }), "{out:?}");
+    let opinions = inner
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::SelfReview { .. }))
+        .count();
+    assert_eq!(opinions, 2, "the opinions are still forwarded");
+    let trajs = rec.trajectories(&history).unwrap();
+    assert_eq!(trajs.len(), 2);
+    assert_eq!(trajs[0].eligibility(), Eligibility::VerifierFailed);
+    assert_eq!(trajs[1].eligibility(), Eligibility::Verified);
+}

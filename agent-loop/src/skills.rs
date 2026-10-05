@@ -1063,6 +1063,16 @@ impl SkillLibrary {
     /// The system-prompt section for one turn: the skills that match `query` (at most `k`, best
     /// first) and how many are installed in all. `None` when no skill is installed.
     pub fn turn_section(&self, query: &str, k: usize) -> Option<String> {
+        self.turn_section_with(&Bm25Ranker, query, k)
+    }
+
+    /// [`SkillLibrary::turn_section`] with another ranker.
+    pub fn turn_section_with(
+        &self,
+        ranker: &dyn SkillRanker,
+        query: &str,
+        k: usize,
+    ) -> Option<String> {
         if self.is_empty() {
             return None;
         }
@@ -1072,7 +1082,7 @@ impl SkillLibrary {
         } else {
             format!("{total} skills are installed")
         };
-        let picked = self.select(query, k);
+        let picked = self.select_with(ranker, query, k);
         if picked.is_empty() {
             return Some(format!(
                 "## Skills\n{installed}; none matches this request. If the member asks for one by \
@@ -1548,8 +1558,8 @@ pub trait SkillRanker: Send + Sync {
 
 /// Okapi BM25 over each skill's name (counted three times) and description. Deterministic: equal
 /// scores break by position, which is name order in a [`SkillLibrary`]. Only skills that share a
-/// term with the query are returned. The sidecar has no embedding model in process, so this
-/// lexical ranker is the one that runs; an embedding ranker can implement [`SkillRanker`].
+/// term with the query are returned. It is also the fallback of
+/// [`crate::retrieval::HybridRetriever`] when no embedding endpoint answers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Bm25Ranker;
 
@@ -1563,27 +1573,44 @@ impl SkillRanker for Bm25Ranker {
     }
 
     fn rank(&self, query: &str, docs: &[(&str, &str)], k: usize) -> Vec<usize> {
-        let mut q = crate::words(query);
-        q.sort();
-        q.dedup();
-        if q.is_empty() || docs.is_empty() || k == 0 {
+        if k == 0 {
             return Vec::new();
         }
-        let terms: Vec<Vec<String>> = docs
-            .iter()
-            .map(|(name, desc)| {
-                let mut t = Vec::new();
-                for _ in 0..NAME_WEIGHT {
-                    t.extend(crate::words(name));
-                }
-                t.extend(crate::words(desc));
-                t
-            })
+        let mut scored: Vec<(usize, f64)> = bm25_scores(query, docs)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, sc)| *sc > 0.0)
             .collect();
-        let n = terms.len() as f64;
-        let avg_len = terms.iter().map(Vec::len).sum::<usize>() as f64 / n;
-        let mut scored: Vec<(usize, f64)> = Vec::new();
-        for (i, doc) in terms.iter().enumerate() {
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+}
+
+/// The BM25 score of every doc for `query` (same order as `docs`; 0 = no shared term). The name
+/// counts three times. [`Bm25Ranker`] ranks by it; the hybrid ranker blends it with embeddings.
+pub fn bm25_scores(query: &str, docs: &[(&str, &str)]) -> Vec<f64> {
+    let mut q = crate::words(query);
+    q.sort();
+    q.dedup();
+    if q.is_empty() || docs.is_empty() {
+        return vec![0.0; docs.len()];
+    }
+    let terms: Vec<Vec<String>> = docs
+        .iter()
+        .map(|(name, desc)| {
+            let mut t = Vec::new();
+            for _ in 0..NAME_WEIGHT {
+                t.extend(crate::words(name));
+            }
+            t.extend(crate::words(desc));
+            t
+        })
+        .collect();
+    let n = terms.len() as f64;
+    let avg_len = terms.iter().map(Vec::len).sum::<usize>() as f64 / n;
+    terms
+        .iter()
+        .map(|doc| {
             let len = doc.len() as f64;
             let mut score = 0.0;
             for w in &q {
@@ -1600,13 +1627,9 @@ impl SkillRanker for Bm25Ranker {
                 };
                 score += idf * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm);
             }
-            if score > 0.0 {
-                scored.push((i, score));
-            }
-        }
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        scored.into_iter().take(k).map(|(i, _)| i).collect()
-    }
+            score
+        })
+        .collect()
 }
 
 /// The per-turn skill index: a [`TurnContext`] that puts the at most `k` skills matching the
@@ -1616,28 +1639,43 @@ impl SkillRanker for Bm25Ranker {
 pub struct SkillTurnIndex {
     lib: Arc<SkillLibrary>,
     k: usize,
+    ranker: Arc<dyn SkillRanker>,
 }
 
 impl SkillTurnIndex {
+    /// Ranked with [`Bm25Ranker`].
     pub fn new(lib: Arc<SkillLibrary>, k: usize) -> Self {
-        SkillTurnIndex { lib, k }
+        SkillTurnIndex {
+            lib,
+            k,
+            ranker: Arc::new(Bm25Ranker),
+        }
+    }
+
+    /// HUP-S1.2: rank with another ranker (the sidecar passes the same hybrid retriever that picks
+    /// its tools, which falls back to BM25 when no embedding endpoint answers). The `k` cap holds
+    /// whatever the ranker returns.
+    pub fn with_ranker(mut self, ranker: Arc<dyn SkillRanker>) -> Self {
+        self.ranker = ranker;
+        self
     }
 
     /// The method that ranks the skills (see [`Bm25Ranker`]).
     pub fn method(&self) -> &'static str {
-        Bm25Ranker.method()
+        self.ranker.method()
     }
 }
 
 impl TurnContext for SkillTurnIndex {
     fn section(&self, user: &str, history: &[Message]) -> Option<String> {
-        if self.lib.select(user, self.k).is_empty() {
+        let r = self.ranker.as_ref();
+        if self.lib.select_with(r, user, self.k).is_empty() {
             if let Some(prev) = history.iter().rev().find(|m| m.role == Role::User) {
-                if !self.lib.select(&prev.content, self.k).is_empty() {
-                    return self.lib.turn_section(&prev.content, self.k);
+                if !self.lib.select_with(r, &prev.content, self.k).is_empty() {
+                    return self.lib.turn_section_with(r, &prev.content, self.k);
                 }
             }
         }
-        self.lib.turn_section(user, self.k)
+        self.lib.turn_section_with(r, user, self.k)
     }
 }
