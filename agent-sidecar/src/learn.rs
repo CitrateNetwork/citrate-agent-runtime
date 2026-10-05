@@ -14,10 +14,11 @@
 //!
 //! - The learn routes (`/learn/...`, in `lib.rs`): propose from a verified workflow run of a
 //!   session, list, accept, reject, resolve a contradiction between two accepted memories (keep
-//!   one, retract the other), and build the SkillRegistry publish payload. A memory accept
-//!   returns the typed memory record for core to store; the sidecar stores no memories. A skill
-//!   accept reloads the skills library, so the skill is offered to the next session without a
-//!   restart.
+//!   one, retract the other; one side may be a memory core passed in, `memory:<id>`), and build
+//!   the SkillRegistry publish payload. A memory accept returns the typed memory record for core
+//!   to store; the sidecar stores no memories. A skill accept reloads the skills library without
+//!   a restart: new sessions start from it, and open sessions with skills see it on their next
+//!   turn.
 //! - The `learn_propose` tool, offered to every session while learning is on. Hermes calls it to
 //!   propose a skill or memory from the session's last verified workflow run. It only proposes:
 //!   the member decides in the app, and nothing is persisted by the tool.
