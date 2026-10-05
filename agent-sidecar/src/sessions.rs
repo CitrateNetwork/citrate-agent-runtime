@@ -545,7 +545,14 @@ pub struct Session {
     /// refused), and its MCP approval cards (present only for an HIC-aware client).
     mcp_offered: Option<Arc<HashMap<String, ToolSpec>>>,
     mcp_approvals: Option<Arc<crate::mcp_approvals::McpApprovals>>,
+    /// Test seam: runs on the emitting thread right after an event becomes visible to readers, so
+    /// a test can act as a core client at the exact moment the event appears.
+    #[cfg(test)]
+    event_hook: Mutex<Option<EventHook>>,
 }
+
+#[cfg(test)]
+pub(crate) type EventHook = Arc<dyn Fn(&Event) + Send + Sync>;
 
 impl Session {
     /// The conversation so far (what the model is sent next turn, after the system prompt).
@@ -627,6 +634,8 @@ impl Session {
     }
 
     fn push(&self, event: Event) {
+        #[cfg(test)]
+        let seen = event.clone();
         if let Ok(mut log) = self.log.lock() {
             log.next_seq += 1;
             let seq = log.next_seq;
@@ -636,6 +645,18 @@ impl Session {
             }
         }
         self.notify.notify_waiters();
+        #[cfg(test)]
+        if let Some(hook) = self.event_hook.lock().ok().and_then(|h| h.clone()) {
+            hook(&seen);
+        }
+    }
+
+    /// Test seam: run `hook` after every event this session makes visible.
+    #[cfg(test)]
+    pub(crate) fn set_event_hook(&self, hook: EventHook) {
+        if let Ok(mut h) = self.event_hook.lock() {
+            *h = Some(hook);
+        }
     }
 
     /// Events with `seq > after`.
@@ -791,16 +812,39 @@ struct CoreHost {
     stop: StopFlag,
     /// Core promised to route `hic: "required"` calls to a person (see `CreateSessionReq`).
     hic_aware: bool,
+    /// Calls registered in `pending` before their `tool_call` event was emitted, with the
+    /// receiving end their [`ToolHost::execute`] waits on.
+    armed: Mutex<HashMap<String, mpsc::Receiver<ToolOutcome>>>,
+}
+
+impl CoreHost {
+    /// Register `call` as waiting for core's answer and return where that answer arrives.
+    fn register(&self, call: &ToolCall) -> Option<mpsc::Receiver<ToolOutcome>> {
+        let (tx, rx) = mpsc::channel();
+        let mut p = self.pending.lock().ok()?;
+        p.insert(call.id.clone(), tx);
+        Some(rx)
+    }
 }
 
 impl ToolHost for CoreHost {
-    fn execute(&self, call: &ToolCall) -> ToolOutcome {
-        let (tx, rx) = mpsc::channel();
-        if let Ok(mut p) = self.pending.lock() {
-            p.insert(call.id.clone(), tx);
-        } else {
-            return ToolOutcome::Error("internal: tool registry unavailable".into());
+    /// Register the call before the loop announces it, so a core client that posts the result
+    /// the moment it reads the `tool_call` event finds it waiting (otherwise the post got 409 and
+    /// the call waited out its deadline).
+    fn before_announce(&self, call: &ToolCall) {
+        if let Some(rx) = self.register(call) {
+            if let Ok(mut a) = self.armed.lock() {
+                a.insert(call.id.clone(), rx);
+            }
         }
+    }
+
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        let armed = self.armed.lock().ok().and_then(|mut a| a.remove(&call.id));
+        let rx = match armed.or_else(|| self.register(call)) {
+            Some(rx) => rx,
+            None => return ToolOutcome::Error("internal: tool registry unavailable".into()),
+        };
         let started = Instant::now();
         let outcome = loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -1726,6 +1770,8 @@ impl SessionManager {
             decide_llm,
             mcp_offered,
             mcp_approvals,
+            #[cfg(test)]
+            event_hook: Mutex::new(None),
         });
         sessions.insert(id.clone(), session);
         drop(sessions);
@@ -1797,6 +1843,7 @@ impl SessionManager {
             deadline: self.core_tool_deadline,
             stop: session.stop.clone(),
             hic_aware: session.hic_aware,
+            armed: Mutex::new(HashMap::new()),
         });
         let mut registry = ToolRegistry::new(session.specs.clone())
             .with_host(HostKind::Core, core)

@@ -211,6 +211,14 @@ impl ToolOutcome {
 /// the loop declines it instead (fail closed).
 pub trait ToolHost: Send + Sync {
     fn execute(&self, call: &ToolCall) -> ToolOutcome;
+    /// Called once for a call the loop is about to dispatch to this host, before the `tool_call`
+    /// event announces it; [`ToolHost::execute`] (or [`ToolHost::execute_with_explicit_approval`])
+    /// follows immediately after the event. A host that is answered from outside (core reads the
+    /// event and posts the result) registers the call here, so an answer sent the moment the event
+    /// is visible always finds it waiting. The default does nothing.
+    fn before_announce(&self, call: &ToolCall) {
+        let _ = call;
+    }
     /// Whether this host routes explicit-approval calls to a person with no automatic path.
     fn honors_explicit_approval(&self) -> bool {
         false
@@ -879,6 +887,11 @@ pub fn run_turn_with(
                 (None, Some(s), Some(h)) if !refused_hic && declined.is_none() => Some((s.host, h)),
                 _ => None,
             };
+            // A host answered from outside (core) must be ready for the answer before the event
+            // that asks for it is visible: register first, then announce.
+            if let Some((_, h)) = &dispatch {
+                h.before_announce(call);
+            }
             sink.emit(Event::ToolCall {
                 step,
                 call: call.clone(),
