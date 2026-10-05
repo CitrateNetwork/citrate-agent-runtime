@@ -795,6 +795,44 @@ async fn checkpoint_routes_list_undo_one_step_and_undo_a_session() {
 }
 
 #[tokio::test]
+async fn a_step_diff_shows_before_and_after_and_refuses_bad_requests() {
+    let s = Scratch::new();
+    let (tools, store) = s.tools();
+    let st = state(manager(vec![]).with_checkpoints(store));
+    let host = FileToolsHost::new(tools, "s7-feed").unwrap();
+    let a = s.proj().join("a.txt");
+    std::fs::write(&a, "one\ntwo\n").unwrap();
+    ok(
+        &host,
+        FS_WRITE_TOOL,
+        serde_json::json!({"path": a, "content": "one\n2\n"}),
+    );
+    let r = app(st.clone())
+        .oneshot(req("GET", "/checkpoints/s7-feed/steps/1/diff", false))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let (code, body) = send(&st, "GET", "/checkpoints/s7-feed/steps/1/diff").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["seq"], 1);
+    assert_eq!(body["status"], "committed");
+    assert_eq!(body["files"][0]["path"], "a.txt");
+    assert_eq!(body["files"][0]["before"]["kind"], "text");
+    assert_eq!(body["files"][0]["before"]["text"], "one\ntwo\n");
+    assert_eq!(body["files"][0]["after"]["text"], "one\n2\n");
+    let (code, body) = send(&st, "GET", "/checkpoints/s7-feed/steps/0/diff").await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body["kind"], "invalid");
+    let (code, body) = send(&st, "GET", "/checkpoints/s7-feed/steps/9/diff").await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(body["kind"], "not_found");
+    // The member edits the file: the after side says why it is not shown.
+    std::fs::write(&a, "member").unwrap();
+    let (_, body) = send(&st, "GET", "/checkpoints/s7-feed/steps/1/diff").await;
+    assert_eq!(body["files"][0]["after"]["kind"], "unavailable");
+}
+
+#[tokio::test]
 async fn an_undo_after_the_member_changed_the_file_is_refused_with_the_reason() {
     let s = Scratch::new();
     let (tools, store) = s.tools();

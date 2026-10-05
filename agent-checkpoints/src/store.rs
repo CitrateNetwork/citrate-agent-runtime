@@ -647,6 +647,30 @@ impl CheckpointStore {
             .collect())
     }
 
+    /// HUP-S5.4: what step `seq` of `session` changed, path by path (see [`crate::StepDiff`]).
+    /// Sides larger than `max_side_bytes` are described, not returned. Read-only.
+    pub fn step_diff(
+        &self,
+        session: &SessionId,
+        seq: u64,
+        max_side_bytes: u64,
+    ) -> Result<crate::StepDiff> {
+        let g = self.lock()?;
+        let sid = session.as_str().to_string();
+        let Some(m) = g.manifests.get(&(sid.clone(), seq)) else {
+            let pruned = g
+                .sessions
+                .get(&sid)
+                .is_some_and(|meta| seq > 0 && seq <= meta.pruned_through);
+            return Err(if pruned {
+                Error::Pruned { session: sid, seq }
+            } else {
+                Error::NotFound { session: sid, seq }
+            });
+        };
+        Ok(crate::diff::diff_of(&self.dir, m, max_side_bytes))
+    }
+
     /// Store usage.
     pub fn usage(&self) -> Result<Usage> {
         let g = self.lock()?;

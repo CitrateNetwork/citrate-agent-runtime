@@ -11,7 +11,7 @@
 //! | browser action after taint | `POST /browser/actions/decide` | here, kind `browser.action` |
 //! | learn accept, reject, resolve, publish | the learn routes | `citrate-agent-learn`, on the same log |
 //! | budgeted SIWE, budget grants and revokes | core's web-budget store | `POST /records/web-signing` |
-//! | folder grants, full access, escalation spend, ceremony and tool approval cards | core | `POST /records/core` ([`write_core`]) |
+//! | folder grants, full access, escalation spend, ceremony and tool approval cards, the in-app faucet switch and top-ups (HUP-S6.5) | core | `POST /records/core` ([`write_core`]) |
 //!
 //! A member decision that allows something is written **before** it takes effect (write-ahead,
 //! like the log itself), and closed with an outcome after. For the two sidecar routes the effect
@@ -153,7 +153,8 @@ pub struct CoreWriteReq {
 }
 
 /// The decisions each core kind may carry. Only an escalation inside the member's daily budget
-/// is HIC-2 (`auto_within_budget`); every other kind is the member's own HIC-1 decision.
+/// and a faucet top-up inside the member's faucet budget are HIC-2 (`auto_within_budget`); every
+/// other kind is the member's own HIC-1 decision.
 fn kind_rule(kind: &str) -> Option<&'static [&'static str]> {
     Some(match kind {
         "grant.folder_added" | "grant.revoked" | "grant.reset" | "grant.full_access_confirmed" => {
@@ -161,6 +162,10 @@ fn kind_rule(kind: &str) -> Option<&'static [&'static str]> {
         }
         "ceremony.approval" | "agent.tool_approval" => &["approved", "denied"],
         "escalation.spend" => &["approved", "auto_within_budget"],
+        // HUP-S6.5 (faucet ADR D4.3): the member's in-app faucet switch, and each faucet call
+        // (HIC-2 when Hermes or an MCP client asked inside the member's budget).
+        "faucet.budget_granted" | "faucet.budget_revoked" => &["approved"],
+        "faucet.topup" => &["approved", "auto_within_budget"],
         _ => return None,
     })
 }

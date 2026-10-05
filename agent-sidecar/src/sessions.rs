@@ -451,6 +451,9 @@ pub struct Session {
     /// HUP-S6.3: present when this session was opened with the toolchain enabled. HUP-S1.9: in
     /// production this is a [`crate::workers::RemoteToolHost`] over the toolchain worker process.
     toolchain: Option<Arc<dyn ToolHost>>,
+    /// HUP-S6.3 → S6.4: the raw reports of this session's toolchain runs, for core's deploy gate
+    /// (present with the toolchain).
+    toolchain_reports: Option<Arc<crate::toolchain_reports::ToolchainReports>>,
     /// HUP-S7.5: derives one metering record per turn from the event stream.
     metering: Arc<MeteringSink>,
     /// Where this session's finished metering records go.
@@ -476,9 +479,41 @@ pub struct Session {
     retriever: Arc<HybridRetriever>,
     /// US-2.2 AC2: present when `shell_run` is on and the session has folder grants.
     shell: Option<Arc<ShellRunSession>>,
+    /// HUP-S5.3: the session's own model endpoint, which `browser_pick` asks through the metered
+    /// `decide()` slot (local grammar backend unless the member opted into Jev for the origin).
+    decide_llm: LlmEndpoint,
+    /// HUP-S4.1: the MCP specs this session was offered (calls to tools that changed since are
+    /// refused), and its MCP approval cards (present only for an HIC-aware client).
+    mcp_offered: Option<Arc<HashMap<String, ToolSpec>>>,
+    mcp_approvals: Option<Arc<crate::mcp_approvals::McpApprovals>>,
 }
 
 impl Session {
+    /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
+    /// given. `None` when this session has no toolchain.
+    pub fn toolchain_reports(
+        &self,
+        project: Option<&str>,
+    ) -> Option<Vec<crate::toolchain_reports::StoredReport>> {
+        self.toolchain_reports.as_ref().map(|r| r.list(project))
+    }
+
+    /// HUP-S4.1: the MCP cards waiting for the member (`None` when the session has none).
+    pub fn mcp_pending(&self) -> Option<Vec<crate::mcp_approvals::McpPending>> {
+        self.mcp_approvals.as_ref().map(|a| a.pending())
+    }
+
+    /// HUP-S4.1: the waiting card `id` (for its decision record).
+    pub fn mcp_waiting(&self, id: &str) -> Option<crate::mcp_approvals::McpPending> {
+        self.mcp_approvals.as_ref().and_then(|a| a.waiting(id))
+    }
+
+    /// HUP-S4.1: the member's decision on a waiting MCP card; it must carry the subject shown.
+    pub fn mcp_decide(&self, id: &str, allow: bool, subject: &str) -> Result<(), SessionError> {
+        let a = self.mcp_approvals.as_ref().ok_or(SessionError::NotFound)?;
+        a.decide(id, allow, subject).map_err(SessionError::Invalid)
+    }
+
     /// HUP-S1.2: how this session counts tokens and ranks tools and skills right now.
     pub fn retrieval_report(&self) -> RetrievalReport {
         RetrievalReport {
@@ -838,13 +873,23 @@ impl ToolHost for SidecarHost {
         }
     }
 
-    /// HUP-S5.1: only the browser can put an action in front of the member (its decision routes).
-    /// Without the browser this stays false, so the loop declines as before.
+    /// HUP-S5.1: the browser can put an action in front of the member (its decision routes);
+    /// HUP-S4.1: so can MCP, through the session's MCP approval cards (HIC-aware clients only).
+    /// Without either this stays false, so the loop declines as before.
     fn honors_explicit_approval(&self) -> bool {
         self.browser.is_some()
+            || self
+                .mcp
+                .as_ref()
+                .is_some_and(|m| m.honors_explicit_approval())
     }
 
     fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        if let Some(m) = &self.mcp {
+            if m.handles(&call.name) && m.honors_explicit_approval() {
+                return m.execute_with_explicit_approval(call, reason);
+            }
+        }
         match &self.browser {
             Some(b) if browser_tools::handles(&call.name) => {
                 b.execute_with_explicit_approval(call, reason)
@@ -1324,6 +1369,7 @@ impl SessionManager {
             }
             specs.extend(FileTools::specs());
         }
+        let mut mcp_offered = None;
         if let Some(mcp) = &self.mcp {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1331,8 +1377,18 @@ impl SessionManager {
                     t.name
                 )));
             }
-            specs.extend(mcp.specs());
+            let offered = mcp.specs();
+            mcp_offered = Some(Arc::new(
+                offered
+                    .iter()
+                    .map(|t| (t.name.clone(), t.clone()))
+                    .collect::<HashMap<_, _>>(),
+            ));
+            specs.extend(offered);
         }
+        // HUP-S4.1: MCP approval cards only for a client that shows `hic: required` to a person.
+        let mcp_approvals = (self.mcp.is_some() && req.hic_aware)
+            .then(|| Arc::new(crate::mcp_approvals::McpApprovals::default()));
         if self.browser.is_some() {
             if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1436,6 +1492,17 @@ impl SessionManager {
             (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
             (None, _) => None,
         };
+        // HUP-S6.3 → S6.4: keep each run's raw report for core's deploy gate; the model sees the
+        // result without it.
+        let toolchain_reports = toolchain
+            .as_ref()
+            .map(|_| Arc::new(crate::toolchain_reports::ToolchainReports::default()));
+        let toolchain: Option<Arc<dyn ToolHost>> = match (toolchain, &toolchain_reports) {
+            (Some(t), Some(r)) => Some(Arc::new(
+                crate::toolchain_reports::CapturingToolchain::new(t, r.clone()),
+            )),
+            (t, _) => t,
+        };
         // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
         // grant store), not a grants file.
         let files = match (&grants, &self.checkpoints) {
@@ -1526,6 +1593,7 @@ impl SessionManager {
                 c.clone(),
             )
         });
+        let decide_llm = req.llm.clone();
         let llm: Arc<dyn LlmClient> = Arc::new(MeteredLlm::new(
             (self.llm_factory)(&req.llm),
             metering.clone(),
@@ -1549,6 +1617,7 @@ impl SessionManager {
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills,
             toolchain,
+            toolchain_reports,
             grants,
             capsule_sandbox,
             metering,
@@ -1561,6 +1630,9 @@ impl SessionManager {
             token_counter,
             retriever,
             shell,
+            decide_llm,
+            mcp_offered,
+            mcp_approvals,
         });
         sessions.insert(id.clone(), session);
         drop(sessions);
@@ -1667,18 +1739,29 @@ impl SessionManager {
             }
         });
         let search = self.search.clone();
-        let mcp_host = self
-            .mcp
-            .clone()
-            .map(|h| McpToolHost::new(h, session.stop.clone()));
+        let mcp_host = self.mcp.clone().map(|h| {
+            let mut t = McpToolHost::new(h, session.stop.clone());
+            if let Some(o) = &session.mcp_offered {
+                t = t.with_offered(o.clone());
+            }
+            if let Some(a) = &session.mcp_approvals {
+                t = t.with_approver(a.clone());
+            }
+            t
+        });
         let learn_host = self
             .learn
             .clone()
             .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
-        let browser_host = self
-            .browser
-            .clone()
-            .map(|b| BrowserToolHost::new(b, session.stop.clone()));
+        let browser_host = self.browser.clone().map(|b| {
+            BrowserToolHost::new(b, session.stop.clone()).with_picker(Arc::new(
+                crate::decide::SessionPicker::new(
+                    self.decide.clone(),
+                    session.decide_llm.clone(),
+                    &session.cfg.model,
+                ),
+            ))
+        });
         let shell_host = session
             .shell
             .as_ref()

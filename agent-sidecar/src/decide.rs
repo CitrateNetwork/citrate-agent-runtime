@@ -397,6 +397,37 @@ impl DecideService {
     }
 }
 
+/// HUP-S5.3: the picker behind a session's `browser_pick` and the web-subset runner: the metered
+/// `decide()` slot on a session's own model endpoint. `auto` resolves to the local grammar backend
+/// unless the member opted into Jev for that origin (never with a session cookie or in attach
+/// mode), and every decision is counted in `/decide/stats`.
+pub struct SessionPicker {
+    svc: Arc<DecideService>,
+    llm: LlmEndpoint,
+    model: String,
+}
+
+impl SessionPicker {
+    pub fn new(svc: Arc<DecideService>, llm: LlmEndpoint, model: &str) -> Self {
+        SessionPicker {
+            svc,
+            llm,
+            model: model.to_string(),
+        }
+    }
+}
+
+impl citrate_agent_browser::pick::Picker for SessionPicker {
+    fn decide(&self, request: &DecideRequest) -> Result<Decision, DecideError> {
+        self.svc.decide(&DecideHttpReq {
+            llm: Some(self.llm.clone()),
+            model: Some(self.model.clone()),
+            request: request.clone(),
+            backend: BackendPref::Auto,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

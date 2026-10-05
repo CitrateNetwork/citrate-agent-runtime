@@ -31,6 +31,8 @@ pub mod chromium;
 pub mod egress;
 pub mod frames;
 pub mod gate;
+pub mod pagelog;
+pub mod pick;
 pub mod scope;
 pub mod service;
 pub mod signin;
