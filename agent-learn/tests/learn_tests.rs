@@ -1421,3 +1421,154 @@ fn a_retracted_memory_no_longer_counts_as_known() {
     );
     assert!(matches!(r, Err(LearnError::AlreadyKnown { .. })), "{r:?}");
 }
+
+// ---- resolving a contradiction with a memory that was not learned here (fan-out 7, L02) -------
+
+/// A learned memory accepted against a known memory core passed in (`memory:mem-7`).
+fn contradicting_known(e: &mut Env) -> Proposal {
+    let known = vec![KnownMemory {
+        id: "mem-7".into(),
+        key: "project.test-command".into(),
+        value: "npm test".into(),
+    }];
+    let p = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("project.test-command", "forge test -vvv"),
+            provenance(),
+            &known,
+        )
+        .unwrap();
+    e.learner
+        .accept(
+            &p.id,
+            MemberAccept {
+                member: "m".into(),
+                acknowledged_conflicts: vec!["memory:mem-7".into()],
+            },
+        )
+        .unwrap();
+    p
+}
+
+#[test]
+fn keeping_the_learned_memory_sets_the_known_one_aside_and_records_hic1() {
+    let mut e = env();
+    let p = contradicting_known(&mut e);
+    let before = records(&e.logdir).len();
+    let r = e
+        .learner
+        .resolve(resolve("m", &p.id, "memory:mem-7"))
+        .unwrap();
+    assert_eq!(r.kept, p.id);
+    assert_eq!(r.retracted, "memory:mem-7");
+    assert_eq!(r.kept_value, "forge test -vvv");
+    assert_eq!(
+        r.retracted_value, "",
+        "the learner never held the known memory's value"
+    );
+    let kept = e.learner.get(&p.id).unwrap();
+    assert!(matches!(kept.state, ProposalState::Persisted));
+    assert_eq!(kept.set_aside, vec!["memory:mem-7".to_string()]);
+    let recs = records(&e.logdir);
+    assert_eq!(recs.len(), before + 2);
+    let Entry::Decision(d) = &recs[before].record.entry else {
+        panic!("expected a decision")
+    };
+    assert_eq!(d.kind, "learn.memory.resolve");
+    assert_eq!(d.tier, HicTier::Hic1);
+    assert!(d
+        .evidence
+        .iter()
+        .any(|x| x.uri == "learn:set-aside/memory:mem-7"));
+    assert!(d
+        .evidence
+        .iter()
+        .any(|x| x.uri == format!("learn:kept/{}", p.id)));
+    assert!(
+        !d.evidence
+            .iter()
+            .any(|x| x.uri.starts_with("learn:proposal/")),
+        "the kept memory is not the subject of a retraction: {:?}",
+        d.evidence
+    );
+    // Resolved once: the same pair cannot be resolved again, either way.
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &p.id, "memory:mem-7")),
+        Err(LearnError::NotAContradiction(_))
+    ));
+    assert!(matches!(
+        e.learner.resolve(resolve("m", "memory:mem-7", &p.id)),
+        Err(LearnError::NotAContradiction(_))
+    ));
+}
+
+#[test]
+fn keeping_the_known_memory_retracts_the_learned_one() {
+    let mut e = env();
+    let p = contradicting_known(&mut e);
+    let r = e
+        .learner
+        .resolve(resolve("m", "memory:mem-7", &p.id))
+        .unwrap();
+    assert_eq!(r.kept, "memory:mem-7");
+    assert_eq!(r.retracted, p.id);
+    assert_eq!(r.kept_value, "");
+    assert_eq!(r.retracted_value, "forge test -vvv");
+    match &e.learner.get(&p.id).unwrap().state {
+        ProposalState::Retracted { by, kept } => {
+            assert_eq!(by, "m");
+            assert_eq!(kept, "memory:mem-7");
+        }
+        other => panic!("expected retracted, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_known_memory_resolution_needs_the_contradiction_the_member_acknowledged() {
+    let mut e = env();
+    let p = contradicting_known(&mut e);
+    for (keep, retract) in [
+        (p.id.as_str(), "memory:mem-8"),
+        ("memory:mem-8", p.id.as_str()),
+        ("memory:mem-7", "memory:mem-7"),
+        ("memory:mem-7", "memory:mem-9"),
+        (p.id.as_str(), "memory:"),
+        (p.id.as_str(), "memory:mem 7"),
+    ] {
+        assert!(
+            matches!(
+                e.learner.resolve(resolve("m", keep, retract)),
+                Err(LearnError::NotAContradiction(_))
+            ),
+            "{keep} / {retract}"
+        );
+    }
+    // A memory with no contradiction against a known one cannot set one aside.
+    let other = e
+        .learner
+        .propose(
+            &verified_run(),
+            memory("deploy chain", "40204"),
+            provenance(),
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &other.id, "memory:mem-7")),
+        Err(LearnError::WrongState { .. })
+    ));
+    e.learner.accept(&other.id, accept("m")).unwrap();
+    assert!(matches!(
+        e.learner.resolve(resolve("m", &other.id, "memory:mem-7")),
+        Err(LearnError::NotAContradiction(_))
+    ));
+    let resolves = records(&e.logdir)
+        .into_iter()
+        .filter(
+            |r| matches!(&r.record.entry, Entry::Decision(d) if d.kind == "learn.memory.resolve"),
+        )
+        .count();
+    assert_eq!(resolves, 0, "no refusal is recorded");
+}
