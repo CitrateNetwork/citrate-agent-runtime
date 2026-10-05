@@ -242,3 +242,30 @@ pub(crate) async fn anchor_proof(
     let v = blocking(move || svc.proof(q.seq).map_err(anchor_err)).await?;
     Ok(Json(v))
 }
+
+#[derive(Deserialize)]
+pub(crate) struct RecordsQuery {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// `GET /anchor/records?before=N&limit=M` — retained decision records, newest first, with each
+/// day's anchor state. Read-only.
+pub(crate) async fn anchor_records(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    q: Option<Query<RecordsQuery>>,
+) -> Reply {
+    if !authorized(&headers, &st.bearer) {
+        return Err(err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let svc = anchor_service(&st)?;
+    let Some(Query(q)) = q else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "before and limit must be numbers",
+        ));
+    };
+    let v = blocking(move || svc.records_page(q.before, q.limit).map_err(anchor_err)).await?;
+    Ok(Json(v))
+}

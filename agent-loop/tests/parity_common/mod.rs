@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 /// sha256 of `fixtures/parity-v1.json`. Changing the fixture means bumping this here AND in
 /// citrate-core `src/agent/parity/parity.test.ts`.
 pub const PARITY_V1_SHA256: &str =
-    "2ecdbe41b965df2493f272323b8f901345bb16515bd1114896a91a34e3a2f1fc";
+    "8a777d62eb90633b1380a30d71c88e957687f13f239c5c93c724a46f00c9b31b";
 
 pub const FIXTURE_BYTES: &[u8] = include_bytes!("../fixtures/parity-v1.json");
 
