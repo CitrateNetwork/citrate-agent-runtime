@@ -6,7 +6,8 @@
 //!   `{"data": [{"index", "embedding"}]}`), served by llama-server started with `--embeddings`
 //!   (for example a BGE model). `CITRATE_HERMES_EMBED_URL` names a dedicated one; without it the
 //!   session tries its own loopback chat server, which answers 501 unless it embeds, and the
-//!   session then ranks lexically and says so.
+//!   session then ranks lexically and says so. `CITRATE_HERMES_EMBED_KEY_FILE` names a file holding
+//!   that endpoint's API key (the embedding llama-server citrate-core starts requires one).
 //!
 //! The wire mapping is pure and tested; each call builds its blocking `reqwest` client inside the
 //! call (always on the blocking pool), like [`crate::llm_http::OpenAiCompatClient`]. Errors are
@@ -18,6 +19,27 @@ use std::time::Duration;
 
 /// Env: a dedicated embedding endpoint (`http://<loopback>[:port][/v1]` or `https://…`).
 pub const EMBED_URL_ENV: &str = "CITRATE_HERMES_EMBED_URL";
+/// Env (US-1.4): the PATH of a file holding the API key of the endpoint named by
+/// [`EMBED_URL_ENV`] (citrate-core writes it `0600` for the embedding llama-server it starts). The
+/// key itself never travels in the environment, and is sent only to that endpoint.
+pub const EMBED_KEY_FILE_ENV: &str = "CITRATE_HERMES_EMBED_KEY_FILE";
+/// Longest key accepted from [`EMBED_KEY_FILE_ENV`] (bytes).
+const MAX_EMBED_KEY: usize = 512;
+
+/// Read the embedding endpoint's key from `path`: the file's first line, trimmed. Errors are
+/// coarse (never the path's contents).
+pub fn read_embed_key(path: &std::path::Path) -> Result<String, String> {
+    let raw = std::fs::read(path).map_err(|_| format!("{EMBED_KEY_FILE_ENV} could not be read"))?;
+    if raw.len() > MAX_EMBED_KEY {
+        return Err(format!("{EMBED_KEY_FILE_ENV} is too long to be a key"));
+    }
+    let text = String::from_utf8(raw).map_err(|_| format!("{EMBED_KEY_FILE_ENV} is not text"))?;
+    let key = text.lines().next().unwrap_or("").trim().to_string();
+    if key.is_empty() || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!("{EMBED_KEY_FILE_ENV} holds no usable key"));
+    }
+    Ok(key)
+}
 
 /// How long one tokenize call may take. A prompt is a few thousand tokens at most; loopback is
 /// fast, so a slow answer means the server is busy or gone, and the session falls back.

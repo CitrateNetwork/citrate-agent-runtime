@@ -473,6 +473,11 @@ pub struct ShellPolicy {
     stdout_cap: usize,
     stderr_cap: usize,
     sandbox: SandboxPolicy,
+    /// Symlinks created in every run's scratch HOME: (path relative to HOME, absolute target).
+    home_links: Vec<(PathBuf, PathBuf)>,
+    /// Programs an allowlisted program starts itself (medusa runs crytic-compile): under the
+    /// sandbox their own directory and Python environment are readable too.
+    helper_programs: Vec<String>,
 }
 
 impl ShellPolicy {
@@ -509,6 +514,8 @@ impl ShellPolicy {
             stdout_cap: DEFAULT_OUTPUT_CAP,
             stderr_cap: DEFAULT_OUTPUT_CAP,
             sandbox: SandboxPolicy::off(),
+            home_links: Vec::new(),
+            helper_programs: Vec::new(),
         })
     }
 
@@ -550,6 +557,42 @@ impl ShellPolicy {
             .filter(|n| !RESERVED_ENV.contains(n))
             .map(|s| s.to_string())
             .collect();
+        self
+    }
+
+    /// Symlinks to create in every run's scratch HOME before the program starts, as
+    /// `(path relative to HOME, absolute target)`; for example a tool's compiler cache entry
+    /// (`.svm/0.8.36/solc-0.8.36`) pointing at the configured compiler, so a program that only
+    /// looks there does not try to download it. The relative path must stay inside HOME (plain
+    /// components only) and the target must be absolute, else the policy is refused. Nothing is
+    /// copied; under the OS sandbox the target must also be readable (a read root).
+    pub fn with_home_links(mut self, links: Vec<(PathBuf, PathBuf)>) -> Result<Self, ShellError> {
+        for (rel, target) in &links {
+            let plain = !rel.as_os_str().is_empty()
+                && rel
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if !plain || !target.is_absolute() {
+                return Err(ShellError::InvalidPolicy {
+                    reason: format!(
+                        "home link {} -> {} must be a plain relative path to an absolute target",
+                        rel.display(),
+                        target.display()
+                    ),
+                });
+            }
+        }
+        self.home_links = links;
+        Ok(self)
+    }
+
+    /// Programs the allowlisted programs start themselves (for example medusa starts
+    /// `crytic-compile`, a Python entry point). Each is looked up on the search path like an
+    /// allowlisted program; under the OS sandbox its real directory and, for a Python virtual
+    /// environment, that environment become readable. They are never run directly: the
+    /// allowlist is unchanged.
+    pub fn with_helper_programs(mut self, names: &[&str]) -> Self {
+        self.helper_programs = names.iter().map(|s| s.to_string()).collect();
         self
     }
 
@@ -817,12 +860,26 @@ impl ShellRunner {
         for d in self.policy.sandbox.extra_read_roots() {
             add(d);
         }
-        if let Ok(real) = std::fs::canonicalize(program) {
-            if let Some(dir) = real.parent() {
-                add(dir);
-                if let Some(env) = dir.parent() {
-                    if env.join("pyvenv.cfg").is_file() {
-                        add(env);
+        let mut programs = vec![program.to_path_buf()];
+        for h in &self.policy.helper_programs {
+            if let Some(p) = self
+                .policy
+                .search_path
+                .iter()
+                .map(|d| d.join(h))
+                .find(|p| p.is_file())
+            {
+                programs.push(p);
+            }
+        }
+        for prog in programs {
+            if let Ok(real) = std::fs::canonicalize(&prog) {
+                if let Some(dir) = real.parent() {
+                    add(dir);
+                    if let Some(env) = dir.parent() {
+                        if env.join("pyvenv.cfg").is_file() {
+                            add(env);
+                        }
                     }
                 }
             }
@@ -883,6 +940,12 @@ impl ShellRunner {
             program: req.program.clone(),
             reason: format!("cannot create scratch HOME: {e}"),
         })?;
+        for (rel, target) in &self.policy.home_links {
+            link_into(scratch.path(), rel, target).map_err(|e| ShellError::Spawn {
+                program: req.program.clone(),
+                reason: format!("cannot prepare the scratch HOME ({}): {e}", rel.display()),
+            })?;
+        }
 
         let mut cmd = match &plan.backend {
             Some(backend) => {
@@ -1150,6 +1213,22 @@ fn lossy_prefix(bytes: &[u8]) -> String {
 }
 
 // ------------------------------------------------------------------------------------------
+/// Create `home/rel` as a symlink to `target` (a copy where symlinks are not available).
+fn link_into(home: &Path, rel: &Path, target: &Path) -> std::io::Result<()> {
+    let at = home.join(rel);
+    if let Some(parent) = at.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, &at)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(target, &at).map(|_| ())
+    }
+}
+
 // Scratch HOME
 // ------------------------------------------------------------------------------------------
 

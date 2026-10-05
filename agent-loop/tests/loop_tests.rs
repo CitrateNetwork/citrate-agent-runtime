@@ -470,3 +470,66 @@ fn only_dispatched_calls_announce_a_host() {
         "refused calls are still reported, just without a host"
     );
 }
+
+/// A host and a sink writing to one ordered log.
+struct OrderHost(Arc<Mutex<Vec<String>>>);
+impl ToolHost for OrderHost {
+    fn before_announce(&self, call: &ToolCall) {
+        self.0.lock().unwrap().push(format!("register {}", call.id));
+    }
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        self.0.lock().unwrap().push(format!("execute {}", call.id));
+        ToolOutcome::Ok("{}".into())
+    }
+}
+struct OrderSink(Arc<Mutex<Vec<String>>>);
+impl EventSink for OrderSink {
+    fn emit(&self, ev: Event) {
+        if let Event::ToolCall { call, .. } = &ev {
+            self.0.lock().unwrap().push(format!("announce {}", call.id));
+        }
+    }
+}
+
+/// A host answered from outside (core reads the `tool_call` event and posts the result) must
+/// have registered the call before that event is visible, or an immediate answer is dropped.
+/// Calls the loop refuses are announced without a host and never registered.
+#[test]
+fn a_dispatched_call_is_registered_with_its_host_before_it_is_announced() {
+    let llm = ScriptLlm::new(vec![
+        Ok(AssistantTurn::tools(vec![
+            call("c1", "node_status", "{}"),
+            call("c2", "no_such_tool", "{}"),
+            call("c3", "node_status", "not json"),
+            call("c4", "node_status", "{}"),
+        ])),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let log = Arc::new(Mutex::new(vec![]));
+    let tools = ToolRegistry::new(vec![spec("node_status", HostKind::Core)])
+        .with_host(HostKind::Core, Arc::new(OrderHost(log.clone())));
+    let mut history = vec![];
+    let out = run_turn(
+        &cfg(6),
+        &llm,
+        &tools,
+        &OrderSink(log.clone()),
+        &StopFlag::default(),
+        &mut history,
+        "status",
+    );
+    assert_eq!(out, RunOutcome::Answered("done".into()));
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "register c1",
+            "announce c1",
+            "execute c1",
+            "announce c2",
+            "announce c3",
+            "register c4",
+            "announce c4",
+            "execute c4",
+        ]
+    );
+}

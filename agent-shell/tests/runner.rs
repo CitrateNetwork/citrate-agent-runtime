@@ -612,3 +612,98 @@ fn git_blame_does_not_run_textconv_drivers() {
     assert_eq!(r.exit_code, Some(0), "{r:?}");
     assert!(!marker.exists(), "blame ran a repository textconv driver");
 }
+
+// ---------------------------------------------------------------- scratch HOME links (HUP-S6)
+
+#[test]
+fn home_links_appear_in_the_scratch_home_and_leave_with_it() {
+    let d = tmp();
+    let target = d.path().join("solc-0.8.36");
+    std::fs::write(&target, "#!/bin/sh\n").expect("target");
+    let policy = ShellPolicy::new(test_allowlist(), sys_path())
+        .expect("policy")
+        .with_home_links(vec![(
+            PathBuf::from(".svm/0.8.36/solc-0.8.36"),
+            target.clone(),
+        )])
+        .expect("links");
+    let r = open_runner(policy)
+        .run(&req(
+            "sh",
+            &[
+                "-c",
+                "readlink \"$HOME/.svm/0.8.36/solc-0.8.36\"; printenv HOME",
+            ],
+            d.path(),
+        ))
+        .expect("run");
+    let mut lines = r.stdout.lines();
+    assert_eq!(
+        lines.next().map(PathBuf::from),
+        Some(target),
+        "{}",
+        r.stdout
+    );
+    let home = PathBuf::from(lines.next().unwrap_or_default());
+    assert!(!home.exists(), "the scratch HOME and its links are removed");
+}
+
+#[test]
+fn home_links_must_stay_inside_home_and_point_at_absolute_targets() {
+    for (rel, target) in [
+        ("../escape", "/bin/sh"),
+        ("/abs/path", "/bin/sh"),
+        ("", "/bin/sh"),
+        (".svm/x", "relative/solc"),
+    ] {
+        let r = ShellPolicy::new(test_allowlist(), sys_path())
+            .expect("policy")
+            .with_home_links(vec![(PathBuf::from(rel), PathBuf::from(target))]);
+        assert!(
+            matches!(r, Err(ShellError::InvalidPolicy { .. })),
+            "{rel} -> {target}"
+        );
+    }
+}
+
+#[test]
+fn a_helper_programs_python_environment_is_readable_only_when_named() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp();
+    let base = d.path().canonicalize().expect("canonical");
+    // A pipx-style venv with crytic-compile, linked from a bin folder on the search path.
+    let env = base.join("venvs/slither");
+    std::fs::create_dir_all(env.join("bin")).expect("venv");
+    std::fs::write(env.join("pyvenv.cfg"), "home = /usr/bin\n").expect("cfg");
+    let entry = env.join("bin/crytic-compile");
+    std::fs::write(&entry, "#!/bin/sh\n").expect("entry");
+    std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let local_bin = base.join("local-bin");
+    std::fs::create_dir_all(&local_bin).expect("bin");
+    std::os::unix::fs::symlink(&entry, local_bin.join("crytic-compile")).expect("link");
+    let mut path = sys_path();
+    path.push(local_bin);
+    let plan = |helpers: &[&str]| {
+        open_runner(
+            ShellPolicy::new(test_allowlist(), path.clone())
+                .expect("policy")
+                .with_helper_programs(helpers),
+        )
+        .plan(&req("echo", &["x"], d.path()))
+        .expect("plan")
+        .read_roots
+    };
+    assert!(
+        plan(&["crytic-compile"]).contains(&env),
+        "the helper's venv is readable"
+    );
+    assert!(!plan(&[]).contains(&env), "not without naming the helper");
+    // The allowlist is unchanged: the helper itself cannot be run.
+    let r = open_runner(
+        ShellPolicy::new(test_allowlist(), path.clone())
+            .expect("policy")
+            .with_helper_programs(&["crytic-compile"]),
+    )
+    .run(&req("crytic-compile", &["."], d.path()));
+    assert!(matches!(r, Err(ShellError::ProgramNotAllowed { .. })));
+}
