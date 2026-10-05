@@ -63,6 +63,10 @@ pub struct BrowserConfig {
     /// Local origins the managed browser may open anyway (developer use, e.g. a local test
     /// chain). Empty by default: only public addresses ([`crate::gate`]).
     pub allow_private: Vec<Origin>,
+    /// HUP-S5.5: whether the managed browser may open the open web ([`gate::OPEN_WEB_ENV`]).
+    /// `true` by default; `false` keeps it to developer-allowed origins on this machine. Attach
+    /// mode (the member's own Chrome) is not affected.
+    pub open_web: bool,
 }
 
 impl Default for BrowserConfig {
@@ -79,6 +83,7 @@ impl Default for BrowserConfig {
             denylist: Denylist::builtin(),
             snapshot_limits: SnapshotLimits::default(),
             allow_private: Vec::new(),
+            open_web: true,
         }
     }
 }
@@ -86,7 +91,8 @@ impl Default for BrowserConfig {
 impl BrowserConfig {
     /// `Some` only when `CITRATE_HERMES_BROWSER=1`. The managed Chromium path comes from
     /// `CITRATE_BROWSER_CHROMIUM` when set; developer-allowed local origins from
-    /// [`gate::ALLOW_PRIVATE_ENV`] (an unreadable list allows nothing).
+    /// [`gate::ALLOW_PRIVATE_ENV`] (an unreadable list allows nothing); the open-web rule from
+    /// [`gate::OPEN_WEB_ENV`] (unset = open, any value but `1` = closed).
     pub fn from_env() -> Option<BrowserConfig> {
         if std::env::var(BROWSER_ENV).ok().as_deref().map(str::trim) != Some("1") {
             return None;
@@ -98,9 +104,11 @@ impl BrowserConfig {
             .ok()
             .and_then(|raw| gate::parse_allow_private(&raw).ok())
             .unwrap_or_default();
+        let open_web = gate::parse_open_web(std::env::var(gate::OPEN_WEB_ENV).ok().as_deref());
         Some(BrowserConfig {
             managed_path,
             allow_private,
+            open_web,
             ..BrowserConfig::default()
         })
     }
@@ -183,6 +191,9 @@ pub struct BrowserStatus {
     pub target_id: Option<String>,
     /// HUP-S2.3: sign-in requests from the page waiting for core (managed mode only).
     pub sign_in_requests: Vec<SignInRequest>,
+    /// HUP-S5.5: the managed browser may open the open web. `false` = its security updates are
+    /// not current, so it opens developer-allowed pages on this machine only.
+    pub open_web: bool,
 }
 
 /// A page the worker is on.
@@ -225,6 +236,9 @@ struct Shared {
     page_version: AtomicU64,
     /// Developer-allowed local origins (managed mode).
     allow_private: Vec<Origin>,
+    /// HUP-S5.5: the managed browser is kept off the open web (the inverse of
+    /// [`BrowserConfig::open_web`], so the derived default stays open).
+    off_web: bool,
     /// The live connection, for answering a paused request off the I/O thread.
     cdp: Mutex<Option<Weak<Cdp>>>,
     /// Why the gate last stopped a page load (read by the step that caused it).
@@ -289,7 +303,7 @@ impl Shared {
                 Verdict::Continue
             }
         } else {
-            gate::managed_verdict(&url, &self.allow_private, document)
+            gate::managed_verdict_for(&url, &self.allow_private, document, !self.off_web)
         };
         let verdict = match verdict {
             Verdict::Resolve { host, port } => {
@@ -468,6 +482,7 @@ impl BrowserService {
     pub fn new(cfg: BrowserConfig) -> Self {
         let shared = Arc::new(Shared {
             allow_private: cfg.allow_private.clone(),
+            off_web: !cfg.open_web,
             ..Shared::default()
         });
         *lock(&shared.scope) = Some(OriginScope::new(cfg.denylist.clone()));
@@ -537,6 +552,7 @@ impl BrowserService {
                 _ => None,
             },
             sign_in_requests: self.sign_in_requests(),
+            open_web: self.cfg.open_web,
         }
     }
 
@@ -1088,7 +1104,7 @@ impl BrowserService {
     /// request anyway; this gives the honest reason up front).
     fn check_managed_target(&self, url: &str) -> Result<()> {
         let allow = &self.cfg.allow_private;
-        match gate::managed_verdict(url, allow, true) {
+        match gate::managed_verdict_for(url, allow, true, self.cfg.open_web) {
             Verdict::Continue => Ok(()),
             Verdict::Block(why) => Err(BrowserError::NotWeb(why)),
             Verdict::Resolve { host, port } => match gate::resolve_and_decide(&host, port, allow) {
@@ -1229,9 +1245,10 @@ impl BrowserService {
         };
         // Every connection the managed browser makes goes through the egress gate (public
         // addresses and developer-allowed origins only). Without it the browser is not started.
-        let egress = EgressGate::start(self.cfg.allow_private.clone()).map_err(|e| {
-            BrowserError::Failed(format!("could not start the browser's network gate: {e}"))
-        })?;
+        let egress = EgressGate::start_with(self.cfg.allow_private.clone(), self.cfg.open_web)
+            .map_err(|e| {
+                BrowserError::Failed(format!("could not start the browser's network gate: {e}"))
+            })?;
         let mut args = egress.browser_args();
         args.extend(self.cfg.extra_args.iter().cloned());
         let chrome = ManagedChrome::launch(&exe, self.cfg.viewport, &args, self.cfg.launch_timeout)
@@ -1613,6 +1630,53 @@ mod tests {
         assert_eq!(method, "Fetch.continueRequest");
         let (method, _) = verdict(s.on_event(&paused("http://127.0.0.1:8546/", "Document", "T1")));
         assert_eq!(method, "Fetch.failRequest");
+    }
+
+    #[test]
+    fn off_the_open_web_the_managed_browser_reaches_only_allowed_loopback_origins() {
+        // HUP-S5.5: browserMayOpenWeb is false (the component updater has no current manifest).
+        let mut s = shared_attached("about:blank");
+        s.attached.store(false, Ordering::SeqCst);
+        *lock(&s.target) = Some("T1".to_string());
+        s.off_web = true;
+        s.allow_private =
+            crate::gate::parse_allow_private("http://127.0.0.1:8545, https://1.1.1.1")
+                .expect("allow");
+        // The fork (an allowed loopback origin) still answers.
+        let (method, _) = verdict(s.on_event(&paused("http://127.0.0.1:8545/", "Document", "T1")));
+        assert_eq!(method, "Fetch.continueRequest");
+        for (url, kind) in [
+            ("https://1.1.1.1/x.js", "Script"),
+            ("https://1.1.1.1/", "Document"),
+            ("https://example.com/", "Document"),
+            ("https://cdn.example.com/app.js", "Script"),
+            ("http://127.0.0.1:8546/", "XHR"),
+        ] {
+            let (method, params) = verdict(s.on_event(&paused(url, kind, "T1")));
+            assert_eq!(method, "Fetch.failRequest", "{url}");
+            assert_eq!(params["errorReason"], "BlockedByClient");
+        }
+        assert!(
+            matches!(&*lock(&s.last_block), Some(BrowserError::NotWeb(why)) if why.contains("off the open web")),
+            "the member is told why"
+        );
+    }
+
+    #[test]
+    fn the_open_web_rule_reaches_the_config_and_the_status() {
+        let closed = BrowserService::new(BrowserConfig {
+            candidates: Vec::new(),
+            open_web: false,
+            ..BrowserConfig::default()
+        });
+        assert!(closed.shared.off_web);
+        assert!(!closed.status().open_web);
+        let open = BrowserService::new(BrowserConfig {
+            candidates: Vec::new(),
+            ..BrowserConfig::default()
+        });
+        assert!(!open.shared.off_web, "open by default: nothing changes");
+        assert!(open.status().open_web);
     }
 
     #[test]

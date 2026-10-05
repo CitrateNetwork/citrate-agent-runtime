@@ -578,3 +578,16 @@ async fn without_the_toolchain_the_reports_route_is_not_found() {
     let (code, _) = get(&st, "/sessions/nope/toolchain/reports", true).await;
     assert_eq!(code, StatusCode::NOT_FOUND);
 }
+
+#[test]
+fn medusas_slither_results_file_is_output_not_a_source() {
+    // medusa 1.5 writes slither_results.json into the project during every campaign (captured
+    // in the hello-mint e2e, fan-out 7); the digest before and after the run must still agree.
+    let s = Scratch::new();
+    let a = sources_sha256(&s.proj()).unwrap();
+    s.write("slither_results.json", "{\"success\": true}");
+    assert_eq!(sources_sha256(&s.proj()).unwrap(), a);
+    // A source that merely starts with the same letters is still a source.
+    s.write("src/slither_results_reader.sol", "contract R {}\n");
+    assert_ne!(sources_sha256(&s.proj()).unwrap(), a);
+}

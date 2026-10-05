@@ -157,6 +157,7 @@ fn usage_is_parsed_from_the_provider_response_when_present() {
             prompt_tokens: 31,
             completion_tokens: 7,
             generation_ms: None,
+            prompt_ms: None,
         })
     );
 }
@@ -187,6 +188,7 @@ async fn a_turn_produces_a_metering_record_with_reported_tokens() {
             prompt_tokens: 12,
             completion_tokens: 3,
             generation_ms: None,
+            prompt_ms: None,
         }),
     ));
     let id = create(&st, no_tools()).await;
@@ -232,6 +234,7 @@ async fn usage_from_every_step_of_a_turn_is_summed() {
             prompt_tokens: 10,
             completion_tokens: 2,
             generation_ms: None,
+            prompt_ms: None,
         }),
     ));
     let id = create(&st, no_tools()).await;
@@ -250,20 +253,20 @@ async fn usage_from_every_step_of_a_turn_is_summed() {
 }
 
 #[tokio::test]
-async fn the_report_lists_what_is_not_measured_yet() {
+async fn every_d27_measure_is_collected_and_an_empty_day_shows_them_unknown() {
+    // HUP-S7.5: the D-27 measures are collected now, so nothing is listed as "not measured"; a day
+    // without them reports each as null (unknown), never zero.
     let st = state(manager(vec![], None));
     let (s, v) = daily(&st, &today()).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["report"]["turns"], 0);
-    let nm: Vec<String> = v["notMeasured"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_str().unwrap().to_string())
-        .collect();
-    for m in ["time to first token", "SALT spent", "energy estimate"] {
-        assert!(nm.iter().any(|x| x == m), "{m} missing from {nm:?}");
+    assert_eq!(v["notMeasured"], serde_json::json!([]));
+    for k in ["ttft_ms", "speed", "resources", "energy_estimate"] {
+        assert!(v["report"][k].is_null(), "{k}: {v}");
     }
+    assert_eq!(v["report"]["self_review"]["label"], "opinion");
+    assert_eq!(v["chain"]["transactions"], 0);
+    assert_eq!(v["chain"]["saltSpentWei"], "0");
 }
 
 #[tokio::test]
@@ -438,6 +441,7 @@ fn llama_server_generation_time_is_read_from_timings() {
             prompt_tokens: 31,
             completion_tokens: 7,
             generation_ms: Some(234),
+            prompt_ms: None,
         })
     );
 }
@@ -458,4 +462,226 @@ fn a_missing_or_nonsense_generation_time_is_unknown() {
             "{body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// HUP-S7.5 (D-27): time to first token, speed, machine peaks and chain spend reach the report
+
+#[tokio::test]
+async fn llama_server_timings_reach_the_daily_report() {
+    let st = state(manager(
+        vec![AssistantTurn::text("hello")],
+        Some(TokenUsage {
+            prompt_tokens: 40,
+            completion_tokens: 30,
+            generation_ms: Some(1_000),
+            prompt_ms: Some(180),
+        }),
+    ));
+    let id = create(&st, no_tools()).await;
+    turn(&st, &id, "hi").await;
+    let (_, v) = daily(&st, &today()).await;
+    assert_eq!(v["report"]["ttft_ms"]["p50"], 180, "{v}");
+    assert_eq!(v["report"]["speed"]["tokens_per_s_milli"], 30_000);
+    let md = v["markdown"].as_str().unwrap();
+    assert!(
+        md.contains("Time to first token p50 / p95 | 180 ms / 180 ms"),
+        "{md}"
+    );
+}
+
+#[test]
+fn llama_server_prompt_time_is_read_as_time_to_first_token() {
+    let body = r#"{"usage":{"prompt_tokens":31,"completion_tokens":7},"timings":{"prompt_n":31,"prompt_ms":88.4,"predicted_ms":233.6}}"#;
+    let u = llm_http::parse_usage(body).unwrap();
+    assert_eq!((u.prompt_ms, u.generation_ms), (Some(88), Some(234)));
+    let none =
+        r#"{"usage":{"prompt_tokens":1,"completion_tokens":1},"timings":{"prompt_ms":"soon"}}"#;
+    assert_eq!(llm_http::parse_usage(none).unwrap().prompt_ms, None);
+}
+
+/// A model that takes a while to answer, so the machine sampler gets readings.
+struct Slow;
+impl LlmClient for Slow {
+    fn complete(&self, _req: &CompletionRequest) -> Result<AssistantTurn, LlmError> {
+        std::thread::sleep(Duration::from_millis(700));
+        Ok(AssistantTurn::text("slow answer"))
+    }
+}
+
+#[tokio::test]
+async fn a_sampled_session_reports_real_machine_peaks_and_a_labelled_energy_estimate() {
+    let llm: Arc<dyn LlmClient> = Arc::new(Slow);
+    let store = metering::MeteringStore::in_memory().with_measures(
+        Some(Arc::new(resources::SystemSampler::with_interval(
+            Duration::from_millis(150),
+        ))),
+        citrate_agent_metering::DEFAULT_ENERGY_MODEL,
+    );
+    let mgr = sessions::SessionManager::new(
+        Arc::new(move |_ep: &sessions::LlmEndpoint| llm.clone()),
+        Duration::from_secs(5),
+    )
+    .with_metering(Arc::new(store));
+    let st = state(mgr);
+    let id = create(&st, no_tools()).await;
+    turn(&st, &id, "hi").await;
+    let (_, v) = daily(&st, &today()).await;
+    let r = &v["report"]["resources"];
+    assert_eq!(r["turns_sampled"], 1, "{v}");
+    assert!(r["ram_total_bytes"].as_u64().unwrap() > 0);
+    assert!(r["cpu_peak_bps"].as_u64().unwrap() <= 10_000);
+    assert_eq!(v["report"]["energy_estimate"]["label"], "estimate");
+    assert!(v["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("Energy (estimate, not measured)"));
+}
+
+const TX: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+#[tokio::test]
+async fn chain_receipts_from_core_become_salt_spent_and_gas() {
+    let st = state(manager(vec![], None));
+    let body = serde_json::json!({
+        "txHash": TX,
+        "purpose": "registry_escalation",
+        "status": 1,
+        "gasUsed": 120_000,
+        "effectiveGasPriceWei": "2000000000",
+        "valueWei": "1000000000000000000",
+    });
+    let r = app(st.clone())
+        .oneshot(req("POST", "/metering/chain-receipt", body.clone(), false))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = app(st.clone())
+        .oneshot(req("POST", "/metering/chain-receipt", body, true))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let (_, v) = daily(&st, &today()).await;
+    assert_eq!(v["chain"]["transactions"], 1, "{v}");
+    assert_eq!(v["chain"]["gasUsed"], 120_000);
+    assert_eq!(v["chain"]["saltSpentWei"], "1000240000000000000");
+    assert!(v["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("SALT spent: 1.00024 SALT"));
+}
+
+#[tokio::test]
+async fn a_malformed_or_overreaching_chain_receipt_is_refused() {
+    let st = state(manager(vec![], None));
+    for body in [
+        serde_json::json!({"txHash": "0x12", "purpose": "agent", "status": 1, "gasUsed": 1, "effectiveGasPriceWei": "1", "valueWei": "0"}),
+        serde_json::json!({"txHash": TX, "purpose": "agent", "status": 3, "gasUsed": 1, "effectiveGasPriceWei": "1", "valueWei": "0"}),
+        serde_json::json!({"txHash": TX, "purpose": "payday", "status": 1, "gasUsed": 1, "effectiveGasPriceWei": "1", "valueWei": "0"}),
+        serde_json::json!({"txHash": TX, "purpose": "agent", "status": 1, "gasUsed": 1, "effectiveGasPriceWei": "1", "valueWei": "0x1"}),
+        // a key or calldata has no place in a receipt
+        serde_json::json!({"txHash": TX, "purpose": "agent", "status": 1, "gasUsed": 1, "effectiveGasPriceWei": "1", "valueWei": "0", "data": "0xdeadbeef"}),
+    ] {
+        let r = app(st.clone())
+            .oneshot(req("POST", "/metering/chain-receipt", body.clone(), true))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let (_, v) = daily(&st, &today()).await;
+    assert_eq!(v["chain"]["transactions"], 0);
+}
+
+#[tokio::test]
+async fn the_benchmark_payload_carries_the_days_gas_and_salt() {
+    let st = state(manager(
+        vec![AssistantTurn::text("hello")],
+        Some(TokenUsage {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            generation_ms: Some(100),
+            prompt_ms: Some(50),
+        }),
+    ));
+    let id = create(&st, no_tools()).await;
+    turn(&st, &id, "hi").await;
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/metering/chain-receipt",
+            serde_json::json!({"txHash": TX, "purpose": "benchmark", "status": 1, "gasUsed": 50_000, "effectiveGasPriceWei": "1", "valueWei": "0"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            "/metering/benchmark",
+            serde_json::json!({"day": today(), "agentId": "7", "registry": "0x00000000000000000000000000000000000000b1"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let p = json(r).await;
+    let metric = |m: &str| {
+        p["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["metric"] == m)
+            .map(|c| c["value"].as_str().unwrap().to_string())
+    };
+    assert_eq!(metric("hermes.daily.gas_used").as_deref(), Some("50000"));
+    assert_eq!(
+        metric("hermes.daily.salt_spent_wei").as_deref(),
+        Some("50000")
+    );
+    assert_eq!(metric("hermes.daily.ttft_p50_ms").as_deref(), Some("50"));
+    assert_eq!(
+        metric("hermes.daily.tokens_per_s_milli").as_deref(),
+        Some("20000")
+    );
+    assert_eq!(p["sent"], false);
+}
+
+#[tokio::test]
+async fn a_workflow_run_is_metered_with_its_verdict_and_the_self_review_opinion() {
+    // HUP-S7.5 (D-27): workflow attempts reach metering like chat turns, so the day's report shows
+    // the verifier's verdict next to the model's labelled opinion (never its text).
+    let script: Arc<dyn LlmClient> = Arc::new(Script {
+        turns: Mutex::new(vec![
+            AssistantTurn::text("READY"),
+            AssistantTurn::text("PASS: OPINION-CANARY it said ready."),
+        ]),
+        usage: None,
+    });
+    let mgr = sessions::SessionManager::new(
+        Arc::new(move |_ep: &sessions::LlmEndpoint| script.clone()),
+        Duration::from_secs(5),
+    )
+    .with_self_review(true);
+    let st = state(mgr);
+    let id = create(&st, no_tools()).await;
+    let wf = serde_json::json!({"id": "say-ready", "steps": [{"id": "ready", "instruction": "Reply READY.", "max_attempts": 1, "verifiers": [{"kind": "answer_contains", "text": "READY"}]}]});
+    let r = app(st.clone())
+        .oneshot(req("POST", &format!("/sessions/{id}/workflows"), wf, true))
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.status());
+    for _ in 0..300 {
+        if !st.sessions.get(&id).unwrap().is_busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, v) = daily(&st, &today()).await;
+    assert_eq!(v["report"]["turns"], 1, "{v}");
+    assert_eq!(v["report"]["verification"]["passed"], 1);
+    assert_eq!(v["report"]["self_review"]["pass"], 1);
+    assert_eq!(v["report"]["self_review"]["label"], "opinion");
+    assert_eq!(v["report"]["self_review"]["agreed_with_verifiers"], 1);
+    assert!(!v.to_string().contains("OPINION-CANARY"));
 }

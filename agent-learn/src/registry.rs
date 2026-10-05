@@ -5,12 +5,19 @@
 //! ```solidity
 //! function registerSkill(string name, string version, string manifestCID,
 //!                        string description, string[] tags) returns (bytes32 skillHash);
-//! // skillHash = keccak256(abi.encodePacked(msg.sender, name, version))
+//! function skillHashOf(address owner, string name, string version) pure returns (bytes32);
+//! // skillHash = skillHashOf(msg.sender, name, version)
+//! //           = keccak256(abi.encode(msg.sender, name, version))
 //! ```
+//!
+//! This is the HUP-S7.1 redeploy version of the contract (citrate-chain PR #272). The earlier
+//! deployment hashed `abi.encodePacked`, where ("skill1", ".0") and ("skill", "1.0") collide; the
+//! redeploy length-prefixes each string, and [`skill_hash`] follows it.
 //!
 //! This module ABI-encodes that call and projects the `skillHash` the contract will assign. It
 //! never signs, never sends, and holds no key (Rule 3): the member signs the transaction through
-//! citrate-core's SignatureCeremony. The encoding is pinned against `cast calldata` output in
+//! citrate-core's SignatureCeremony. The encoding is pinned against `cast calldata` output, and the id
+//! against `skillHashOf` called on a local anvil deployment of the contract, both in
 //! `tests/fixtures/register_skill_cast.json`.
 //!
 //! The contract stores no content hash, so the learner carries the SKILL.md SHA-256 as a
@@ -94,12 +101,23 @@ pub fn encode_register_skill(
     out
 }
 
-/// The id the contract assigns: `keccak256(abi.encodePacked(owner, name, version))`.
+/// The id the contract assigns: `skillHashOf(owner, name, version)`, which is
+/// `keccak256(abi.encode(owner, name, version))`.
+///
+/// `abi.encode` lays out a head of three words (the owner left-padded to 32 bytes, then the byte
+/// offsets of the two string tails) followed by each string's length word and padded bytes.
 pub fn skill_hash(owner: &[u8; 20], name: &str, version: &str) -> [u8; 32] {
+    let name_tail = encode_string(name);
+    let version_tail = encode_string(version);
+    let mut owner_word = [0u8; 32];
+    owner_word[12..].copy_from_slice(owner);
+    let head_len = 32 * 3;
     let mut h = Keccak256::new();
-    h.update(owner);
-    h.update(name.as_bytes());
-    h.update(version.as_bytes());
+    h.update(owner_word);
+    h.update(word_usize(head_len));
+    h.update(word_usize(head_len + name_tail.len()));
+    h.update(&name_tail);
+    h.update(&version_tail);
     h.finalize().into()
 }
 
