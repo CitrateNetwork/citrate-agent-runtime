@@ -1,8 +1,8 @@
 ---
 created: 2026-10-01
-branch: hup/n3-metering-trajectories
+branch: hup/n7-metering-d27
 author: Larry Klosowski + Claude Opus 5.5
-status: implemented (library only; not yet wired into sidecar sessions)
+status: implemented and wired into sidecar sessions; D-27 measures added 2026-10-04 (record schema 2)
 ---
 
 # citrate-agent-metering
@@ -16,6 +16,8 @@ decision D-27, story US-7.3).
 |---|---|
 | `MeteringSink` | An `EventSink` adapter for the agent loop. Wraps the session's sink, forwards every event unchanged, and keeps one `TurnRecord` per loop turn. |
 | `TurnRecord` | Model, tokens in/out (only when the model client reports them, otherwise `null`), latency, steps, tool calls by name (ok / declined / error / needed explicit approval), verifier outcomes, the loop's outcome, and whether the turn tainted the session. |
+| D-27 measures (schema 2) | Time to first token (the turn's first model call, llama-server `timings.prompt_ms`), generation tokens and time (tokens per second, `timings.predicted_ms`), CPU / GPU / RAM peaks and means from a host `ResourceSampler`, an energy figure labelled `estimate` (mean load x nominal watts x turn time; nothing measured power), and the self-review claim (PASS / FAIL / unclear) labelled `opinion`, never its text. Every field is optional: a version 1 line still reads, and an unknown measure is left out, never zero. |
+| `ChainReceipt` / `ChainSpendSummary` | SALT spent and gas. citrate-core reports each mined Hermes transaction (hash, purpose, status, gas used, effective gas price, value) after its ceremony; the day sums distinct hashes: SALT spent = gas fee + value sent by successful transactions. |
 | `MeteringLog` | A local append-only JSONL file of records. A bad line is an error naming the line, never skipped. |
 | `DailyReport` | One UTC day aggregated: outcomes, verified passed / failed / unverified, verified success rate, latency p50 / p95 / max, tokens, tool and verifier tallies, models. JSON and markdown. |
 | `build_benchmark_payload` | Opt-in only. Turns a daily report into unsigned calldata for `BenchmarkRegistry.record(uint256,bytes32,bytes32,uint256)`. |
@@ -70,10 +72,15 @@ The contract records `msg.sender` and `block.timestamp` itself. Two things follo
 BenchmarkRegistry is **not in the 40204 address book yet** (D-24 deploys it in the next
 redeploy). The registry address is always a caller input.
 
+## D-27 in the benchmark payload
+
+Eleven more per-metric calls (26 at most a day; core accepts 32): `ttft_p50_ms`, `ttft_p95_ms`,
+`tokens_per_s_milli`, `cpu_peak_bps`, `gpu_peak_bps`, `ram_peak_mib`, `energy_estimate_uwh`,
+`self_review_opinion_pass`, `self_review_opinion_fail`, `gas_used` and `salt_spent_wei` (all under
+`hermes.daily.`). Each is omitted on a day nothing measured it. The submission shape (one card per
+metric) and the energy model's nominal watts (30 W CPU, 30 W GPU) are pending owner sign-off.
+
 ## Not done here
 
-- Wiring into sidecar sessions (`/sessions`): no session creates a `MeteringSink` yet.
-- Usage reporting from the model client (`record_usage` exists; nothing calls it yet).
-- The core half of S7.5: activity monitor, journal surface, opt-in UI, ceremony submission.
-- D-27 measures not derivable from the event stream: TTFT, tokens/sec, SALT spend, gas, CPU / GPU /
-  RAM peak, the energy estimate and the model's labelled self-review.
+- Live sharing needs an AgentSBT on 40204 and BenchmarkRegistry in the address book.
+- Refunds a member claims back from the InferenceRouter are not subtracted from SALT spent.

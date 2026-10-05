@@ -40,8 +40,10 @@ const SKIP_DIRS: [&str; 8] = [
     ".git",
     "dist",
 ];
-/// Report files the tools write into the project; they are output, not sources.
-const SKIP_FILE_PREFIXES: [&str; 1] = ["aderyn-report"];
+/// Report files the tools write into the project; they are output, not sources. medusa writes
+/// `slither_results.json` (it runs slither for its value extraction) during every campaign, so
+/// without this a medusa run could never be bound to the sources forge tested.
+const SKIP_FILE_PREFIXES: [&str; 2] = ["aderyn-report", "slither_results.json"];
 /// Bounds on the source digest walk. Past them the digest is `None` (never a partial digest).
 const MAX_SOURCE_FILES: usize = 20_000;
 const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;

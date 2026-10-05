@@ -402,6 +402,33 @@ fn managed_browser_opens_local_addresses_only_when_a_developer_allows_them() {
     assert_eq!(page.title, "Example login");
 }
 
+/// HUP-S5.5: with browserMayOpenWeb false, the managed browser opens only developer-allowed pages
+/// on this machine (a site preview, an anvil fork). A public address is refused before the browser
+/// is asked, so nothing here reaches the internet.
+#[test]
+fn off_the_open_web_the_managed_browser_opens_only_allowed_pages_on_this_machine() {
+    let Some(exe) = common::chromium() else {
+        return;
+    };
+    let (base, log) = common::serve_logged();
+    let svc = BrowserService::new(citrate_agent_browser::BrowserConfig {
+        open_web: false,
+        ..common::config_allowing(exe, &base)
+    });
+    let page = svc
+        .navigate(&format!("{base}/login"))
+        .expect("the allowed local page opens");
+    assert_eq!(page.title, "Example login");
+    for public in ["https://example.com/", "https://1.1.1.1/"] {
+        match svc.navigate(public) {
+            Err(BrowserError::NotWeb(why)) => assert!(why.contains("off the open web"), "{why}"),
+            other => panic!("expected a refusal for {public}, got {other:?}"),
+        }
+    }
+    assert!(!svc.status().open_web);
+    assert!(common::hits(&log, "/login") >= 1);
+}
+
 #[test]
 fn a_page_cannot_make_the_managed_browser_reach_another_local_service() {
     let Some(exe) = common::chromium() else {

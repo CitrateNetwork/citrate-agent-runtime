@@ -548,6 +548,19 @@ pub struct Session {
 }
 
 impl Session {
+    /// The conversation so far (what the model is sent next turn, after the system prompt).
+    pub fn history_snapshot(&self) -> Vec<Message> {
+        self.history.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    /// HUP-S6 US-6.2: the deploy guard over this session's toolchain reports (`None` without
+    /// the toolchain).
+    pub fn deploy_guard(&self) -> Option<crate::deploy_guard::DeployGuard> {
+        self.toolchain_reports
+            .clone()
+            .map(crate::deploy_guard::DeployGuard::new)
+    }
+
     /// HUP-S6.3 → S6.4: the latest toolchain report per (project, tool), only `project`'s when
     /// given. `None` when this session has no toolchain.
     pub fn toolchain_reports(
@@ -1654,7 +1667,8 @@ impl SessionManager {
             // tools included (or the session's own `maxToolsPerRequest`, if it asked for more).
             max_tools_total: Some(max_tools.max(TOOL_SCHEMA_CEILING)),
         };
-        let metering = Arc::new(MeteringSink::new(
+        // D-27: the store attaches its machine sampler and energy model to the session's sink.
+        let metering = Arc::new(self.metering.sink(
             id.clone(),
             cfg.model.clone(),
             specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
@@ -1787,6 +1801,11 @@ impl SessionManager {
         let mut registry = ToolRegistry::new(session.specs.clone())
             .with_host(HostKind::Core, core)
             .with_taint(session.taint.clone());
+        // US-6.2: while the session's latest toolchain reports block a deploy, `contract_deploy`
+        // is declined before it is announced, so core never opens a SignatureCeremony for it.
+        if let Some(guard) = session.deploy_guard() {
+            registry = registry.with_policy(Arc::new(guard));
+        }
         let skill_host = session.skills.as_ref().map(|l| SkillHost::new(l.current()));
         let capsule_host = capsules.map(|d| CapsuleHost {
             dispatch: d,
@@ -1905,7 +1924,13 @@ impl SessionManager {
         let rid = run_id.clone();
         let self_review = self.self_review;
         tokio::task::spawn_blocking(move || {
-            let sink = SessionSink(s.clone());
+            // HUP-S7.5 (D-27): a workflow's attempts are metered like chat turns, so their verifier
+            // verdicts and self-review opinions reach the daily report.
+            let session_sink = SessionSink(s.clone());
+            let sink = TeeSink {
+                observers: vec![s.metering.as_ref()],
+                last: &session_sink,
+            };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
             let reviewer =
                 LlmSelfReviewer::new(s.llm.as_ref(), s.cfg.model.clone(), SELF_REVIEW_MAX_TOKENS);
@@ -1928,6 +1953,8 @@ impl SessionManager {
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
+            // The last attempt's verdicts and opinion arrive after its `done`: drain now.
+            s.metering_store.append(s.metering.take_records());
             s.set_run(
                 &rid,
                 match out {
@@ -1982,16 +2009,23 @@ impl SessionManager {
                 last: &session_sink,
             };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
-            run_turn_with(
-                &s.cfg,
-                &s.opts,
-                s.llm.as_ref(),
-                &registry,
-                &sink,
-                &s.stop,
-                &mut history,
-                &text,
-            );
+            // US-6.1 AC2 / US-6.2: a deploy request while the gate blocks is answered with the
+            // refusal, the findings and the proposed fix, without a model call or any tool call.
+            match s.deploy_guard().and_then(|g| g.answer_to(&text)) {
+                Some(refusal) => answer_without_model(&sink, &mut history, &text, refusal),
+                None => {
+                    run_turn_with(
+                        &s.cfg,
+                        &s.opts,
+                        s.llm.as_ref(),
+                        &registry,
+                        &sink,
+                        &s.stop,
+                        &mut history,
+                        &text,
+                    );
+                }
+            }
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
@@ -2036,6 +2070,28 @@ impl SessionManager {
     pub fn count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
     }
+}
+
+/// A turn the sidecar answers itself (the deploy guard's refusal): the same events a model turn
+/// that answers in one step emits, and the same history.
+fn answer_without_model(
+    sink: &dyn EventSink,
+    history: &mut Vec<Message>,
+    user: &str,
+    answer: String,
+) {
+    history.push(Message::user(user));
+    sink.emit(Event::StepStart { step: 1 });
+    history.push(Message {
+        role: citrate_agent_loop::Role::Assistant,
+        content: answer.clone(),
+        tool_calls: vec![],
+        tool_call_id: None,
+    });
+    sink.emit(Event::Final { content: answer });
+    sink.emit(Event::Done {
+        outcome: "answered".into(),
+    });
 }
 
 /// Parse a `tool_results` status into an outcome.
