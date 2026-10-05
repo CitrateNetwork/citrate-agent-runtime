@@ -285,4 +285,9 @@ async fn web_search_without_searxng_reports_not_installed_in_the_session() {
     assert_eq!(v["enabled"], serde_json::json!(true));
     assert_eq!(v["searxng"], serde_json::json!("not_installed"));
     assert_eq!(v["reader"], serde_json::json!("local"));
+    assert_eq!(
+        v["engines"],
+        serde_json::json!([]),
+        "no SearXNG configured, so no engine"
+    );
 }

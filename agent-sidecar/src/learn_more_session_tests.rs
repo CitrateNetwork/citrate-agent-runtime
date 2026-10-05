@@ -131,7 +131,28 @@ async fn open_session(st: &Arc<AppState>) -> String {
 }
 
 /// Send one message and wait for the turn to finish.
+///
+/// The wait reads only events logged after this message was posted: a session that already
+/// finished a turn (or a workflow) holds an older `done`, and matching it would return before
+/// this turn reached the model. It also waits for the previous turn or workflow to release the
+/// session, which happens just after its `done`, so the post is not refused as busy.
 async fn send(st: &Arc<AppState>, sid: &str, text: &str) {
+    let mut after = None;
+    for _ in 0..100 {
+        let (_, page) = call(
+            st,
+            "GET",
+            &format!("/sessions/{sid}/events?after=0&wait_ms=0"),
+            serde_json::Value::Null,
+        )
+        .await;
+        if page["busy"] == false {
+            after = page["lastSeq"].as_u64();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut after = after.expect("the session stayed busy before this message");
     let (s, v) = call(
         st,
         "POST",
@@ -140,7 +161,6 @@ async fn send(st: &Arc<AppState>, sid: &str, text: &str) {
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
-    let mut after = 0u64;
     for _ in 0..100 {
         let (_, page) = call(
             st,

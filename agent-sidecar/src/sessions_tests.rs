@@ -1016,3 +1016,83 @@ async fn busy_sessions_are_never_replaced() {
     }
     st.sessions.stop_all();
 }
+
+/// A core client that answers a call the instant its `tool_call` event is visible: the session's
+/// loop thread is held right after the event is appended (and waiters are woken) until the test
+/// has posted the result through `POST …/tool_results` once, with no retry and without consulting
+/// `pending_core_calls`. Every answer must land. Before the fix the call was registered only after
+/// the event, so this post got 409 every time and the call timed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_posted_the_moment_the_tool_call_is_visible_is_delivered() {
+    use citrate_agent_loop::{Event, HostKind};
+    let st = state_with(
+        vec![
+            tc("c1", "web_fetch"),
+            tc("c2", "write_note"),
+            AssistantTurn::text("ok"),
+        ],
+        // Short, so an answer that was dropped shows up as a 409 in the assertion below rather
+        // than as a slow test.
+        Duration::from_secs(2),
+    );
+    let id = create_with(&st, taint_body(Some(true))).await;
+    let session = st.sessions.get(&id).expect("session");
+    let (seen_tx, mut seen_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Option<&'static str>)>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    session.set_event_hook(Arc::new(move |ev: &Event| {
+        if let Event::ToolCall {
+            call,
+            host: Some(HostKind::Core),
+            hic,
+            ..
+        } = ev
+        {
+            let _ = seen_tx.send((call.id.clone(), *hic));
+            // Hold the loop here, between the announcement and whatever follows it, until the
+            // client has answered.
+            if let Ok(rx) = release_rx.lock() {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }));
+    say(&st, &id, "read then write").await;
+    let mut answered = vec![];
+    for _ in 0..2 {
+        let (call_id, hic) = tokio::time::timeout(Duration::from_secs(15), seen_rx.recv())
+            .await
+            .expect("a core tool_call in time")
+            .expect("hook alive");
+        let r = app(st.clone())
+            .oneshot(req(
+                "POST",
+                &format!("/sessions/{id}/tool_results"),
+                serde_json::json!({"callId": call_id, "status": "ok", "content": "done"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        answered.push((call_id, hic, r.status()));
+        release_tx.send(()).expect("release the loop");
+    }
+    assert_eq!(
+        answered,
+        vec![
+            ("c1".to_string(), None, StatusCode::OK),
+            // The tainted write still reaches core marked for the member's decision: answering
+            // early changes when the result can land, not who has to decide it.
+            ("c2".to_string(), Some("required"), StatusCode::OK),
+        ]
+    );
+    let evs = wait_for(&st, &id, "done").await;
+    for c in ["c1", "c2"] {
+        let r = evs
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["call_id"] == c)
+            .unwrap_or_else(|| panic!("no tool_result for {c}: {evs:?}"));
+        assert_eq!(r["status"], "ok", "{c}: {r}");
+        assert_eq!(r["content"], "done", "{c}: {r}");
+    }
+    assert!(session.pending_core_calls().is_empty());
+}

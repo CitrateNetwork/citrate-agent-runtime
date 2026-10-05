@@ -24,6 +24,7 @@ pub mod capsule_sandbox;
 mod chain_routes;
 mod checkpoint_routes;
 pub mod decide;
+pub mod deploy_guard;
 pub mod escalation;
 pub mod files;
 pub mod grants;
@@ -33,6 +34,7 @@ pub mod llm_http;
 pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
+pub mod resources;
 pub mod retrieval_http;
 pub mod search;
 pub mod sessions;
@@ -362,6 +364,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route(
             "/metering/benchmark",
             post(chain_routes::metering_benchmark),
+        )
+        // HUP-S7.5 (D-27): core reports each mined Hermes transaction (SALT spent and gas)
+        .route(
+            "/metering/chain-receipt",
+            post(chain_routes::metering_chain_receipt),
         )
         // HUP-S7.3: nightly anchor batch (core signs with the anchor key; nothing is sent here)
         .route("/anchor/status", get(chain_routes::anchor_status))
@@ -1729,7 +1736,8 @@ type JsonErr = (StatusCode, Json<serde_json::Value>);
 
 // ── HUP-S5.2 / S5.3: search status + the decide() slot ──────────────────
 
-/// `{enabled, searxng, reader}`. Never a key, a path, or a query.
+/// `{enabled, searxng, reader, engines}`: `engines` names the third-party engines SearXNG may
+/// load (US-5.2 AC2). Never a key, a path, or a query.
 async fn search_status(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1739,7 +1747,7 @@ async fn search_status(
     }
     let Some(host) = st.sessions.search() else {
         return Ok(Json(serde_json::json!({
-            "enabled": false, "searxng": "off", "reader": "local"
+            "enabled": false, "searxng": "off", "reader": "local", "engines": []
         })));
     };
     let reader = if host.third_party_reader() {
@@ -1747,6 +1755,7 @@ async fn search_status(
     } else {
         "local"
     };
+    let engines = host.searxng().engines();
     let searxng = tokio::task::spawn_blocking(move || match host.searxng().state() {
         citrate_agent_search::SearxngState::NotInstalled(_) => "not_installed",
         citrate_agent_search::SearxngState::Idle => "idle",
@@ -1756,7 +1765,7 @@ async fn search_status(
     .await
     .unwrap_or("failed");
     Ok(Json(serde_json::json!({
-        "enabled": true, "searxng": searxng, "reader": reader
+        "enabled": true, "searxng": searxng, "reader": reader, "engines": engines
     })))
 }
 
@@ -2151,6 +2160,8 @@ mod verify_probes_tests;
 mod browser_session_tests;
 #[cfg(test)]
 mod decide_route_tests;
+#[cfg(test)]
+mod deploy_guard_session_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]
