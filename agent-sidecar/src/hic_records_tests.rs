@@ -370,6 +370,60 @@ async fn core_events_become_records_the_anchor_batches_and_proves() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn core_faucet_events_are_recorded_with_the_right_tier() {
+    // HUP-S6.5 (faucet ADR D4.3): the member's faucet switch is HIC-1; a top-up asked by Hermes
+    // inside the member's budget is HIC-2; a top-up the member clicked is HIC-1.
+    let fx = Fx::new();
+    let st = fx.state(vec![], None, None, true);
+    let batch = serde_json::json!({ "records": [
+        core_record(1, "faucet.budget_granted", "approved", Some("completed")),
+        core_record(2, "faucet.topup", "auto_within_budget", Some("completed")),
+        core_record(3, "faucet.topup", "approved", Some("failed")),
+        core_record(4, "faucet.topup", "auto_within_budget", Some("outcome_unknown")),
+        core_record(5, "faucet.budget_revoked", "approved", Some("completed")),
+    ]});
+    let (s, v) = call(&st, "POST", "/records/core", batch).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let d = decisions(&fx);
+    let tiers: Vec<_> = d.iter().map(|(_, e)| (e.kind.as_str(), e.tier)).collect();
+    assert_eq!(
+        tiers,
+        vec![
+            ("faucet.budget_granted", HicTier::Hic1),
+            ("faucet.topup", HicTier::Hic2),
+            ("faucet.topup", HicTier::Hic1),
+            ("faucet.topup", HicTier::Hic2),
+            ("faucet.budget_revoked", HicTier::Hic1),
+        ]
+    );
+    assert_eq!(outcome_of(&fx, d[2].0), Some(Outcome::Failed));
+    assert_eq!(outcome_of(&fx, d[3].0), Some(Outcome::OutcomeUnknown));
+    fx.anchor_covers_all();
+
+    // A faucet switch is never HIC-2, and a top-up is never a denial.
+    for bad in [
+        core_record(
+            6,
+            "faucet.budget_granted",
+            "auto_within_budget",
+            Some("completed"),
+        ),
+        core_record(7, "faucet.budget_revoked", "denied", None),
+        core_record(8, "faucet.topup", "denied", None),
+        core_record(9, "faucet.drain", "approved", Some("completed")),
+    ] {
+        let (s, v) = call(
+            &st,
+            "POST",
+            "/records/core",
+            serde_json::json!({ "records": [bad.clone()] }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_core_batch_writes_nothing() {
     let fx = Fx::new();
     let st = fx.state(vec![], None, None, true);

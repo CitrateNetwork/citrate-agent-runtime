@@ -89,6 +89,8 @@ wasmtime-wasi-io = "49.0.2"
 # HUP-S2.5 — capsule WASI preopens are scoped to live folder grants. In-repo
 # path crate (agent-grants -> agent-guard); keyless, nothing in it signs.
 citrate-agent-grants = { path = "../../agent-grants" }
+# Shared public-address predicate for capsule egress allowlists (keyless, tiny).
+citrate-agent-guard = { path = "../../agent-guard" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

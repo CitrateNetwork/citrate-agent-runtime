@@ -30,6 +30,9 @@
 //!   CITRATE_HERMES_SHELL_PATH   shell_run search path override, a path list (optional)
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
+//!   CITRATE_HERMES_MCP_REGISTRY HUP-S4.4: core's owner-only saved MCP server list
+//!                               (mcp-servers.json); POST /mcp/probe starts only entries saved
+//!                               there exactly as sent; unset = every probe is refused (optional)
 //!   CITRATE_HERMES_CHECKPOINTS  HUP-S2.9: absolute directory of the undo checkpoint store; set =
 //!                               the /checkpoints undo routes are served, and sessions opened with
 //!                               a grant document get checkpointed file_write / sheet_write plus
@@ -76,11 +79,15 @@
 //!                               serves the /browser control routes; anything else = off (optional)
 //!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
 //!                               updater); unset = a system Chromium if one exists (optional)
+//!   CITRATE_BROWSER_ALLOW_PRIVATE  developer use: local origins the managed browser may open
+//!                               (comma separated, e.g. http://127.0.0.1:8545); unset = public
+//!                               web addresses only (optional)
 //!
 //! HUP-S1.9: `citrate-agent-sidecar --worker toolchain` runs this binary as the toolchain worker
 //! process instead (stdio line protocol, started and supervised by the control-plane process; it
 //! reads the same `CITRATE_HERMES_TOOLCHAIN*` variables). On SIGTERM or Ctrl-C the control plane
-//! stops accepting requests and shuts its workers down cleanly before exiting.
+//! stops accepting requests and stops its child processes (workers, browser, SearXNG, MCP
+//! servers) before exiting.
 
 use std::sync::Arc;
 
@@ -180,19 +187,20 @@ async fn control_plane() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the worker processes first (each gets a shutdown
-    // request and a grace period, well inside core's 5 s stop grace), then let the server drain.
-    // Off the async runtime: it joins the supervisor threads.
+    // HUP-S1.9: on SIGTERM / Ctrl-C, stop the child processes first (workers get a shutdown
+    // request and a grace period, well inside core's 5 s stop grace; the browser, SearXNG and MCP
+    // servers are stopped explicitly), then let the server drain. Off the async runtime: it joins
+    // the supervisor threads.
     let sessions = state.sessions.clone();
     let served = axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+            let _ = tokio::task::spawn_blocking(move || sessions.shutdown_children()).await;
         })
         .await;
     // Idempotent: covers a server that ended without a signal.
     let sessions = state.sessions.clone();
-    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_workers()).await;
+    let _ = tokio::task::spawn_blocking(move || sessions.shutdown_children()).await;
     served?;
     Ok(())
 }

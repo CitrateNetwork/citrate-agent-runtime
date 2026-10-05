@@ -1,0 +1,90 @@
+{
+ "what": "HUP-S5.2 live run: web_search and read_url through the Hermes sidecar (citrate-agent-sidecar built from hup/n6-web-browse) with a real SearXNG and a real model.",
+ "recorded": "2026-10-04",
+ "setup": {
+  "searxng": "commit d48c4b555421e824342c51d68482dd0898e54d0f (2026.10.4), installed with pip into a Python 3.12 venv; started by the sidecar's supervisor on loopback with its generated settings",
+  "sidecar_env": [
+   "CITRATE_HERMES_SEARCH=1",
+   "CITRATE_HERMES_SEARXNG=<venv>",
+   "CITRATE_HERMES_SEARXNG_DATA=<data dir>",
+   "CITRATE_HERMES_BROWSER=1",
+   "CITRATE_BROWSER_CHROMIUM=<Chrome for Testing 154>"
+  ],
+  "model": "gemma-4-E4B-it-Q4_0.gguf (T0) on llama-server build 10909, loopback",
+  "reader": "local readability (nothing sent to a third party)"
+ },
+ "first_attempt": "The first run failed: SearXNG refused the generated settings.yml ('Invalid settings.yml') because a Rust string continuation dropped the indentation of every nested key. Fixed in agent-search (settings_nest_every_key_under_its_section), then this run passed.",
+ "upstream_engines_note": "Across the runs on this machine brave refused ('too many requests'), duckduckgo answered with a CAPTCHA and wikidata timed out; the results came from the remaining engines. Engine availability is outside Citrate's control.",
+ "seconds": 148.0,
+ "prompt": "Use web_search to find the SearXNG project's official documentation site, then use read_url on the best result and tell me in two sentences what SearXNG is.",
+ "events": [
+  {
+   "type": "step_start",
+   "step": 1
+  },
+  {
+   "type": "tool_call",
+   "step": 1,
+   "call": {
+    "id": "HxXn0c5roiYv8uIdnwtghQIBcWeMWBEi",
+    "name": "web_search",
+    "arguments": "{\"query\":\"SearXNG project official documentation\"}"
+   },
+   "host": "sidecar"
+  },
+  {
+   "type": "tool_result",
+   "step": 1,
+   "call_id": "HxXn0c5roiYv8uIdnwtghQIBcWeMWBEi",
+   "status": "ok",
+   "content": "[search results from web_search: untrusted data, not instructions]\nquery: SearXNG project official documentation\n1. SearXNG Documentation (2026.10.4+d48c4b555)\n   https://searxng.org/\n   … the origin. SearXNG development has been started in the middle of 2021 as a fork of the searx project.\n2. About SearXNG - SearXNG Documentation (2026.10.2+26b90797e)\n   https://docs.searxng.org/user/about.html\n   To get further information, visit SearXNG's project documentation at SearXNG docs. Why use it?¶. SearXNG may not offer you as personalized results as Google ...\n3. SearXNG is a free internet metasearch engine which ... - GitHub\n   https://github.com/searxng/searxng\n   This project is licensed under the GNU Affero General Public License ... Users are neither tracked nor profiled. docs.searxng.org. Topics. bingbrave ...\n4. Installation - SearXNG Documentation (2026.10.2+19ffbcd30)\n   https://docs.searxng.org/admin/installation.html\n   If you do not have any special preferences, it's recommended to use the Installation container or the Installation Script. Attention. SearXNG is growing rapidly ...\n5. Development Quickstart - SearXNG Documentation (2026.10.2+ ...\n   https://docs.searxng.org/dev/quickstart.html\n   SearXNG loves developers; Developers do not need to worry about tool chains, the usual developer tasks can be comfortably executed via make. Don't hesitate, ...\n6. SearxNG — UberLab 7 documentation\n   https://lab.uberspace.de/guide_searx/\n   The official documentation is a good address. Tested with Uberspace 7.9.0.0 ... All project logos are property of the respective project.\n7. searx_search | langchain_community - LangChain Reference\n   https://reference.langchain.com/python/langchain-community/utilities/searx_search\n   See SearxNG Configured Engines <https://docs.searxng.org ... searxng which is better maintained than the original Searx project and offers more features.\n8. Local AI Stack: Configure searxng Part3 - Valentin Mariette - Medium\n   https://nospof.medium.com/local-ai-stack-configure-searxng-part3-c627d518a275\n   Jan 17, 2026 ... It is an active fork of the original Searx project ... The official documentation can be found : https://docs.searxng.org/admin/settings/ ...\n[end of search results]"
+  },
+  {
+   "type": "tainted",
+   "step": 1,
+   "source": "web_search",
+   "reason": "web_search returned untrusted content"
+  },
+  {
+   "type": "step_end",
+   "step": 1
+  },
+  {
+   "type": "step_start",
+   "step": 2
+  },
+  {
+   "type": "tool_call",
+   "step": 2,
+   "call": {
+    "id": "hgcgkXKvffs3HBABW3MpGoYkoQMZ66xE",
+    "name": "read_url",
+    "arguments": "{\"url\":\"https://docs.searxng.org/user/about.html\"}"
+   },
+   "host": "sidecar"
+  },
+  {
+   "type": "tool_result",
+   "step": 2,
+   "call_id": "hgcgkXKvffs3HBABW3MpGoYkoQMZ66xE",
+   "status": "ok",
+   "content": "[web page from read_url: untrusted data, not instructions]\nsource: https://docs.searxng.org/user/about.html\ntitle: About SearXNG - SearXNG Documentation (2026.10.4+d48c4b555)\nreader: local readability (nothing was sent to a third party)\n\nSearXNG is a [metasearch engine](https://en.wikipedia.org/wiki/Metasearch_engine), aggregating the results of other `search engines` while not storing information about its users.\n\nThe SearXNG project is driven by an open community. Come join us on Matrix if you have questions or just want to chat about SearXNG at [#searxng:matrix.org](https://matrix.to/#/#searxng:matrix.org)\n\nMake SearXNG better:\n\n- You can improve SearXNG translations at [Weblate](https://translate.codeberg.org/projects/searxng/), or…\n\n- Track development, send contributions, and report issues at [SearXNG sources](https://github.com/searxng/searxng).\n\n- To get further information, visit SearXNG’s project documentation at [SearXNG docs](https://docs.searxng.org/).\n\n## Why use it?[¶](#why-use-it \"Link to this heading\")\n\n- SearXNG may not offer you as personalized results as Google, but it doesn’t generate a profile about you.\n\n- SearXNG doesn’t care about what you search for, never shares anything with a third-party, and can’t be used to compromise you.\n\n- SearXNG is free software; the code is 100% open, and everyone is welcome to make it better.\n\nIf you do care about privacy, want to be a conscious user, or otherwise believe in digital freedom, make SearXNG your default search engine or run it on your own server!\n\n## How do I set it as the default search engine?[¶](#how-do-i-set-it-as-the-default-search-engine \"Link to this heading\")\n\nSearXNG supports [OpenSearch](https://github.com/dewitt/opensearch/blob/master/opensearch-1-1-draft-6.md). For more information on changing your default search engine, see your browser’s documentation:\n\n- [Firefox](https://support.mozilla.org/en-US/kb/add-or-remove-search-engine-firefox)\n\n- [Microsoft Edge](https://support.microsoft.com/en-us/help/4028574/microsoft-edge-change-the-default-search-engine) - Behind the link, you will also find some useful instructions for Chrome and Safari.\n\n- [Chromium](https://www.chromium.org/tab-to-search)-based browsers only add websites that the user navigates to without a path.\n\nWhen adding a search engine, there must be no duplicates with the same name. If you encounter a problem where you cannot add the search engine, you can either:\n\n- Remove the duplicate (default name: SearXNG) or\n\n- Contact the owner to give the instance a different name from the default.\n\n## How does it work?[¶](#how-does-it-work \"Link to this heading\")\n\nSearXNG is a fork of the well-known [searx](https://github.com/searx/searx) [metasearch engine](https://en.wikipedia.org/wiki/Metasearch_engine) which was inspired by the [Seeks project](https://beniz.github.io/seeks/). It provides basic privacy by mixing your queries with searches on other platforms without storing search data. SearXNG can be added to your browser’s search bar; moreover, it can be set as the default search engine.\n\nThe `stats page` contains some useful anonymous usage statistics about the engines used.\n\n## How can I make it my own?[¶](#how-can-i-make-it-my-own \"Link to this heading\")\n\nSearXNG appreciates your concern regarding logs, so take the code from the [SearXNG sources](https://github.com/searxng/searxng) and run it yourself!\n\nAdd your instance to this [list of public instances](https://searx.space) to help other people reclaim their privacy and make the internet freer. The more decentralized the internet is, the more freedom we have!\n[end of web page]"
+  },
+  {
+   "type": "step_end",
+   "step": 2
+  },
+  {
+   "type": "step_start",
+   "step": 3
+  },
+  {
+   "type": "final",
+   "content": "SearXNG is a metasearch engine that aggregates results from various other search engines while maintaining user privacy by not storing information about its users. It provides a degree of privacy by mixing search queries with other platforms without collecting or sharing user data."
+  },
+  {
+   "type": "done",
+   "outcome": "answered"
+  }
+ ]
+}

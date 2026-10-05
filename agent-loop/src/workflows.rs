@@ -16,8 +16,8 @@
 
 use crate::interview::bundled_tracks;
 use crate::verifiers_tooling::{
-    ForgeTestsPass, MedusaNoFailures, SarifBelowThreshold, Severity, ADERYN_SCAN_TOOL,
-    FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
+    ForgeTestsPass, MedusaNoFailures, SarifBelowThreshold, ScanReportRead, Severity,
+    ADERYN_SCAN_TOOL, FORGE_TEST_TOOL, MEDUSA_FUZZ_TOOL, SLITHER_SCAN_TOOL,
 };
 use crate::{
     AnswerContains, FileDigest, HttpProbe, HttpStatusIs, JsonFieldEquals, Sha256Equals, Step,
@@ -99,6 +99,10 @@ pub enum VerifierSpec {
         threshold: String,
     },
     MedusaNoFailures {},
+    /// The latest scan of a SARIF scanner produced a report that was read (any findings).
+    ScanReportRead {
+        tool: String,
+    },
     /// HUP-S1.3: `GET url` answers exactly `status`.
     HttpStatusIs {
         url: String,
@@ -118,7 +122,8 @@ impl VerifierSpec {
             VerifierSpec::ToolSucceeded { tool }
             | VerifierSpec::ToolNotCalled { tool }
             | VerifierSpec::JsonFieldEquals { tool, .. }
-            | VerifierSpec::SarifBelowThreshold { tool, .. } => Some(tool),
+            | VerifierSpec::SarifBelowThreshold { tool, .. }
+            | VerifierSpec::ScanReportRead { tool } => Some(tool),
             VerifierSpec::ForgeTestsPass {} => Some(FORGE_TEST_TOOL),
             VerifierSpec::MedusaNoFailures {} => Some(MEDUSA_FUZZ_TOOL),
             VerifierSpec::AnswerContains { .. }
@@ -177,6 +182,11 @@ impl VerifierSpec {
                 if Severity::parse(threshold).is_none() {
                     return Err(format!("unknown severity {threshold:?}"));
                 }
+            }
+            VerifierSpec::ScanReportRead { tool }
+                if tool != SLITHER_SCAN_TOOL && tool != ADERYN_SCAN_TOOL =>
+            {
+                return Err(format!("{tool:?} is not a SARIF scanner"));
             }
             VerifierSpec::HttpStatusIs { url, status } => {
                 let lower = url.to_ascii_lowercase();
@@ -251,6 +261,7 @@ impl VerifierSpec {
                 Arc::new(SarifBelowThreshold::new(tool, t))
             }
             VerifierSpec::MedusaNoFailures {} => Arc::new(MedusaNoFailures::default()),
+            VerifierSpec::ScanReportRead { tool } => Arc::new(ScanReportRead::new(tool)),
             VerifierSpec::HttpStatusIs { url, status } => {
                 let probe = env.http.clone().ok_or_else(|| {
                     "http_status_is needs the sidecar session's HTTP probe".to_string()

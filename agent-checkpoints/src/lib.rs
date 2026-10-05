@@ -60,6 +60,7 @@
 //! owns the app-data directory and the undo UI.
 
 mod blobs;
+mod diff;
 mod error;
 mod fsutil;
 mod git;
@@ -69,6 +70,7 @@ mod session;
 mod state;
 mod store;
 
+pub use diff::{FileDiff, Side, StepDiff, DEFAULT_MAX_SIDE_BYTES};
 pub use error::{Conflict, Error, Result};
 pub use git::{checkpoint_ref, GitCheckpoint};
 pub use manifest::StepStatus;

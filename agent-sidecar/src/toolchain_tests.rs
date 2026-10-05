@@ -491,7 +491,13 @@ fn forge_test_runs_the_fixed_template_offline_and_reports_failures() {
     assert_eq!(env.run.as_ref().unwrap()["exit_code"], 1);
     assert_eq!(
         s.args_of("forge"),
-        vec!["test", "--json", "--match-contract", "CounterFailTest"]
+        vec![
+            "test",
+            "--json",
+            "--force",
+            "--match-contract",
+            "CounterFailTest"
+        ]
     );
     let envv = s.env_of("forge");
     assert_eq!(envv[0], "true", "FOUNDRY_OFFLINE");
@@ -507,6 +513,22 @@ fn forge_test_runs_the_fixed_template_offline_and_reports_failures() {
     ));
 }
 
+/// HUP-S6.3 -> S6.4: forge_test always rebuilds from the sources (`--force`), so an artifact
+/// placed in `out/` by hand is cleared rather than recorded as this run's build and bound to the
+/// deploy gate. Without `--force`, forge skips an unchanged build and keeps `out/` as it is.
+#[test]
+fn forge_test_always_rebuilds_so_out_cannot_be_planted() {
+    let s = Scratch::new();
+    s.fake("forge", Some("forge-test-pass.json"), "", 0);
+    let (_out, env) = run(
+        &s.host(),
+        FORGE_TEST_TOOL,
+        serde_json::json!({"project": s.proj()}),
+    );
+    assert_eq!(env.status, RunStatus::Completed);
+    assert_eq!(s.args_of("forge"), vec!["test", "--json", "--force"]);
+}
+
 #[test]
 fn forge_test_passing_run_passes_the_verifier() {
     let s = Scratch::new();
@@ -519,7 +541,13 @@ fn forge_test_passing_run_passes_the_verifier() {
     assert!(env.verdict.as_ref().unwrap().passed);
     assert_eq!(
         s.args_of("forge"),
-        vec!["test", "--json", "--match-test", "test_Increment"]
+        vec![
+            "test",
+            "--json",
+            "--force",
+            "--match-test",
+            "test_Increment"
+        ]
     );
     assert_eq!(
         verify(&ForgeTestsPass::default(), &[record(FORGE_TEST_TOOL, &out)]),

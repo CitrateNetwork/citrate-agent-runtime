@@ -96,8 +96,10 @@ impl Cdp {
         let addr = loopback_ws_addr(ws_url)?;
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
             .map_err(|e| format!("could not reach the browser: {e}"))?;
+        // The handshake waits as long as a command may (at least 10 s): a loaded machine can take
+        // longer than that to answer it (A51).
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(timeout.max(Duration::from_secs(10))))
             .map_err(|e| e.to_string())?;
         let (mut ws, _resp) = tungstenite::client(ws_url, stream)
             .map_err(|e| format!("the browser refused the DevTools connection: {e}"))?;

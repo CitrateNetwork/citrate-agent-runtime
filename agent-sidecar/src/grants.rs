@@ -488,7 +488,7 @@ impl FileToolHost {
             Ok(x) => x,
             Err(e) => return ToolOutcome::Denied(e),
         };
-        let mut f = match open_nofollow(&file, false) {
+        let mut f = match open_checked(&file, false) {
             Ok(f) => f,
             Err(e) => return ToolOutcome::Error(format!("cannot open {}: {e}", file.display())),
         };
@@ -615,10 +615,13 @@ pub(crate) fn hard_linked(_m: &std::fs::Metadata) -> bool {
 
 /// Open without following a symlink at the leaf (where the OS allows), so a link swapped in after
 /// the check is refused instead of followed.
-pub(crate) fn open_nofollow(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+fn open_nofollow(path: &Path, write: bool, create_new: bool) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
     if write {
-        o.write(true).create(true).truncate(true);
+        o.write(true);
+        if create_new {
+            o.create_new(true);
+        }
     } else {
         o.read(true);
     }
@@ -628,4 +631,80 @@ pub(crate) fn open_nofollow(path: &Path, write: bool) -> std::io::Result<std::fs
         o.custom_flags(libc::O_NOFOLLOW);
     }
     o.open(path)
+}
+
+/// Where an open file actually is (macOS `F_GETPATH`, Linux `/proc/self/fd`).
+#[cfg(target_os = "macos")]
+fn opened_path(f: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated, into `buf`, which is
+    // PATH_MAX + 1 bytes long; the fd is open for the whole call.
+    let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn opened_path(f: &std::fs::File) -> Option<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()
+}
+
+/// Whether the opened file is the one at `expected` (the grant check's resolved path). macOS
+/// volumes are usually case-insensitive, so case alone is not a mismatch there.
+#[cfg(unix)]
+pub(crate) fn opened_at(f: &std::fs::File, expected: &Path) -> bool {
+    match opened_path(f) {
+        Some(actual) if actual == expected => true,
+        Some(actual) if cfg!(target_os = "macos") => actual
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// Open the file the grant check resolved (`path`, already canonical), never through a symlink
+/// at the leaf, and confirm the opened file is still at that path: a folder on the way that was
+/// swapped for a link after the check makes the open land elsewhere, and it is refused (a file
+/// this call created there is removed). A write opens an existing file without truncating it,
+/// or creates a new one, and truncates only once the open is confirmed. On systems where the
+/// opened path cannot be read (not Unix) the open is not confirmed.
+pub(crate) fn open_checked(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+    let moved = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the path changed while it was being opened",
+        )
+    };
+    let (f, created) = if write {
+        match open_nofollow(path, true, false) {
+            Ok(f) => (f, false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (open_nofollow(path, true, true)?, true)
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        (open_nofollow(path, false, false)?, false)
+    };
+    #[cfg(unix)]
+    if !opened_at(&f, path) {
+        if created {
+            if let Some(actual) = opened_path(&f) {
+                let _ = std::fs::remove_file(actual);
+            }
+        }
+        return Err(moved());
+    }
+    #[cfg(not(unix))]
+    let _ = (created, moved);
+    if write {
+        f.set_len(0)?;
+    }
+    Ok(f)
 }

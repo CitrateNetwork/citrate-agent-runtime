@@ -72,14 +72,43 @@ impl From<WireOutcome> for ToolOutcome {
     }
 }
 
-/// The spec for a toolchain worker: `program --worker toolchain`, with `env` added to the
-/// inherited environment (production passes none).
+/// What the toolchain worker inherits from the sidecar (exact names; `*` ends a prefix): process
+/// basics (as the MCP host's base list) and the `CITRATE_HERMES_TOOLCHAIN*` / solc settings
+/// [`ToolchainConfig::from_env`] reads.
+pub const TOOLCHAIN_WORKER_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "COMSPEC",
+    "CITRATE_HERMES_TOOLCHAIN*",
+    "CITRATE_HERMES_SOLC",
+];
+
+/// The spec for a toolchain worker: `program --worker toolchain`, inheriting only
+/// [`TOOLCHAIN_WORKER_ENV`], with `env` added (production passes none).
 pub fn toolchain_worker_spec(program: PathBuf, env: Vec<(String, String)>) -> WorkerSpec {
     WorkerSpec {
         kind: WorkerKind::Toolchain,
         program,
         args: vec![WORKER_ARG.to_string(), WORKER_TOOLCHAIN.to_string()],
         env,
+        // Process basics and the toolchain's own settings only: nothing else from the sidecar's
+        // environment (model endpoints, API key files, MCP config) reaches the worker.
+        env_inherit: Some(TOOLCHAIN_WORKER_ENV.iter().map(|s| s.to_string()).collect()),
         // The worker needs none of the control plane's own settings.
         env_remove: [
             "CITRATE_HERMES_TOKEN_FILE",
@@ -362,6 +391,49 @@ mod tests {
     #[test]
     fn the_call_timeout_outlasts_the_longest_toolchain_run() {
         assert!(TOOLCHAIN_CALL_TIMEOUT.as_secs() > crate::toolchain::LONGEST_RUN_SECS);
+    }
+
+    /// The toolchain worker inherits only process basics and the toolchain's own settings, never
+    /// the rest of the sidecar's environment (model endpoints, API key files, ...).
+    #[test]
+    fn the_toolchain_worker_inherits_only_what_it_needs() {
+        let s = toolchain_worker_spec(PathBuf::from("/x/sidecar"), vec![]);
+        let allow = s.env_inherit.expect("an inherit list");
+        let passes = |k: &str| {
+            allow.iter().any(|a| match a.strip_suffix('*') {
+                Some(prefix) => k.starts_with(prefix),
+                None => a == k,
+            })
+        };
+        for k in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "TZ",
+            "TMPDIR",
+            "CITRATE_HERMES_TOOLCHAIN",
+            "CITRATE_HERMES_TOOLCHAIN_ROOTS",
+            "CITRATE_HERMES_TOOLCHAIN_PATH",
+            "CITRATE_HERMES_SOLC",
+        ] {
+            assert!(passes(k), "{k} is needed by the worker");
+        }
+        for k in [
+            "CITRATE_HERMES_TOKEN_FILE",
+            "CITRATE_HERMES_ADDR",
+            "CITRATE_HERMES_JEV_KEY_FILE",
+            "CITRATE_HERMES_JINA_KEY_FILE",
+            "CITRATE_HERMES_MCP",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "HF_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "FOUNDRY_FFI",
+        ] {
+            assert!(!passes(k), "{k} must not reach the worker");
+        }
     }
 
     #[test]

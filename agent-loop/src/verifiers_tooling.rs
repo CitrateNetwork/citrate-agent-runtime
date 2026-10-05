@@ -783,6 +783,41 @@ pub struct ToolchainEnvelope {
     /// no report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// HUP-S6.3/S6.4 (retro A27): the raw report for the app's deploy gate. The sidecar session
+    /// takes it out of the envelope before the model sees the result and keeps it for core,
+    /// whose deploy gate parses it again and alone decides READY. The `verdict` above only drives
+    /// workflow steps; it is never a deploy verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateReport>,
+}
+
+/// What the app's deploy gate needs from one completed toolchain run (HUP-S6.3 → HUP-S6.4).
+///
+/// The deploy gate in citrate-core is the one source of truth for a deploy verdict: it re-parses
+/// `output` itself. This record only carries the raw facts and binds them to one state of the
+/// project: `sources_sha256` is taken before and after the run (a run whose sources changed while
+/// it ran carries `None`), and a forge run records the creation bytecode of every artifact it
+/// built, so core can check that the bytecode it deploys is the one these tools saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateReport {
+    /// The canonical project folder the tool ran in.
+    pub project: String,
+    /// The program's raw stdout report (JSON, SARIF or log text), exactly as captured.
+    pub output: String,
+    pub duration_ms: u64,
+    /// SHA-256 over the project's sources at the run (see the sidecar's `toolchain_reports`).
+    #[serde(default)]
+    pub sources_sha256: Option<String>,
+    /// medusa: the call budget the campaign was started with (`--test-limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_limit: Option<u64>,
+    /// medusa: the campaign's lcov coverage report, when this run wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_lcov: Option<String>,
+    /// forge: `<File>.sol/<Contract>.json` under `out/` -> SHA-256 of its creation bytecode hex
+    /// (lower case, no `0x`), as built by this run.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub artifacts: std::collections::BTreeMap<String, String>,
 }
 
 impl ToolchainEnvelope {
@@ -796,6 +831,7 @@ impl ToolchainEnvelope {
             verdict: Some(verdict),
             run: None,
             diagnostics: Vec::new(),
+            gate: None,
         }
     }
 
@@ -809,6 +845,7 @@ impl ToolchainEnvelope {
             verdict: None,
             run: None,
             diagnostics: Vec::new(),
+            gate: None,
         }
     }
 
@@ -819,6 +856,12 @@ impl ToolchainEnvelope {
 
     pub fn with_diagnostics(mut self, lines: Vec<String>) -> Self {
         self.diagnostics = lines;
+        self
+    }
+
+    /// Attach the raw report for the app's deploy gate (see [`GateReport`]).
+    pub fn with_gate(mut self, gate: GateReport) -> Self {
+        self.gate = Some(gate);
         self
     }
 
@@ -945,6 +988,38 @@ impl Verifier for SarifBelowThreshold {
     fn verify(&self, ctx: &VerifyContext) -> Verdict {
         let t = self.threshold;
         rejudge(ctx, &self.tool, |r: &SarifReport| judge_sarif(r, t))
+    }
+}
+
+/// Passes when the latest scan of `tool` produced a SARIF report that was read, whatever it
+/// found (an audit reports the findings). A run whose output could not be read never passes.
+#[derive(Debug, Clone)]
+pub struct ScanReportRead {
+    pub tool: String,
+}
+
+impl ScanReportRead {
+    pub fn new(tool: &str) -> Self {
+        ScanReportRead { tool: tool.into() }
+    }
+}
+
+impl Verifier for ScanReportRead {
+    fn name(&self) -> String {
+        format!("{}: the scan report was read", self.tool)
+    }
+    fn verify(&self, ctx: &VerifyContext) -> Verdict {
+        rejudge(ctx, &self.tool, |r: &SarifReport| {
+            let tool = if r.tool.is_empty() { "scan" } else { &r.tool };
+            ToolchainVerdict {
+                passed: true,
+                reason: format!(
+                    "{tool}: report read ({})",
+                    plural(r.counts.total(), "finding", "findings")
+                ),
+                evidence: serde_json::to_value(r).unwrap_or(Value::Null),
+            }
+        })
     }
 }
 
