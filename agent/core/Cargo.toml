@@ -91,6 +91,9 @@ wasmtime-wasi-io = "49.0.2"
 citrate-agent-grants = { path = "../../agent-grants" }
 # Shared public-address predicate for capsule egress allowlists (keyless, tiny).
 citrate-agent-guard = { path = "../../agent-guard" }
+# HUP-S7.1: the AnchorRegistry own-anchor check (isAnchoredBy on the next registry version, the
+# first committer on the deployed one) as a pure read sequence. Keyless; nothing in it signs.
+citrate-agent-anchor = { path = "../../agent-anchor" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

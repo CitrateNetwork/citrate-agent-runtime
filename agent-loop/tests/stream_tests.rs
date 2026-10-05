@@ -256,6 +256,7 @@ impl LlmClient for StreamingWithUsage {
                 prompt_tokens: 40,
                 completion_tokens: 8,
                 generation_ms: Some(200),
+                prompt_ms: None,
             }),
         ))
     }

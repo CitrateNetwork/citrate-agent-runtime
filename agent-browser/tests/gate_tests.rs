@@ -8,7 +8,8 @@
 //!   are never sent there.
 
 use citrate_agent_browser::gate::{
-    fetch_patterns, managed_verdict, parse_allow_private, resolved_verdict, Verdict,
+    closed_verdict, fetch_patterns, is_loopback_host, managed_verdict, managed_verdict_for,
+    parse_allow_private, parse_open_web, resolved_verdict, Verdict,
 };
 use citrate_agent_browser::scope::Origin;
 
@@ -135,4 +136,108 @@ fn managed_mode_pauses_every_request_and_attach_mode_every_page_load() {
     let attached = fetch_patterns(true);
     assert_eq!(attached[0]["resourceType"], "Document");
     assert_eq!(attached[0]["requestStage"], "Request");
+}
+
+// ---- HUP-S5.5: off the open web (browserMayOpenWeb = false) -----------------------------------
+
+#[test]
+fn the_open_web_switch_is_open_unless_core_says_otherwise_and_fails_closed() {
+    assert!(parse_open_web(None), "unset: the behaviour before the rule");
+    assert!(parse_open_web(Some("1")));
+    assert!(parse_open_web(Some(" 1 ")));
+    for closed in ["0", "", "true", "yes", "01", "off"] {
+        assert!(!parse_open_web(Some(closed)), "{closed:?} is closed");
+    }
+}
+
+#[test]
+fn off_the_open_web_no_public_address_is_reached() {
+    for url in [
+        "https://example.com/",
+        "https://1.1.1.1/",
+        "http://[2606:4700:4700::1111]/",
+        "https://cdn.example.com/app.js",
+        "http://10.0.0.5/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:8545/",
+        "http://localhost:3000/",
+    ] {
+        assert!(
+            matches!(closed_verdict(url, &[]), Verdict::Block(ref why) if why.contains("off the open web")),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn off_the_open_web_only_allowed_origins_on_this_machine_open() {
+    let allow = parse_allow_private(
+        "http://127.0.0.1:8545, http://localhost:3000, http://[::1]:9000, http://10.0.0.5:8545, https://example.com",
+    )
+    .expect("allow");
+    for url in [
+        "http://127.0.0.1:8545/rpc",
+        "http://localhost:3000/",
+        "http://[::1]:9000/",
+    ] {
+        assert_eq!(closed_verdict(url, &allow), Verdict::Continue, "{url}");
+    }
+    for url in [
+        "http://10.0.0.5:8545/",
+        "https://example.com/",
+        "http://127.0.0.1:8546/",
+    ] {
+        assert!(
+            matches!(closed_verdict(url, &allow), Verdict::Block(_)),
+            "{url} is not an allowed origin on this machine"
+        );
+    }
+    // Non-network schemes stay inside the browser.
+    assert_eq!(closed_verdict("about:blank", &[]), Verdict::Continue);
+    assert!(matches!(closed_verdict("http://", &[]), Verdict::Block(_)));
+}
+
+#[test]
+fn the_open_web_rule_picks_the_verdict() {
+    assert_eq!(
+        managed_verdict_for("https://1.1.1.1/", &[], true, true),
+        Verdict::Continue,
+        "open: a public address is reached as before"
+    );
+    assert!(matches!(
+        managed_verdict_for("https://1.1.1.1/", &[], true, false),
+        Verdict::Block(_)
+    ));
+    assert!(
+        matches!(
+            managed_verdict_for("https://example.com/", &[], true, false),
+            Verdict::Block(_)
+        ),
+        "closed: a name is refused, never resolved"
+    );
+}
+
+#[test]
+fn loopback_hosts_are_recognised_as_written() {
+    for h in [
+        "localhost",
+        "LOCALHOST",
+        "localhost.",
+        "127.0.0.1",
+        "127.8.9.10",
+        "[::1]",
+        "[::ffff:127.0.0.1]",
+    ] {
+        assert!(is_loopback_host(h), "{h}");
+    }
+    for h in [
+        "localhost.example.com",
+        "10.0.0.1",
+        "[::ffff:10.0.0.1]",
+        "1.1.1.1",
+        "example.com",
+        "[fd00::1]",
+    ] {
+        assert!(!is_loopback_host(h), "{h}");
+    }
 }
