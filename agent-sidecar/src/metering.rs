@@ -248,6 +248,19 @@ impl LlmClient for MeteredLlm {
         }
         Ok((turn, usage))
     }
+
+    /// HUP-S1.1 (g1-render): streamed answers are metered exactly like whole ones.
+    fn complete_streaming(
+        &self,
+        req: &CompletionRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AssistantTurn, Option<TokenUsage>), LlmError> {
+        let (turn, usage) = self.inner.complete_streaming(req, on_delta)?;
+        if let Some(u) = usage {
+            self.sink.record_usage(u.prompt_tokens, u.completion_tokens);
+        }
+        Ok((turn, usage))
+    }
 }
 
 /// Fans each event out to observers (metering, trajectories) and then to the session's own log.

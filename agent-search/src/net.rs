@@ -1,56 +1,14 @@
 //! Target policy: which URLs `read_url` may fetch and which addresses it may connect to.
 
 use crate::SearchError;
+use citrate_agent_guard::net::is_local_name as local_name;
 use reqwest::Url;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 /// The Jina Reader endpoint used when the member opts in without naming another.
 pub const JINA_DEFAULT_ENDPOINT: &str = "https://r.jina.ai/";
 
-fn v4_public(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    !(ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        || o[0] == 0
-        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 shared address space
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 protocol assignments
-        || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
-        || o[0] >= 240) // 240.0.0.0/4 reserved
-}
-
-fn v6_public(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return v4_public(v4);
-    }
-    let s = ip.segments();
-    // NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 address.
-    if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
-        let v4 = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
-        return v4_public(v4);
-    }
-    !(ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
-        || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
-        || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site local (deprecated)
-        || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 documentation
-        || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0))
-    // ::/96 IPv4-compatible
-}
-
-/// True for an address on the public internet.
-pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4_public(v4),
-        IpAddr::V6(v6) => v6_public(v6),
-    }
-}
+pub use citrate_agent_guard::net::is_public_ip;
 
 /// Parse an absolute http(s) URL with a host and no credentials.
 pub(crate) fn parse_target(raw: &str) -> Result<Url, SearchError> {
@@ -85,17 +43,6 @@ fn literal_ip(url: &Url) -> Option<IpAddr> {
 
 fn allowed(ip: IpAddr, allow_private: &[IpAddr]) -> bool {
     is_public_ip(ip) || allow_private.contains(&ip)
-}
-
-/// Names that never denote a public host, whatever DNS says.
-fn local_name(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "localhost"
-        || h.ends_with(".localhost")
-        || h.ends_with(".local")
-        || h.ends_with(".internal")
-        || h.ends_with(".home.arpa")
-        || !h.contains('.')
 }
 
 /// Check a target without resolving it: literal addresses and local names only. Used for a target
@@ -202,6 +149,28 @@ mod tests {
         assert!(is_public_ip("::ffff:1.1.1.1".parse().unwrap()));
         assert!(is_public_ip("64:ff9b::808:808".parse().unwrap()));
         assert!(is_public_ip("100.128.0.1".parse().unwrap()));
+    }
+
+    /// 6to4 (2002::/16) and Teredo (2001::/32) carry an IPv4 address inside the IPv6 one: 6to4 is
+    /// judged by the embedded address, and Teredo is never public.
+    #[test]
+    fn tunnelled_ipv4_addresses_are_judged_by_the_embedded_address() {
+        for n in [
+            "2002:7f00:1::1",                       // 6to4 of 127.0.0.1
+            "2002:a00:1::",                         // 6to4 of 10.0.0.1
+            "2002:c0a8:101::1",                     // 6to4 of 192.168.1.1
+            "2002:a9fe:a9fe::1",                    // 6to4 of 169.254.169.254
+            "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo, client 127.0.0.1
+            "2001:0:4136:e378:8000:63bf:f5ff:fffe", // Teredo, client 10.0.0.1
+            "2001:0:a00:1:8000:63bf:f7f7:f7f7",     // Teredo, server 10.0.0.1
+        ] {
+            assert!(!is_public_ip(n.parse().unwrap()), "{n}");
+        }
+        // 6to4 of a public address stays public; Teredo never is (its endpoint sits behind a relay).
+        assert!(is_public_ip("2002:101:101::1".parse().unwrap())); // 6to4 of 1.1.1.1
+        assert!(!is_public_ip(
+            "2001:0:4136:e378:8000:63bf:f7f7:f7f7".parse().unwrap() // client 8.8.8.8
+        ));
     }
 
     #[test]
