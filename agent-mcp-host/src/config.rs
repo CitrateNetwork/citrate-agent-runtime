@@ -37,6 +37,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1 << 20;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 16_000;
+/// How long a tool call that became a task (Tasks extension) is polled before it is cancelled.
+pub const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+const MIN_TASK_TIMEOUT_MS: u64 = 1_000;
+const MAX_TASK_TIMEOUT_MS: u64 = 3_600_000;
 const MIN_TIMEOUT_MS: u64 = 100;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MIN_RESPONSE_BYTES: usize = 1024;
@@ -98,6 +102,8 @@ pub struct ServerConfig {
     pub max_output_chars: usize,
     /// Offer tools that are not annotated read-only. Default false.
     pub allow_write_tools: bool,
+    /// Longest a tool call that the server turned into a task is polled (Tasks extension).
+    pub task_timeout: Duration,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -127,6 +133,7 @@ impl ServerConfig {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
             allow_write_tools: false,
+            task_timeout: DEFAULT_TASK_TIMEOUT,
         }
     }
 
@@ -169,6 +176,7 @@ struct RawServer {
     max_output_chars: Option<usize>,
     #[serde(default)]
     allow_write_tools: bool,
+    task_timeout_ms: Option<u64>,
 }
 
 /// `[a-z0-9][a-z0-9_-]{0,23}` with no `__` (the name is part of every exposed tool name).
@@ -296,8 +304,28 @@ impl McpConfig {
                     }
                     for (k, v) in &r.env {
                         validate_env_key(k)?;
+                        // The user-entry env rules apply to every entry the file holds, so the
+                        // file cannot bring in what the Settings form refuses.
+                        if !crate::user::valid_env_key(k) {
+                            return Err(format!(
+                                "server {:?}: env name {k:?} must use letters, digits and '_'",
+                                r.name
+                            ));
+                        }
+                        if crate::user::is_loader_env(k) {
+                            return Err(format!(
+                                "server {:?}: env {k} changes which code the server loads",
+                                r.name
+                            ));
+                        }
                         if v.contains('\0') {
                             return Err(format!("server {:?}: NUL in env value", r.name));
+                        }
+                        if crate::user::is_env_reference(v) {
+                            return Err(format!(
+                                "server {:?}: env {k} refers to another variable; values are literal",
+                                r.name
+                            ));
                         }
                     }
                     let cwd = match r.cwd {
@@ -356,6 +384,10 @@ impl McpConfig {
             }
             if let Some(c) = r.max_output_chars {
                 cfg.max_output_chars = c.clamp(256, 200_000);
+            }
+            if let Some(ms) = r.task_timeout_ms {
+                cfg.task_timeout =
+                    Duration::from_millis(ms.clamp(MIN_TASK_TIMEOUT_MS, MAX_TASK_TIMEOUT_MS));
             }
             cfg.allow_write_tools = r.allow_write_tools;
             servers.push(cfg);
@@ -441,6 +473,31 @@ url = "https://scan.example/api/mcp"
         for c in cases {
             assert!(McpConfig::parse_toml(c).is_err(), "accepted: {c}");
         }
+    }
+
+    /// The allowlist file is checked with the same env rules as a user entry when it is loaded,
+    /// so whoever can write the file still cannot make a server load other code or inherit a
+    /// secret by reference.
+    #[test]
+    fn the_allowlist_refuses_loader_env_and_env_references_at_load() {
+        for env in [
+            "{\"LD_PRELOAD\": \"/tmp/x.so\"}",
+            "{\"DYLD_INSERT_LIBRARIES\": \"/tmp/x.dylib\"}",
+            "{\"ld_library_path\": \"/tmp\"}",
+            "{\"NODE_OPTIONS\": \"--require /tmp/x.js\"}",
+            "{\"PYTHONPATH\": \"/tmp\"}",
+            "{\"TOKEN\": \"${GITHUB_TOKEN}\"}",
+            "{\"TOKEN\": \"$OPENAI_API_KEY\"}",
+            "{\"TOKEN\": \"%APPDATA%\"}",
+            "{\"1BAD\": \"x\"}",
+        ] {
+            let json = format!(
+                "{{\"servers\": [{{\"name\": \"a\", \"transport\": \"stdio\", \"command\": \"/bin/x\", \"env\": {env}}}]}}"
+            );
+            assert!(McpConfig::parse_json(&json).is_err(), "accepted: {env}");
+        }
+        let ok = r#"{"servers": [{"name": "a", "transport": "stdio", "command": "/bin/x", "env": {"MEM_TENANT": "personal", "PRICE": "pa$$word"}}]}"#;
+        assert!(McpConfig::parse_json(ok).is_ok());
     }
 
     #[test]

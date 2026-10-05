@@ -926,3 +926,42 @@ async fn a_grant_rooted_in_a_deny_location_grants_nothing_and_does_not_refuse_th
     assert_eq!(r.status(), StatusCode::OK);
     assert_eq!(body_json(r).await["grants"]["ignored"], 2);
 }
+
+/// The file tools open the path the grant check resolved, and then confirm the opened file is
+/// still at that path. If a folder on the way was swapped for a link after the check, the open
+/// lands elsewhere and is refused: nothing is read from or left behind in the other place.
+#[cfg(unix)]
+#[test]
+fn an_open_that_lands_somewhere_other_than_the_checked_path_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).expect("mkdir");
+    std::fs::write(real.join("x.txt"), "elsewhere").expect("write");
+    // `swapped` stands for a checked folder that now leads somewhere else.
+    std::os::unix::fs::symlink(&real, base.join("swapped")).expect("symlink");
+
+    let read = crate::grants::open_checked(&base.join("swapped/x.txt"), false);
+    assert!(read.is_err(), "a read that landed elsewhere is refused");
+    let write = crate::grants::open_checked(&base.join("swapped/new.txt"), true);
+    assert!(write.is_err(), "a write that landed elsewhere is refused");
+    assert!(
+        !real.join("new.txt").exists(),
+        "nothing is left behind in the other place"
+    );
+
+    // The checked path itself opens, for reading and for writing (new and existing files).
+    assert!(crate::grants::open_checked(&real.join("x.txt"), false).is_ok());
+    {
+        use std::io::Write;
+        let mut f = crate::grants::open_checked(&real.join("x.txt"), true).expect("existing");
+        f.write_all(b"new").expect("write");
+    }
+    assert_eq!(
+        std::fs::read_to_string(real.join("x.txt")).expect("read"),
+        "new",
+        "an existing file is truncated before it is written"
+    );
+    assert!(crate::grants::open_checked(&real.join("fresh.txt"), true).is_ok());
+    assert!(real.join("fresh.txt").exists());
+}

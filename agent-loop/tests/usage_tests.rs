@@ -24,6 +24,7 @@ impl LlmClient for Reporting {
             Some(TokenUsage {
                 prompt_tokens: 12,
                 completion_tokens: 3,
+                generation_ms: None,
             }),
         ))
     }
@@ -52,7 +53,8 @@ fn a_reporting_client_passes_usage_through() {
         usage,
         Some(TokenUsage {
             prompt_tokens: 12,
-            completion_tokens: 3
+            completion_tokens: 3,
+            generation_ms: None,
         })
     );
 }

@@ -34,6 +34,29 @@ pub const NEXT: &str = r#"<!doctype html><html><head><title>Welcome page</title>
 <script>document.getElementById('who').textContent = 'Signed in as ' + new URLSearchParams(location.search).get('email');</script>
 </body></html>"#;
 
+/// A page that requests `?u=<url>` from its own script once loaded (a sub-resource request the
+/// page makes on its own).
+pub const FETCHER: &str = r#"<!doctype html><html><head><title>Fetcher</title></head>
+<body><h1>Fetcher</h1><p id="out">waiting</p>
+<script>var u = new URLSearchParams(location.search).get('u'); fetch(u).then(function(r){ return r.text(); }).then(function(t){ document.getElementById('out').textContent = 'got ' + t; }).catch(function(e){ document.getElementById('out').textContent = 'failed'; });</script>
+</body></html>"#;
+
+/// A page that opens a WebSocket to `?u=<ws url>` from its own script once loaded, and reports
+/// whether it opened, failed or closed.
+pub const WS_OPENER: &str = r#"<!doctype html><html><head><title>Socket</title></head>
+<body><h1>Socket</h1><p id="out">waiting</p>
+<script>var o = document.getElementById('out'); try { var w = new WebSocket(new URLSearchParams(location.search).get('u')); w.onopen = function(){ o.textContent = 'opened'; }; w.onerror = function(){ o.textContent = 'failed'; }; w.onclose = function(){ if (o.textContent === 'waiting') o.textContent = 'closed'; }; } catch (e) { o.textContent = 'failed'; }</script>
+</body></html>"#;
+
+/// The request paths a [`serve_logged`] server has received, in order.
+pub type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// How many requests in `log` asked for a path starting with `prefix`.
+pub fn hits(log: &RequestLog, prefix: &str) -> usize {
+    log.lock()
+        .map(|g| g.iter().filter(|p| p.starts_with(prefix)).count())
+        .unwrap_or(0)
+}
 /// HUP-S2.3: a dApp page that asks the wallet for an address and then a sign-in signature, and
 /// embeds a frame that tries to reach the sign-in bridge directly.
 pub const DAPP: &str = r#"<!doctype html><html><head><title>dapp</title></head>
@@ -63,6 +86,13 @@ window.parent.postMessage(r, '*');
 
 /// Serve LOGIN at /login and NEXT at /next on 127.0.0.1; returns the base URL.
 pub fn serve() -> String {
+    serve_logged().0
+}
+
+/// [`serve`], also returning the log of every request path it receives.
+pub fn serve_logged() -> (String, RequestLog) {
+    let log: RequestLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => panic!("bind: {e}"),
@@ -73,11 +103,15 @@ pub fn serve() -> String {
         .unwrap_or_default();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let seen = seen.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(&stream);
                 let mut first = String::new();
                 if reader.read_line(&mut first).is_err() {
                     return;
+                }
+                if let Ok(mut g) = seen.lock() {
+                    g.push(first.split_whitespace().nth(1).unwrap_or("/").to_string());
                 }
                 loop {
                     let mut l = String::new();
@@ -97,6 +131,12 @@ pub fn serve() -> String {
                     ("200 OK", if yes { "yes" } else { "no" })
                 } else if path.starts_with("/next") {
                     ("200 OK", NEXT)
+                } else if path.starts_with("/fetcher") {
+                    ("200 OK", FETCHER)
+                } else if path.starts_with("/wsopener") {
+                    ("200 OK", WS_OPENER)
+                } else if path.starts_with("/secret") {
+                    ("200 OK", "local secret")
                 } else if path.starts_with("/dapp") {
                     ("200 OK", DAPP)
                 } else if path.starts_with("/frame") {
@@ -113,17 +153,25 @@ pub fn serve() -> String {
             });
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), log)
 }
 
-/// The Chromium the live tests use, or None (the test prints that it skipped).
+/// The Chromium the live tests use, or None (the test prints that it skipped). A managed
+/// Chromium named by `CITRATE_BROWSER_CHROMIUM` (for example an unpacked Chrome for Testing) is
+/// preferred over a system one, as in production.
 pub fn chromium() -> Option<PathBuf> {
-    match discover(None, &system_candidates()) {
+    let managed = std::env::var_os(citrate_agent_browser::chromium::MANAGED_CHROMIUM_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    match discover(managed.as_deref(), &system_candidates()) {
         ChromiumStatus::NotInstalled { .. } => {
             eprintln!("SKIPPED: no Chromium-family browser is installed on this machine");
             None
         }
-        s => s.path(),
+        s => {
+            eprintln!("live browser: {s:?}");
+            s.path()
+        }
     }
 }
 
@@ -143,6 +191,19 @@ pub fn config(exe: PathBuf) -> BrowserConfig {
         extra_args: test_args(),
         approval_timeout: std::time::Duration::from_secs(5),
         ..BrowserConfig::default()
+    }
+}
+
+/// [`config`] for a managed browser that may open `base`, a local test server (the managed
+/// browser opens public addresses only unless an origin is allowed).
+pub fn config_allowing(exe: PathBuf, base: &str) -> BrowserConfig {
+    let allow = match citrate_agent_browser::gate::parse_allow_private(base) {
+        Ok(a) => a,
+        Err(e) => panic!("{base}: {e}"),
+    };
+    BrowserConfig {
+        allow_private: allow,
+        ..config(exe)
     }
 }
 

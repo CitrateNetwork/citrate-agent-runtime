@@ -41,6 +41,8 @@ pub struct RefEntry {
     pub name: String,
     pub backend_node_id: i64,
     pub disabled: bool,
+    /// The element's current value (text fields), cleaned and cut like its name; empty when none.
+    pub value: String,
 }
 
 /// A snapshot: the text the model reads and the refs it can act on.
@@ -249,6 +251,7 @@ impl<'a> Builder<'a> {
                     name: name.clone(),
                     backend_node_id: b,
                     disabled,
+                    value: value.clone(),
                 });
             }
             for c in children {
