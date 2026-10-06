@@ -27,7 +27,9 @@
 //! user, and with the sidecar's environment unless its spec names an inherit list. On Unix each
 //! worker starts a session of its own, and when it ends (crash, kill or shutdown) every process
 //! left in that session is killed, so programs it started in their own process groups (a forge
-//! run, say) do not outlive it. On Windows they may still outlive it until their own timeout.
+//! run, say) do not outlive it. The worker is reaped only after that, so the session id it led
+//! cannot have been given to another process while the session is being signalled (SCL-S0.4).
+//! On Windows they may still outlive it until their own timeout.
 //! Nothing here holds a key or signs (Rule 3).
 
 pub mod protocol;
@@ -303,9 +305,9 @@ impl Inner {
                 Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ping::Missed,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if let Ok(Some(st)) = child.try_wait() {
+            if matches!(has_exited(child), Ok(true)) {
                 self.lock().pending.remove(&id);
-                return Ping::Exited(st);
+                return Ping::Exited;
             }
             if self.lock().shutting_down || Instant::now() >= deadline {
                 self.lock().pending.remove(&id);
@@ -575,19 +577,24 @@ fn all_pids() -> Vec<libc::pid_t> {
 }
 
 /// Kill every process left in the session the worker `sid` led (see [`spawn_child`]): the
-/// programs it started, whatever process group they are in. Run right after the worker is
-/// reaped. Best effort, a few passes in case one of them was forking.
+/// programs it started, whatever process group they are in. Run after the worker has exited and
+/// BEFORE it is reaped: while the exited worker is unreaped its id stays taken, so `sid` still
+/// names that session and no other process can hold it. Best effort, a few passes in case one of
+/// them was forking.
 #[cfg(unix)]
 fn stop_session(sid: u32) {
     let Ok(sid) = libc::pid_t::try_from(sid) else {
         return;
     };
+    #[cfg(test)]
+    tests::note_session_stop(sid);
     // SAFETY: getpid/getsid/kill are plain syscalls on integer ids; no memory is shared.
     let me = unsafe { libc::getpid() };
     for _ in 0..3 {
         let mut found = false;
         for pid in all_pids() {
-            if pid <= 1 || pid == me {
+            // The exited (unreaped) worker itself is skipped: it holds the id and is reaped next.
+            if pid <= 1 || pid == me || pid == sid {
                 continue;
             }
             // SAFETY: see above.
@@ -609,33 +616,79 @@ fn stop_session(sid: u32) {
 #[cfg(not(unix))]
 fn stop_session(_sid: u32) {}
 
-/// Kill the child (best effort) and reap it.
-fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
+/// `waitid` on the child with `WNOWAIT`: reports whether it has exited without reaping it.
+/// `block` waits for the exit. Retries on `EINTR`.
+#[cfg(unix)]
+fn wait_exit(child: &Child, block: bool) -> std::io::Result<bool> {
+    let pid = child.id() as libc::id_t;
+    let mut options = libc::WEXITED | libc::WNOWAIT;
+    if !block {
+        options |= libc::WNOHANG;
+    }
+    loop {
+        // SAFETY: zeroed is a valid siginfo_t; waitid writes into it. With WNOWAIT nothing is
+        // reaped, so the child stays ours until `Child::wait`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::waitid(libc::P_PID, pid, &mut info, options) };
+        if rc == 0 {
+            // With WNOHANG and no exit yet, si_pid stays 0.
+            // SAFETY: waitid filled the SIGCHLD fields of `info`.
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Whether the child has exited, WITHOUT reaping it (Unix). The caller reaps it with
+/// `Child::wait` once its session has been stopped.
+#[cfg(unix)]
+fn has_exited(child: &mut Child) -> std::io::Result<bool> {
+    wait_exit(child, false)
+}
+
+#[cfg(not(unix))]
+fn has_exited(child: &mut Child) -> std::io::Result<bool> {
+    child.try_wait().map(|s| s.is_some())
+}
+
+/// Kill the child (best effort) and wait until it has exited, without reaping it on Unix.
+fn kill_and_wait(child: &mut Child) {
+    // The child is not reaped yet, so this signals the worker and nothing else.
     let _ = child.kill();
-    child.wait().ok()
+    #[cfg(unix)]
+    {
+        let _ = wait_exit(child, true);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.wait();
+    }
 }
 
 /// The result of a monitor ping.
 enum Ping {
     Answered,
     Missed,
-    Exited(ExitStatus),
+    Exited,
 }
 
-/// What ended one child's life.
+/// What ended one child's life. Either way the child has exited and is not reaped yet.
 enum End {
-    Exited(Option<ExitStatus>),
-    Shutdown(Option<ExitStatus>),
+    Exited,
+    Shutdown,
 }
 
 /// Watch one running child until it exits, is killed for missing health checks, or shutdown is
-/// requested.
+/// requested. Returns once the child has exited; it is left unreaped for the caller.
 fn watch(inner: &Inner, child: &mut Child) -> End {
     let p = &inner.policy;
     // Startup: the first ping must be answered.
     let ready = inner.ping_watching(child, p.startup_timeout);
-    if let Ping::Exited(st) = ready {
-        return End::Exited(Some(st));
+    if let Ping::Exited = ready {
+        return End::Exited;
     }
     if matches!(ready, Ping::Answered) {
         let mut s = inner.lock();
@@ -645,27 +698,33 @@ fn watch(inner: &Inner, child: &mut Child) -> End {
         drop(s);
         inner.cv.notify_all();
     } else if inner.lock().shutting_down {
-        return End::Shutdown(graceful_stop(inner, child));
-    } else if let Ok(Some(st)) = child.try_wait() {
-        return End::Exited(Some(st));
+        graceful_stop(inner, child);
+        return End::Shutdown;
+    } else if matches!(has_exited(child), Ok(true)) {
+        return End::Exited;
     } else {
         inner.lock().last_error = Some("did not answer its startup health check".into());
-        return End::Exited(kill_and_reap(child));
+        kill_and_wait(child);
+        return End::Exited;
     }
     let mut next_health = Instant::now() + p.health_interval;
     let mut misses = 0u32;
     loop {
-        match child.try_wait() {
-            Ok(Some(st)) => return End::Exited(Some(st)),
-            Ok(None) => {}
-            Err(_) => return End::Exited(kill_and_reap(child)),
+        match has_exited(child) {
+            Ok(true) => return End::Exited,
+            Ok(false) => {}
+            Err(_) => {
+                kill_and_wait(child);
+                return End::Exited;
+            }
         }
         if inner.sleep_unless_shutdown(POLL) {
-            return End::Shutdown(graceful_stop(inner, child));
+            graceful_stop(inner, child);
+            return End::Shutdown;
         }
         if Instant::now() >= next_health {
             match inner.ping_watching(child, p.health_timeout) {
-                Ping::Exited(st) => return End::Exited(Some(st)),
+                Ping::Exited => return End::Exited,
                 Ping::Answered => {
                     misses = 0;
                     inner.lock().healthy = true;
@@ -674,13 +733,14 @@ fn watch(inner: &Inner, child: &mut Child) -> End {
                     misses += 1;
                     inner.lock().healthy = false;
                     if misses >= p.health_failures_to_kill {
-                        if let Ok(Some(st)) = child.try_wait() {
-                            return End::Exited(Some(st));
+                        if matches!(has_exited(child), Ok(true)) {
+                            return End::Exited;
                         }
                         inner.lock().last_error = Some(format!(
                             "stopped answering health checks ({misses} missed in a row)"
                         ));
-                        return End::Exited(kill_and_reap(child));
+                        kill_and_wait(child);
+                        return End::Exited;
                     }
                 }
             }
@@ -689,8 +749,9 @@ fn watch(inner: &Inner, child: &mut Child) -> End {
     }
 }
 
-/// Ask the child to stop, close its input, wait out the grace period, then kill it.
-fn graceful_stop(inner: &Inner, child: &mut Child) -> Option<ExitStatus> {
+/// Ask the child to stop, close its input, wait out the grace period, then kill it. Returns once
+/// it has exited (not reaped).
+fn graceful_stop(inner: &Inner, child: &mut Child) {
     let grace = inner.policy.shutdown_grace;
     let _ = inner.request(
         METHOD_SHUTDOWN,
@@ -700,10 +761,10 @@ fn graceful_stop(inner: &Inner, child: &mut Child) -> Option<ExitStatus> {
     inner.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
     let deadline = Instant::now() + grace;
     loop {
-        match child.try_wait() {
-            Ok(Some(st)) => return Some(st),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
-            _ => return kill_and_reap(child),
+        match has_exited(child) {
+            Ok(true) => return,
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(POLL),
+            _ => return kill_and_wait(child),
         }
     }
 }
@@ -728,7 +789,7 @@ fn monitor(inner: Arc<Inner>) {
                     "could not start {}: {e}",
                     inner.spec.program.display()
                 ));
-                End::Exited(None)
+                (End::Exited, None)
             }
             Ok(mut child) => {
                 *inner.stdin.lock().unwrap_or_else(|p| p.into_inner()) = child.stdin.take();
@@ -745,15 +806,15 @@ fn monitor(inner: Arc<Inner>) {
                 inner.lock().pid = Some(pid);
                 let end = watch(&inner, &mut child);
                 inner.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
-                // The worker is gone (and reaped); stop anything it left running.
+                // The worker has exited but is not reaped yet, so its id still names its session:
+                // stop anything it left running there, and only then reap it.
                 stop_session(pid);
-                end
+                let status = child.wait().ok();
+                (end, status)
             }
         };
-        let (status, requested) = match end {
-            End::Exited(st) => (st, false),
-            End::Shutdown(st) => (st, true),
-        };
+        let (end, status) = end;
+        let requested = matches!(end, End::Shutdown);
         let desc = status.as_ref().map(describe_exit);
         {
             let mut s = inner.lock();
@@ -807,6 +868,132 @@ fn monitor(inner: Arc<Inner>) {
         if inner.sleep_unless_shutdown(backoff) {
             inner.set_state(WorkerState::Stopped);
             return;
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Every session stop: the session id and whether its leader was still this process's
+    /// unreaped child at that moment (so the id could not have been handed to another process).
+    static STOPS: Mutex<Vec<(libc::pid_t, bool)>> = Mutex::new(Vec::new());
+
+    /// Whether `pid` is still an unreaped child of this process (running or exited). `waitid`
+    /// with `WNOWAIT` looks without reaping; it fails with `ECHILD` once the child was reaped.
+    fn held(pid: libc::pid_t) -> bool {
+        // SAFETY: zeroed is a valid siginfo_t; waitid writes into it and reaps nothing (WNOWAIT).
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+        }
+    }
+
+    pub(super) fn note_session_stop(sid: libc::pid_t) {
+        let h = held(sid);
+        STOPS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((sid, h));
+    }
+
+    fn sh() -> PathBuf {
+        ["/bin/sh", "/usr/bin/sh"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .expect("a shell")
+    }
+
+    fn alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some(i) = s.rfind(')') {
+                if s[i + 1..].trim_start().starts_with('Z') {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// SCL-S0.4: when a worker ends, the processes left in its session are signalled while the
+    /// worker itself is still unreaped, so its id (the session id) still names that session and
+    /// cannot belong to an unrelated process. Only then is the worker reaped.
+    #[test]
+    fn a_worker_session_is_stopped_before_the_worker_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("citrate-worker-sid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let pidfile = dir.join("left.pid");
+        // The worker starts a long-lived program in its session, then exits at once.
+        let spec = WorkerSpec {
+            kind: WorkerKind::Toolchain,
+            program: sh(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "sleep 600 & echo $! > '{p}.tmp' && mv '{p}.tmp' '{p}'; exit 3",
+                    p = pidfile.display()
+                ),
+            ],
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            env_inherit: None,
+        };
+        let policy = RestartPolicy {
+            max_restarts: 0,
+            startup_timeout: Duration::from_secs(5),
+            ..RestartPolicy::default()
+        };
+        let worker = Worker::start(spec, policy);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while worker.status().state != WorkerState::Failed && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let left: Option<libc::pid_t> = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        let state = worker.status().state;
+        drop(worker);
+        let stops: Vec<_> = STOPS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        // Clean up whatever the worker left, pass or fail.
+        let left_alive = left.is_some_and(alive);
+        if let Some(pid) = left.filter(|p| alive(*p)) {
+            // SAFETY: kill(2) on the program this test's worker started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            state,
+            WorkerState::Failed,
+            "the worker ran once and was given up on"
+        );
+        assert!(left.is_some(), "the worker started its program");
+        assert!(
+            !left_alive,
+            "the program left in the worker's session was stopped"
+        );
+        assert!(!stops.is_empty(), "the worker's session was stopped");
+        for (sid, held) in stops {
+            assert!(
+                held,
+                "session {sid} was signalled after its leader was reaped (its id may be reused)"
+            );
         }
     }
 }
