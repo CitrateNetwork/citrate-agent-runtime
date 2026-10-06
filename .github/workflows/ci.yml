@@ -77,6 +77,39 @@ jobs:
           bash scripts/semgrep/run-ar-b-046.sh
         continue-on-error: true
 
+  # citrate-core ships agent-sidecar on Windows (core#263/#266). agent-shell has real
+  # Windows code paths (Job Object process-tree kill, protected-DACL scratch dir, .exe
+  # resolution) whose tests only compile and run here; the release build is the exact
+  # command core's Windows pipeline runs.
+  windows:
+    name: Windows (agent-shell tests + agent-sidecar release build)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: cargo clippy (agent-shell, Windows)
+        run: cargo clippy -p citrate-agent-shell --all-targets --locked -- -D warnings
+
+      - name: cargo test (agent-shell, Windows)
+        env:
+          CARGO_INCREMENTAL: 0
+        run: cargo test -p citrate-agent-shell --locked
+
+      - name: cargo build --release (agent-sidecar, x86_64-pc-windows-msvc)
+        env:
+          CARGO_INCREMENTAL: 0
+        run: cargo build --release --locked -p agent-sidecar
+
   hic-terminology:
     name: HIC terminology guard (public-claims accuracy)
     runs-on: ubuntu-latest

@@ -238,6 +238,12 @@ fn true_program() -> Option<&'static str> {
 }
 
 fn probe() -> Result<Backend, String> {
+    if cfg!(windows) {
+        return Err(
+            "no OS sandbox backend is implemented for Windows (neither Seatbelt nor bubblewrap exists there)"
+                .to_string(),
+        );
+    }
     let Some(truth) = true_program() else {
         return Err("no `true` program to probe the sandbox with".to_string());
     };

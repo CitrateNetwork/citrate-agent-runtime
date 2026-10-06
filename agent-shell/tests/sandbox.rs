@@ -5,6 +5,7 @@
 //! writes inside it and in the scratch HOME allowed, no reads of the member's other folders.
 //! The Linux (bubblewrap) path is proven here at the argv level; the run proof on Linux is a
 //! separate machine run (see the crate docs).
+#![cfg(unix)] // Real Unix binaries and Unix sandboxes; the Windows suite is tests/windows.rs.
 
 use citrate_agent_shell::sandbox::{
     bwrap_command, seatbelt_profile, Backend, SandboxMode, SandboxPolicy, SandboxSpec,
