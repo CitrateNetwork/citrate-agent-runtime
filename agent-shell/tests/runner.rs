@@ -3,6 +3,7 @@
 //! These tests exec real system binaries (`/bin/echo`, `/bin/sleep`, `/bin/sh`,
 //! `/usr/bin/printenv`, `/usr/bin/seq`, `/usr/bin/git`) through a test allowlist, so they
 //! prove the runner's behaviour against the OS, not against a fake.
+#![cfg(unix)] // Real Unix binaries and Unix sandboxes; the Windows suite is tests/windows.rs.
 
 use citrate_agent_shell::{Allowlist, ArgPolicy, RunRequest, ShellError, ShellPolicy, ShellRunner};
 use std::path::{Path, PathBuf};

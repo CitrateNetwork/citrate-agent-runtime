@@ -238,6 +238,12 @@ fn true_program() -> Option<&'static str> {
 }
 
 fn probe() -> Result<Backend, String> {
+    if cfg!(windows) {
+        return Err(
+            "no OS sandbox backend is implemented for Windows (neither Seatbelt nor bubblewrap exists there)"
+                .to_string(),
+        );
+    }
     let Some(truth) = true_program() else {
         return Err("no `true` program to probe the sandbox with".to_string());
     };
@@ -505,11 +511,20 @@ mod tests {
         assert!(p.backend().is_err());
     }
 
+    /// An absolute path on this platform (`/abs` has no drive, so it is relative on Windows).
+    fn abs() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\abs")
+        } else {
+            PathBuf::from("/abs")
+        }
+    }
+
     #[test]
     fn relative_extra_read_roots_are_dropped() {
         let p = SandboxPolicy::new(SandboxMode::Preferred)
-            .with_extra_read_roots(vec![PathBuf::from("rel"), PathBuf::from("/abs")]);
-        assert_eq!(p.extra_read_roots(), &[PathBuf::from("/abs")]);
+            .with_extra_read_roots(vec![PathBuf::from("rel"), abs()]);
+        assert_eq!(p.extra_read_roots(), &[abs()]);
     }
 
     #[test]

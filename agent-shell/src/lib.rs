@@ -24,6 +24,8 @@
 //!   list plug in.
 //! - **Wall-clock timeout.** The child leads its own process group; on timeout the whole group
 //!   is killed with `SIGKILL`. Leftover group members are also killed when the leader exits.
+//!   On Windows the same guarantee comes from a per-run Job Object (`TerminateJobObject`,
+//!   `KILL_ON_JOB_CLOSE`); see the Windows section below.
 //! - **Capped capture.** stdout and stderr are captured separately up to per-stream byte caps,
 //!   with a truncation marker and the true byte count, and drained to EOF so a chatty child
 //!   never blocks on a full pipe.
@@ -44,6 +46,27 @@
 //! default of [`ShellPolicy::new`]) runs exactly as before and reports `enforced: false`.
 //! This crate never holds a key and never signs (Rule 3).
 //!
+//! ## Windows
+//!
+//! The same guarantees hold on Windows, with Windows mechanisms (the `win` module):
+//!
+//! - The process tree is a per-run **Job Object**. The child is created suspended (with
+//!   `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`), assigned to the job, then resumed, so
+//!   nothing it starts escapes; a timeout and the post-exit reap are `TerminateJobObject`, and
+//!   `KILL_ON_JOB_CLOSE` reaps the tree if the host dies. [`RunReport::signal`] is always
+//!   `None` (Windows has no signals); a killed run reports `timed_out` and exit code 1.
+//! - The scratch HOME gets a protected owner-and-SYSTEM-only DACL (the `0700` equivalent).
+//!   The child also sees it as `USERPROFILE`, `TEMP`, `TMP`, `APPDATA` and `LOCALAPPDATA`, and
+//!   gets the host's `SystemRoot`/`SystemDrive`/`windir`, without which Winsock and the crypto
+//!   providers fail to load. These are reserved names (compared case-insensitively, as Windows
+//!   does), like `PATH`.
+//! - The search path is joined with `;`, and an entry may not contain `;`. A bare name
+//!   resolves to `<dir>\\<name>.exe` or `.com` (or `<name>` itself when it already ends in
+//!   one of those); `.bat`/`.cmd` are never resolved, because Windows runs them through
+//!   `cmd.exe`, which is a shell.
+//! - There is no OS sandbox backend on Windows: [`sandbox::SandboxMode::Required`] refuses,
+//!   exactly as it does on any host without a working backend.
+//!
 //! Lifted from `citrate-agent-code` (`agent-code/src/tools/shell_exec.rs`,
 //! `git_operations.rs`): the bare-name/relative-path refusal, the cleared environment with a
 //! fixed PATH, the isolated scratch HOME, and git's global/system config pinned to `/dev/null`.
@@ -51,14 +74,20 @@
 //! synchronous, dependency-light library.
 
 pub mod sandbox;
+#[cfg(windows)]
+mod win;
 
 use sandbox::{Backend, SandboxMode, SandboxPolicy, SandboxSpec, SandboxSummary};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -449,6 +478,49 @@ fn policy_env(policy: &ArgPolicy) -> Vec<(&'static str, &'static str)> {
 /// Variables the runner always sets itself; a request can never supply them.
 const RESERVED_ENV: &[&str] = &["PATH", "HOME", "TMPDIR", "NO_COLOR"];
 
+/// Windows-only variables the runner sets itself: the scratch directory under every name
+/// Windows programs look for it, and the system-location variables the host passes through.
+#[cfg(windows)]
+const WINDOWS_RESERVED_ENV: &[&str] = &[
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+];
+
+/// Host variables every Windows child gets (when set): Winsock, CryptoAPI and many runtimes
+/// fail to initialise without `SystemRoot`.
+#[cfg(windows)]
+const WINDOWS_SYSTEM_ENV: &[&str] = &["SystemRoot", "SystemDrive", "windir"];
+
+/// Variables under the scratch directory on Windows (besides the portable `HOME`/`TMPDIR`).
+#[cfg(windows)]
+const WINDOWS_SCRATCH_ENV: &[&str] = &["USERPROFILE", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA"];
+
+#[cfg(unix)]
+fn is_reserved_env(name: &str) -> bool {
+    RESERVED_ENV.contains(&name)
+}
+
+/// Windows environment names are case-insensitive (`Path` is `PATH`), so the check is too.
+#[cfg(windows)]
+fn is_reserved_env(name: &str) -> bool {
+    RESERVED_ENV
+        .iter()
+        .chain(WINDOWS_RESERVED_ENV)
+        .any(|r| r.eq_ignore_ascii_case(name))
+}
+
+/// The separator of the child's `PATH` (and so a character no search-path entry may contain).
+#[cfg(unix)]
+const PATH_LIST_SEP: char = ':';
+#[cfg(windows)]
+const PATH_LIST_SEP: char = ';';
+
 /// Locale/time variables copied from the host when present.
 pub const DEFAULT_PASSTHROUGH_ENV: &[&str] = &["LANG", "LC_ALL", "LC_CTYPE", "TZ"];
 
@@ -495,9 +567,12 @@ impl ShellPolicy {
                     reason: format!("search path entry {} is not absolute", d.display()),
                 });
             }
-            if d.to_string_lossy().contains(':') {
+            if d.to_string_lossy().contains(PATH_LIST_SEP) {
                 return Err(ShellError::InvalidPolicy {
-                    reason: format!("search path entry {} contains ':'", d.display()),
+                    reason: format!(
+                        "search path entry {} contains '{PATH_LIST_SEP}'",
+                        d.display()
+                    ),
                 });
             }
         }
@@ -532,6 +607,7 @@ impl ShellPolicy {
     /// The system directories, in lookup order. User-local toolchain directories (for example
     /// Foundry's `~/.foundry/bin`) are not included; a host that wants them adds them
     /// explicitly, which keeps the decision visible.
+    #[cfg(unix)]
     pub fn default_search_path() -> Vec<PathBuf> {
         ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
             .iter()
@@ -539,11 +615,34 @@ impl ShellPolicy {
             .collect()
     }
 
+    /// The system directories, in lookup order: `%SystemRoot%\\System32`, `%SystemRoot%`,
+    /// then Git for Windows' and Node.js's standard install directories under
+    /// `%ProgramFiles%`. Locations come from the host's `SystemRoot`/`ProgramFiles` when they
+    /// are absolute, else the Windows defaults. As on Unix, per-user toolchain directories are
+    /// left to the host to add explicitly.
+    #[cfg(windows)]
+    pub fn default_search_path() -> Vec<PathBuf> {
+        let abs_var = |name: &str, default: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| PathBuf::from(default))
+        };
+        let system_root = abs_var("SystemRoot", "C:\\Windows");
+        let program_files = abs_var("ProgramFiles", "C:\\Program Files");
+        vec![
+            system_root.join("System32"),
+            system_root,
+            program_files.join("Git").join("cmd"),
+            program_files.join("nodejs"),
+        ]
+    }
+
     /// Replace the host variables copied through when present (default: locale + TZ).
     pub fn with_passthrough_env(mut self, names: &[&str]) -> Self {
         self.passthrough_env = names
             .iter()
-            .filter(|n| !RESERVED_ENV.contains(n))
+            .filter(|n| !is_reserved_env(n))
             .map(|s| s.to_string())
             .collect();
         self
@@ -554,7 +653,7 @@ impl ShellPolicy {
     pub fn with_request_env_allow(mut self, names: &[&str]) -> Self {
         self.request_env_allow = names
             .iter()
-            .filter(|n| !RESERVED_ENV.contains(n))
+            .filter(|n| !is_reserved_env(n))
             .map(|s| s.to_string())
             .collect();
         self
@@ -622,11 +721,35 @@ impl ShellPolicy {
     }
 
     /// Resolve a validated, allowlisted name to an absolute executable path on the search path.
+    #[cfg(unix)]
     pub fn resolve(&self, program: &str) -> Result<PathBuf, ShellError> {
         for dir in &self.search_path {
             let candidate = dir.join(program);
             if let Ok(meta) = std::fs::metadata(&candidate) {
                 if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                    return Ok(candidate);
+                }
+            }
+        }
+        Err(ShellError::ProgramNotFound {
+            program: program.to_string(),
+            search_path: self.search_path.clone(),
+        })
+    }
+
+    /// Resolve a validated, allowlisted name to an absolute executable path on the search path.
+    ///
+    /// Windows has no execute bit; what makes a file directly executable (without a shell) is
+    /// its extension. Each directory is tried for `<name>.exe` then `<name>.com`, or for
+    /// `<name>` itself when it already ends in `.exe`/`.com`. `.bat`/`.cmd` are never
+    /// candidates: `CreateProcess` runs them through `cmd.exe`, and no shell is ever involved.
+    #[cfg(windows)]
+    pub fn resolve(&self, program: &str) -> Result<PathBuf, ShellError> {
+        let names = windows_exe_names(program);
+        for dir in &self.search_path {
+            for name in &names {
+                let candidate = dir.join(name);
+                if std::fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
                     return Ok(candidate);
                 }
             }
@@ -970,7 +1093,7 @@ impl ShellRunner {
                 c
             }
         };
-        cmd.current_dir(&plan.cwd)
+        cmd.current_dir(child_cwd(&plan.cwd))
             .env_clear()
             .env("PATH", join_search_path(&self.policy.search_path))
             .env("HOME", scratch.path())
@@ -978,9 +1101,25 @@ impl ShellRunner {
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Leader of a new process group, so a timeout can kill everything it started.
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // Leader of a new process group, so a timeout can kill everything it started.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        // Suspended in a new process group with no console window; `ProcessTree::adopt` puts
+        // it in this run's job and resumes it.
+        #[cfg(windows)]
+        cmd.creation_flags(win::CREATION_FLAGS);
+        #[cfg(windows)]
+        {
+            for name in WINDOWS_SCRATCH_ENV {
+                cmd.env(name, scratch.path());
+            }
+            for name in WINDOWS_SYSTEM_ENV {
+                if let Some(v) = std::env::var_os(name) {
+                    cmd.env(name, v);
+                }
+            }
+        }
         for name in &self.policy.passthrough_env {
             if let Some(v) = std::env::var_os(name) {
                 cmd.env(name, v);
@@ -993,20 +1132,27 @@ impl ShellRunner {
             cmd.env(k, v);
         }
 
+        let tree = ProcessTree::prepare().map_err(|e| ShellError::Spawn {
+            program: req.program.clone(),
+            reason: format!("cannot create the process tree container: {e}"),
+        })?;
         let started = Instant::now();
         let mut child = cmd.spawn().map_err(|e| ShellError::Spawn {
             program: req.program.clone(),
             reason: e.to_string(),
         })?;
-        let pgid = libc::pid_t::try_from(child.id()).unwrap_or(0);
+        let tree = tree.adopt(&mut child).map_err(|e| ShellError::Spawn {
+            program: req.program.clone(),
+            reason: format!("cannot contain the process tree: {e}"),
+        })?;
 
         let out = Capture::spawn_reader(child.stdout.take(), self.policy.stdout_cap);
         let err = Capture::spawn_reader(child.stderr.take(), self.policy.stderr_cap);
 
-        let (status, timed_out) = wait_with_deadline(&mut child, pgid, started + plan.timeout);
+        let (status, timed_out) = wait_with_deadline(&mut child, &tree, started + plan.timeout);
         // Reap anything the leader left behind in its group. (A group id is not reused while
         // any member is alive; when none is left this is a no-op.)
-        kill_group(pgid);
+        tree.kill();
         let duration = started.elapsed();
 
         let drain_deadline = Instant::now() + DRAIN_GRACE;
@@ -1014,7 +1160,7 @@ impl ShellRunner {
         let err = err.finish(drain_deadline);
 
         let (exit_code, signal) = match status {
-            Some(s) => (s.code(), s.signal()),
+            Some(s) => (s.code(), exit_signal(&s)),
             None => (None, None),
         };
 
@@ -1059,6 +1205,41 @@ pub struct RunPlan {
     pub sandbox: SandboxSummary,
 }
 
+/// The directory handed to the child as its cwd. On Unix, the canonical cwd itself.
+#[cfg(unix)]
+fn child_cwd(canonical: &Path) -> &Path {
+    canonical
+}
+
+/// On Windows `canonicalize` yields a verbatim path (`\\?\C:\x`), which many programs
+/// (`cmd.exe`, Git for Windows, Node) refuse or mishandle as a working directory. A verbatim
+/// *disk* path is handed over as the equivalent plain drive path (`C:\x`); the grant checks
+/// and the report keep the canonical form. Other verbatim forms (UNC, device) are kept.
+#[cfg(windows)]
+fn child_cwd(canonical: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut comps = canonical.components();
+    if let Some(Component::Prefix(p)) = comps.next() {
+        if let Prefix::VerbatimDisk(letter) = p.kind() {
+            let mut out = PathBuf::from(format!("{}:\\", char::from(letter)));
+            out.extend(comps.filter(|c| !matches!(c, Component::RootDir)));
+            return out;
+        }
+    }
+    canonical.to_path_buf()
+}
+
+/// The file names a bare program name may resolve to on Windows (see [`ShellPolicy::resolve`]).
+#[cfg(windows)]
+fn windows_exe_names(program: &str) -> Vec<String> {
+    let lower = program.to_ascii_lowercase();
+    if lower.ends_with(".exe") || lower.ends_with(".com") {
+        vec![program.to_string()]
+    } else {
+        vec![format!("{program}.exe"), format!("{program}.com")]
+    }
+}
+
 fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1067,9 +1248,10 @@ fn join_search_path(dirs: &[PathBuf]) -> String {
     dirs.iter()
         .map(|d| d.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
-        .join(":")
+        .join(PATH_LIST_SEP.encode_utf8(&mut [0u8; 4]))
 }
 
+#[cfg(unix)]
 fn kill_group(pgid: libc::pid_t) {
     if pgid > 0 {
         // SAFETY: kill(2) with a negative pid signals a process group; it has no memory
@@ -1080,11 +1262,92 @@ fn kill_group(pgid: libc::pid_t) {
     }
 }
 
+/// Everything one run started: the child's process group on Unix, its Job Object on Windows.
+#[cfg(unix)]
+struct ProcessTree {
+    pgid: libc::pid_t,
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    /// Nothing to create up front: the group is the child itself (`process_group(0)`).
+    fn prepare() -> std::io::Result<PendingTree> {
+        Ok(PendingTree)
+    }
+
+    fn kill(&self) {
+        kill_group(self.pgid);
+    }
+}
+
+#[cfg(unix)]
+struct PendingTree;
+
+#[cfg(unix)]
+impl PendingTree {
+    fn adopt(self, child: &mut Child) -> std::io::Result<ProcessTree> {
+        Ok(ProcessTree {
+            pgid: libc::pid_t::try_from(child.id()).unwrap_or(0),
+        })
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: win::Job,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    /// The job is created before the spawn so a failure leaves no suspended child behind.
+    fn prepare() -> std::io::Result<PendingTree> {
+        Ok(PendingTree {
+            job: win::Job::new()?,
+        })
+    }
+
+    fn kill(&self) {
+        self.job.kill();
+    }
+}
+
+#[cfg(windows)]
+struct PendingTree {
+    job: win::Job,
+}
+
+#[cfg(windows)]
+impl PendingTree {
+    /// Assign the suspended child to the job and resume it. If that fails the child never
+    /// ran a single instruction of the program; it is terminated and reaped.
+    fn adopt(self, child: &mut Child) -> std::io::Result<ProcessTree> {
+        match self.job.adopt(child) {
+            Ok(()) => Ok(ProcessTree { job: self.job }),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(s: &std::process::ExitStatus) -> Option<i32> {
+    s.signal()
+}
+
+/// Windows has no signals: a process ended by the job reports its exit code (1) instead.
+#[cfg(windows)]
+fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 /// Poll the child until it exits or the deadline passes; on deadline kill the whole group and
 /// reap the leader. Returns `(status, timed_out)`; status is `None` only if waiting failed.
 fn wait_with_deadline(
     child: &mut Child,
-    pgid: libc::pid_t,
+    tree: &ProcessTree,
     deadline: Instant,
 ) -> (Option<std::process::ExitStatus>, bool) {
     let mut sleep = Duration::from_millis(2);
@@ -1093,13 +1356,13 @@ fn wait_with_deadline(
             Ok(Some(s)) => return (Some(s), false),
             Ok(None) => {}
             Err(_) => {
-                kill_group(pgid);
+                tree.kill();
                 return (child.wait().ok(), false);
             }
         }
         let now = Instant::now();
         if now >= deadline {
-            kill_group(pgid);
+            tree.kill();
             return (child.wait().ok(), true);
         }
         std::thread::sleep(sleep.min(deadline - now));
@@ -1232,7 +1495,8 @@ fn link_into(home: &Path, rel: &Path, target: &Path) -> std::io::Result<()> {
 // Scratch HOME
 // ------------------------------------------------------------------------------------------
 
-/// A fresh, private (0700) directory per run, removed on drop.
+/// A fresh, private (0700; on Windows an owner-and-SYSTEM-only protected DACL) directory per
+/// run, removed on drop.
 struct ScratchDir(PathBuf);
 
 impl ScratchDir {
@@ -1246,7 +1510,10 @@ impl ScratchDir {
             std::process::id(),
             SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        #[cfg(unix)]
         std::fs::DirBuilder::new().mode(0o700).create(&p)?;
+        #[cfg(windows)]
+        win::create_private_dir(&p)?;
         Ok(Self(p))
     }
 
@@ -1308,6 +1575,7 @@ mod tests {
         assert!(e.to_string().contains("not on the shell allowlist"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn plan_reports_without_running() {
         let d = std::env::temp_dir();
@@ -1323,5 +1591,87 @@ mod tests {
         assert_eq!(plan.resolved_path, PathBuf::from("/usr/bin/git"));
         assert_eq!(plan.args, vec!["log", "--no-ext-diff", "--no-textconv"]);
         assert_eq!(plan.timeout, Duration::from_secs(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_env_is_case_insensitive() {
+        let p = ShellPolicy::new(Allowlist::empty(), ShellPolicy::default_search_path())
+            .expect("policy")
+            .with_request_env_allow(&[
+                "Path",
+                "home",
+                "UserProfile",
+                "temp",
+                "SYSTEMROOT",
+                "FOUNDRY_PROFILE",
+            ]);
+        assert_eq!(p.request_env_allow, vec!["FOUNDRY_PROFILE".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_search_path_uses_semicolons_and_accepts_drive_letters() {
+        let p = ShellPolicy::default_search_path();
+        assert!(p.iter().all(|d| d.is_absolute()));
+        assert!(ShellPolicy::new(Allowlist::empty(), p.clone()).is_ok());
+        assert!(join_search_path(&p).contains(';'));
+        assert!(ShellPolicy::new(Allowlist::empty(), vec![PathBuf::from("C:\\a;C:\\b")]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolution_tries_exe_and_com_but_never_scripts() {
+        assert_eq!(windows_exe_names("forge"), vec!["forge.exe", "forge.com"]);
+        assert_eq!(windows_exe_names("git.EXE"), vec!["git.EXE"]);
+        let d = tempfile::tempdir().expect("tempdir");
+        std::fs::write(d.path().join("tool.cmd"), b"@echo off").expect("write");
+        std::fs::write(d.path().join("tool.bat"), b"@echo off").expect("write");
+        let p = ShellPolicy::new(Allowlist::empty(), vec![d.path().to_path_buf()]).expect("policy");
+        assert!(matches!(
+            p.resolve("tool"),
+            Err(ShellError::ProgramNotFound { .. })
+        ));
+        std::fs::write(d.path().join("tool.exe"), b"MZ").expect("write");
+        assert_eq!(
+            p.resolve("tool").expect("resolve"),
+            d.path().join("tool.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_plan_resolves_a_system_program() {
+        let d = std::env::temp_dir();
+        let r = ShellRunner::new(
+            ShellPolicy::new(
+                Allowlist::empty().allow("whoami", ArgPolicy::Any),
+                ShellPolicy::default_search_path(),
+            )
+            .expect("policy"),
+            |_p: &Path| Ok(()),
+        );
+        let plan = r
+            .plan(&RunRequest::new("whoami", vec![], &d))
+            .expect("plan");
+        assert!(plan
+            .resolved_path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with("\\system32\\whoami.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_cwd_drops_the_verbatim_disk_prefix() {
+        assert_eq!(
+            child_cwd(Path::new(r"\\?\C:\work\proj")),
+            PathBuf::from(r"C:\work\proj")
+        );
+        assert_eq!(child_cwd(Path::new(r"C:\work")), PathBuf::from(r"C:\work"));
+        assert_eq!(
+            child_cwd(Path::new(r"\\?\UNC\srv\share\x")),
+            PathBuf::from(r"\\?\UNC\srv\share\x")
+        );
     }
 }
