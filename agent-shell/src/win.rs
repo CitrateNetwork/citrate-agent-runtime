@@ -289,10 +289,11 @@ mod tests {
             .expect("spawn");
         job.adopt(&child).expect("adopt");
         drop(job);
+        // ping -n 30 runs ~29s; returning at once means closing the job ended it. (The exit
+        // code of a process ended by job close is not specified, so it is not asserted.)
         let t = Instant::now();
-        let status = child.wait().expect("wait");
-        assert!(t.elapsed() < Duration::from_secs(5));
-        assert!(!status.success());
+        child.wait().expect("wait");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     #[test]

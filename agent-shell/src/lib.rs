@@ -1248,7 +1248,7 @@ fn join_search_path(dirs: &[PathBuf]) -> String {
     dirs.iter()
         .map(|d| d.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
-        .join(":")
+        .join(PATH_LIST_SEP.encode_utf8(&mut [0u8; 4]))
 }
 
 #[cfg(unix)]
