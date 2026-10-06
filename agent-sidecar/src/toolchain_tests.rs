@@ -1216,3 +1216,116 @@ fn live_slither_scan_finds_the_reentrancy() {
     assert!(!v.passed, "{}", v.reason);
     assert!(v.reason.contains("reentrancy-eth"), "{}", v.reason);
 }
+
+// ---- HUP-S6: medusa.json in the templates' shape (pending owner sign-off) -------------------
+
+fn hello_mint_medusa_json() -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(fixture_path("captured/medusa-hellomint-T1.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_templates_own_medusa_json_lets_every_tool_run() {
+    let s = Scratch::new();
+    fake_all(&s);
+    std::fs::write(
+        s.proj().join("medusa.json"),
+        hello_mint_medusa_json().to_string(),
+    )
+    .unwrap();
+    for tool in ALL_TOOLS {
+        let (_, env) = run(&s.host(), tool, serde_json::json!({"project": s.proj()}));
+        assert_ne!(env.status, RunStatus::Refused, "{tool}: {}", env.summary);
+    }
+}
+
+#[test]
+fn a_medusa_json_outside_the_templates_shape_is_refused() {
+    type Mutate = Box<dyn Fn(&mut serde_json::Value)>;
+    let cases: Vec<(&str, Mutate)> = vec![
+        (
+            "enableFFI",
+            Box::new(|v| v["fuzzing"]["chainConfig"]["cheatCodes"]["enableFFI"] = true.into()),
+        ),
+        (
+            "args",
+            Box::new(|v| {
+                v["compilation"]["platformConfig"]["args"] =
+                    serde_json::json!(["--compile-custom-build", "sh -c id"])
+            }),
+        ),
+        (
+            "target",
+            Box::new(|v| v["compilation"]["platformConfig"]["target"] = "/etc".into()),
+        ),
+        (
+            "crytic-compile",
+            Box::new(|v| v["compilation"]["platform"] = "solc".into()),
+        ),
+        (
+            "solcVersion",
+            Box::new(|v| v["compilation"]["platformConfig"]["solcVersion"] = "/tmp/solc".into()),
+        ),
+        (
+            "corpusDirectory",
+            Box::new(|v| v["fuzzing"]["corpusDirectory"] = "../outside".into()),
+        ),
+        (
+            "logDirectory",
+            Box::new(|v| v["logging"]["logDirectory"] = "/tmp/logs".into()),
+        ),
+        ("outside fuzzing", Box::new(|v| v["extra"] = 1.into())),
+        (
+            "compilation settings",
+            Box::new(|v| {
+                v.as_object_mut().unwrap().remove("compilation");
+            }),
+        ),
+    ];
+    for (needle, mutate) in cases {
+        let s = Scratch::new();
+        fake_all(&s);
+        let mut v = hello_mint_medusa_json();
+        mutate(&mut v);
+        std::fs::write(s.proj().join("medusa.json"), v.to_string()).unwrap();
+        let (_, env) = run(
+            &s.host(),
+            MEDUSA_FUZZ_TOOL,
+            serde_json::json!({"project": s.proj()}),
+        );
+        assert_eq!(env.status, RunStatus::Refused, "{needle}: {}", env.summary);
+        assert!(env.summary.contains(needle), "{needle}: {}", env.summary);
+    }
+}
+
+// ---- HUP-S6: aderyn finds the configured solc in the scratch HOME's svm folder ---------------
+
+#[test]
+fn the_configured_solc_is_linked_where_aderyn_looks_for_it() {
+    let s = Scratch::new();
+    // A stand-in aderyn that, like the real one, only reports when ~/.svm has the compiler.
+    let script = format!(
+        "#!/bin/sh\n/usr/bin/readlink \"$HOME/.svm/0.8.36/solc-0.8.36\" > '{}'\n/bin/cat '{}'\nexit 0\n",
+        s.base.join("aderyn.link").display(),
+        fixture_path("aderyn-lows-only.sarif").display()
+    );
+    let p = s.bin().join("aderyn");
+    std::fs::write(&p, script).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, env) = run(
+        &s.host(),
+        ADERYN_SCAN_TOOL,
+        serde_json::json!({"project": s.proj()}),
+    );
+    assert!(env.verdict.as_ref().unwrap().passed, "{}", env.summary);
+    assert_eq!(
+        std::fs::read_to_string(s.base.join("aderyn.link"))
+            .unwrap()
+            .trim(),
+        "/opt/solc/solc-0.8.36"
+    );
+    assert_eq!(svm_links(None), vec![]);
+    assert_eq!(svm_links(Some(Path::new("relative/solc"))), vec![]);
+}

@@ -1,13 +1,18 @@
 //! The daily report: one UTC day of turn records, aggregated, as JSON and markdown.
 
 use crate::day::utc_day_bounds_ms;
+use crate::measures::{
+    tokens_per_s_milli, SelfReviewClaim, ENERGY_ESTIMATE_LABEL, SELF_REVIEW_OPINION,
+};
 use crate::record::{ToolTally, TurnOutcome, TurnRecord, Verification};
 use crate::MeteringError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Report schema version.
-pub const REPORT_SCHEMA: u32 = 1;
+/// Report schema version. Version 2 (HUP-S7.5, D-27) adds `ttft_ms`, `speed`, `resources`,
+/// `energy_estimate` and `self_review`; each is absent from (and defaults when reading) a version 1
+/// report.
+pub const REPORT_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeCounts {
@@ -41,6 +46,76 @@ pub struct TokenTotals {
     pub turns_reporting: u32,
 }
 
+/// D-27: tokens per second over the day, from the server's own generation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedTotals {
+    /// Completion tokens covered by a reported generation time.
+    pub tokens: u64,
+    pub generation_ms: u64,
+    /// tokens / seconds, times 1000.
+    pub tokens_per_s_milli: u64,
+    pub turns_reporting: u32,
+}
+
+/// D-27: the day's machine load peaks, over the turns that were sampled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceTotals {
+    pub turns_sampled: u32,
+    pub cpu_peak_bps: u32,
+    pub ram_used_peak_bytes: u64,
+    pub ram_total_bytes: u64,
+    /// `None` when no sampled turn had a GPU reading.
+    pub gpu_peak_bps: Option<u32>,
+}
+
+/// D-27: the day's energy figure. An estimate, labelled as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnergyTotals {
+    /// Always "estimate".
+    pub label: String,
+    pub microwatt_hours: u64,
+    pub turns_estimated: u32,
+    /// Turns whose estimate left the GPU out (its load was unknown).
+    pub turns_without_gpu: u32,
+}
+
+/// D-27: the model's self-review claims, labelled "opinion", and how they compare with the
+/// verifiers' verdicts on the same turns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfReviewCounts {
+    /// Always "opinion".
+    pub label: String,
+    pub pass: u32,
+    pub fail: u32,
+    pub unclear: u32,
+    /// The claim matched the verifiers' verdict (PASS on a passed turn, FAIL on a failed one).
+    pub agreed_with_verifiers: u32,
+    /// The claim contradicted the verifiers' verdict.
+    pub disagreed_with_verifiers: u32,
+}
+
+impl Default for SelfReviewCounts {
+    fn default() -> Self {
+        SelfReviewCounts {
+            label: SELF_REVIEW_OPINION.to_string(),
+            pass: 0,
+            fail: 0,
+            unclear: 0,
+            agreed_with_verifiers: 0,
+            disagreed_with_verifiers: 0,
+        }
+    }
+}
+
+impl SelfReviewCounts {
+    /// Opinions recorded.
+    pub fn total(&self) -> u32 {
+        self.pass
+            .saturating_add(self.fail)
+            .saturating_add(self.unclear)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassFail {
     pub passed: u32,
@@ -69,6 +144,21 @@ pub struct DailyReport {
     /// Turns per model.
     pub models: BTreeMap<String, u32>,
     pub tainted_turns: u32,
+    /// D-27: the server's time to first token over the turns that reported it.
+    #[serde(default)]
+    pub ttft_ms: Option<LatencyStats>,
+    /// D-27: generation speed; `None` when no turn reported a generation time.
+    #[serde(default)]
+    pub speed: Option<SpeedTotals>,
+    /// D-27: machine load peaks; `None` when no turn was sampled.
+    #[serde(default)]
+    pub resources: Option<ResourceTotals>,
+    /// D-27: the energy estimate; `None` when no turn has one.
+    #[serde(default)]
+    pub energy_estimate: Option<EnergyTotals>,
+    /// D-27: self-review opinions.
+    #[serde(default)]
+    pub self_review: SelfReviewCounts,
 }
 
 pub(crate) fn nearest_rank(sorted: &[u64], pct: u64) -> u64 {
@@ -104,9 +194,15 @@ impl DailyReport {
             verifiers: BTreeMap::new(),
             models: BTreeMap::new(),
             tainted_turns: 0,
+            ttft_ms: None,
+            speed: None,
+            resources: None,
+            energy_estimate: None,
+            self_review: SelfReviewCounts::default(),
         };
         let mut sessions = BTreeSet::new();
         let mut latencies = Vec::new();
+        let mut ttfts = Vec::new();
         for rec in records
             .iter()
             .filter(|x| x.started_unix_ms >= start && x.started_unix_ms < end)
@@ -156,6 +252,80 @@ impl DailyReport {
             if rec.tainted {
                 inc(&mut r.tainted_turns);
             }
+            if let Some(t) = rec.ttft_ms {
+                ttfts.push(t);
+            }
+            if let Some(g) = rec.generation {
+                let s = r.speed.get_or_insert(SpeedTotals {
+                    tokens: 0,
+                    generation_ms: 0,
+                    tokens_per_s_milli: 0,
+                    turns_reporting: 0,
+                });
+                s.tokens = s.tokens.saturating_add(g.tokens);
+                s.generation_ms = s.generation_ms.saturating_add(g.ms);
+                inc(&mut s.turns_reporting);
+            }
+            if let Some(p) = rec.resources {
+                let t = r.resources.get_or_insert(ResourceTotals {
+                    turns_sampled: 0,
+                    cpu_peak_bps: 0,
+                    ram_used_peak_bytes: 0,
+                    ram_total_bytes: 0,
+                    gpu_peak_bps: None,
+                });
+                inc(&mut t.turns_sampled);
+                t.cpu_peak_bps = t.cpu_peak_bps.max(p.cpu_peak_bps);
+                t.ram_used_peak_bytes = t.ram_used_peak_bytes.max(p.ram_used_peak_bytes);
+                t.ram_total_bytes = t.ram_total_bytes.max(p.ram_total_bytes);
+                t.gpu_peak_bps = match (t.gpu_peak_bps, p.gpu_peak_bps) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            if let Some(e) = &rec.energy_estimate {
+                let t = r.energy_estimate.get_or_insert(EnergyTotals {
+                    label: ENERGY_ESTIMATE_LABEL.to_string(),
+                    microwatt_hours: 0,
+                    turns_estimated: 0,
+                    turns_without_gpu: 0,
+                });
+                t.microwatt_hours = t.microwatt_hours.saturating_add(e.microwatt_hours);
+                inc(&mut t.turns_estimated);
+                if !e.gpu_included {
+                    inc(&mut t.turns_without_gpu);
+                }
+            }
+            if let Some(sr) = &rec.self_review {
+                let c = &mut r.self_review;
+                match sr.claim {
+                    SelfReviewClaim::Pass => inc(&mut c.pass),
+                    SelfReviewClaim::Fail => inc(&mut c.fail),
+                    SelfReviewClaim::Unclear => inc(&mut c.unclear),
+                }
+                match (sr.claim, rec.verification()) {
+                    (SelfReviewClaim::Pass, Verification::Passed)
+                    | (SelfReviewClaim::Fail, Verification::Failed) => {
+                        inc(&mut c.agreed_with_verifiers)
+                    }
+                    (SelfReviewClaim::Pass, Verification::Failed)
+                    | (SelfReviewClaim::Fail, Verification::Passed) => {
+                        inc(&mut c.disagreed_with_verifiers)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(s) = r.speed.as_mut() {
+            s.tokens_per_s_milli = tokens_per_s_milli(s.tokens, s.generation_ms).unwrap_or(0);
+        }
+        if !ttfts.is_empty() {
+            ttfts.sort_unstable();
+            r.ttft_ms = Some(LatencyStats {
+                p50: nearest_rank(&ttfts, 50),
+                p95: nearest_rank(&ttfts, 95),
+                max: ttfts.last().copied().unwrap_or(0),
+            });
         }
         r.sessions = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
         let judged = u64::from(r.verification.passed) + u64::from(r.verification.failed);
@@ -171,6 +341,63 @@ impl DailyReport {
             });
         }
         Ok(r)
+    }
+
+    /// The D-27 rows of the markdown table. A measure no turn reported is written as unknown.
+    fn d27_markdown_rows(&self) -> String {
+        let mut s = String::new();
+        match &self.ttft_ms {
+            Some(t) => s.push_str(&format!(
+                "| Time to first token p50 / p95 | {} ms / {} ms |\n",
+                t.p50, t.p95
+            )),
+            None => s.push_str(
+                "| Time to first token | unknown (the model server did not report it) |\n",
+            ),
+        }
+        match &self.speed {
+            Some(sp) => s.push_str(&format!(
+                "| Tokens per second | {}.{} (over {} turns) |\n",
+                sp.tokens_per_s_milli / 1000,
+                (sp.tokens_per_s_milli % 1000) / 100,
+                sp.turns_reporting
+            )),
+            None => s.push_str("| Tokens per second | unknown (no generation time reported) |\n"),
+        }
+        match &self.resources {
+            Some(rt) => {
+                let gpu = rt.gpu_peak_bps.map_or("unknown".to_string(), |g| {
+                    format!("{}.{:02}%", g / 100, g % 100)
+                });
+                s.push_str(&format!(
+                    "| Peak CPU / GPU / RAM (whole machine) | {}.{:02}% / {} / {} MiB of {} MiB |\n",
+                    rt.cpu_peak_bps / 100,
+                    rt.cpu_peak_bps % 100,
+                    gpu,
+                    rt.ram_used_peak_bytes / (1024 * 1024),
+                    rt.ram_total_bytes / (1024 * 1024)
+                ));
+            }
+            None => s.push_str("| Peak CPU / GPU / RAM | unknown (not sampled) |\n"),
+        }
+        match &self.energy_estimate {
+            Some(e) => s.push_str(&format!(
+                "| Energy (estimate, not measured) | {}.{:03} mWh |\n",
+                e.microwatt_hours / 1000,
+                e.microwatt_hours % 1000
+            )),
+            None => s.push_str("| Energy (estimate) | unknown (not sampled) |\n"),
+        }
+        let sr = &self.self_review;
+        if sr.total() > 0 {
+            s.push_str(&format!(
+                "| Self-review (opinion, not a verdict) PASS / FAIL / unclear | {} / {} / {} (agreed with verifiers {}, disagreed {}) |\n",
+                sr.pass, sr.fail, sr.unclear, sr.agreed_with_verifiers, sr.disagreed_with_verifiers
+            ));
+        } else {
+            s.push_str("| Self-review (opinion) | none recorded |\n");
+        }
+        s
     }
 
     /// Pretty JSON.
@@ -223,6 +450,7 @@ impl DailyReport {
             "| Turns that read untrusted content | {} |\n",
             self.tainted_turns
         ));
+        s.push_str(&self.d27_markdown_rows());
         if !self.tool_calls.is_empty() {
             s.push_str("\n## Tool calls\n\n| Tool | Calls | Ok | Declined | Errors | Needed explicit approval |\n|---|---|---|---|---|---|\n");
             for (name, t) in &self.tool_calls {

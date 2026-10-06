@@ -13,6 +13,11 @@
 //! - [`DailyReport`] aggregates one UTC day into JSON and markdown.
 //! - [`EscalationReceipt`] / [`EscalationLog`] / [`EscalationSummary`] (HUP-S1.5, US-1.5 AC3): one
 //!   content-free receipt per escalation that may have cost the member money, summed per day.
+//! - D-27 measures (HUP-S7.5, US-7.3 AC1) on each record: time to first token and generation time
+//!   from the model server's own timings, CPU/GPU/RAM peaks from a host-supplied
+//!   [`ResourceSampler`], an energy figure labelled "estimate", and the model's self-review claim
+//!   labelled "opinion". [`ChainReceipt`] / [`ChainSpendSummary`] carry SALT spent and gas from the
+//!   receipts of Hermes's chain transactions (reported by citrate-core, which signs them).
 //! - [`DecisionLog`] / [`DecisionReport`] (HUP-S5.3): the `decide()` slot's content-free decision
 //!   records and task outcomes, reported per backend (local, jev) with task success rates.
 //! - [`build_benchmark_payload`] turns a report into calldata for
@@ -23,25 +28,31 @@
 //! Honesty rules carried from the loop: an `answered` turn is **not** a success. Only verifier
 //! verdicts make a turn verified; a turn with no verifier is "unverified", counted separately.
 //!
-//! Not wired into sidecar sessions yet: this crate is the library half. The sidecar wiring, the
-//! activity monitor surface and the nightly batch are separate work packages.
+//! The sidecar wires this into every session (`agent-sidecar/src/metering.rs`); citrate-core shows
+//! the daily report in the Journal and signs any on-chain sharing.
 
 use thiserror::Error;
 
 mod benchmark;
+mod chain_receipts;
 mod clock;
 mod day;
 mod decisions;
 mod escalations;
 mod log;
+mod measures;
 mod record;
 mod report;
 mod sink;
 
 pub use benchmark::{
-    build_benchmark_payload, hermes_capsule_id, metric_name_hash, record_selector, BenchmarkCall,
-    BenchmarkOptIn, BenchmarkPayload, BENCHMARK_RECORD_SIGNATURE, CITRATE_CHAIN_ID,
-    HERMES_CAPSULE_LABEL, METRICS,
+    build_benchmark_payload, build_benchmark_payload_with, hermes_capsule_id, metric_name_hash,
+    record_selector, BenchmarkCall, BenchmarkOptIn, BenchmarkPayload, BENCHMARK_RECORD_SIGNATURE,
+    CITRATE_CHAIN_ID, HERMES_CAPSULE_LABEL, METRICS,
+};
+pub use chain_receipts::{
+    format_salt, ChainPurpose, ChainReceipt, ChainReceiptLog, ChainSpendSummary,
+    CHAIN_RECEIPT_SCHEMA,
 };
 pub use clock::{Clock, SystemClock};
 pub use day::{utc_day_bounds_ms, utc_day_of_ms};
@@ -53,9 +64,17 @@ pub use escalations::{
     ESCALATION_RECEIPT_SCHEMA,
 };
 pub use log::MeteringLog;
-pub use record::{ToolTally, TurnOutcome, TurnRecord, Verification, VerifierOutcome};
+pub use measures::{
+    tokens_per_s_milli, EnergyEstimate, EnergyModel, Generation, ResourcePeaks, ResourceSample,
+    ResourceSampler, SelfReview, SelfReviewClaim, TurnSampling, BPS_WHOLE, DEFAULT_ENERGY_MODEL,
+    ENERGY_ESTIMATE_LABEL, SELF_REVIEW_OPINION,
+};
+pub use record::{
+    ToolTally, TurnOutcome, TurnRecord, Verification, VerifierOutcome, RECORD_SCHEMA,
+};
 pub use report::{
-    DailyReport, LatencyStats, OutcomeCounts, PassFail, TokenTotals, VerificationCounts,
+    DailyReport, EnergyTotals, LatencyStats, OutcomeCounts, PassFail, ResourceTotals,
+    SelfReviewCounts, SpeedTotals, TokenTotals, VerificationCounts, REPORT_SCHEMA,
 };
 pub use sink::{MeteringSink, UNKNOWN_TOOL};
 
@@ -76,4 +95,6 @@ pub enum MeteringError {
     EmptyReport,
     #[error("not a usable contract address: {0:?}")]
     InvalidAddress(String),
+    #[error("not a valid chain receipt: {0}")]
+    InvalidReceipt(String),
 }

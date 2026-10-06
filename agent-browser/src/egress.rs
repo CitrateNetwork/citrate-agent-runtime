@@ -10,6 +10,11 @@
 //! a name resolves to must be public, and the relay connects to the address it checked, so a name
 //! cannot be re-pointed at this machine between the check and the connection.
 //!
+//! **Off the open web (HUP-S5.5).** A gate started with `open_web = false` ([`EgressGate::start_with`])
+//! relays to developer-allowed origins on this machine only: an allowed IP literal must be
+//! loopback, and an allowed name must resolve to loopback addresses only. Public addresses are
+//! refused like local ones.
+//!
 //! Only unauthenticated `CONNECT` (RFC 1928) is spoken. The relay listens on 127.0.0.1 only, and
 //! reaches nothing a local process could not already reach, so it grants no new access.
 
@@ -21,6 +26,7 @@ use std::time::Duration;
 
 use citrate_agent_guard::net::{is_local_name, is_public_ip};
 
+use crate::gate::is_loopback_ip;
 use crate::scope::Origin;
 
 /// How long a client has to finish the SOCKS5 handshake, and how long a connection attempt to a
@@ -44,8 +50,15 @@ pub struct EgressGate {
 }
 
 impl EgressGate {
-    /// Listen on a free loopback port and relay for `allow` (developer-allowed local origins).
+    /// Listen on a free loopback port and relay for `allow` (developer-allowed local origins),
+    /// with the open web reachable.
     pub fn start(allow: Vec<Origin>) -> io::Result<EgressGate> {
+        EgressGate::start_with(allow, true)
+    }
+
+    /// [`EgressGate::start`] under the open-web rule: with `open_web = false` only allowed
+    /// origins on this machine are relayed (HUP-S5.5).
+    pub fn start_with(allow: Vec<Origin>, open_web: bool) -> io::Result<EgressGate> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -70,7 +83,7 @@ impl EgressGate {
                     let spawned = std::thread::Builder::new()
                         .name("citrate-browser-relay".to_string())
                         .spawn(move || {
-                            let _ = serve(client, &allow);
+                            let _ = serve(client, &allow, open_web);
                             done.fetch_sub(1, Ordering::SeqCst);
                         });
                     if spawned.is_err() {
@@ -125,7 +138,15 @@ fn allowed_origin(allow: &[Origin], host: &str, port: u16) -> bool {
 }
 
 /// Resolve and judge a target: the addresses to try, or the SOCKS5 reply code refusing it.
-fn decide(target: &Target, port: u16, allow: &[Origin]) -> Result<Vec<SocketAddr>, u8> {
+fn decide(
+    target: &Target,
+    port: u16,
+    allow: &[Origin],
+    open_web: bool,
+) -> Result<Vec<SocketAddr>, u8> {
+    if !open_web {
+        return decide_closed(target, port, allow);
+    }
     match target {
         Target::Ip(ip) => {
             if allowed_origin(allow, &ip.to_string(), port) || is_public_ip(*ip) {
@@ -155,12 +176,42 @@ fn decide(target: &Target, port: u16, allow: &[Origin]) -> Result<Vec<SocketAddr
     }
 }
 
+/// Off the open web: an allowed origin on this machine, or nothing.
+fn decide_closed(target: &Target, port: u16, allow: &[Origin]) -> Result<Vec<SocketAddr>, u8> {
+    match target {
+        Target::Ip(ip) => {
+            if allowed_origin(allow, &ip.to_string(), port) && is_loopback_ip(*ip) {
+                Ok(vec![SocketAddr::new(*ip, port)])
+            } else {
+                Err(REPLY_NOT_ALLOWED)
+            }
+        }
+        Target::Name(name) => {
+            if !allowed_origin(allow, name, port) {
+                return Err(REPLY_NOT_ALLOWED);
+            }
+            use std::net::ToSocketAddrs;
+            let addrs: Vec<SocketAddr> = (name.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|_| REPLY_HOST_UNREACHABLE)?
+                .collect();
+            if addrs.is_empty() {
+                return Err(REPLY_HOST_UNREACHABLE);
+            }
+            if !addrs.iter().all(|a| is_loopback_ip(a.ip())) {
+                return Err(REPLY_NOT_ALLOWED);
+            }
+            Ok(addrs)
+        }
+    }
+}
+
 fn reply(client: &mut TcpStream, code: u8) -> io::Result<()> {
     client.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0])
 }
 
 /// One client connection: the SOCKS5 handshake, the decision, then the relay.
-fn serve(mut client: TcpStream, allow: &[Origin]) -> io::Result<()> {
+fn serve(mut client: TcpStream, allow: &[Origin], open_web: bool) -> io::Result<()> {
     client.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let mut head = [0u8; 2];
     client.read_exact(&mut head)?;
@@ -220,7 +271,7 @@ fn serve(mut client: TcpStream, allow: &[Origin]) -> io::Result<()> {
     client.read_exact(&mut port)?;
     let port = u16::from_be_bytes(port);
 
-    let addrs = match decide(&target, port, allow) {
+    let addrs = match decide(&target, port, allow, open_web) {
         Ok(a) => a,
         Err(code) => {
             reply(&mut client, code)?;
@@ -274,15 +325,54 @@ mod tests {
 
     #[test]
     fn public_literals_pass_and_local_ones_do_not() {
-        let ok = decide(&Target::Ip("1.1.1.1".parse().expect("ip")), 443, &[]);
+        let ok = decide(&Target::Ip("1.1.1.1".parse().expect("ip")), 443, &[], true);
         assert_eq!(ok, Ok(vec!["1.1.1.1:443".parse().expect("addr")]));
         for bad in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fd00::1"] {
             let ip: IpAddr = bad.parse().expect("ip");
             assert_eq!(
-                decide(&Target::Ip(ip), 80, &[]),
+                decide(&Target::Ip(ip), 80, &[], true),
                 Err(REPLY_NOT_ALLOWED),
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn off_the_open_web_only_allowed_loopback_targets_pass() {
+        let allow = crate::gate::parse_allow_private(
+            "http://127.0.0.1:8545, http://10.0.0.5:8545, http://1.1.1.1:443",
+        )
+        .expect("allow");
+        let ip = |s: &str| Target::Ip(s.parse().expect("ip"));
+        assert_eq!(
+            decide(&ip("127.0.0.1"), 8545, &allow, false),
+            Ok(vec!["127.0.0.1:8545".parse().expect("addr")]),
+            "the allowed fork on loopback"
+        );
+        assert_eq!(
+            decide(&ip("1.1.1.1"), 443, &[], false),
+            Err(REPLY_NOT_ALLOWED),
+            "a public address is refused"
+        );
+        assert_eq!(
+            decide(&ip("1.1.1.1"), 443, &allow, false),
+            Err(REPLY_NOT_ALLOWED),
+            "even an allowed public origin is refused"
+        );
+        assert_eq!(
+            decide(&ip("10.0.0.5"), 8545, &allow, false),
+            Err(REPLY_NOT_ALLOWED),
+            "an allowed origin on the local network is not this machine"
+        );
+        assert_eq!(
+            decide(&ip("127.0.0.1"), 8546, &allow, false),
+            Err(REPLY_NOT_ALLOWED),
+            "loopback without an allow is refused"
+        );
+        assert_eq!(
+            decide(&Target::Name("example.com".into()), 443, &allow, false),
+            Err(REPLY_NOT_ALLOWED),
+            "a public name is refused before it is resolved"
+        );
     }
 }

@@ -77,6 +77,7 @@ fn usage(p: u64, c: u64, ms: Option<u64>) -> Option<TokenUsage> {
         prompt_tokens: p,
         completion_tokens: c,
         generation_ms: ms,
+        prompt_ms: None,
     })
 }
 fn tools() -> ToolRegistry {
@@ -121,12 +122,14 @@ fn each_reported_model_call_emits_its_usage_on_its_own_step() {
                 prompt_tokens: 120,
                 completion_tokens: 9,
                 generation_ms: Some(300),
+                prompt_ms: None,
             },
             Event::Usage {
                 step: 2,
                 prompt_tokens: 140,
                 completion_tokens: 4,
                 generation_ms: None,
+                prompt_ms: None,
             },
         ]
     );
@@ -159,6 +162,7 @@ fn usage_serializes_with_the_wire_tag_and_omits_an_unknown_generation_time() {
         prompt_tokens: 10,
         completion_tokens: 3,
         generation_ms: None,
+        prompt_ms: None,
     })
     .unwrap();
     assert_eq!(

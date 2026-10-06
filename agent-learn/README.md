@@ -67,15 +67,36 @@ on one key the member resolves twice.
   answer is lost, core picks the resolution up from the proposal list (a retracted proposal names
   the one kept).
 
+## Resolving against a memory core already held
+
+A contradiction can also be with a memory core passed in `known_memories` (`memory:<id>`, not
+learned here). `resolve` accepts it as one side when the learned memory's accept acknowledged that
+exact contradiction:
+
+- keep the known memory, retract the learned one: the learned proposal becomes `retracted` with
+  `kept = "memory:<id>"`, as between two learned memories;
+- keep the learned memory, set the known one aside: the learned proposal stays `persisted` and
+  lists the id in `set_aside`. Core retires the known memory in its own store.
+
+Either way it is one HIC-1 decision, recorded first (a set-aside carries `learn:set-aside/` and
+`learn:kept/` evidence and never a `learn:proposal/` subject, so a restart cannot read it as a
+retraction of the kept memory). The learner never held the known memory's value, so that side of
+the `Resolution` is empty. A recorded set-aside is re-applied on open if the file lost it.
+
 ## Publishing to SkillRegistry
 
 The contract is citrate-chain `contracts/src/SkillRegistry.sol`:
 `registerSkill(string name, string version, string manifestCID, string description, string[] tags)`,
-with `skillHash = keccak256(abi.encodePacked(msg.sender, name, version))`.
+with `skillHash = skillHashOf(msg.sender, name, version) = keccak256(abi.encode(msg.sender, name, version))`.
+This is the HUP-S7.1 redeploy version (citrate-chain PR #272). The earlier deployment used
+`abi.encodePacked`, under which ("skill1", ".0") and ("skill", "1.0") share one id.
 
 - The encoding is pinned against `cast calldata` (`tests/fixtures/register_skill_cast.json`).
-  On 2026-10-01 a local anvil run deployed `SkillRegistry.sol`, sent the first fixture's calldata
-  from anvil account 0, and `getSkill(expected hash)` returned the registered skill with its tags.
+- The id is pinned against `skillHashOf` called on the #272 contract. On 2026-10-04 a local anvil
+  run deployed that `SkillRegistry.sol`, sent the first fixture's calldata from anvil account 0,
+  the `SkillRegistered` event carried the expected hash, and `getSkill(expected hash)` returned the
+  registered skill. The fixture also keeps the old packed ids, and a test fails if the projected id
+  ever equals one (a revert to the packed layout).
 - The contract has no content-hash field, so the payload adds two tags: `hermes-learned` and
   `sha256:<SKILL.md sha256>`. `manifestCID` is empty ("pending pin", which the contract allows)
   unless the caller passes a CID; pinning the skill bundle to IPFS is not done here.
@@ -112,8 +133,9 @@ first.
   come from `POST /sessions/:id/workflows` (`run_verified_workflow` in the session).
 - A skill accept reloads the sidecar's skills library from its sources (`CITRATE_HERMES_SKILLS`,
   which core points at the same skills folder), so the skill is offered to the next session
-  without a restart. The accept answer says so (`skills_reloaded`, `skills_offered`). Sessions
-  already open keep the library they started with.
+  without a restart. The accept answer says so (`skills_reloaded`, `skills_offered`). Every open
+  session that was opened with skills takes the reloaded library on its next turn, in its per-turn
+  index and through `skill_load` (restricted to its persona's allowlist).
 - citrate-core shows the proposal card, stores accepted memories, and routes the publish payload
   to its SignatureCeremony (core branch `hup/n4-learn-e2e`).
 
@@ -122,7 +144,7 @@ first.
 - Skills only: a proposal is one `SKILL.md`. Bundled `references/` or `scripts/` are not proposed.
 - The runtime does not pin to IPFS: `manifestCID` is whatever the caller passes (core pins the
   `SKILL.md` to the local IPFS node before it asks for the publish payload).
-- A session that is already open does not see a skill accepted after it started; the next
-  session does.
-- Contradictions with memories core passes in `known_memories` (not learned here) are surfaced,
-  but `resolve` only settles two learned memories; core has no other memory store to retract in.
+- A session opened with no skills at all (an empty library) has no `skill_load` tool, so a skill
+  accepted after it started reaches the next session, not that one.
+- `ContradictionResolve.tla` models two learned memories. Resolving against a known memory
+  (below) is covered by the Rust tests, not by the model.

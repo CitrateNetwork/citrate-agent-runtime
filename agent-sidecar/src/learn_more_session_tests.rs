@@ -7,7 +7,7 @@ use super::*;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use citrate_agent_loop::skills::{SkillSource, SKILL_LOAD_TOOL};
-use citrate_agent_loop::{AssistantTurn, CompletionRequest, LlmClient, LlmError};
+use citrate_agent_loop::{AssistantTurn, CompletionRequest, LlmClient, LlmError, ToolCall};
 use std::sync::Mutex;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -131,7 +131,28 @@ async fn open_session(st: &Arc<AppState>) -> String {
 }
 
 /// Send one message and wait for the turn to finish.
+///
+/// The wait reads only events logged after this message was posted: a session that already
+/// finished a turn (or a workflow) holds an older `done`, and matching it would return before
+/// this turn reached the model. It also waits for the previous turn or workflow to release the
+/// session, which happens just after its `done`, so the post is not refused as busy.
 async fn send(st: &Arc<AppState>, sid: &str, text: &str) {
+    let mut after = None;
+    for _ in 0..100 {
+        let (_, page) = call(
+            st,
+            "GET",
+            &format!("/sessions/{sid}/events?after=0&wait_ms=0"),
+            serde_json::Value::Null,
+        )
+        .await;
+        if page["busy"] == false {
+            after = page["lastSeq"].as_u64();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut after = after.expect("the session stayed busy before this message");
     let (s, v) = call(
         st,
         "POST",
@@ -140,7 +161,6 @@ async fn send(st: &Arc<AppState>, sid: &str, text: &str) {
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
-    let mut after = 0u64;
     for _ in 0..100 {
         let (_, page) = call(
             st,
@@ -266,6 +286,128 @@ async fn an_accepted_skill_is_offered_to_the_next_session_without_a_restart() {
         system_prompt(last)
     );
     assert!(last.tools.iter().any(|t| t.name == SKILL_LOAD_TOOL));
+}
+
+/// Fan-out 7 (L02): the session the member is already in sees an accepted skill on its next
+/// turn, in its per-turn index and through `skill_load`, without a sidecar restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accepted_skill_reaches_an_open_session_on_its_next_turn() {
+    let fx = Fx::new();
+    // A session opened with a skills library: another source already holds one skill.
+    let team = fx.root.path().join("team");
+    let other = team.join("release-notes");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("SKILL.md"),
+        "---\nname: release-notes\ndescription: Drafts release notes\n---\n\nList the changes.\n",
+    )
+    .unwrap();
+    let load = ToolCall {
+        id: "k1".into(),
+        name: SKILL_LOAD_TOOL.into(),
+        arguments: r#"{"name":"deploy-checklist"}"#.into(),
+    };
+    let (st, rec) = state(
+        vec![
+            AssistantTurn::text("All checks pass."),
+            AssistantTurn::text("Nothing to check yet."),
+            AssistantTurn::tools(vec![load]),
+            AssistantTurn::text("Done."),
+        ],
+        Some(fx.service()),
+        vec![
+            SkillSource::new("user", fx.skills_dir()),
+            SkillSource::new("team", &team),
+        ],
+    );
+    let sid = open_session(&st).await;
+    let run = verified_run(&st, &sid, "checks pass").await;
+    let p = propose(
+        &st,
+        &sid,
+        &run,
+        serde_json::json!({"kind": "skill", "skill_md": SKILL}),
+    )
+    .await;
+
+    // Before the accept, this session's turn does not offer the proposed skill.
+    send(&st, &sid, "check my contract before deploy").await;
+    {
+        let seen = rec.seen.lock().unwrap();
+        let last = seen.last().unwrap();
+        assert!(
+            !system_prompt(last).contains("deploy-checklist"),
+            "{}",
+            system_prompt(last)
+        );
+        assert!(last.tools.iter().any(|t| t.name == SKILL_LOAD_TOOL));
+    }
+
+    let (s, v) = call(
+        &st,
+        "POST",
+        &format!("/learn/proposals/{}/accept", p["id"].as_str().unwrap()),
+        serde_json::json!({"member": "0xmember"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["skills_reloaded"], true, "{v}");
+    assert_eq!(v["skills_offered"], 2, "{v}");
+
+    // The same session's next turn ranks the skill into its prompt and can load its body.
+    let n = rec.seen.lock().unwrap().len();
+    send(&st, &sid, "check my contract before deploy").await;
+    let seen = rec.seen.lock().unwrap();
+    let first = seen.get(n).unwrap();
+    assert!(
+        system_prompt(first).contains("- deploy-checklist: Checks a contract before deploy"),
+        "{}",
+        system_prompt(first)
+    );
+    let after_load = seen.get(n + 1).unwrap();
+    assert!(
+        after_load
+            .messages
+            .iter()
+            .any(|m| m.content.contains("1. Run the tests.")),
+        "skill_load returned the accepted skill's body"
+    );
+}
+
+/// A refresh never widens a persona's allowlist, and a reload that leaves no skills empties the
+/// open session's view.
+#[test]
+fn a_live_refresh_keeps_the_persona_allowlist() {
+    let fx = Fx::new();
+    for (name, desc) in [
+        ("deploy-checklist", "Checks a contract"),
+        ("release-notes", "Drafts notes"),
+    ] {
+        let d = fx.skills_dir().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\n\nBody.\n"),
+        )
+        .unwrap();
+    }
+    let lib = Arc::new(citrate_agent_loop::skills::SkillLibrary::load(&[
+        SkillSource::new("user", fx.skills_dir()),
+    ]));
+    let live = sessions::LiveSkills::new(
+        Arc::new(citrate_agent_loop::skills::SkillLibrary::empty()),
+        Some(vec!["release-notes".to_string()]),
+    );
+    live.refresh(Some(&lib));
+    assert_eq!(live.current().names(), vec!["release-notes"]);
+    let open = sessions::LiveSkills::new(
+        Arc::new(citrate_agent_loop::skills::SkillLibrary::empty()),
+        None,
+    );
+    open.refresh(Some(&lib));
+    assert_eq!(open.current().len(), 2);
+    open.refresh(None);
+    assert!(open.current().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -495,4 +637,72 @@ async fn resolving_needs_the_bearer_learning_on_and_no_emergency_stop() {
     )
     .await;
     assert_eq!(one["state"]["state"], "persisted", "nothing changed: {one}");
+}
+
+/// Fan-out 7 (L02): a contradiction with a memory core holds (not learned here) is resolved
+/// through the same route: keeping the learned memory sets the known one aside.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contradiction_with_a_known_memory_is_resolved_through_the_route() {
+    let fx = Fx::new();
+    let (st, _) = state(
+        vec![AssistantTurn::text("All checks pass.")],
+        Some(fx.service()),
+        vec![],
+    );
+    let sid = open_session(&st).await;
+    let run = verified_run(&st, &sid, "checks pass").await;
+    let (s, p) = call(
+        &st,
+        "POST",
+        "/learn/proposals",
+        serde_json::json!({
+            "session_id": sid,
+            "run_id": run,
+            "content": {"kind": "memory", "key": "deploy chain", "value": "40204"},
+            "known_memories": [{"id": "mem-7", "key": "Deploy Chain", "value": "1"}]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{p}");
+    let id = p["id"].as_str().unwrap().to_string();
+    let (s, v) = call(
+        &st,
+        "POST",
+        &format!("/learn/proposals/{id}/accept"),
+        serde_json::json!({"member": "0xmember", "acknowledged_conflicts": ["memory:mem-7"]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["persisted"]["belnap"], "both", "{v}");
+
+    let (s, v) = call(
+        &st,
+        "POST",
+        "/learn/memories/resolve",
+        serde_json::json!({"member": "0xmember", "keep": id, "retract": "memory:mem-7"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["resolution"]["kept"], id.as_str());
+    assert_eq!(v["resolution"]["retracted"], "memory:mem-7");
+
+    let (_, one) = call(
+        &st,
+        "GET",
+        &format!("/learn/proposals/{id}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(one["state"]["state"], "persisted", "{one}");
+    assert_eq!(one["set_aside"], serde_json::json!(["memory:mem-7"]));
+
+    // A known memory the learned one never contradicted is refused.
+    let (s, v) = call(
+        &st,
+        "POST",
+        "/learn/memories/resolve",
+        serde_json::json!({"member": "0xmember", "keep": id, "retract": "memory:mem-8"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
 }

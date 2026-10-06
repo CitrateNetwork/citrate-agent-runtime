@@ -10,7 +10,9 @@
 //! When neither exists the status says "not installed", with the places that were checked. The
 //! launched browser is headless, uses a fresh private profile in a temporary folder (never the
 //! member's own profile), exposes DevTools on loopback only, and is killed (profile removed) when
-//! dropped.
+//! dropped. On Unix it leads a process group of its own and the whole group is killed (its
+//! helper processes too), so no part of it keeps running or keeps its DevTools endpoint open
+//! after the sidecar stops it (SCL-S0.3).
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -221,16 +223,22 @@ impl ManagedChrome {
         ];
         args.extend(extra_args.iter().cloned());
         args.push("about:blank".to_string());
-        let child = Command::new(exe)
-            .args(&args)
+        let mut cmd = Command::new(exe);
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                let _ = std::fs::remove_dir_all(&profile);
-                format!("could not start the browser at {}: {e}", exe.display())
-            })?;
+            .stderr(Stdio::null());
+        // The browser leads a process group of its own: its helpers join it, so stopping the
+        // group stops all of it, and a signal meant for the sidecar's group does not reach it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn().map_err(|e| {
+            let _ = std::fs::remove_dir_all(&profile);
+            format!("could not start the browser at {}: {e}", exe.display())
+        })?;
         let mut me = ManagedChrome {
             child,
             profile,
@@ -267,6 +275,16 @@ impl ManagedChrome {
         &self.ws_url
     }
 
+    /// The browser's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The browser's temporary profile folder (removed when this is dropped).
+    pub fn profile_dir(&self) -> &Path {
+        &self.profile
+    }
+
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -274,6 +292,18 @@ impl ManagedChrome {
 
 impl Drop for ManagedChrome {
     fn drop(&mut self) {
+        // Kill the browser's whole process group while the browser itself is not reaped yet (so
+        // its id, which is the group id, still names this group), then the browser, then reap.
+        // This also covers helpers left behind by a browser that already exited on its own.
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            if pid > 1 && unreaped(pid) {
+                // SAFETY: kill(2) on the process group this browser leads (see `launch`).
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         // Helper processes may hold the profile for a moment after the browser exits.
@@ -282,6 +312,30 @@ impl Drop for ManagedChrome {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Whether `pid` is still an unreaped child of this process (running, or exited and not yet
+/// waited for). Looks with `WNOWAIT`, so nothing is reaped.
+#[cfg(unix)]
+fn unreaped(pid: libc::pid_t) -> bool {
+    loop {
+        // SAFETY: zeroed is a valid siginfo_t; waitid writes into it and reaps nothing.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
         }
     }
 }

@@ -744,3 +744,48 @@ fn a_memory_offered_again_after_a_lost_save_still_counts_as_accepted_for_contrad
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn a_known_memory_set_aside_whose_save_was_lost_is_still_applied_after_a_restart() {
+    let env = Env::new();
+    let run = verified_run("s1");
+    let known = vec![KnownMemory {
+        id: "mem-7".into(),
+        key: "k".into(),
+        value: "zero".into(),
+    }];
+    let a = {
+        let (mut l, _) = env.open();
+        let a = l
+            .propose(&run, memory("k", "one"), prov("s1"), &known)
+            .unwrap();
+        l.accept(
+            &a.id,
+            MemberAccept {
+                member: "member-1".into(),
+                acknowledged_conflicts: vec!["memory:mem-7".into()],
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(env.store()).unwrap();
+        l.resolve(MemberResolve {
+            member: "member-1".into(),
+            keep: a.id.clone(),
+            retract: "memory:mem-7".into(),
+        })
+        .unwrap();
+        drop(l);
+        restore_file(&env.store(), &before);
+        a
+    };
+    let (l, report) = env.open();
+    assert_eq!(report.reconciled, 1, "{report:?}");
+    let p = l.get(&a.id).unwrap();
+    assert!(matches!(p.state, ProposalState::Persisted));
+    assert_eq!(p.set_aside, vec!["memory:mem-7".to_string()]);
+    // Applied once: a second restart changes nothing.
+    drop(l);
+    let (l, report) = env.open();
+    assert_eq!(report.reconciled, 0, "{report:?}");
+    assert_eq!(l.get(&a.id).unwrap().set_aside.len(), 1);
+}
