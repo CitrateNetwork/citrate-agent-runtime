@@ -489,6 +489,28 @@ impl CapsuleDispatch {
         ))
     }
 
+    fn verified_capsule(&self, capsule_name: &str) -> Result<&Capsule, AgentError> {
+        let capsule = self
+            .capsules
+            .get(capsule_name)
+            .ok_or_else(|| self.not_loaded(capsule_name))?;
+        if self.unverified.contains(capsule_name) {
+            return Err(AgentError::Capsule(format!(
+                "refusing to instantiate unverified capsule {capsule_name:?}: it is not bound to a \
+                 valid manifest content_hash + publisher signature. Pack and sign it with \
+                 cit-capsule-pack (CIT-AGENT-3e)."
+            )));
+        }
+        Ok(capsule)
+    }
+
+    /// Return the manifest from the exact verified, allowlisted capsule snapshot
+    /// held by this dispatch. Hosts that audit or apply additional policy to a
+    /// call must use this accessor rather than reopening the capsule archive.
+    pub fn verified_manifest(&self, capsule_name: &str) -> Result<&Manifest, AgentError> {
+        Ok(&self.verified_capsule(capsule_name)?.manifest)
+    }
+
     /// Invoke a capsule from JSON — the Hermes-sidecar (agent-sidecar) entry point (ADR-001,
     /// Option A). The caller passes only the capsule name + a JSON object of args; this discovers the
     /// capsule's single exported interface + function and its param types **from the component itself**
@@ -526,23 +548,13 @@ impl CapsuleDispatch {
         args: &serde_json::Value,
         provider: Option<&dyn SandboxProvider>,
     ) -> Result<serde_json::Value, AgentError> {
-        let capsule = self
-            .capsules
-            .get(capsule_name)
-            .ok_or_else(|| self.not_loaded(capsule_name))?;
+        let capsule = self.verified_capsule(capsule_name)?;
         // AR-B-008: refuse an unverified capsule BEFORE any of its bytes reach
         // `Component::from_binary` (full Cranelift compilation — the largest
         // untrusted-parsing surface in the crate). RFC §4.5 requires manifest
         // signature verification to succeed before WASM parsing begins. The gate
         // in `call_raw` runs too late: `discover_single_entry` below already
         // compiled the component. Mirror the `call_raw` gate here at the top.
-        if self.unverified.contains(capsule_name) {
-            return Err(AgentError::Capsule(format!(
-                "refusing to instantiate unverified capsule {capsule_name:?}: it is not bound to a \
-                 valid manifest content_hash + publisher signature. Pack and sign it with \
-                 cit-capsule-pack (CIT-AGENT-3e)."
-            )));
-        }
         // Discover the single (interface, function, params) from the component's own type.
         let component =
             wasmtime::component::Component::from_binary(&self.engine, &capsule.archive.wasm)

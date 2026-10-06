@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod connect_cmd;
+mod demo_cmd;
 mod doctor_cmd;
 mod hermes_cmd;
 
@@ -25,6 +26,8 @@ enum Command {
     Connect(connect_cmd::ConnectArgs),
     /// Drive the Hermes agent sidecar (status, sessions, events, chat).
     Hermes(hermes_cmd::HermesArgs),
+    /// Run the deterministic, offline signed-capsule demonstration.
+    Demo(demo_cmd::DemoArgs),
 }
 
 fn main() {
@@ -52,6 +55,8 @@ fn main() {
         Command::Connect(args) => connect_cmd::run(args),
         // Synchronous (reqwest::blocking) — must not run inside a tokio runtime.
         Command::Hermes(args) => hermes_cmd::run(args),
+        // Synchronous and offline; the capsule manifest denies every external capability.
+        Command::Demo(args) => demo_cmd::run(args),
     };
     std::process::exit(exit);
 }
