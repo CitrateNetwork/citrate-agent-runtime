@@ -2160,7 +2160,7 @@ mod verify_probes_tests;
 mod browser_session_tests;
 #[cfg(test)]
 mod decide_route_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod deploy_guard_session_tests;
 #[cfg(test)]
 mod search_session_tests;
@@ -2168,9 +2168,9 @@ mod search_session_tests;
 mod shell_run_tests;
 #[cfg(test)]
 mod signin_route_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod toolchain_reports_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod toolchain_tests;
 
 // ---- HUP-S3.4: verified workflow runs + verified self-learning ----

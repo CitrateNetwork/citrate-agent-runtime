@@ -108,7 +108,7 @@ jobs:
       - name: cargo build --release (agent-sidecar, x86_64-pc-windows-msvc)
         env:
           CARGO_INCREMENTAL: 0
-        run: cargo build --release --locked -p agent-sidecar
+        run: cargo build --release --locked -p agent-sidecar --target x86_64-pc-windows-msvc
 
   hic-terminology:
     name: HIC terminology guard (public-claims accuracy)

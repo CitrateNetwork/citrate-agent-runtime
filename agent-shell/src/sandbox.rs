@@ -16,7 +16,9 @@
 //!   read-only masks over `.git/hooks`, `.git/config` and the `.env*` files that exist at the top
 //!   of a granted folder ([`bwrap_command`]). A Landlock fallback is not implemented: with no
 //!   working `bwrap` the backend is unavailable.
-//! - **Windows**: this crate does not build there; no command runs on Windows.
+//! - **Windows**: the runner builds and uses a Job Object for bounded process cleanup, but has
+//!   no OS sandbox backend. A Job Object is cleanup containment, not a filesystem, network, or
+//!   security sandbox, so [`SandboxMode::Required`] refuses the run.
 //!
 //! Detection ([`detect`]) probes the backend once per process by running `true` inside it, so a
 //! `bwrap` that is installed but cannot create namespaces (for example where unprivileged user

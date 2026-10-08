@@ -51,10 +51,12 @@
 //! The same guarantees hold on Windows, with Windows mechanisms (the `win` module):
 //!
 //! - The process tree is a per-run **Job Object**. The child is created suspended (with
-//!   `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`), assigned to the job, then resumed, so
-//!   nothing it starts escapes; a timeout and the post-exit reap are `TerminateJobObject`, and
-//!   `KILL_ON_JOB_CLOSE` reaps the tree if the host dies. [`RunReport::signal`] is always
-//!   `None` (Windows has no signals); a killed run reports `timed_out` and exit code 1.
+//!   `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`), assigned to the job, then resumed.
+//!   Ordinary descendants it creates directly with `CreateProcess` remain associated with the
+//!   job; timeout and post-exit cleanup use `TerminateJobObject`, and `KILL_ON_JOB_CLOSE` is a
+//!   final fallback. Job Objects provide cleanup containment, not an OS sandbox, and do not
+//!   cover launches brokered outside the job. [`RunReport::signal`] is always `None` (Windows
+//!   has no signals); a killed run reports `timed_out` and exit code 1.
 //! - The scratch HOME gets a protected owner-and-SYSTEM-only DACL (the `0700` equivalent).
 //!   The child also sees it as `USERPROFILE`, `TEMP`, `TMP`, `APPDATA` and `LOCALAPPDATA`, and
 //!   gets the host's `SystemRoot`/`SystemDrive`/`windir`, without which Winsock and the crypto
@@ -533,6 +535,11 @@ pub const DEFAULT_OUTPUT_CAP: usize = 64 * 1024;
 /// reported and `output_incomplete` is set.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// A fresh, fixed bound for Windows Job Object termination and leader reaping. This is
+/// deliberately independent of both the requested execution timeout and output drain grace.
+#[cfg(windows)]
+const WINDOWS_CLEANUP_GRACE: Duration = Duration::from_secs(5);
+
 /// Everything that is fixed about how programs run, independent of a single request.
 #[derive(Debug, Clone)]
 pub struct ShellPolicy {
@@ -836,14 +843,16 @@ pub struct RunReport {
     /// An output pipe was still open after the drain grace (a process outside the group held
     /// it); the capture is what had arrived by then.
     pub output_incomplete: bool,
+    /// Post-start cleanup failed. The run facts remain available, but the run did not pass.
+    pub cleanup_error: Option<String>,
     /// Whether (and how) the run was wrapped in the OS sandbox.
     pub sandbox: SandboxSummary,
 }
 
 impl RunReport {
-    /// Exited normally with code 0 and did not time out.
+    /// Exited normally with code 0, did not time out, and completed cleanup.
     pub fn passed(&self) -> bool {
-        self.exit_code == Some(0) && !self.timed_out
+        self.exit_code == Some(0) && !self.timed_out && self.cleanup_error.is_none()
     }
 
     /// The report as a JSON object, plus a derived `passed` field.
@@ -1149,20 +1158,46 @@ impl ShellRunner {
         let out = Capture::spawn_reader(child.stdout.take(), self.policy.stdout_cap);
         let err = Capture::spawn_reader(child.stderr.take(), self.policy.stderr_cap);
 
+        #[cfg(unix)]
         let (status, timed_out) = wait_with_deadline(&mut child, &tree, started + plan.timeout);
+        #[cfg(unix)]
+        let cleanup_error = None;
+        #[cfg(windows)]
+        let (status, timed_out, mut cleanup_error) = {
+            let waited = wait_with_deadline(&mut child, &tree, started + plan.timeout);
+            drop(tree);
+            (waited.status, waited.timed_out, waited.cleanup_error)
+        };
         // Reap anything the leader left behind in its group. (A group id is not reused while
         // any member is alive; when none is left this is a no-op.)
+        #[cfg(unix)]
         tree.kill();
         let duration = started.elapsed();
 
         let drain_deadline = Instant::now() + DRAIN_GRACE;
         let out = out.finish(drain_deadline);
         let err = err.finish(drain_deadline);
+        let output_incomplete = !(out.reached_eof && err.reached_eof);
+        #[cfg(windows)]
+        if output_incomplete {
+            add_cleanup_error(
+                &mut cleanup_error,
+                "output pipes did not reach EOF before the drain deadline".to_string(),
+            );
+        }
 
         let (exit_code, signal) = match status {
             Some(s) => (s.code(), exit_signal(&s)),
             None => (None, None),
         };
+
+        #[cfg(windows)]
+        if let Err(e) = scratch.remove() {
+            add_cleanup_error(
+                &mut cleanup_error,
+                format!("cannot remove the scratch HOME after process cleanup: {e}"),
+            );
+        }
 
         Ok(RunReport {
             program: req.program.clone(),
@@ -1180,7 +1215,8 @@ impl ShellRunner {
             stderr_bytes: err.total,
             stdout_truncated: out.truncated,
             stderr_truncated: err.truncated,
-            output_incomplete: !(out.reached_eof && err.reached_eof),
+            output_incomplete,
+            cleanup_error,
             sandbox: plan.sandbox,
         })
     }
@@ -1306,8 +1342,8 @@ impl ProcessTree {
         })
     }
 
-    fn kill(&self) {
-        self.job.kill();
+    fn terminate_and_wait_empty(&self, deadline: Instant) -> std::io::Result<()> {
+        self.job.terminate_and_wait_empty(deadline)
     }
 }
 
@@ -1323,12 +1359,87 @@ impl PendingTree {
     fn adopt(self, child: &mut Child) -> std::io::Result<ProcessTree> {
         match self.job.adopt(child) {
             Ok(()) => Ok(ProcessTree { job: self.job }),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(e)
+            Err(adopt_error) => {
+                let deadline = Instant::now() + WINDOWS_CLEANUP_GRACE;
+                let job_cleanup = self.job.terminate_and_wait_empty(deadline);
+                let leader_cleanup = kill_and_reap_leader_until(child, deadline);
+                match (job_cleanup, leader_cleanup) {
+                    (Ok(()), Ok(_)) => Err(adopt_error),
+                    (job, leader) => Err(std::io::Error::other(format!(
+                        "cannot adopt the suspended process: {adopt_error}; cleanup failed ({})",
+                        cleanup_failures(job.err(), leader.err())
+                            .unwrap_or_else(|| "unknown cleanup failure".to_string())
+                    ))),
+                }
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_failures(job: Option<std::io::Error>, leader: Option<std::io::Error>) -> Option<String> {
+    match (job, leader) {
+        (Some(job), Some(leader)) => Some(format!(
+            "Job Object cleanup failed: {job}; process leader cleanup failed: {leader}"
+        )),
+        (Some(job), None) => Some(format!("Job Object cleanup failed: {job}")),
+        (None, Some(leader)) => Some(format!("process leader cleanup failed: {leader}")),
+        (None, None) => None,
+    }
+}
+
+#[cfg(windows)]
+fn add_cleanup_error(cleanup_error: &mut Option<String>, error: String) {
+    match cleanup_error {
+        Some(current) => {
+            current.push_str("; ");
+            current.push_str(&error);
+        }
+        None => *cleanup_error = Some(error),
+    }
+}
+
+#[cfg(windows)]
+fn reap_leader_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut sleep = Duration::from_millis(2);
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "process leader did not exit before the Windows cleanup deadline",
+                    ));
+                }
+                std::thread::sleep(sleep.min(deadline - now));
+                sleep = (sleep * 2).min(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn kill_and_reap_leader_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(status);
+    }
+    let kill_error = child.kill().err();
+    match reap_leader_until(child, deadline) {
+        Ok(status) => Ok(status),
+        Err(reap_error) => Err(match kill_error {
+            Some(kill_error) => std::io::Error::other(format!(
+                "could not terminate the process leader: {kill_error}; could not reap it: {reap_error}"
+            )),
+            None => reap_error,
+        }),
     }
 }
 
@@ -1345,6 +1456,7 @@ fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {
 
 /// Poll the child until it exits or the deadline passes; on deadline kill the whole group and
 /// reap the leader. Returns `(status, timed_out)`; status is `None` only if waiting failed.
+#[cfg(unix)]
 fn wait_with_deadline(
     child: &mut Child,
     tree: &ProcessTree,
@@ -1364,6 +1476,75 @@ fn wait_with_deadline(
         if now >= deadline {
             tree.kill();
             return (child.wait().ok(), true);
+        }
+        std::thread::sleep(sleep.min(deadline - now));
+        sleep = (sleep * 2).min(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+struct WindowsWait {
+    status: Option<std::process::ExitStatus>,
+    timed_out: bool,
+    cleanup_error: Option<String>,
+}
+
+#[cfg(windows)]
+fn finish_windows_cleanup(
+    child: &mut Child,
+    tree: &ProcessTree,
+    deadline: Instant,
+) -> (Option<std::process::ExitStatus>, Option<String>) {
+    let job_error = tree.terminate_and_wait_empty(deadline).err();
+    let leader = kill_and_reap_leader_until(child, deadline);
+    let (status, leader_error) = match leader {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(error)),
+    };
+    (status, cleanup_failures(job_error, leader_error))
+}
+
+/// Poll the Windows leader until it exits or the execution deadline passes. Once adoption has
+/// succeeded, every path returns the available run facts and any bounded-cleanup failure.
+#[cfg(windows)]
+fn wait_with_deadline(child: &mut Child, tree: &ProcessTree, deadline: Instant) -> WindowsWait {
+    let mut sleep = Duration::from_millis(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let (_, cleanup_error) =
+                    finish_windows_cleanup(child, tree, Instant::now() + WINDOWS_CLEANUP_GRACE);
+                return WindowsWait {
+                    status: Some(status),
+                    timed_out: false,
+                    cleanup_error,
+                };
+            }
+            Ok(None) => {}
+            Err(wait_error) => {
+                let cleanup_deadline = Instant::now() + WINDOWS_CLEANUP_GRACE;
+                let (status, mut cleanup_error) =
+                    finish_windows_cleanup(child, tree, cleanup_deadline);
+                add_cleanup_error(
+                    &mut cleanup_error,
+                    format!("cannot query the process leader: {wait_error}"),
+                );
+                return WindowsWait {
+                    status,
+                    timed_out: false,
+                    cleanup_error,
+                };
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let cleanup_deadline = Instant::now() + WINDOWS_CLEANUP_GRACE;
+            let (status, cleanup_error) = finish_windows_cleanup(child, tree, cleanup_deadline);
+            return WindowsWait {
+                status,
+                timed_out: true,
+                cleanup_error,
+            };
         }
         std::thread::sleep(sleep.min(deadline - now));
         sleep = (sleep * 2).min(Duration::from_millis(25));
@@ -1520,11 +1701,28 @@ impl ScratchDir {
     fn path(&self) -> &Path {
         &self.0
     }
+
+    #[cfg(windows)]
+    fn remove(mut self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {
+                self.0.clear();
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.0.clear();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -1573,6 +1771,34 @@ mod tests {
         };
         assert_eq!(e.kind(), "program_not_allowed");
         assert!(e.to_string().contains("not on the shell allowlist"));
+    }
+
+    #[test]
+    fn cleanup_failure_is_serialized_and_never_passes() {
+        let report = RunReport {
+            program: "tool".into(),
+            resolved_path: PathBuf::from("tool"),
+            args: Vec::new(),
+            cwd: PathBuf::from("."),
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            timeout_ms: 1_000,
+            duration_ms: 10,
+            stdout: "ok".into(),
+            stderr: String::new(),
+            stdout_bytes: 2,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            output_incomplete: false,
+            cleanup_error: Some("scratch removal failed".into()),
+            sandbox: SandboxSummary::not_enforced("test", &[]),
+        };
+
+        assert!(!report.passed());
+        assert_eq!(report.to_json()["passed"], false);
+        assert_eq!(report.to_json()["cleanup_error"], "scratch removal failed");
     }
 
     #[cfg(unix)]
