@@ -661,6 +661,7 @@ fn run_facts(r: &RunReport) -> serde_json::Value {
         "stderr_bytes": r.stderr_bytes,
         "stdout_truncated": r.stdout_truncated,
         "output_incomplete": r.output_incomplete,
+        "cleanup_error": r.cleanup_error,
         "sandbox": r.sandbox,
     })
 }
@@ -668,6 +669,17 @@ fn run_facts(r: &RunReport) -> serde_json::Value {
 /// Turn a finished run into the tool result.
 fn judge_run(tool: &str, plan: &CallPlan, r: &RunReport, ctx: &RunContext<'_>) -> ToolOutcome {
     let facts = run_facts(r);
+    if let Some(cleanup_error) = &r.cleanup_error {
+        return ToolOutcome::Error(
+            ToolchainEnvelope::not_run(
+                tool,
+                RunStatus::Failed,
+                format!("{} ran but cleanup failed: {cleanup_error}", plan.program),
+            )
+            .with_run(facts)
+            .to_content(),
+        );
+    }
     if r.timed_out {
         return ToolOutcome::Error(
             ToolchainEnvelope::not_run(
@@ -731,4 +743,68 @@ fn judge_run(tool: &str, plan: &CallPlan, r: &RunReport, ctx: &RunContext<'_>) -
         ));
     }
     ToolOutcome::Ok(env.to_content())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use citrate_agent_shell::sandbox::SandboxSummary;
+
+    fn cleanup_failed_report() -> RunReport {
+        RunReport {
+            program: "forge".into(),
+            resolved_path: PathBuf::from("forge"),
+            args: vec!["test".into(), "--json".into()],
+            cwd: PathBuf::from("."),
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            timeout_ms: 1_000,
+            duration_ms: 10,
+            stdout: "not verifier output".into(),
+            stderr: String::new(),
+            stdout_bytes: 19,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            output_incomplete: false,
+            cleanup_error: Some("Job Object accounting failed".into()),
+            sandbox: SandboxSummary {
+                backend: "none".into(),
+                enforced: false,
+                network: "allowed".into(),
+                writable: Vec::new(),
+                readable_extra: Vec::new(),
+                summary: "test".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_is_failed_before_output_is_judged() {
+        let plan = CallPlan {
+            program: "forge",
+            argv: vec!["test".into(), "--json".into()],
+            wall_secs: 1,
+            threshold: Severity::High,
+            test_limit: None,
+        };
+        let ctx = RunContext {
+            project: Path::new("."),
+            started: std::time::SystemTime::now(),
+            sources: None,
+        };
+        let out = judge_run(FORGE_TEST_TOOL, &plan, &cleanup_failed_report(), &ctx);
+        let ToolOutcome::Error(content) = out else {
+            panic!("cleanup failure must be a tool error");
+        };
+        let env = ToolchainEnvelope::from_content(&content).expect("envelope");
+
+        assert_eq!(env.status, RunStatus::Failed);
+        assert!(env.verdict.is_none());
+        assert!(env.gate.is_none());
+        let facts = env.run.expect("run facts");
+        assert_eq!(facts["exit_code"], 0);
+        assert_eq!(facts["cleanup_error"], "Job Object accounting failed");
+    }
 }

@@ -3,10 +3,11 @@
 //! - **Process tree.** Unix makes the child the leader of a new process group and kills the
 //!   group with `SIGKILL`. Windows has no process groups that can be signalled, so every run
 //!   gets its own Job Object instead: the child is created suspended, assigned to the job, and
-//!   only then resumed, so nothing it starts can escape the job (children inherit job
-//!   membership, and breakaway is not permitted). [`Job::kill`] is `TerminateJobObject`, which
-//!   ends every process in the tree; the job also carries `KILL_ON_JOB_CLOSE`, so if the
-//!   runner (or the whole sidecar) goes away, closing the last handle reaps the tree too.
+//!   only then resumed. Ordinary descendants created directly with `CreateProcess` inherit job
+//!   membership because breakaway is not permitted. [`Job::kill`] is `TerminateJobObject`, and
+//!   the job also carries `KILL_ON_JOB_CLOSE`, so closing the last handle reaps associated
+//!   processes. This is cleanup containment, not an OS sandbox; brokered launches outside the
+//!   job are outside this guarantee.
 //! - **Process creation flags.** `CREATE_NEW_PROCESS_GROUP` keeps a console Ctrl+C/Ctrl+Break
 //!   aimed at the host from reaching the child (and vice versa), the same isolation a new
 //!   Unix process group gives; `CREATE_NO_WINDOW` stops a console program spawned from the
@@ -24,6 +25,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::process::Child;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{LocalFree, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{
@@ -35,9 +37,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
@@ -104,23 +107,20 @@ impl Job {
         resume_threads(child.id())
     }
 
-    /// End every process in the job. Ending an empty job is a successful no-op; an error
-    /// (which would mean the handle is unusable) is ignored, as on Unix, because closing the
-    /// handle on drop still kills the tree via `KILL_ON_JOB_CLOSE`.
-    pub(crate) fn kill(&self) {
+    /// Request termination of every process in the job. A successful return means the request
+    /// was accepted, not that every associated process has finished exiting.
+    pub(crate) fn kill(&self) -> io::Result<()> {
         // SAFETY: the job handle is valid.
-        unsafe {
-            TerminateJobObject(self.raw(), KILLED_EXIT_CODE);
+        let ok = unsafe { TerminateJobObject(self.raw(), KILLED_EXIT_CODE) };
+        if ok == 0 {
+            // Read the thread-local Win32 error before making another system call.
+            return Err(io::Error::last_os_error());
         }
+        Ok(())
     }
 
     /// Processes currently alive in the job.
-    #[cfg(test)]
     pub(crate) fn active_processes(&self) -> io::Result<u32> {
-        use windows_sys::Win32::System::JobObjects::{
-            JobObjectBasicAccountingInformation, QueryInformationJobObject,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        };
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: `info` is a correctly sized output buffer that outlives the call.
         let ok = unsafe {
@@ -136,6 +136,27 @@ impl Job {
             return Err(io::Error::last_os_error());
         }
         Ok(info.ActiveProcesses)
+    }
+
+    /// Terminate the job and wait until its accounting reports no associated processes.
+    pub(crate) fn terminate_and_wait_empty(&self, deadline: Instant) -> io::Result<()> {
+        self.kill()?;
+        let mut sleep = Duration::from_millis(2);
+        loop {
+            let active = self.active_processes()?;
+            if active == 0 {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Job Object still has {active} active process(es) after termination"),
+                ));
+            }
+            std::thread::sleep(sleep.min(deadline - now));
+            sleep = (sleep * 2).min(Duration::from_millis(25));
+        }
     }
 }
 
@@ -268,14 +289,32 @@ mod tests {
             job.active_processes().expect("query") >= 3,
             "tree did not start"
         );
-        job.kill();
+        job.terminate_and_wait_empty(Instant::now() + Duration::from_secs(5))
+            .expect("terminate and empty");
         let status = child.wait().expect("wait");
         assert_eq!(status.code(), Some(KILLED_EXIT_CODE as i32));
-        let t = Instant::now();
-        while job.active_processes().expect("query") > 0 && t.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
         assert_eq!(job.active_processes().expect("query"), 0);
+    }
+
+    #[test]
+    fn non_job_handle_propagates_termination_and_accounting_errors() {
+        use std::os::windows::io::IntoRawHandle;
+
+        let file = tempfile::tempfile().expect("temp file");
+        let raw = file.into_raw_handle();
+        // SAFETY: `raw` is a valid, uniquely owned file handle. The test deliberately stores a
+        // valid handle of the wrong kernel-object type to exercise Win32 API error propagation.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let job = Job { handle };
+
+        assert!(
+            job.kill().is_err(),
+            "TerminateJobObject must report failure"
+        );
+        assert!(
+            job.active_processes().is_err(),
+            "QueryInformationJobObject must report failure"
+        );
     }
 
     #[test]

@@ -446,6 +446,7 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
         "stdout_truncated": r.stdout_truncated,
         "stderr_truncated": r.stderr_truncated,
         "output_incomplete": r.output_incomplete,
+        "cleanup_error": r.cleanup_error,
         "sandbox": r.sandbox,
     });
     let isolation = if r.sandbox.enforced {
@@ -453,6 +454,17 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
     } else {
         "without an OS sandbox".to_string()
     };
+    if let Some(cleanup_error) = &r.cleanup_error {
+        return ToolOutcome::Error(
+            ToolchainEnvelope::not_run(
+                SHELL_RUN_TOOL,
+                RunStatus::Failed,
+                format!("{} ran but cleanup failed: {cleanup_error}", r.program),
+            )
+            .with_run(facts)
+            .to_content(),
+        );
+    }
     if r.timed_out {
         return ToolOutcome::Error(
             ToolchainEnvelope::not_run(
@@ -553,6 +565,36 @@ impl ToolHost for ShellRunHost {
 mod tests {
     use super::*;
 
+    fn cleanup_failed_report() -> RunReport {
+        RunReport {
+            program: "echo".into(),
+            resolved_path: PathBuf::from("echo"),
+            args: vec!["ok".into()],
+            cwd: PathBuf::from("."),
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            timeout_ms: 1_000,
+            duration_ms: 10,
+            stdout: "ok\n".into(),
+            stderr: String::new(),
+            stdout_bytes: 3,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            output_incomplete: false,
+            cleanup_error: Some("scratch removal failed".into()),
+            sandbox: SandboxSummary {
+                backend: "none".into(),
+                enforced: false,
+                network: "allowed".into(),
+                writable: Vec::new(),
+                readable_extra: Vec::new(),
+                summary: "test".into(),
+            },
+        }
+    }
+
     #[test]
     fn parse_keeps_argv_exactly() {
         let p = parse(r#"{"argv":["npm","run","build -- --x"],"cwd":"/p"}"#).expect("parse");
@@ -568,5 +610,20 @@ mod tests {
         let many: Vec<String> = (0..MAX_ARGV).map(|_| "y".repeat(MAX_ARG_BYTES)).collect();
         let raw = serde_json::json!({"argv": many, "cwd": "/p"}).to_string();
         assert!(parse(&raw).is_err(), "total argv bytes are bounded too");
+    }
+
+    #[test]
+    fn cleanup_failure_is_failed_with_run_facts() {
+        let out = report(&["echo".into(), "ok".into()], &cleanup_failed_report());
+        let ToolOutcome::Error(content) = out else {
+            panic!("cleanup failure must be a tool error");
+        };
+        let env = ToolchainEnvelope::from_content(&content).expect("envelope");
+
+        assert_eq!(env.status, RunStatus::Failed);
+        assert!(env.verdict.is_none());
+        let facts = env.run.expect("run facts");
+        assert_eq!(facts["exit_code"], 0);
+        assert_eq!(facts["cleanup_error"], "scratch removal failed");
     }
 }
