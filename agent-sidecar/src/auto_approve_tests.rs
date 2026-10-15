@@ -45,6 +45,7 @@ pub(crate) fn shell_sandboxed() -> Option<shell_run::ShellRunConfig> {
         sandbox: SandboxPolicy::new(SandboxMode::Required),
         approval_timeout: std::time::Duration::from_secs(20),
         auto_approve: Some(Arc::new(AutoApproveList::shipped().expect("list"))),
+        commit_identity: shell_run::GitIdentity::hermes(),
     })
 }
 

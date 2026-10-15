@@ -167,7 +167,9 @@ pub(crate) fn risky_config(text: &str) -> Vec<(String, String)> {
 /// `merge.*.driver`, `credential.*`, `include.path` / `includeIf.*.path`, `url.*.insteadOf` to a
 /// non-https (or file) place, `protocol.*.allow = always`, `gpg.program`; plus other keys that
 /// name a program (`core.askPass`, `core.gitProxy`, `sequence.editor`, `diff.*.command`,
-/// `gpg.*.program`, `pager.*`, `*.cmd`/`*.path` of the tool sections, upload/receive-pack hooks).
+/// `gpg.*.program`, `pager.*`, `*.cmd`/`*.path` of the tool sections, upload/receive-pack hooks);
+/// plus what could drop the `Co-authored-by: Hermes` trailer from later commits (`trailer.*`,
+/// `commit.cleanup`, `core.commentChar`/`commentString`).
 fn is_risky(key: &str, value: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     let (first, rest) = lower.split_once('.').unwrap_or((lower.as_str(), ""));
@@ -175,7 +177,15 @@ fn is_risky(key: &str, value: &str) -> bool {
     match first {
         "core" => matches!(
             last,
-            "hookspath" | "fsmonitor" | "sshcommand" | "pager" | "editor" | "askpass" | "gitproxy"
+            "hookspath"
+                | "fsmonitor"
+                | "sshcommand"
+                | "pager"
+                | "editor"
+                | "askpass"
+                | "gitproxy"
+                | "commentchar"
+                | "commentstring"
         ),
         "alias" | "filter" | "credential" => true,
         "diff" => matches!(last, "external" | "textconv" | "command"),
@@ -201,6 +211,10 @@ fn is_risky(key: &str, value: &str) -> bool {
         "remote" => matches!(last, "uploadpack" | "receivepack"),
         "pager" => true,
         "browser" | "man" | "difftool" | "mergetool" => matches!(last, "cmd" | "path"),
+        // `trailer.<token>.cmd` / `.command` run a program; the rest can drop the
+        // `Co-authored-by: Hermes` trailer from later commits (owner decision 2026-10-15).
+        "trailer" => true,
+        "commit" => last == "cleanup",
         _ => false,
     }
 }
@@ -486,7 +500,7 @@ fn revert_config(b: &RepoSnap, out: &mut BTreeSet<String>) {
         Ok(()) => {
             for e in drop {
                 out.insert(format!(
-                    "reverted: removed git config {} = {} from {} (git could run a program or fetch from it outside the sandbox)",
+                    "reverted: removed git config {} = {} from {} (git could run a program or fetch from it outside the sandbox, or drop the Hermes trailer from commits)",
                     e.key,
                     e.value,
                     config.display()
@@ -528,6 +542,18 @@ mod tests {
         let url = "[url \"file:///x\"]\n\tinsteadOf = https://a/\n[url \"https://m/\"]\n\tinsteadOf = https://a/\n[protocol \"ext\"]\n\tallow = always\n[protocol \"file\"]\n\tallow = user\n";
         let keys: Vec<String> = risky_config(url).into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, vec!["url.file:///x.insteadof", "protocol.ext.allow"]);
+        let trailer = "[trailer \"x\"]\n\tcmd = evil\n\tkey = Co-authored-by\n[trailer]\n\tifmissing = doNothing\n[commit]\n\tcleanup = scissors\n\tgpgsign = false\n[core]\n\tcommentChar = C\n";
+        let keys: Vec<String> = risky_config(trailer).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "trailer.x.cmd",
+                "trailer.x.key",
+                "trailer.ifmissing",
+                "commit.cleanup",
+                "core.commentchar"
+            ]
+        );
     }
 
     #[test]

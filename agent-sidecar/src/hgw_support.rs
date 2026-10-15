@@ -90,6 +90,7 @@ pub(crate) fn shell_open() -> shell_run::ShellRunConfig {
         sandbox: SandboxPolicy::new(SandboxMode::Off),
         approval_timeout: Duration::from_secs(20),
         auto_approve: None,
+        commit_identity: shell_run::GitIdentity::hermes(),
     }
 }
 

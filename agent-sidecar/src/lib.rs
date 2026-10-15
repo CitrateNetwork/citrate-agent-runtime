@@ -29,6 +29,7 @@ pub mod decide;
 pub mod deploy_guard;
 pub mod escalation;
 pub mod files;
+pub mod git_identity;
 pub mod grants;
 pub mod hic_records;
 pub mod learn;
