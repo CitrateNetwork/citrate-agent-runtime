@@ -361,7 +361,9 @@ pub fn capture(reports: &ToolchainReports, call: &ToolCall, outcome: ToolOutcome
     let (content, is_err) = match &outcome {
         ToolOutcome::Ok(c) => (c.as_str(), false),
         ToolOutcome::Error(c) => (c.as_str(), true),
-        ToolOutcome::Untrusted(_) | ToolOutcome::Denied(_) => return outcome,
+        ToolOutcome::Untrusted(_) | ToolOutcome::Vouched(_) | ToolOutcome::Denied(_) => {
+            return outcome
+        }
     };
     let Ok(mut env) = ToolchainEnvelope::from_content(content) else {
         return outcome;

@@ -89,6 +89,7 @@ pub(crate) fn shell_open() -> shell_run::ShellRunConfig {
         search_path: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
         sandbox: SandboxPolicy::new(SandboxMode::Off),
         approval_timeout: Duration::from_secs(20),
+        auto_approve: None,
     }
 }
 

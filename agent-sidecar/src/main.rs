@@ -30,6 +30,9 @@
 //!                               approves, run in the OS sandbox, never without it) in every
 //!                               session opened with folder grants; anything else = off (optional)
 //!   CITRATE_HERMES_SHELL_PATH   shell_run search path override, a path list (optional)
+//!   CITRATE_HERMES_AUTO_APPROVE HGW-5: `0` = every shell_run command asks; an absolute path =
+//!                               that auto-approve list instead of the shipped one; unset = the
+//!                               shipped list (policy/auto_approve.toml) (optional)
 //!   CITRATE_HERMES_MAX_STEPS    HGW-4: model calls per turn for sessions that send no maxSteps;
 //!                               default 24, at most 32 (optional)
 //!   CITRATE_HERMES_PROJECTS     HGW-3: `1` offers project_create (a new project folder, after the

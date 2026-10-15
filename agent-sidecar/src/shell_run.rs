@@ -19,7 +19,12 @@
 //!    their whole subtree ([`crate::grants::SessionGrants::shell_scope`]); that grant's folder is
 //!    the only one the command may write. The OS sandbox is **required**: with no working backend
 //!    the call is refused and nothing is asked.
-//! 3. **HIC required, always.** The call parks as a [`ShellPending`] (the exact argv, the program
+//! 3. **HIC required, except the auto-approve list (HGW-5, D-16 as amended).** A command that
+//!    matches a rule of [`crate::auto_approve`] runs without a card only when the session is
+//!    untainted, the OS sandbox is enforced, and its folder is inside one of the session's project
+//!    roots; that run may write only the project (not the wider grant), it is recorded
+//!    (`shell.run.auto`), and its result says so (`run.approval = {mode: "auto", rule, project}`).
+//!    Everything else parks as a [`ShellPending`] (the exact argv, the program
 //!    it resolves to, the canonical cwd, the timeout, the sandbox) that citrate-core shows as an
 //!    approval card (`GET /sessions/:id/shell/pending`). The member's decision
 //!    (`POST /sessions/:id/shell/decide`) must carry the argv and cwd that were shown; anything
@@ -67,6 +72,18 @@ pub const OUTPUT_CAP: usize = 32 * 1024;
 /// model in the result's summary, from the end of the stream, where npm, cargo and tsc print the
 /// cause. The full capture (head and tail) stays in the run facts.
 pub const FAILURE_TAIL_BYTES: usize = 2048;
+/// HGW-5: the author and committer of commits made through `shell_run` (`git` runs only). The
+/// run's scratch HOME has no git identity, so without these git refuses to commit; and a commit
+/// Hermes makes is Hermes's, whoever's machine it is. These outrank the repository's own
+/// `user.name`/`user.email` for that run (pending owner sign-off on the wording).
+pub const GIT_AGENT_NAME: &str = "Hermes";
+pub const GIT_AGENT_EMAIL: &str = "hermes@citrate.invalid";
+const GIT_IDENTITY_ENV: [&str; 4] = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
 /// Most argv entries, longest entry, and most argv bytes a call may propose.
 pub const MAX_ARGV: usize = 64;
 pub const MAX_ARG_BYTES: usize = 4096;
@@ -79,6 +96,9 @@ pub struct ShellRunConfig {
     /// Production is always [`SandboxMode::Required`].
     pub sandbox: SandboxPolicy,
     pub approval_timeout: Duration,
+    /// HGW-5: commands that may run without a card (see the module docs). `None` = every command
+    /// asks.
+    pub auto_approve: Option<Arc<crate::auto_approve::AutoApproveList>>,
 }
 
 impl ShellRunConfig {
@@ -103,10 +123,22 @@ impl ShellRunConfig {
                 p
             }
         };
+        // HGW-5: the shipped list unless CITRATE_HERMES_AUTO_APPROVE says otherwise; a list that
+        // does not load turns auto-approval off (every command asks) and says why.
+        let auto_approve = match crate::auto_approve::AutoApproveList::from_env_value(
+            get(crate::auto_approve::AUTO_APPROVE_ENV).as_deref(),
+        ) {
+            Ok(l) => l.map(Arc::new),
+            Err(e) => {
+                eprintln!("citrate-agent-sidecar: auto-approval is off: {e}");
+                None
+            }
+        };
         Some(ShellRunConfig {
             search_path,
             sandbox: SandboxPolicy::new(SandboxMode::Required),
             approval_timeout: APPROVAL_TIMEOUT,
+            auto_approve,
         })
     }
 
@@ -119,7 +151,7 @@ impl ShellRunConfig {
 pub fn shell_run_spec() -> ToolSpec {
     ToolSpec {
         name: SHELL_RUN_TOOL.into(),
-        description: "Run one command in a folder the member granted. The member sees the exact command and folder and must approve it before it runs. It runs in an OS sandbox with no network, may write only in that granted folder, and is stopped at its time limit. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
+        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, listed read and build commands (ls, cat, head, node <file>, npm run <script>, npm test, forge build/test, cargo build/test --offline, git init/status/diff/add/commit) run without asking; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -306,6 +338,11 @@ impl ShellApprovals {
 /// session's waiting commands.
 pub struct ShellRunSession {
     runner: Arc<ShellRunner>,
+    /// HGW-5: the runner for auto-approved commands: same policy, but a run may write only the
+    /// project root that holds its folder (and is refused outside a project).
+    auto_runner: Arc<ShellRunner>,
+    auto_approve: Option<Arc<crate::auto_approve::AutoApproveList>>,
+    records: Option<Arc<citrate_agent_records::DecisionLog>>,
     approvals: Arc<ShellApprovals>,
     approval_timeout: Duration,
 }
@@ -318,15 +355,32 @@ impl ShellRunSession {
             .with_default_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .with_max_timeout(Duration::from_secs(MAX_TIMEOUT_SECS))
             .with_output_caps(OUTPUT_CAP, OUTPUT_CAP)
+            .with_request_env_allow(&GIT_IDENTITY_ENV)
             .with_sandbox(cfg.sandbox.clone());
+        let g = grants.clone();
+        let auto_runner = ShellRunner::with_scope(policy.clone(), move |cwd: &Path| {
+            let (dir, _) = g.shell_scope(cwd)?;
+            g.project_root_of(&dir)
+                .map(|root| vec![root])
+                .ok_or_else(|| "the folder is not inside a project".to_string())
+        });
         let runner = ShellRunner::with_scope(policy, move |cwd: &Path| {
             grants.shell_scope(cwd).map(|(_, root)| vec![root])
         });
         Ok(ShellRunSession {
             runner: Arc::new(runner),
+            auto_runner: Arc::new(auto_runner),
+            auto_approve: cfg.auto_approve.clone(),
+            records: None,
             approvals: Arc::new(ShellApprovals::default()),
             approval_timeout: cfg.approval_timeout,
         })
+    }
+
+    /// HUP-S2.6: record auto-approved runs in this decision log (when configured).
+    pub fn with_records(mut self, log: Option<Arc<citrate_agent_records::DecisionLog>>) -> Self {
+        self.records = log;
+        self
     }
 
     pub fn approvals(&self) -> &Arc<ShellApprovals> {
@@ -339,6 +393,9 @@ impl ShellRunSession {
     pub fn host(&self, taint: TaintState, stop: StopFlag, hic_aware: bool) -> ShellRunHost {
         ShellRunHost {
             runner: self.runner.clone(),
+            auto_runner: self.auto_runner.clone(),
+            auto_approve: self.auto_approve.clone(),
+            records: self.records.clone(),
             approvals: self.approvals.clone(),
             approval_timeout: self.approval_timeout,
             taint,
@@ -351,6 +408,9 @@ impl ShellRunSession {
 /// Executes `shell_run` calls.
 pub struct ShellRunHost {
     runner: Arc<ShellRunner>,
+    auto_runner: Arc<ShellRunner>,
+    auto_approve: Option<Arc<crate::auto_approve::AutoApproveList>>,
+    records: Option<Arc<citrate_agent_records::DecisionLog>>,
     approvals: Arc<ShellApprovals>,
     approval_timeout: Duration,
     taint: TaintState,
@@ -435,10 +495,21 @@ fn refusal_for(e: &ShellError) -> ToolOutcome {
 
 fn request_of(p: &Proposal) -> Option<RunRequest> {
     let (program, rest) = p.argv.split_first()?;
-    Some(
-        RunRequest::new(program, rest.to_vec(), &p.cwd)
-            .timeout(Duration::from_secs(p.timeout_secs)),
-    )
+    let mut req = RunRequest::new(program, rest.to_vec(), &p.cwd)
+        .timeout(Duration::from_secs(p.timeout_secs));
+    if program == "git" {
+        for (i, name) in GIT_IDENTITY_ENV.iter().enumerate() {
+            req = req.env(
+                name,
+                if i % 2 == 0 {
+                    GIT_AGENT_NAME
+                } else {
+                    GIT_AGENT_EMAIL
+                },
+            );
+        }
+    }
+    Some(req)
 }
 
 /// The same program, argv and folder as approved.
@@ -458,7 +529,13 @@ pub(crate) fn tail_of(s: &str, max: usize) -> String {
     s[start..].to_string()
 }
 
-fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
+/// How a run was released (HGW-5): by the member's card, or by an auto-approve rule.
+enum Released<'a> {
+    Member,
+    Auto { rule: &'a str, project: &'a Path },
+}
+
+fn report(argv: &[String], r: &RunReport, released: &Released<'_>) -> ToolOutcome {
     let mut facts = serde_json::json!({
         "program": r.program,
         "args": r.args,
@@ -479,7 +556,22 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
         "cleanup_error": r.cleanup_error,
         "sandbox": r.sandbox,
         "git_warnings": r.git_warnings,
+        "approval": match released {
+            Released::Member => serde_json::json!({ "mode": "member" }),
+            Released::Auto { rule, project } => serde_json::json!({
+                "mode": "auto",
+                "rule": rule,
+                "project": project,
+            }),
+        },
     });
+    let auto_note = match released {
+        Released::Member => String::new(),
+        Released::Auto { rule, project } => format!(
+            "Ran without a card under the auto-approve rule {rule} (sandboxed, no network, writing only the project {}). ",
+            project.display()
+        ),
+    };
     // HGW-2: git state the command left that would run a program outside the sandbox later.
     let git_note = if r.git_warnings.is_empty() {
         String::new()
@@ -549,7 +641,7 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
             SHELL_RUN_TOOL,
             RunStatus::Completed,
             format!(
-                "{} {ended} after {} ms ({isolation}){git_note}{failure_note}",
+                "{auto_note}{} {ended} after {} ms ({isolation}){git_note}{failure_note}",
                 r.program, r.duration_ms
             ),
         )
@@ -571,6 +663,12 @@ impl ShellRunHost {
         let Some(req) = request_of(&proposal) else {
             return refuse(RunStatus::Refused, "argv is empty");
         };
+        // HGW-5: a listed command inside a project runs without a card (never after taint).
+        if hic_reason.is_none() {
+            if let Some(out) = self.try_auto(call, &proposal.argv, &req) {
+                return out;
+            }
+        }
         // Everything is checked (grants, program, sandbox) before the member is asked.
         let plan = match self.runner.plan(&req) {
             Ok(p) => p,
@@ -616,9 +714,72 @@ impl ShellRunHost {
             );
         }
         match self.runner.run(&req) {
-            Ok(r) => report(&proposal.argv, &r),
+            Ok(r) => report(&proposal.argv, &r, &Released::Member),
             Err(e) => refusal_for(&e),
         }
+    }
+
+    /// HGW-5: run `req` without a card when every condition holds (untainted, listed, OS sandbox
+    /// enforced, inside a project, recorded when records are on). `None` = ask as usual.
+    fn try_auto(&self, call: &ToolCall, argv: &[String], req: &RunRequest) -> Option<ToolOutcome> {
+        if self.taint.is_tainted() {
+            return None;
+        }
+        let rule = self.auto_approve.as_ref()?.matching(argv)?.to_string();
+        let plan = self.auto_runner.plan(req).ok()?;
+        if !plan.sandbox.enforced {
+            return None;
+        }
+        let project = plan.write_roots.first()?.clone();
+        let seq = match &self.records {
+            Some(log) => match crate::hic_records::record_auto_decision(
+                log,
+                "shell.run.auto",
+                &format!("{} (in {})", argv.join(" "), plan.cwd.display()),
+                &format!(
+                    "auto-approve rule {rule}: {} runs in the OS sandbox with no network, writing only the project {}",
+                    argv.join(" "),
+                    project.display()
+                ),
+                vec![citrate_agent_records::EvidenceRef {
+                    kind: "shell_run".to_string(),
+                    uri: format!("sidecar:shell_run/{}", call.id),
+                    digest: None,
+                }],
+            ) {
+                Ok(seq) => Some(seq),
+                // Not recorded = not released without a card: ask instead.
+                Err(_) => return None,
+            },
+            None => None,
+        };
+        let out = match self.auto_runner.run(req) {
+            // The output of a listed command run this way derives from the project's own files
+            // (no network, writes only in the project, an untainted session), like a folder-grant
+            // file read: it is vouched for and does not taint. Errors keep the tool's annotation.
+            Ok(r) => match report(
+                argv,
+                &r,
+                &Released::Auto {
+                    rule: &rule,
+                    project: &project,
+                },
+            ) {
+                ToolOutcome::Ok(s) => ToolOutcome::Vouched(s),
+                other => other,
+            },
+            Err(e) => refusal_for(&e),
+        };
+        if let (Some(log), Some(seq)) = (&self.records, seq) {
+            let (outcome, detail) = match &out {
+                ToolOutcome::Ok(_) | ToolOutcome::Vouched(_) => {
+                    (citrate_agent_records::Outcome::Completed, "ran")
+                }
+                _ => (citrate_agent_records::Outcome::Failed, "did not complete"),
+            };
+            crate::hic_records::record_outcome(log, seq, outcome, detail);
+        }
+        Some(out)
     }
 
     /// The reason a tainted session's command is gated (the loop's wording, naming the source).
@@ -712,7 +873,11 @@ mod tests {
 
     #[test]
     fn cleanup_failure_is_failed_with_run_facts() {
-        let out = report(&["echo".into(), "ok".into()], &cleanup_failed_report());
+        let out = report(
+            &["echo".into(), "ok".into()],
+            &cleanup_failed_report(),
+            &Released::Member,
+        );
         let ToolOutcome::Error(content) = out else {
             panic!("cleanup failure must be a tool error");
         };

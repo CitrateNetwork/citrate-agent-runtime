@@ -112,6 +112,7 @@ fn cfg_with(sandbox: SandboxPolicy) -> ShellRunConfig {
         search_path: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
         sandbox,
         approval_timeout: Duration::from_secs(10),
+        auto_approve: None,
     }
 }
 
@@ -146,7 +147,10 @@ fn wait_pending(approvals: &ShellApprovals) -> ShellPending {
 
 fn envelope(o: &ToolOutcome) -> ToolchainEnvelope {
     let s = match o {
-        ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) | ToolOutcome::Error(s) => s,
+        ToolOutcome::Ok(s)
+        | ToolOutcome::Untrusted(s)
+        | ToolOutcome::Vouched(s)
+        | ToolOutcome::Error(s) => s,
         ToolOutcome::Denied(s) => panic!("unexpected denial: {s}"),
     };
     ToolchainEnvelope::from_content(s).unwrap()
@@ -187,6 +191,15 @@ fn shell_run_is_off_unless_the_env_flag_is_exactly_1() {
     assert_eq!(c.sandbox.mode(), SandboxMode::Required);
     assert_eq!(c.search_path, vec![PathBuf::from("/opt/x/bin")]);
     assert_eq!(c.approval_timeout, APPROVAL_TIMEOUT);
+    // HGW-5: the shipped auto-approve list is on by default; `0` turns it off.
+    assert!(c.auto_approve.is_some());
+    let off = ShellRunConfig::from_env_vars(vars(&[
+        (SHELL_RUN_ENV, "1"),
+        ("HOME", "/h"),
+        (crate::auto_approve::AUTO_APPROVE_ENV, "0"),
+    ]))
+    .unwrap();
+    assert!(off.auto_approve.is_none());
 }
 
 #[test]
@@ -614,6 +627,41 @@ fn a_failing_command_reports_its_exit_status_and_the_end_of_its_output() {
     let env = envelope(&ok);
     assert!(!env.summary.contains("stderr"), "{}", env.summary);
     assert!(env.run.unwrap().get("stderr_tail").is_none());
+}
+
+/// HGW-5: commits Hermes makes through shell_run name Hermes as author and committer (the run's
+/// scratch HOME has no identity, so git would otherwise refuse to commit).
+#[test]
+fn git_runs_carry_the_hermes_identity_and_other_programs_do_not() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let a = approve_next(s.approvals().clone());
+    let out = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call(
+            "c1",
+            &[
+                "sh",
+                "-c",
+                "echo \"[$GIT_AUTHOR_NAME] [$GIT_COMMITTER_EMAIL]\"",
+            ],
+            &fx.proj(),
+        ));
+    a.join().unwrap();
+    assert_eq!(envelope(&out).run.unwrap()["stdout"], "[] []\n");
+    if std::path::Path::new("/usr/bin/git").exists() {
+        let a = approve_next(s.approvals().clone());
+        let out = s
+            .host(TaintState::default(), StopFlag::default(), false)
+            .execute(&call("c2", &["git", "var", "GIT_AUTHOR_IDENT"], &fx.proj()));
+        a.join().unwrap();
+        let run = envelope(&out).run.unwrap();
+        let ident = run["stdout"].as_str().unwrap_or_default();
+        assert!(
+            ident.starts_with(&format!("{GIT_AGENT_NAME} <{GIT_AGENT_EMAIL}>")),
+            "{run}"
+        );
+    }
 }
 
 /// HGW-2: a command that leaves git set up to run a program later (outside the sandbox) is

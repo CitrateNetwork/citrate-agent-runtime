@@ -20,6 +20,7 @@
 
 pub mod action_approvals;
 pub mod anchor;
+pub mod auto_approve;
 pub mod browser;
 pub mod capsule_sandbox;
 mod chain_routes;
@@ -2378,12 +2379,16 @@ mod verify_probes_tests;
 
 #[cfg(all(test, unix))]
 mod action_approvals_tests;
+#[cfg(all(test, unix))]
+mod auto_approve_tests;
 #[cfg(test)]
 mod browser_session_tests;
 #[cfg(test)]
 mod decide_route_tests;
 #[cfg(all(test, unix))]
 mod deploy_guard_session_tests;
+#[cfg(all(test, unix))]
+mod e2e_build_tests;
 #[cfg(all(test, unix))]
 mod hgw_support;
 #[cfg(all(test, unix))]

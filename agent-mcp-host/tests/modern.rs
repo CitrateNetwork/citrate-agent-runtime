@@ -42,6 +42,7 @@ fn text_of(o: &ToolOutcome) -> String {
     match o {
         ToolOutcome::Ok(s)
         | ToolOutcome::Untrusted(s)
+        | ToolOutcome::Vouched(s)
         | ToolOutcome::Denied(s)
         | ToolOutcome::Error(s) => s.clone(),
     }

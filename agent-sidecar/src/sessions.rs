@@ -1748,7 +1748,9 @@ impl SessionManager {
             (Some(cfg), Some(g)) => {
                 specs.push(shell_run_spec());
                 Some(Arc::new(
-                    ShellRunSession::new(cfg, g.clone()).map_err(SessionError::Invalid)?,
+                    ShellRunSession::new(cfg, g.clone())
+                        .map_err(SessionError::Invalid)?
+                        .with_records(self.records.clone()),
                 ))
             }
             _ => None,

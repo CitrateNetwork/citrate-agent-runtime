@@ -178,6 +178,12 @@ pub enum ToolOutcome {
     /// The tool ran, but this particular output is untrusted whatever the tool's annotation says
     /// (e.g. a file read that resolved outside the granted folders). Taints the session.
     Untrusted(String),
+    /// HGW-5: the tool ran, and its host vouches that this particular output carries only content
+    /// the session may already trust, whatever the tool's annotation says: an auto-approved
+    /// `shell_run` (a listed read or build command, in the OS sandbox with no network, writing
+    /// only a project in the member's grants), whose output derives from the project's own files
+    /// like a folder-grant file read. Never taints. A host that cannot show that never uses it.
+    Vouched(String),
     /// A human (or policy) declined the effect — nothing happened.
     Denied(String),
     /// The tool failed.
@@ -187,14 +193,14 @@ pub enum ToolOutcome {
 impl ToolOutcome {
     fn to_content(&self) -> String {
         match self {
-            ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) => s.clone(),
+            ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) | ToolOutcome::Vouched(s) => s.clone(),
             ToolOutcome::Denied(why) => format!("declined: {why}. Nothing was done."),
             ToolOutcome::Error(e) => format!("tool error: {e}"),
         }
     }
     fn status(&self) -> &'static str {
         match self {
-            ToolOutcome::Ok(_) | ToolOutcome::Untrusted(_) => "ok",
+            ToolOutcome::Ok(_) | ToolOutcome::Untrusted(_) | ToolOutcome::Vouched(_) => "ok",
             ToolOutcome::Denied(_) => "denied",
             ToolOutcome::Error(_) => "error",
         }
@@ -944,6 +950,7 @@ pub fn run_turn_with(
             let ingested_untrusted = ran
                 && match &outcome {
                     ToolOutcome::Untrusted(_) => true,
+                    ToolOutcome::Vouched(_) => false,
                     ToolOutcome::Ok(_) | ToolOutcome::Error(_) => {
                         spec.is_some_and(|s| s.annotations.output_untrusted())
                     }

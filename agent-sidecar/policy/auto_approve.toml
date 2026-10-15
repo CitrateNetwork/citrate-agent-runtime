@@ -1,0 +1,159 @@
+# HGW-5 — the auto-approve list (D-16 as amended, owner decision 2026-10-15 HGW (3)).
+#
+# A `shell_run` command that matches one rule below runs WITHOUT an approval card, but only when
+# ALL of these hold (checked in agent-sidecar/src/auto_approve.rs and shell_run.rs):
+#   * the session has not read untrusted content (after taint every command asks, HGW-1);
+#   * the OS sandbox is enforced for the run (no network; Seatbelt or bubblewrap);
+#   * the folder it runs in is inside one of the session's project roots, and the run may write
+#     only that project (not the wider folder grant);
+#   * auto-approve is on (CITRATE_HERMES_AUTO_APPROVE is not `0`).
+# Anything else (other programs or arguments, network, outside a project) still shows a card.
+#
+# Rule fields:
+#   id            stable name, recorded with every auto-approved run
+#   program       the bare program name
+#   subcommands   the first argument must be one of these (absent = no subcommand)
+#   flags         flags allowed anywhere after the subcommand (exact match)
+#   value_flags   flags that take a value (`-m msg` or `--message=msg`), with the value's kind
+#   require_one_of  at least one of these flags must be present
+#   operands      the kind of every non-flag argument: relative-path | script-name | pattern |
+#                 name | none
+#   min_operands / max_operands
+# Value kinds: relative-path (no absolute path, no `..`, no `~`, no leading `-`), script-name
+# ([A-Za-z0-9:._-], at most 64), name ([A-Za-z0-9_.-]), pattern and text (no NUL; pattern at most
+# 256 bytes, no leading `-`; text at most 4096 bytes), count (digits).
+
+version = 1
+
+[[rule]]
+id = "ls"
+program = "ls"
+flags = ["-1", "-a", "-A", "-l", "-la", "-al", "-lh", "-lah", "-alh", "-R", "-F"]
+operands = "relative-path"
+max_operands = 16
+
+[[rule]]
+id = "pwd"
+program = "pwd"
+operands = "none"
+
+[[rule]]
+id = "cat"
+program = "cat"
+flags = ["-n"]
+operands = "relative-path"
+min_operands = 1
+max_operands = 16
+
+[[rule]]
+id = "head"
+program = "head"
+value_flags = { "-n" = "count", "-c" = "count" }
+operands = "relative-path"
+min_operands = 1
+max_operands = 16
+
+[[rule]]
+id = "tail"
+program = "tail"
+value_flags = { "-n" = "count", "-c" = "count" }
+operands = "relative-path"
+min_operands = 1
+max_operands = 16
+
+[[rule]]
+id = "wc"
+program = "wc"
+flags = ["-l", "-w", "-c"]
+operands = "relative-path"
+min_operands = 1
+max_operands = 16
+
+[[rule]]
+id = "node-script"
+program = "node"
+operands = "relative-path"
+min_operands = 1
+max_operands = 1
+
+[[rule]]
+id = "npm-run"
+program = "npm"
+subcommands = ["run", "run-script"]
+flags = ["--silent", "-s"]
+operands = "script-name"
+min_operands = 1
+max_operands = 1
+
+[[rule]]
+id = "npm-test"
+program = "npm"
+subcommands = ["test", "t"]
+flags = ["--silent", "-s"]
+operands = "none"
+
+[[rule]]
+id = "npx-tsc"
+program = "npx"
+subcommands = ["tsc"]
+flags = ["--noEmit", "--pretty"]
+value_flags = { "-p" = "relative-path", "--project" = "relative-path" }
+operands = "none"
+
+[[rule]]
+id = "forge-build-test"
+program = "forge"
+subcommands = ["build", "test"]
+flags = ["--offline", "--force", "--json", "--summary", "--gas-report", "-vv", "-vvv", "-vvvv"]
+value_flags = { "--match-test" = "pattern", "--mt" = "pattern", "--match-contract" = "pattern", "--mc" = "pattern" }
+operands = "none"
+
+[[rule]]
+id = "cargo-offline"
+program = "cargo"
+subcommands = ["build", "test", "check"]
+require_one_of = ["--offline", "--frozen"]
+flags = ["--offline", "--frozen", "--locked", "--release", "--all-targets", "--workspace", "--lib", "--bins", "--tests", "-q", "--quiet"]
+value_flags = { "-p" = "name", "--package" = "name", "--test" = "name", "--bin" = "name" }
+operands = "pattern"
+max_operands = 1
+
+[[rule]]
+id = "git-init"
+program = "git"
+subcommands = ["init"]
+flags = ["-q", "--quiet"]
+operands = "none"
+
+[[rule]]
+id = "git-status"
+program = "git"
+subcommands = ["status"]
+flags = ["-s", "--short", "-b", "--branch", "--porcelain"]
+operands = "relative-path"
+max_operands = 16
+
+[[rule]]
+id = "git-diff"
+program = "git"
+subcommands = ["diff"]
+flags = ["--stat", "--cached", "--staged", "--name-only", "--no-color"]
+operands = "relative-path"
+max_operands = 16
+
+[[rule]]
+id = "git-add"
+program = "git"
+subcommands = ["add"]
+flags = ["-A", "--all", "-u"]
+operands = "relative-path"
+max_operands = 64
+
+[[rule]]
+id = "git-commit"
+program = "git"
+subcommands = ["commit"]
+flags = ["-a", "--all", "-q", "--quiet"]
+value_flags = { "-m" = "text", "--message" = "text" }
+require_one_of = ["-m", "--message"]
+operands = "none"
