@@ -69,6 +69,10 @@ ignore = [
     #   RUSTSEC-2026-0204 crossbeam-epoch 0.9.18 -> 0.9.21
     #   RUSTSEC-2026-0258 h2            0.4.14 -> 0.4.16
     #   RUSTSEC-2026-0185 quinn-proto   0.11.14 -> 0.11.15
+    # 2026-10-15 refresh, also fixed in-lock:
+    #   RUSTSEC-2026-0338..0342 quinn-proto 0.11.15 -> 0.11.19
+    #   RUSTSEC-2026-0346..0349 rustls      0.23.45 -> 0.23.46 (live path)
+    #   RUSTSEC-2026-0352..0364 wasmtime(-wasi) 49.0.2 -> 49.0.3
     #
     # RUSTSEC-2026-0220 — ruint <1.20.0: incorrect overflow flags +
     # truncated shift amounts on Uint shift ops (CWE-682). ruint is
@@ -100,6 +104,20 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+
+    # RUSTSEC-2026-0346 / 0349 (2026-10-15 refresh) — rustls `Debug`
+    # impls exposing client session secrets; unauthenticated ServerHello
+    # downgrade to classical key exchange. Same inert subtree as the
+    # webpki entries above: these hits are on rustls 0.22.4 via
+    # serenity's unenabled gateway feature (`cargo tree -e all --target
+    # all --all-features -i rustls@0.22.4` matches nothing), and the fix
+    # is 0.23.46, outside 0.22's semver range. The live rustls was bumped
+    # 0.23.45 -> 0.23.46 in the same change, which also closes 0347/0348
+    # (no entry needed). Note the ignore is by ID, so it also covers a
+    # future 0.23 regression below 0.23.46; the lockfile pin is the guard.
+    # Tracked as REM-24.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
 ]
 
 # ─── Unmaintained-warning ignores (REM-21 hygiene) ─────────────────
