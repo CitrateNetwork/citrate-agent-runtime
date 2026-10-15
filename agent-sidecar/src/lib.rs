@@ -300,8 +300,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/shell/decide", post(shell_decide))
         .route("/sessions/:id/mcp/pending", get(mcp_pending))
         .route("/sessions/:id/mcp/decide", post(mcp_decide))
-        .route("/sessions/:id/actions/pending", get(action_pending))
-        .route("/sessions/:id/actions/decide", post(action_decide))
+        .route("/sessions/:id/approvals/pending", get(action_pending))
+        .route("/sessions/:id/approvals/:aid/decide", post(action_decide))
+        .route("/sessions/:id/taint/clear", post(taint_clear))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -1050,8 +1051,9 @@ async fn mcp_pending(
     Ok(Json(serde_json::json!({ "pending": pending })))
 }
 
-/// HGW-1: `GET /sessions/:id/actions/pending`: the action cards waiting for the member (tainted
-/// effectful sidecar calls in an HIC-aware session). A session without them has none.
+/// HGW-1: `GET /sessions/:id/approvals/pending`: the approval cards waiting for the member
+/// (tainted effectful sidecar calls in an HIC-aware session). A session without them has none.
+/// `shell_run` keeps its own cards on `/sessions/:id/shell/pending`.
 async fn action_pending(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1070,18 +1072,17 @@ async fn action_pending(
 
 #[derive(Deserialize)]
 struct ActionDecideReq {
-    id: String,
     allow: bool,
     subject: String,
 }
 
-/// HGW-1: `POST /sessions/:id/actions/decide {id, allow, subject}`: the member's decision on one
-/// action card. `subject` must be the arguments that were shown; otherwise 409 and nothing is
-/// decided. Recorded like the other HIC decisions (write-ahead for an allow).
+/// HGW-1: `POST /sessions/:id/approvals/:aid/decide {allow, subject}`: the member's decision on
+/// one approval card. `subject` must be the arguments that were shown; otherwise 409 and nothing
+/// is decided. Recorded like the other HIC decisions (write-ahead for an allow).
 async fn action_decide(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path((id, aid)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, JsonErr> {
     if !authorized(&headers, &st.bearer) {
@@ -1092,9 +1093,9 @@ async fn action_decide(
         .get(&id)
         .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
     let req: ActionDecideReq = serde_json::from_slice(&body)
-        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {id, allow, subject}"))?;
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {allow, subject}"))?;
     let card = session
-        .action_waiting(&req.id)
+        .action_waiting(&aid)
         .filter(|c| c.subject == req.subject)
         .ok_or_else(|| {
             json_err(
@@ -1113,7 +1114,7 @@ async fn action_decide(
             "the member decided on the exact action shown, in a session that read untrusted content",
             vec![citrate_agent_records::EvidenceRef {
                 kind: "sidecar_tool_call".to_string(),
-                uri: format!("sidecar:sessions/{id}/actions/{}", req.id),
+                uri: format!("sidecar:sessions/{id}/approvals/{aid}"),
                 digest: None,
             }],
         )
@@ -1125,7 +1126,7 @@ async fn action_decide(
         },
         _ => None,
     };
-    match session.action_decide(&req.id, req.allow, &req.subject) {
+    match session.action_decide(&aid, req.allow, &req.subject) {
         Ok(()) => {
             if let Some(log) = &log {
                 match allow_seq {
@@ -1160,6 +1161,86 @@ async fn action_decide(
             Err(json_err(StatusCode::CONFLICT, &msg))
         }
     }
+}
+
+#[derive(Deserialize)]
+struct TaintClearReq {
+    note: String,
+}
+
+/// HGW-W1 (#74): `POST /sessions/:id/taint/clear {note}`: the member clears the session's taint
+/// (`TaintState::clear_by_member`), from an explicit card in the app. Refused (409) for a
+/// scheduled run, whose taint is never cleared, and when nothing is tainted; 400 for an empty
+/// note. The decision is recorded write-ahead, and without a records log (or when the record
+/// cannot be written) nothing is cleared (503). Approving one action never clears the taint.
+async fn taint_clear(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let req: TaintClearReq = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {note}"))?;
+    let ack = citrate_agent_loop::MemberClear::new(req.note.clone()).ok_or_else(|| {
+        json_err(
+            StatusCode::BAD_REQUEST,
+            "the note is empty; nothing was cleared",
+        )
+    })?;
+    if session.is_unattended() {
+        return Err(json_err(
+            StatusCode::CONFLICT,
+            "a scheduled run's taint is never cleared",
+        ));
+    }
+    let sources = session.taint().sources().unwrap_or_default();
+    if !session.taint().is_tainted() {
+        return Err(json_err(
+            StatusCode::CONFLICT,
+            "this session is not tainted",
+        ));
+    }
+    let log = st.sessions.records().ok_or_else(|| {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "clearing a taint must be recorded, and no decision records are configured; nothing was cleared",
+        )
+    })?;
+    let seq = hic_records::record_member_decision(
+        &log,
+        "taint.clear",
+        &format!(
+            "clear the untrusted-content taint of session {id} (sources: {})",
+            sources.join(", ")
+        ),
+        true,
+        &req.note,
+        vec![citrate_agent_records::EvidenceRef {
+            kind: "taint_clear".to_string(),
+            uri: format!("sidecar:sessions/{id}/taint"),
+            digest: None,
+        }],
+    )
+    .map_err(|e| json_err(StatusCode::SERVICE_UNAVAILABLE, &e))?;
+    let cleared = session.taint().clear_by_member(ack);
+    hic_records::record_outcome(
+        &log,
+        seq,
+        citrate_agent_records::Outcome::Completed,
+        "the session's taint was cleared",
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "cleared": cleared.map(|r| serde_json::json!({"source": r.source, "reason": r.reason})),
+        "sources": sources,
+    })))
 }
 
 #[derive(Deserialize)]

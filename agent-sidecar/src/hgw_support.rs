@@ -30,8 +30,8 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `base/home/proj` (granted read + write), `base/home/other` (not granted) and the undo store
-/// at `base/ckpt` (outside the home).
+/// `base/home/proj` (granted read + write), `base/home/other` (not granted); undo stores go in
+/// `base/ckpt-<n>` (outside the home).
 pub(crate) struct Fx {
     pub base: PathBuf,
 }
@@ -44,7 +44,7 @@ impl Fx {
             N.fetch_add(1, Ordering::SeqCst)
         ));
         let _ = std::fs::remove_dir_all(&base);
-        for d in ["home/proj/src", "home/other", "ckpt"] {
+        for d in ["home/proj/src", "home/other"] {
             std::fs::create_dir_all(base.join(d)).expect("fixture dirs");
         }
         Fx {
@@ -112,8 +112,11 @@ pub(crate) fn manager_with(
     shell: Option<shell_run::ShellRunConfig>,
 ) -> sessions::SessionManager {
     let script = Arc::new(Script(Mutex::new(turns)));
-    let store =
-        Arc::new(CheckpointStore::open(&fx.base.join("ckpt"), Config::default()).expect("store"));
+    // One store per manager: a store is locked while it is open.
+    let dir = fx
+        .base
+        .join(format!("ckpt-{}", N.fetch_add(1, Ordering::SeqCst)));
+    let store = Arc::new(CheckpointStore::open(&dir, Config::default()).expect("store"));
     let mut mgr = sessions::SessionManager::new(
         Arc::new(move |_ep: &sessions::LlmEndpoint| script.clone() as Arc<dyn LlmClient>),
         Duration::from_secs(5),
@@ -251,28 +254,37 @@ pub(crate) async fn member_answers(
     app: &axum::Router,
     s: &sessions::Session,
     id: &str,
-    decide: impl Fn(&'static str, &serde_json::Value) -> bool,
+    mut decide: impl FnMut(&'static str, &serde_json::Value) -> bool,
 ) -> Vec<Answered> {
     let mut out = Vec::new();
     for _ in 0..3000 {
         for route in ["shell", "actions"] {
+            // Labels: `shell` = the shell_run cards, `actions` = the session's approval cards.
+            let base = if route == "shell" {
+                "shell"
+            } else {
+                "approvals"
+            };
             let (st, body) =
-                send(app, "GET", &format!("/sessions/{id}/{route}/pending"), None).await;
+                send(app, "GET", &format!("/sessions/{id}/{base}/pending"), None).await;
             assert_eq!(st, StatusCode::OK, "{route}: {body}");
             for card in body["pending"].as_array().cloned().unwrap_or_default() {
                 let allow = decide(route, &card);
-                let decision = if route == "shell" {
-                    serde_json::json!({"id": card["id"], "allow": allow, "argv": card["argv"], "cwd": card["cwd"]})
+                let (url, decision) = if route == "shell" {
+                    (
+                        format!("/sessions/{id}/shell/decide"),
+                        serde_json::json!({"id": card["id"], "allow": allow, "argv": card["argv"], "cwd": card["cwd"]}),
+                    )
                 } else {
-                    serde_json::json!({"id": card["id"], "allow": allow, "subject": card["subject"]})
+                    (
+                        format!(
+                            "/sessions/{id}/approvals/{}/decide",
+                            card["id"].as_str().unwrap_or_default()
+                        ),
+                        serde_json::json!({"allow": allow, "subject": card["subject"]}),
+                    )
                 };
-                let (st, b) = send(
-                    app,
-                    "POST",
-                    &format!("/sessions/{id}/{route}/decide"),
-                    Some(decision),
-                )
-                .await;
+                let (st, b) = send(app, "POST", &url, Some(decision)).await;
                 assert_eq!(st, StatusCode::OK, "{route} decide: {b}");
                 out.push(Answered { route, card, allow });
             }

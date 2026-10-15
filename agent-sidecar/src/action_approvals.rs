@@ -4,7 +4,8 @@
 //! output, a web page, an MCP result), an effectful sidecar-hosted call (`fs_*`, `file_write`,
 //! `sheet_write`, the toolchain tools, `project_create`, capsules) is not refused for the rest of
 //! the conversation. It waits here as an approval card that citrate-core shows to the member
-//! (`GET /sessions/:id/actions/pending`, decided with `POST /sessions/:id/actions/decide`):
+//! (`GET /sessions/:id/approvals/pending`, decided with
+//! `POST /sessions/:id/approvals/:aid/decide {allow, subject}`):
 //!
 //! - the card shows the tool, the exact arguments that will be used (`subject`, canonical JSON),
 //!   a one-line summary, why it is gated (`hicReason`) and every source that tainted the session
@@ -12,7 +13,8 @@
 //! - a decision must carry the `subject` that was shown; anything else is refused and changes
 //!   nothing;
 //! - an allow releases **that one call**, with those arguments. The session stays tainted, so
-//!   the next effectful call asks again (no approval is ever global);
+//!   the next effectful call asks again (no approval is ever global). Clearing the taint is a
+//!   separate, explicit, recorded member action (`POST /sessions/:id/taint/clear`);
 //! - a decline, a session stop, or no decision within [`ACTION_APPROVAL_TIMEOUT`] declines it.
 //!
 //! The queue exists only for a session opened with `hicAware: true` (core's promise that a
@@ -235,7 +237,7 @@ impl ActionApprovals {
                 break if a {
                     Ok(())
                 } else {
-                    Err("the member declined this action".to_string())
+                    Err("the member declined this action; ask the member what to do instead of retrying it".to_string())
                 };
             }
             if stop.is_stopped() {

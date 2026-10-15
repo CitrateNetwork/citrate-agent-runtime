@@ -15,6 +15,8 @@
 //! - Headless: `without_an_hic_aware_app_tainted_actions_are_declined_and_say_why`.
 //! - Routes: `the_action_routes_need_the_bearer_and_a_known_session`.
 //! - Records: `action_decisions_are_recorded_for_the_anchor`.
+//! - Explicit clear (HGW-W1, #74): `taint_clear_is_an_explicit_recorded_member_action`.
+//! - Ask, don't retry: `a_declined_action_tells_the_model_to_ask_not_retry`.
 
 #![cfg(unix)]
 
@@ -181,7 +183,7 @@ async fn a_decision_must_carry_the_arguments_that_were_shown() {
         let (_, ac) = send(
             &app,
             "GET",
-            &format!("/sessions/{id}/actions/pending"),
+            &format!("/sessions/{id}/approvals/pending"),
             None,
         )
         .await;
@@ -192,12 +194,13 @@ async fn a_decision_must_carry_the_arguments_that_were_shown() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(card.is_object(), "no action card appeared");
-    let url = format!("/sessions/{id}/actions/decide");
+    let aid = card["id"].as_str().unwrap_or_default().to_string();
+    let url = format!("/sessions/{id}/approvals/{aid}/decide");
     let (st, _) = send(
         &app,
         "POST",
         &url,
-        Some(serde_json::json!({"id": card["id"], "allow": true, "subject": "{\"path\":\"/etc/x\"}"})),
+        Some(serde_json::json!({"allow": true, "subject": "{\"path\":\"/etc/x\"}"})),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -205,18 +208,24 @@ async fn a_decision_must_carry_the_arguments_that_were_shown() {
     let (st, _) = send(
         &app,
         "POST",
-        &url,
-        Some(serde_json::json!({"id": "act-999", "allow": true, "subject": card["subject"]})),
+        &format!("/sessions/{id}/approvals/act-999/decide"),
+        Some(serde_json::json!({"allow": true, "subject": card["subject"]})),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
-    let (st, _) = send(&app, "POST", &url, Some(serde_json::json!({"id": 1}))).await;
+    let (st, _) = send(
+        &app,
+        "POST",
+        &url,
+        Some(serde_json::json!({"allow": "yes"})),
+    )
+    .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     let (st, _) = send(
         &app,
         "POST",
         &url,
-        Some(serde_json::json!({"id": card["id"], "allow": true, "subject": card["subject"]})),
+        Some(serde_json::json!({"allow": true, "subject": card["subject"]})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -259,7 +268,7 @@ async fn without_an_hic_aware_app_tainted_actions_are_declined_and_say_why() {
     let (st, body) = send(
         &app,
         "GET",
-        &format!("/sessions/{id}/actions/pending"),
+        &format!("/sessions/{id}/approvals/pending"),
         None,
     )
     .await;
@@ -280,20 +289,20 @@ async fn the_action_routes_need_the_bearer_and_a_known_session() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/sessions/{id}/actions/pending"))
+                .uri(format!("/sessions/{id}/approvals/pending"))
                 .body(Body::empty())
                 .expect("req"),
         )
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let (st, _) = send(&app, "GET", "/sessions/nope/actions/pending", None).await;
+    let (st, _) = send(&app, "GET", "/sessions/nope/approvals/pending", None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (st, _) = send(
         &app,
         "POST",
-        "/sessions/nope/actions/decide",
-        Some(serde_json::json!({"id": "act-1", "allow": true, "subject": "{}"})),
+        "/sessions/nope/approvals/act-1/decide",
+        Some(serde_json::json!({"allow": true, "subject": "{}"})),
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
@@ -347,4 +356,116 @@ async fn action_decisions_are_recorded_for_the_anchor() {
     });
     assert_eq!(outcome, Some(Outcome::Completed));
     assert_eq!(decisions[1].1, Decision::Denied);
+}
+
+/// HGW-W1 (#74): a member can clear a session's taint, but only as an explicit, recorded action:
+/// not for a scheduled run, not with an empty note, and not when the decision cannot be recorded
+/// (write-ahead, fail closed). After a clear, effectful calls run without a card again.
+#[tokio::test(flavor = "multi_thread")]
+async fn taint_clear_is_an_explicit_recorded_member_action() {
+    use citrate_agent_records::{Decision, DecisionLog, Entry, LogConfig};
+    let fx = Fx::new("taint-clear");
+    let f = fx.proj().join("after-clear.txt");
+    // Without a records log, nothing is cleared.
+    let mgr = Arc::new(manager_with(&fx, vec![], Some(shell_open())));
+    let id = mgr.create(create_req(fx.rw_doc(), true)).expect("session");
+    let s = mgr.get(&id).expect("session");
+    s.taint().taint("shell_run", "output");
+    let app = app_for(mgr.clone());
+    let url = format!("/sessions/{id}/taint/clear");
+    let (st, _) = send(
+        &app,
+        "POST",
+        &url,
+        Some(serde_json::json!({"note": "I read that output"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(s.taint().is_tainted());
+    // With records: an empty note is refused, a real one clears and is recorded.
+    let dir = fx.base.join("records");
+    let (log, _) = DecisionLog::open(&dir, LogConfig::default()).expect("log");
+    let turns = vec![
+        AssistantTurn::tools(vec![fs_write("c1", &f, "F")]),
+        AssistantTurn::text("ok"),
+    ];
+    let mgr = Arc::new(manager_with(&fx, turns, Some(shell_open())).with_records(Arc::new(log)));
+    let id = mgr.create(create_req(fx.rw_doc(), true)).expect("session");
+    let s = mgr.get(&id).expect("session");
+    s.taint().taint("shell_run", "output");
+    let app = app_for(mgr.clone());
+    let url = format!("/sessions/{id}/taint/clear");
+    let (st, _) = send(&app, "POST", &url, Some(serde_json::json!({"note": "  "}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, body) = send(
+        &app,
+        "POST",
+        &url,
+        Some(serde_json::json!({"note": "I read that output"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["cleared"]["source"], "shell_run");
+    assert!(!s.taint().is_tainted());
+    let (st, _) = send(
+        &app,
+        "POST",
+        &url,
+        Some(serde_json::json!({"note": "again"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "nothing to clear");
+    // The next write runs without a card.
+    mgr.send(&id, "go".into(), None).expect("send");
+    wait_done(&s).await;
+    assert_eq!(result_of(&s, "c1").await["status"], "ok");
+    assert!(f.exists());
+    let recs = citrate_agent_records::read::page(&dir, None, 10_000).expect("records");
+    assert!(recs.iter().any(|r| matches!(&r.record.entry,
+        Entry::Decision(d) if d.kind == "taint.clear" && d.decision == Decision::Approved && d.subject.contains("shell_run"))));
+    // A scheduled run's taint is never cleared.
+    let mut req = create_req(fx.rw_doc(), true);
+    req.unattended = true;
+    let id = mgr.create(req).expect("session");
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/sessions/{id}/taint/clear"),
+        Some(serde_json::json!({"note": "please"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(mgr.get(&id).expect("session").taint().is_tainted());
+}
+
+/// HGW-W1 (#74 AC3): a declined action tells the model to ask the member, not to retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declined_action_tells_the_model_to_ask_not_retry() {
+    let fx = Fx::new("taint-decline-hint");
+    let proj = fx.proj();
+    let turns = vec![
+        AssistantTurn::tools(vec![shell("c1", &["echo", "x"], &proj)]),
+        AssistantTurn::tools(vec![fs_write("c2", &proj.join("a.txt"), "A")]),
+        AssistantTurn::tools(vec![shell("c3", &["echo", "y"], &proj)]),
+        AssistantTurn::text("ok"),
+    ];
+    let mgr = Arc::new(manager_with(&fx, turns, Some(shell_open())));
+    let id = mgr.create(create_req(fx.rw_doc(), true)).expect("session");
+    let s = mgr.get(&id).expect("session");
+    let app = app_for(mgr.clone());
+    mgr.send(&id, "go".into(), None).expect("send");
+    // Allow the first command; decline the write and the second command.
+    let mut n = 0;
+    member_answers(&app, &s, &id, move |_, _| {
+        n += 1;
+        n == 1
+    })
+    .await;
+    for c in ["c2", "c3"] {
+        let r = result_of(&s, c).await;
+        assert_eq!(r["status"], "denied", "{r}");
+        let msg = r["content"].as_str().unwrap_or_default();
+        assert!(msg.contains("ask the member"), "{msg}");
+        assert!(msg.contains("instead of retrying"), "{msg}");
+    }
 }

@@ -67,8 +67,8 @@
 //!   `/shell` routes and runs only in the OS sandbox. The name is reserved while it is on.
 //! - HGW-1 (owner decision 2026-10-15): taint escalates to HIC approval instead of ending the
 //!   conversation. In a session opened with `hicAware: true`, a tainted effectful sidecar-hosted
-//!   call waits for the member on the session's action cards (`/actions` routes,
-//!   [`crate::action_approvals`]); `shell_run`, MCP and browser calls use their own cards, which
+//!   call waits for the member on the session's approval cards (`/sessions/:id/approvals`
+//!   routes, [`crate::action_approvals`]); `shell_run`, MCP and browser calls use their own cards, which
 //!   carry the same reason. Each approval releases one call and the session stays tainted.
 //!   Without `hicAware` nobody can be asked, so such calls are declined with
 //!   [`citrate_agent_loop::cannot_ask_reason`].
@@ -555,6 +555,8 @@ pub struct Session {
     mcp_approvals: Option<Arc<crate::mcp_approvals::McpApprovals>>,
     /// HGW-1: the cards for tainted effectful sidecar calls (present only for an HIC-aware app).
     actions: Option<Arc<ActionApprovals>>,
+    /// HUP-S10.3: a scheduled run nobody watches; its taint is never cleared.
+    unattended: bool,
     /// Test seam: runs on the emitting thread right after an event becomes visible to readers, so
     /// a test can act as a core client at the exact moment the event appears.
     #[cfg(test)]
@@ -601,6 +603,11 @@ impl Session {
     pub fn mcp_decide(&self, id: &str, allow: bool, subject: &str) -> Result<(), SessionError> {
         let a = self.mcp_approvals.as_ref().ok_or(SessionError::NotFound)?;
         a.decide(id, allow, subject).map_err(SessionError::Invalid)
+    }
+
+    /// HUP-S10.3: whether this is a scheduled run nobody watches (its taint is never cleared).
+    pub fn is_unattended(&self) -> bool {
+        self.unattended
     }
 
     /// HGW-1: the action cards waiting for the member (`None` when the session has none, i.e. it
@@ -1836,6 +1843,7 @@ impl SessionManager {
             mcp_offered,
             mcp_approvals,
             actions,
+            unattended: req.unattended,
             #[cfg(test)]
             event_hook: Mutex::new(None),
         });

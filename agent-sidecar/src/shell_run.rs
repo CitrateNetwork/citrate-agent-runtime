@@ -270,7 +270,7 @@ impl ShellApprovals {
                 break if a {
                     Ok(())
                 } else {
-                    Err("the member declined this command".to_string())
+                    Err("the member declined this command; ask the member what to do instead of retrying it".to_string())
                 };
             }
             if stopped() {
