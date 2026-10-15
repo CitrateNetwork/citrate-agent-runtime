@@ -849,10 +849,10 @@ pub struct RunReport {
     pub cleanup_error: Option<String>,
     /// Whether (and how) the run was wrapped in the OS sandbox.
     pub sandbox: SandboxSummary,
-    /// HGW-2: git state the run left behind that would start a program the next time the member
-    /// uses git outside the sandbox (a hook, `core.hooksPath`, an alias that runs a shell, …), and
-    /// that was not there before the run. Reported, never changed. Empty (and not serialized)
-    /// when there is nothing new.
+    /// HGW-2: what the run added to git that would start a program the next time git is used
+    /// outside the sandbox (a hook, `core.hooksPath`, an alias, a filter, an include, …), which
+    /// the runner then reverted (owner decision 2026-10-15): one line per revert, or per item it
+    /// could not revert. Empty (and not serialized) when there was nothing to revert.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub git_warnings: Vec<String>,
 }
@@ -1149,9 +1149,10 @@ impl ShellRunner {
             cmd.env(k, v);
         }
 
-        // HGW-2: what git would run later, before the run (only what is new is reported).
+        // HGW-2: the repositories this run could touch, before it (what it adds that would make
+        // git run a program later is reverted after it).
         let repos = git_state::repo_dirs(&plan.cwd, &plan.write_roots);
-        let git_before = git_state::risks(&repos);
+        let git_before = git_state::snapshot(&repos);
         let tree = ProcessTree::prepare().map_err(|e| ShellError::Spawn {
             program: req.program.clone(),
             reason: format!("cannot create the process tree container: {e}"),
@@ -1210,10 +1211,7 @@ impl ShellRunner {
             );
         }
 
-        let git_warnings: Vec<String> = git_state::risks(&repos)
-            .difference(&git_before)
-            .cloned()
-            .collect();
+        let git_warnings = git_state::revert_new(&git_before);
         Ok(RunReport {
             program: req.program.clone(),
             resolved_path: plan.resolved_path,

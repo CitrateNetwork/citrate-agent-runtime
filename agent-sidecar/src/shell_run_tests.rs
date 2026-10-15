@@ -689,11 +689,12 @@ fn git_runs_have_hooks_and_fsmonitor_off() {
     }
 }
 
-/// HGW-2: a command that leaves git set up to run a program later (outside the sandbox) is
+/// HGW-2 (owner decision 2026-10-15): git config a command adds that would run a program later
+/// (outside the sandbox) is reverted and
 /// reported to the model and the member: the run facts carry `git_warnings` and the summary says
 /// so.
 #[test]
-fn risky_git_state_left_by_a_command_is_reported() {
+fn risky_git_state_left_by_a_command_is_reverted_and_reported() {
     let fx = Fx::new();
     std::fs::create_dir_all(fx.proj().join(".git/hooks")).unwrap();
     let s = session(&fx, &cfg_open());
@@ -717,7 +718,13 @@ fn risky_git_state_left_by_a_command_is_reported() {
     let facts = env.run.expect("run facts");
     let w = facts["git_warnings"].to_string();
     assert!(w.contains("core.hookspath"), "{w}");
-    assert!(env.summary.contains("git"), "{}", env.summary);
+    assert!(w.contains("reverted"), "{w}");
+    assert!(env.summary.contains("were undone"), "{}", env.summary);
+    let cfg = std::fs::read_to_string(fx.proj().join(".git/config")).unwrap();
+    assert!(
+        !cfg.contains("hooksPath"),
+        "the risky key was reverted: {cfg}"
+    );
     assert!(
         env.summary.contains("outside the sandbox"),
         "{}",

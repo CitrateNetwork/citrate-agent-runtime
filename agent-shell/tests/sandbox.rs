@@ -250,28 +250,138 @@ fn bwrap_command_isolates_network_and_binds_only_the_grant_writable() {
     assert!(!a.iter().any(|x| x.ends_with(".git/config")), "{a:?}");
 }
 
-/// HGW-2: a run that leaves git in a state that would run a program the next time the member uses
-/// git in a terminal (a hook, `core.hooksPath`, `core.fsmonitor`, an alias that runs a shell…) is
-/// reported in `git_warnings`. What was already there before the run is not reported again.
+/// Owner decision 2026-10-15 (runtime, 1): risky git state a run adds is REVERTED after the run
+/// (and reported in `git_warnings`): every listed risky key, new hook files, a symlinked hooks
+/// folder. Normal config the run adds survives; what was there before the run is untouched.
 #[test]
-fn new_risky_git_state_is_reported_after_a_run() {
+fn new_risky_git_state_is_reverted_after_a_run_and_normal_config_survives() {
     let fx = Fx::new();
     let repo = fx.grant().join("repo");
     std::fs::create_dir_all(repo.join(".git/hooks")).expect("repo");
-    // Already there before the run (a member's own hook manager): not reported.
+    // Already there before the run (the member's own): untouched and not reported.
     std::fs::write(repo.join(".git/hooks/pre-push"), "#!/bin/sh\n").expect("hook");
-    std::fs::write(repo.join(".git/config"), "[core]\n\tbare = false\n").expect("config");
+    let before = "[core]\n\tbare = false\n\teditor = vim\n[alias]\n\tst = status\n";
+    std::fs::write(repo.join(".git/config"), before).expect("config");
+    let risky = r#"[core]
+	hooksPath = .h
+	fsmonitor = ./fsm.sh
+	sshCommand = ssh -o ProxyCommand=evil
+	pager = less; evil
+	editor = evil-editor
+[alias]
+	x = !sh -c id
+	co = checkout
+[filter "lfs"]
+	smudge = evil %f
+[diff]
+	external = evil-diff
+[diff "bin"]
+	textconv = evil-conv
+[merge "ours"]
+	driver = evil-merge %A
+[credential]
+	helper = evil-cred
+[include]
+	path = ../evil.inc
+[includeIf "gitdir:~/"]
+	path = ~/.evil
+[url "file:///tmp/evil"]
+	insteadOf = https://github.com/
+[url "https://mirror.example.invalid/"]
+	insteadOf = https://github.com/
+[protocol "ext"]
+	allow = always
+[gpg]
+	program = evil-gpg
+[user]
+	name = Member
+	email = member@example.invalid
+[remote "origin"]
+	url = https://example.invalid/r.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+[core]
+	autocrlf = input
+"#;
+    std::fs::write(fx.grant().join("risky.txt"), risky).expect("risky");
     let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
-    let cmd = "printf '[core]\\n\\thooksPath = .h\\n[alias]\\n\\tx = !sh -c id\\n' >> .git/config; echo '#!/bin/sh' > .git/hooks/post-checkout; echo ok";
+    let cmd =
+        "cat ../risky.txt >> .git/config; echo '#!/bin/sh' > .git/hooks/post-checkout; echo ok";
     let rep = r.run(&sh(cmd, &repo)).expect("run");
     assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
-    let w = rep.git_warnings.join("\n");
-    assert!(w.contains("core.hookspath"), "{w}");
-    assert!(w.contains("alias.x"), "{w}");
-    assert!(w.contains("post-checkout"), "{w}");
+    let after = std::fs::read_to_string(repo.join(".git/config")).expect("config");
+    for gone in [
+        "hooksPath",
+        "fsmonitor",
+        "sshCommand",
+        "less; evil",
+        "evil-editor",
+        "!sh -c id",
+        "checkout",
+        "smudge",
+        "evil-diff",
+        "textconv",
+        "evil-merge",
+        "evil-cred",
+        "evil.inc",
+        "~/.evil",
+        "file:///tmp/evil",
+        "allow = always",
+        "evil-gpg",
+    ] {
+        assert!(!after.contains(gone), "{gone} survived:\n{after}");
+    }
+    for kept in [
+        "bare = false",
+        "editor = vim",
+        "st = status",
+        "name = Member",
+        "email = member@example.invalid",
+        "url = https://example.invalid/r.git",
+        "remote = origin",
+        "autocrlf = input",
+        "https://mirror.example.invalid/",
+    ] {
+        assert!(after.contains(kept), "{kept} was removed:\n{after}");
+    }
     assert!(
-        !w.contains("pre-push"),
-        "pre-existing state is not reported: {w}"
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "a new hook is removed"
+    );
+    assert!(
+        repo.join(".git/hooks/pre-push").exists(),
+        "the member's own hook stays"
+    );
+    let w = rep.git_warnings.join("\n");
+    for k in [
+        "core.hookspath",
+        "core.fsmonitor",
+        "core.sshcommand",
+        "core.pager",
+        "core.editor",
+        "alias.x",
+        "alias.co",
+        "filter.lfs.smudge",
+        "diff.external",
+        "diff.bin.textconv",
+        "merge.ours.driver",
+        "credential.helper",
+        "include.path",
+        "includeif.gitdir:~/.path",
+        "url.file:///tmp/evil.insteadof",
+        "protocol.ext.allow",
+        "gpg.program",
+        "post-checkout",
+    ] {
+        assert!(w.contains(k), "{k} not reported: {w}");
+    }
+    assert!(w.contains("reverted"), "{w}");
+    assert!(!w.contains("pre-push") && !w.contains("user.name"), "{w}");
+    // The repo still works with what is left.
+    assert!(
+        rep.git_warnings.iter().all(|l| !l.contains("could not")),
+        "{w}"
     );
     // A run that changes nothing about git reports nothing.
     let rep = r.run(&sh("echo quiet", &repo)).expect("run");
@@ -281,6 +391,90 @@ fn new_risky_git_state_is_reported_after_a_run() {
         v.get("git_warnings").is_none(),
         "empty warnings are not serialized: {v}"
     );
+}
+
+/// A brand-new repository's risky config and a symlinked config are reverted too.
+#[test]
+fn a_new_repo_or_a_swapped_config_is_reverted() {
+    let fx = Fx::new();
+    let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
+    let fresh = fx.grant().join("fresh");
+    std::fs::create_dir_all(&fresh).expect("fresh");
+    let cmd = "mkdir -p .git/hooks && printf '[core]\\n\\trepositoryformatversion = 0\\n\\thooksPath = x\\n' > .git/config";
+    let rep = r.run(&sh(cmd, &fresh)).expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let cfg = std::fs::read_to_string(fresh.join(".git/config")).expect("config");
+    assert!(
+        cfg.contains("repositoryformatversion") && !cfg.contains("hooksPath"),
+        "{cfg}"
+    );
+    // A config swapped for a symlink goes back to what it was.
+    let repo = fx.grant().join("swap");
+    std::fs::create_dir_all(repo.join(".git")).expect("repo");
+    std::fs::write(repo.join(".git/config"), "[user]\n\tname = M\n").expect("cfg");
+    std::fs::write(fx.grant().join("evil.cfg"), "[core]\n\thooksPath = /tmp\n").expect("evil");
+    let rep = r
+        .run(&sh(
+            "rm .git/config && ln -s ../../evil.cfg .git/config",
+            &repo,
+        ))
+        .expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let m = std::fs::symlink_metadata(repo.join(".git/config")).expect("meta");
+    assert!(!m.file_type().is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/config")).expect("cfg"),
+        "[user]\n\tname = M\n"
+    );
+    assert!(
+        rep.git_warnings.join("\n").contains("symbolic link"),
+        "{:?}",
+        rep.git_warnings
+    );
+}
+
+/// A `.git` the run turned into a pointer (a `gitdir:` file or a symbolic link) to a git folder
+/// elsewhere is reported with the risky state found there. The folder it points at may be the
+/// member's own, so it is not changed.
+#[test]
+fn a_git_pointer_made_by_the_run_is_reported_not_followed_into_changes() {
+    let fx = Fx::new();
+    let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
+    let elsewhere = fx.grant().join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join("hooks")).expect("dir");
+    std::fs::write(elsewhere.join("config"), "[core]\n\thooksPath = /tmp/h\n").expect("cfg");
+    std::fs::write(elsewhere.join("hooks/post-checkout"), "#!/bin/sh\n").expect("hook");
+    let proj = fx.grant().join("proj");
+    std::fs::create_dir_all(&proj).expect("proj");
+    let rep = r
+        .run(&sh("printf 'gitdir: ../elsewhere\\n' > .git", &proj))
+        .expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let w = rep.git_warnings.join("\n");
+    assert!(
+        w.contains("core.hookspath") && w.contains("post-checkout"),
+        "{w}"
+    );
+    assert!(w.contains("not changed"), "{w}");
+    assert!(
+        std::fs::read_to_string(elsewhere.join("config"))
+            .expect("cfg")
+            .contains("hooksPath"),
+        "the folder pointed at is left as it was"
+    );
+    assert!(elsewhere.join("hooks/post-checkout").exists());
+    // The same pointer, already there before the next run, is not reported again.
+    let rep = r.run(&sh("echo quiet", &proj)).expect("run");
+    assert!(rep.git_warnings.is_empty(), "{:?}", rep.git_warnings);
+    #[cfg(unix)]
+    {
+        let linked = fx.grant().join("linked");
+        std::fs::create_dir_all(&linked).expect("linked");
+        let rep = r.run(&sh("ln -s ../elsewhere .git", &linked)).expect("run");
+        assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+        let w = rep.git_warnings.join("\n");
+        assert!(w.contains("core.hookspath"), "{w}");
+    }
 }
 
 #[test]
@@ -453,6 +647,25 @@ mod macos {
         assert_eq!(rep.stdout.trim(), "1");
         assert!(fx.grant().join(".git/config").is_file());
         assert!(rep.git_warnings.is_empty(), "{:?}", rep.git_warnings);
+    }
+
+    /// Owner decision 2026-10-15: real git under Seatbelt setting risky config is reverted after
+    /// the run; the identity and remote it set survive.
+    #[test]
+    fn git_config_set_by_real_git_under_seatbelt_is_reverted() {
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), required());
+        let cmd = "git init -q . && git config core.hooksPath .h && git config alias.x '!id' && git config user.name M && git remote add origin https://example.invalid/r.git";
+        let rep = r.run(&sh(cmd, &fx.grant())).expect("run");
+        assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+        let cfg = std::fs::read_to_string(fx.grant().join(".git/config")).expect("config");
+        assert!(!cfg.contains("hooksPath") && !cfg.contains("!id"), "{cfg}");
+        assert!(
+            cfg.contains("name = M") && cfg.contains("example.invalid"),
+            "{cfg}"
+        );
+        let w = rep.git_warnings.join("\n");
+        assert!(w.contains("core.hookspath") && w.contains("alias.x"), "{w}");
     }
 
     /// HGW-2: with `.git` writable, hooks stay closed: no hook file but samples, no renaming a

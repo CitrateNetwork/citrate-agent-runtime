@@ -596,12 +596,13 @@ fn report(argv: &[String], r: &RunReport, released: &Released<'_>) -> ToolOutcom
             project.display()
         ),
     };
-    // HGW-2: git state the command left that would run a program outside the sandbox later.
+    // HGW-2 (owner decision 2026-10-15): git changes the command made that would run a program
+    // outside the sandbox later were reverted after it; the model and the member are told.
     let git_note = if r.git_warnings.is_empty() {
         String::new()
     } else {
         format!(
-            ". Warning: the command left git set up to run a program outside the sandbox the next time git is used ({}); the member should review it",
+            ". After it ran, git changes that would run a program outside the sandbox were undone ({}); do not set them again",
             r.git_warnings.join("; ")
         )
     };
