@@ -35,6 +35,7 @@ pub mod llm_http;
 pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
+pub mod projects;
 pub mod resources;
 pub mod retrieval_http;
 pub mod search;
@@ -1859,6 +1860,25 @@ pub fn production_sessions_with(
     let mgr = mgr.with_self_review(self_review_from_env_var(
         std::env::var("CITRATE_HERMES_SELF_REVIEW").ok().as_deref(),
     ));
+    // HGW-3: project_create (off by default; every project needs the member's approval).
+    let mgr = match projects::ProjectsConfig::from_env_vars(
+        |k| std::env::var(k).ok(),
+        projects::production_render_sandbox(),
+    ) {
+        Ok(Some(cfg)) => {
+            eprintln!(
+                "citrate-agent-sidecar: project_create on for sessions with folder grants; projects go in {}{}",
+                cfg.root.display(),
+                if cfg.renderer.is_some() { ", with templates" } else { "" }
+            );
+            mgr.with_projects(Arc::new(cfg))
+        }
+        Ok(None) => mgr,
+        Err(e) => {
+            eprintln!("citrate-agent-sidecar: project_create stays off: {e}");
+            mgr
+        }
+    };
     // US-2.2 AC2: shell_run (off by default; always inside the OS sandbox).
     let mgr = match shell_run::ShellRunConfig::from_env() {
         Some(cfg) => {
@@ -2364,6 +2384,8 @@ mod deploy_guard_session_tests;
 mod hgw_support;
 #[cfg(all(test, unix))]
 mod project_policy_tests;
+#[cfg(all(test, unix))]
+mod projects_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]

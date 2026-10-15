@@ -72,6 +72,10 @@
 //!   carry the same reason. Each approval releases one call and the session stays tainted.
 //!   Without `hicAware` nobody can be asked, so such calls are declined with
 //!   [`citrate_agent_loop::cannot_ask_reason`].
+//! - HGW-3: when projects are on (`CITRATE_HERMES_PROJECTS=1`, default off), every session opened
+//!   with folder grants also offers the sidecar-hosted `project_create` ([`crate::projects`]):
+//!   it creates `<projects root>/<name>` after the member approves the action card, and the new
+//!   folder becomes one of the session's project roots. The name is reserved while it is on.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -975,6 +979,8 @@ pub(crate) struct SidecarHost {
     pub(crate) actions: Option<Arc<ActionApprovals>>,
     pub(crate) taint: TaintState,
     pub(crate) stop: StopFlag,
+    /// HGW-3: `project_create`, when projects are on and the session has grants.
+    pub(crate) projects: Option<crate::projects::ProjectCreateHost>,
 }
 
 impl ToolHost for SidecarHost {
@@ -982,6 +988,11 @@ impl ToolHost for SidecarHost {
         if call.name == SHELL_RUN_TOOL {
             if let Some(s) = &self.shell {
                 return s.execute(call);
+            }
+        }
+        if crate::projects::ProjectCreateHost::handles(&call.name) {
+            if let Some(p) = &self.projects {
+                return p.execute(call);
             }
         }
         if browser_tools::handles(&call.name) {
@@ -1066,6 +1077,14 @@ impl ToolHost for SidecarHost {
                 None => cannot_ask(),
             };
         }
+        if crate::projects::ProjectCreateHost::handles(&call.name) {
+            return match &self.projects {
+                Some(p) if p.honors_explicit_approval() => {
+                    p.execute_with_explicit_approval(call, reason)
+                }
+                _ => cannot_ask(),
+            };
+        }
         if let Some(m) = &self.mcp {
             if m.handles(&call.name) {
                 return if m.honors_explicit_approval() {
@@ -1144,6 +1163,8 @@ pub struct SessionManager {
     uses: AtomicU64,
     /// US-2.2 AC2: `shell_run` for sessions opened with folder grants (default off).
     shell_run: Option<Arc<ShellRunConfig>>,
+    /// HGW-3: `project_create` for sessions opened with folder grants (default off).
+    projects: Option<Arc<crate::projects::ProjectsConfig>>,
     /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
     /// US-1.3 AC2: ask the model for a self-review of every workflow step attempt and record it
@@ -1179,6 +1200,7 @@ impl SessionManager {
             mcp_registry: None,
             uses: AtomicU64::new(0),
             shell_run: None,
+            projects: None,
             records: None,
             self_review: false,
         }
@@ -1223,6 +1245,12 @@ impl SessionManager {
     /// US-2.2 AC2: offer `shell_run` to every new session opened with folder grants.
     pub fn with_shell_run(mut self, cfg: Arc<ShellRunConfig>) -> Self {
         self.shell_run = Some(cfg);
+        self
+    }
+
+    /// HGW-3: offer `project_create` to every new session opened with folder grants.
+    pub fn with_projects(mut self, cfg: Arc<crate::projects::ProjectsConfig>) -> Self {
+        self.projects = Some(cfg);
         self
     }
 
@@ -1625,6 +1653,16 @@ impl SessionManager {
             }
             specs.push(crate::learn::learn_propose_spec());
         }
+        if self.projects.is_some()
+            && specs
+                .iter()
+                .any(|t| t.name == crate::projects::PROJECT_CREATE_TOOL)
+        {
+            return Err(SessionError::Invalid(format!(
+                "the tool name '{}' is reserved by the sidecar while projects are on",
+                crate::projects::PROJECT_CREATE_TOOL
+            )));
+        }
         if self.shell_run.is_some() && specs.iter().any(|t| t.name == SHELL_RUN_TOOL) {
             return Err(SessionError::Invalid(format!(
                 "the tool name '{SHELL_RUN_TOOL}' is reserved by the sidecar while shell_run is on"
@@ -1682,6 +1720,9 @@ impl SessionManager {
                 Some(Arc::new(g))
             }
         };
+        if self.projects.is_some() && grants.is_some() {
+            specs.push(crate::projects::project_create_spec());
+        }
         let shell = match (&self.shell_run, &grants) {
             (Some(cfg), Some(g)) => {
                 specs.push(shell_run_spec());
@@ -2007,8 +2048,19 @@ impl SessionManager {
                 session.hic_aware,
             )
         });
+        let projects_host = match (&self.projects, &session.grants) {
+            (Some(cfg), Some(g)) => Some(crate::projects::ProjectCreateHost::new(
+                cfg.clone(),
+                g.clone(),
+                session.actions.clone(),
+                session.taint.clone(),
+                session.stop.clone(),
+            )),
+            _ => None,
+        };
         if file_host.is_some()
             || shell_host.is_some()
+            || projects_host.is_some()
             || skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
@@ -2035,6 +2087,7 @@ impl SessionManager {
                     actions: session.actions.clone(),
                     taint: session.taint.clone(),
                     stop: session.stop.clone(),
+                    projects: projects_host,
                 }),
             );
         }
