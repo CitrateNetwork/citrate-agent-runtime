@@ -288,6 +288,48 @@ async fn auto_approval_can_be_turned_off() {
     assert_eq!(answered.len(), 1);
 }
 
+/// HGW-W11 (#77): the app can show the list in effect (Settings), read-only, behind the bearer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_list_in_effect_is_readable_for_the_app() {
+    use axum::http::StatusCode;
+    let fx = Fx::new("auto-list-route");
+    let mut cfg = shell_open();
+    cfg.auto_approve = Some(Arc::new(AutoApproveList::shipped().expect("list")));
+    let app = app_for(Arc::new(manager_with(&fx, vec![], Some(cfg))));
+    let (st, body) = send(&app, "GET", "/shell/auto-approve", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["enabled"], true);
+    let ids: Vec<&str> = body["rules"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|r| r["id"].as_str()).collect())
+        .unwrap_or_default();
+    for id in ["npm-run", "git-commit", "forge-build-test", "cargo-offline"] {
+        assert!(ids.contains(&id), "{ids:?}");
+    }
+    assert_eq!(
+        body["conditions"].as_array().map(|a| a.len()),
+        Some(4),
+        "{body}"
+    );
+    // Off: still answers, says so.
+    let app = app_for(Arc::new(manager_with(&fx, vec![], Some(shell_open()))));
+    let (st, body) = send(&app, "GET", "/shell/auto-approve", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+    // Behind the bearer.
+    use tower::ServiceExt;
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/shell/auto-approve")
+                .body(axum::body::Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_approved_runs_are_recorded_for_the_anchor() {
     use citrate_agent_records::{ActorKind, Decision, DecisionLog, Entry, LogConfig, Outcome};

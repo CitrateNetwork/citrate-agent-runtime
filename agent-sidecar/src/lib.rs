@@ -300,6 +300,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/shell/pending", get(shell_pending))
         .route("/sessions/:id/toolchain/reports", get(toolchain_reports))
         .route("/sessions/:id/shell/decide", post(shell_decide))
+        .route("/shell/auto-approve", get(auto_approve_list))
         .route("/sessions/:id/mcp/pending", get(mcp_pending))
         .route("/sessions/:id/mcp/decide", post(mcp_decide))
         .route("/sessions/:id/approvals/pending", get(action_pending))
@@ -1378,6 +1379,31 @@ async fn toolchain_reports(
         .toolchain_reports(q.project.as_deref())
         .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "this session has no toolchain"))?;
     Ok(Json(serde_json::json!({ "reports": reports })))
+}
+
+/// HGW-W11 (#77): `GET /shell/auto-approve`: the auto-approve list in effect, read-only, for the
+/// app's Settings. Data source: the list `shell_run` was started with (the shipped
+/// `policy/auto_approve.toml`, or the file `CITRATE_HERMES_AUTO_APPROVE` names). `enabled` is
+/// false when shell_run or auto-approval is off; `conditions` are the checks every match must
+/// also pass.
+async fn auto_approve_list(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let list = st.sessions.auto_approve_list();
+    Ok(Json(serde_json::json!({
+        "enabled": list.is_some(),
+        "conditions": [
+            "the session has not read untrusted content",
+            "the OS sandbox is enforced (no network)",
+            "the folder is inside one of the session's projects",
+            "the run may write only that project",
+        ],
+        "rules": list.map(|l| l.rules.clone()).unwrap_or_default(),
+    })))
 }
 
 #[derive(Deserialize)]

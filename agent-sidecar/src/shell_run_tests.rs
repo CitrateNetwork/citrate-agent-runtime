@@ -664,6 +664,31 @@ fn git_runs_carry_the_hermes_identity_and_other_programs_do_not() {
     }
 }
 
+/// HGW-W11 (#77): git run through shell_run never runs hooks or an fsmonitor (command-scope
+/// config, which outranks the repository's own).
+#[test]
+fn git_runs_have_hooks_and_fsmonitor_off() {
+    if !std::path::Path::new("/usr/bin/git").exists() {
+        return;
+    }
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.proj().join(".git")).unwrap();
+    let s = session(&fx, &cfg_open());
+    for (key, want) in [("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false")] {
+        let a = approve_next(s.approvals().clone());
+        let out = s
+            .host(TaintState::default(), StopFlag::default(), false)
+            .execute(&call("c1", &["git", "config", "--get", key], &fx.proj()));
+        a.join().unwrap();
+        let run = envelope(&out).run.unwrap();
+        assert_eq!(
+            run["stdout"].as_str().unwrap_or_default().trim(),
+            want,
+            "{key}: {run}"
+        );
+    }
+}
+
 /// HGW-2: a command that leaves git set up to run a program later (outside the sandbox) is
 /// reported to the model and the member: the run facts carry `git_warnings` and the summary says
 /// so.

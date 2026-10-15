@@ -84,6 +84,27 @@ const GIT_IDENTITY_ENV: [&str; 4] = [
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
 ];
+/// HGW-W11 (#77): git run through `shell_run` never runs hooks or an fsmonitor. Command-scope
+/// config (these variables) outranks the repository's own `.git/config`.
+const GIT_SAFETY_ENV: [(&str, &str); 5] = [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+    ("GIT_CONFIG_VALUE_0", "/dev/null"),
+    ("GIT_CONFIG_KEY_1", "core.fsmonitor"),
+    ("GIT_CONFIG_VALUE_1", "false"),
+];
+/// Every request variable `shell_run` may set (all fixed by this module, never by the model).
+const REQUEST_ENV: [&str; 9] = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_KEY_1",
+    "GIT_CONFIG_VALUE_1",
+];
 /// Most argv entries, longest entry, and most argv bytes a call may propose.
 pub const MAX_ARGV: usize = 64;
 pub const MAX_ARG_BYTES: usize = 4096;
@@ -151,7 +172,7 @@ impl ShellRunConfig {
 pub fn shell_run_spec() -> ToolSpec {
     ToolSpec {
         name: SHELL_RUN_TOOL.into(),
-        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, listed read and build commands (ls, cat, head, node <file>, npm run <script>, npm test, forge build/test, cargo build/test --offline, git init/status/diff/add/commit) run without asking; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
+        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, listed read and build commands (ls, cat, head, node <file>, npm run build/test/lint/typecheck, npm test, forge build/test, cargo build/test --offline, git init/status/diff/add/commit) run without asking; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -355,7 +376,7 @@ impl ShellRunSession {
             .with_default_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .with_max_timeout(Duration::from_secs(MAX_TIMEOUT_SECS))
             .with_output_caps(OUTPUT_CAP, OUTPUT_CAP)
-            .with_request_env_allow(&GIT_IDENTITY_ENV)
+            .with_request_env_allow(&REQUEST_ENV)
             .with_sandbox(cfg.sandbox.clone());
         let g = grants.clone();
         let auto_runner = ShellRunner::with_scope(policy.clone(), move |cwd: &Path| {
@@ -498,6 +519,9 @@ fn request_of(p: &Proposal) -> Option<RunRequest> {
     let mut req = RunRequest::new(program, rest.to_vec(), &p.cwd)
         .timeout(Duration::from_secs(p.timeout_secs));
     if program == "git" {
+        for (name, value) in GIT_SAFETY_ENV {
+            req = req.env(name, value);
+        }
         for (i, name) in GIT_IDENTITY_ENV.iter().enumerate() {
             req = req.env(
                 name,

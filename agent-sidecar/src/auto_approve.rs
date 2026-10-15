@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The list shipped with the sidecar.
 pub const DEFAULT_LIST: &str = include_str!("../policy/auto_approve.toml");
@@ -24,7 +24,7 @@ const MAX_PATTERN: usize = 256;
 const MAX_TEXT: usize = 4096;
 
 /// What one argument may be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
     /// A relative path that stays inside the folder: no root, no `..`, no `~`, no leading `-`.
@@ -82,7 +82,7 @@ fn relative_path(v: &str) -> bool {
 }
 
 /// One rule of the list.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub id: String,
@@ -96,6 +96,10 @@ pub struct Rule {
     #[serde(default)]
     pub require_one_of: Vec<String>,
     pub operands: Kind,
+    /// When not empty, every operand must be one of these exact values (e.g. the npm script
+    /// names `build`, `test`, `lint`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operand_values: Vec<String>,
     #[serde(default)]
     pub min_operands: usize,
     #[serde(default = "default_max_operands")]
@@ -153,7 +157,9 @@ impl Rule {
                 }
                 return false;
             }
-            if !self.operands.accepts(a) {
+            if !self.operands.accepts(a)
+                || (!self.operand_values.is_empty() && !self.operand_values.iter().any(|v| v == a))
+            {
                 return false;
             }
             operands += 1;
@@ -170,7 +176,7 @@ impl Rule {
 }
 
 /// The parsed list.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoApproveList {
     pub version: u32,
@@ -283,7 +289,8 @@ mod tests {
             (v(&["wc", "-l", "src/a.ts"]), "wc"),
             (v(&["node", "build.js"]), "node-script"),
             (v(&["npm", "run", "build"]), "npm-run"),
-            (v(&["npm", "run", "test:unit"]), "npm-run"),
+            (v(&["npm", "run", "lint"]), "npm-run"),
+            (v(&["npm", "run", "typecheck"]), "npm-run"),
             (v(&["npm", "test"]), "npm-test"),
             (v(&["npx", "tsc", "--noEmit"]), "npx-tsc"),
             (v(&["forge", "build"]), "forge-build-test"),
@@ -319,6 +326,10 @@ mod tests {
             v(&["npm", "ci"]),
             v(&["npm", "run", "build", "--", "--watch"]),
             v(&["npm", "run"]),
+            // HGW-W11 (#77): only the listed script names.
+            v(&["npm", "run", "deploy"]),
+            v(&["npm", "run", "dev"]),
+            v(&["npm", "run", "test:unit"]),
             v(&["npm", "run", "-build"]),
             v(&["npx", "create-next-app", "demo"]),
             v(&["npx", "tsc", "-p", "/etc"]),

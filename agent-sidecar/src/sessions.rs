@@ -1275,6 +1275,11 @@ impl SessionManager {
         self
     }
 
+    /// HGW-W11: the auto-approve list `shell_run` uses (`None` when shell_run or the list is off).
+    pub fn auto_approve_list(&self) -> Option<Arc<crate::auto_approve::AutoApproveList>> {
+        self.shell_run.as_ref().and_then(|c| c.auto_approve.clone())
+    }
+
     /// Whether `shell_run` is on.
     pub fn shell_run_enabled(&self) -> bool {
         self.shell_run.is_some()

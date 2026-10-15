@@ -18,6 +18,7 @@
 #   require_one_of  at least one of these flags must be present
 #   operands      the kind of every non-flag argument: relative-path | script-name | pattern |
 #                 name | none
+#   operand_values  when present, every operand must be one of these exact values
 #   min_operands / max_operands
 # Value kinds: relative-path (no absolute path, no `..`, no `~`, no leading `-`), script-name
 # ([A-Za-z0-9:._-], at most 64), name ([A-Za-z0-9_.-]), pattern and text (no NUL; pattern at most
@@ -82,6 +83,7 @@ program = "npm"
 subcommands = ["run", "run-script"]
 flags = ["--silent", "-s"]
 operands = "script-name"
+operand_values = ["build", "test", "lint", "typecheck"]
 min_operands = 1
 max_operands = 1
 
