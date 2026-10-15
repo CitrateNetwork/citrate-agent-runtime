@@ -553,6 +553,69 @@ fn a_tainted_hic_aware_session_asks_with_the_reason_and_runs_only_on_allow() {
     drop(host);
 }
 
+/// HGW-4: a failing command hands the model its exit status and the end of its stderr (where
+/// npm, cargo and tsc print the cause), bounded, in the summary it reads first; the full capture
+/// (head and tail) stays in the run facts.
+#[test]
+fn a_failing_command_reports_its_exit_status_and_the_end_of_its_output() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let a = approve_next(s.approvals().clone());
+    let out = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call(
+            "c1",
+            &[
+                "sh",
+                "-c",
+                "echo compiling; seq 1 40000 >&2; echo 'src/index.ts(3,1): error TS2304: Cannot find name foo.' >&2; exit 2",
+            ],
+            &fx.proj(),
+        ));
+    a.join().unwrap();
+    let env = envelope(&out);
+    assert_eq!(env.status, RunStatus::Completed);
+    assert!(
+        env.summary.contains("exited with code 2"),
+        "{}",
+        env.summary
+    );
+    assert!(
+        env.summary.contains("Cannot find name foo"),
+        "the cause is in the summary: {}",
+        env.summary
+    );
+    assert!(
+        env.summary.len() < FAILURE_TAIL_BYTES * 2 + 512,
+        "the summary is bounded: {}",
+        env.summary.len()
+    );
+    let run = env.run.unwrap();
+    assert_eq!(run["exit_code"], 2);
+    assert!(run["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("Cannot find name foo"));
+    let tail = run["stderr_tail"].as_str().unwrap();
+    assert!(
+        tail.ends_with(
+            "Cannot find name foo.
+"
+        ),
+        "{tail}"
+    );
+    assert!(tail.len() <= FAILURE_TAIL_BYTES + 4);
+    // A command that succeeds adds no tail.
+    let a = approve_next(s.approvals().clone());
+    let ok = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call("c2", &["echo", "fine"], &fx.proj()));
+    a.join().unwrap();
+    let env = envelope(&ok);
+    assert!(!env.summary.contains("stderr"), "{}", env.summary);
+    assert!(env.run.unwrap().get("stderr_tail").is_none());
+}
+
 /// HGW-2: a command that leaves git set up to run a program later (outside the sandbox) is
 /// reported to the model and the member: the run facts carry `git_warnings` and the summary says
 /// so.

@@ -63,6 +63,10 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 /// Bytes of stdout and of stderr kept from one command.
 pub const OUTPUT_CAP: usize = 32 * 1024;
+/// HGW-4: bytes of a failing command's stderr (or stdout, when stderr is empty) handed to the
+/// model in the result's summary, from the end of the stream, where npm, cargo and tsc print the
+/// cause. The full capture (head and tail) stays in the run facts.
+pub const FAILURE_TAIL_BYTES: usize = 2048;
 /// Most argv entries, longest entry, and most argv bytes a call may propose.
 pub const MAX_ARGV: usize = 64;
 pub const MAX_ARG_BYTES: usize = 4096;
@@ -442,8 +446,20 @@ fn same_command(a: &RunPlan, b: &RunPlan) -> bool {
     a.resolved_path == b.resolved_path && a.args == b.args && a.cwd == b.cwd
 }
 
+/// The last `max` bytes of `s` (on a character boundary).
+pub(crate) fn tail_of(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
 fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
-    let facts = serde_json::json!({
+    let mut facts = serde_json::json!({
         "program": r.program,
         "args": r.args,
         "argv": argv,
@@ -509,12 +525,31 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
         (None, Some(s)) => format!("was ended by signal {s}"),
         (None, None) => "ended without a status".to_string(),
     };
+    // HGW-4: a failing command hands the model the end of its output, so it can fix the cause.
+    let failure_note = if r.exit_code == Some(0) {
+        String::new()
+    } else {
+        let (stream, text) = if r.stderr.trim().is_empty() {
+            ("stdout", r.stdout.as_str())
+        } else {
+            ("stderr", r.stderr.as_str())
+        };
+        let tail = tail_of(text, FAILURE_TAIL_BYTES);
+        if let Some(o) = facts.as_object_mut() {
+            o.insert(format!("{stream}_tail"), serde_json::json!(tail));
+        }
+        if tail.trim().is_empty() {
+            ". It printed nothing".to_string()
+        } else {
+            format!(". The end of its {stream}:\n{tail}")
+        }
+    };
     ToolOutcome::Ok(
         ToolchainEnvelope::not_run(
             SHELL_RUN_TOOL,
             RunStatus::Completed,
             format!(
-                "{} {ended} after {} ms ({isolation}){git_note}",
+                "{} {ended} after {} ms ({isolation}){git_note}{failure_note}",
                 r.program, r.duration_ms
             ),
         )

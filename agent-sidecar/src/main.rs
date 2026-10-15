@@ -30,6 +30,8 @@
 //!                               approves, run in the OS sandbox, never without it) in every
 //!                               session opened with folder grants; anything else = off (optional)
 //!   CITRATE_HERMES_SHELL_PATH   shell_run search path override, a path list (optional)
+//!   CITRATE_HERMES_MAX_STEPS    HGW-4: model calls per turn for sessions that send no maxSteps;
+//!                               default 24, at most 32 (optional)
 //!   CITRATE_HERMES_PROJECTS     HGW-3: `1` offers project_create (a new project folder, after the
 //!                               member approves it) in sessions opened with folder grants (optional)
 //!   CITRATE_HERMES_PROJECTS_ROOT  absolute folder new projects go in; default ~/Citrate/Projects

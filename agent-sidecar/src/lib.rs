@@ -1860,6 +1860,10 @@ pub fn production_sessions_with(
     let mgr = mgr.with_self_review(self_review_from_env_var(
         std::env::var("CITRATE_HERMES_SELF_REVIEW").ok().as_deref(),
     ));
+    // HGW-4: turns run up to 24 model calls unless CITRATE_HERMES_MAX_STEPS says otherwise.
+    let mgr = mgr.with_default_max_steps(sessions::max_steps_from_env(
+        std::env::var("CITRATE_HERMES_MAX_STEPS").ok().as_deref(),
+    ));
     // HGW-3: project_create (off by default; every project needs the member's approval).
     let mgr = match projects::ProjectsConfig::from_env_vars(
         |k| std::env::var(k).ok(),
@@ -2382,6 +2386,8 @@ mod decide_route_tests;
 mod deploy_guard_session_tests;
 #[cfg(all(test, unix))]
 mod hgw_support;
+#[cfg(all(test, unix))]
+mod loop_capability_tests;
 #[cfg(all(test, unix))]
 mod project_policy_tests;
 #[cfg(all(test, unix))]

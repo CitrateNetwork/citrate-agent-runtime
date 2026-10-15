@@ -384,7 +384,41 @@ fn stdout_is_capped_with_a_truncation_marker() {
         "{}",
         &r.stdout[900..]
     );
+    // HGW-4: the end of the output is kept too (a failure's cause is usually last).
+    assert!(r.stdout.ends_with("19999\n20000\n"), "{}", &r.stdout[900..]);
     assert!(r.stdout.len() < 1100);
+}
+
+/// HGW-4: a long, failing build keeps both its first lines (where compilers report the first
+/// error) and its last lines (where npm, cargo and forge print the cause), with the middle cut.
+#[test]
+fn capped_output_keeps_the_head_and_the_tail() {
+    let d = tmp();
+    let policy = ShellPolicy::new(test_allowlist(), sys_path())
+        .expect("policy")
+        .with_output_caps(4096, 4096);
+    let r = open_runner(policy)
+        .run(&req(
+            "sh",
+            &[
+                "-c",
+                "echo FIRST-ERROR >&2; seq 1 50000 >&2; echo 'npm ERR! missing script: build' >&2; exit 1",
+            ],
+            d.path(),
+        ))
+        .expect("run");
+    assert_eq!(r.exit_code, Some(1));
+    assert!(r.stderr_truncated);
+    assert!(r.stderr.starts_with("FIRST-ERROR\n"), "{}", &r.stderr[..64]);
+    assert!(
+        r.stderr
+            .trim_end()
+            .ends_with("npm ERR! missing script: build"),
+        "{}",
+        &r.stderr[r.stderr.len() - 64..]
+    );
+    assert!(r.stderr.contains("bytes omitted]"));
+    assert!(r.stderr.len() <= 4096 + 64, "{}", r.stderr.len());
 }
 
 #[test]
@@ -404,7 +438,9 @@ fn stderr_is_captured_separately_and_capped() {
     assert!(!r.passed());
     assert_eq!(r.stdout, "out\n");
     assert!(r.stderr_truncated);
-    assert!(r.stderr.starts_with("0123456789"));
+    // HGW-4: half the cap from the start, half from the end.
+    assert!(r.stderr.starts_with("01234"), "{}", r.stderr);
+    assert!(r.stderr.ends_with("cdef\n"), "{}", r.stderr);
     assert_eq!(r.stderr_bytes, 17);
 }
 

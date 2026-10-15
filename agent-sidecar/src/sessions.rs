@@ -148,6 +148,18 @@ pub const MAX_SESSIONS: usize = 8;
 pub const EVENT_LOG_CAP: usize = 2000;
 /// Upper bounds a client may request.
 pub const MAX_STEPS_CAP: u32 = 32;
+/// HGW-4: model calls per turn when neither the session (`maxSteps`) nor the sidecar
+/// (`CITRATE_HERMES_MAX_STEPS`) says otherwise. A build (create, write, run, read the error, fix,
+/// run again) takes more than the old default of 8.
+pub const DEFAULT_MAX_STEPS: u32 = 24;
+
+/// HGW-4: the sidecar-wide default for `maxSteps` from `CITRATE_HERMES_MAX_STEPS`: a whole number,
+/// clamped to 1..=[`MAX_STEPS_CAP`]. Unset or not a number = [`DEFAULT_MAX_STEPS`].
+pub fn max_steps_from_env(v: Option<&str>) -> u32 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| n.clamp(1, u64::from(MAX_STEPS_CAP)) as u32)
+        .unwrap_or(DEFAULT_MAX_STEPS)
+}
 pub const MAX_TOKENS_CAP: u32 = 8192;
 /// Longest a long-poll may wait.
 pub const MAX_WAIT_MS: u64 = 25_000;
@@ -1165,6 +1177,8 @@ pub struct SessionManager {
     shell_run: Option<Arc<ShellRunConfig>>,
     /// HGW-3: `project_create` for sessions opened with folder grants (default off).
     projects: Option<Arc<crate::projects::ProjectsConfig>>,
+    /// HGW-4: `maxSteps` for a session that does not send one.
+    default_max_steps: u32,
     /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
     /// US-1.3 AC2: ask the model for a self-review of every workflow step attempt and record it
@@ -1201,6 +1215,7 @@ impl SessionManager {
             uses: AtomicU64::new(0),
             shell_run: None,
             projects: None,
+            default_max_steps: DEFAULT_MAX_STEPS,
             records: None,
             self_review: false,
         }
@@ -1245,6 +1260,12 @@ impl SessionManager {
     /// US-2.2 AC2: offer `shell_run` to every new session opened with folder grants.
     pub fn with_shell_run(mut self, cfg: Arc<ShellRunConfig>) -> Self {
         self.shell_run = Some(cfg);
+        self
+    }
+
+    /// HGW-4: `maxSteps` for sessions that do not send one (clamped to 1..=[`MAX_STEPS_CAP`]).
+    pub fn with_default_max_steps(mut self, n: u32) -> Self {
+        self.default_max_steps = n.clamp(1, MAX_STEPS_CAP);
         self
     }
 
@@ -1807,7 +1828,10 @@ impl SessionManager {
         let cfg = LoopConfig {
             model: req.model,
             system_prompt,
-            max_steps: req.max_steps.unwrap_or(8).clamp(1, MAX_STEPS_CAP),
+            max_steps: req
+                .max_steps
+                .unwrap_or(self.default_max_steps)
+                .clamp(1, MAX_STEPS_CAP),
             max_tool_calls_per_step: req.max_tool_calls_per_step.unwrap_or(4).clamp(1, 16),
             max_tokens: req.max_tokens.unwrap_or(2048).clamp(64, MAX_TOKENS_CAP),
         };
