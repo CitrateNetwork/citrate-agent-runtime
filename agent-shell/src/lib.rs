@@ -1149,10 +1149,9 @@ impl ShellRunner {
             cmd.env(k, v);
         }
 
-        // HGW-2: the repositories this run could touch, before it (what it adds that would make
-        // git run a program later is reverted after it).
-        let repos = git_state::repo_dirs(&plan.cwd, &plan.write_roots);
-        let git_before = git_state::snapshot(&repos);
+        // HGW-2: every repository in the run's write roots, before it (what the run adds that
+        // would make git run a program later is reverted after it).
+        let git_before = git_state::snapshot(&plan.write_roots);
         let tree = ProcessTree::prepare().map_err(|e| ShellError::Spawn {
             program: req.program.clone(),
             reason: format!("cannot create the process tree container: {e}"),

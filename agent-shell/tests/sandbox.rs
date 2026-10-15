@@ -434,21 +434,21 @@ fn a_new_repo_or_a_swapped_config_is_reverted() {
 }
 
 /// A `.git` the run turned into a pointer (a `gitdir:` file or a symbolic link) to a git folder
-/// elsewhere is reported with the risky state found there. The folder it points at may be the
-/// member's own, so it is not changed.
+/// outside the write roots is reported with the risky state found there and left as it was
+/// (the run could not have written there). A pointer into the write roots is followed and the
+/// folder it points at is cleaned like any other repository.
 #[test]
-fn a_git_pointer_made_by_the_run_is_reported_not_followed_into_changes() {
+fn a_git_pointer_outside_the_write_roots_is_reported_and_one_inside_is_cleaned() {
     let fx = Fx::new();
     let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
-    let elsewhere = fx.grant().join("elsewhere");
+    let elsewhere = fx.other().join("elsewhere");
     std::fs::create_dir_all(elsewhere.join("hooks")).expect("dir");
     std::fs::write(elsewhere.join("config"), "[core]\n\thooksPath = /tmp/h\n").expect("cfg");
     std::fs::write(elsewhere.join("hooks/post-checkout"), "#!/bin/sh\n").expect("hook");
     let proj = fx.grant().join("proj");
     std::fs::create_dir_all(&proj).expect("proj");
-    let rep = r
-        .run(&sh("printf 'gitdir: ../elsewhere\\n' > .git", &proj))
-        .expect("run");
+    let cmd = format!("printf 'gitdir: {}\\n' > .git", elsewhere.display());
+    let rep = r.run(&sh(&cmd, &proj)).expect("run");
     assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
     let w = rep.git_warnings.join("\n");
     assert!(
@@ -460,7 +460,7 @@ fn a_git_pointer_made_by_the_run_is_reported_not_followed_into_changes() {
         std::fs::read_to_string(elsewhere.join("config"))
             .expect("cfg")
             .contains("hooksPath"),
-        "the folder pointed at is left as it was"
+        "the folder pointed at, outside the write roots, is left as it was"
     );
     assert!(elsewhere.join("hooks/post-checkout").exists());
     // The same pointer, already there before the next run, is not reported again.
@@ -470,10 +470,119 @@ fn a_git_pointer_made_by_the_run_is_reported_not_followed_into_changes() {
     {
         let linked = fx.grant().join("linked");
         std::fs::create_dir_all(&linked).expect("linked");
-        let rep = r.run(&sh("ln -s ../elsewhere .git", &linked)).expect("run");
+        let cmd = format!("ln -s '{}' .git", elsewhere.display());
+        let rep = r.run(&sh(&cmd, &linked)).expect("run");
         assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
         let w = rep.git_warnings.join("\n");
         assert!(w.contains("core.hookspath"), "{w}");
+    }
+
+    // Inside the write roots: a git folder the run made and pointed at is cleaned. (A pointer at
+    // a folder git would not use as a repository is not followed: git refuses it.)
+    let inner = fx.grant().join("inner");
+    std::fs::create_dir_all(&inner).expect("inner");
+    let cmd = "mkdir -p ../gd/hooks ../gd/objects ../gd/refs && echo 'ref: refs/heads/main' > ../gd/HEAD && printf '[core]\\n\\tbare = false\\n\\thooksPath = /tmp/h\\n' > ../gd/config && echo x > ../gd/hooks/post-checkout && printf 'gitdir: ../gd\\n' > .git";
+    let rep = r.run(&sh(cmd, &inner)).expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let gd = fx.grant().join("gd");
+    let cfg = std::fs::read_to_string(gd.join("config")).expect("cfg");
+    assert!(
+        cfg.contains("bare = false") && !cfg.contains("hooksPath"),
+        "{cfg}"
+    );
+    assert!(!gd.join("hooks/post-checkout").exists());
+    let w = rep.git_warnings.join("\n");
+    assert!(
+        w.contains("reverted") && w.contains("core.hookspath"),
+        "{w}"
+    );
+
+    // A worktree's `commondir` into the write roots: the common folder is cleaned too.
+    let wt = fx.grant().join("wt");
+    std::fs::create_dir_all(wt.join(".git")).expect("wt");
+    let cmd = "mkdir -p ../common/hooks ../common/objects ../common/refs && echo 'ref: refs/heads/main' > ../common/HEAD && printf '[alias]\\n\\tx = !id\\n' > ../common/config && printf '../../common\\n' > .git/commondir";
+    let rep = r.run(&sh(cmd, &wt)).expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let cfg = std::fs::read_to_string(fx.grant().join("common/config")).expect("cfg");
+    assert!(!cfg.contains("!id"), "{cfg}");
+}
+
+/// Every repository in the write roots is covered, however deep, and including ones the run
+/// creates: a nested repository, one beside the run's folder, a bare repository.
+#[test]
+fn repositories_anywhere_in_the_write_roots_are_cleaned() {
+    let fx = Fx::new();
+    // The member's own repository beside the run's folder, with its own hook and alias.
+    let sib = fx.grant().join("sib");
+    std::fs::create_dir_all(sib.join(".git/hooks")).expect("sib");
+    std::fs::write(sib.join(".git/hooks/pre-push"), "#!/bin/sh\n").expect("hook");
+    std::fs::write(sib.join(".git/config"), "[alias]\n\tst = status\n").expect("cfg");
+    let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
+    let cmd = "mkdir -p ../deep/a/b/c/.git/hooks && printf '[core]\\n\\thooksPath = .h\\n' > ../deep/a/b/c/.git/config && echo x > ../deep/a/b/c/.git/hooks/post-checkout \
+        && printf '[alias]\\n\\tx = !id\\n' >> ../sib/.git/config && echo x > ../sib/.git/hooks/post-merge \
+        && mkdir -p ../bare.git/objects ../bare.git/refs ../bare.git/hooks && echo 'ref: refs/heads/main' > ../bare.git/HEAD \
+        && printf '[core]\\n\\tbare = true\\n\\tfsmonitor = ./f\\n' > ../bare.git/config && echo x > ../bare.git/hooks/pre-receive";
+    let rep = r.run(&sh(cmd, &fx.grant().join("sub"))).expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let g = fx.grant();
+    let deep = std::fs::read_to_string(g.join("deep/a/b/c/.git/config")).expect("cfg");
+    assert!(!deep.contains("hooksPath"), "{deep}");
+    assert!(!g.join("deep/a/b/c/.git/hooks/post-checkout").exists());
+    let sibc = std::fs::read_to_string(sib.join(".git/config")).expect("cfg");
+    assert!(
+        sibc.contains("st = status") && !sibc.contains("!id"),
+        "{sibc}"
+    );
+    assert!(
+        sib.join(".git/hooks/pre-push").exists(),
+        "the member's own hook stays"
+    );
+    assert!(!sib.join(".git/hooks/post-merge").exists());
+    let bare = std::fs::read_to_string(g.join("bare.git/config")).expect("cfg");
+    assert!(
+        bare.contains("bare = true") && !bare.contains("fsmonitor"),
+        "{bare}"
+    );
+    assert!(!g.join("bare.git/hooks/pre-receive").exists());
+    let w = rep.git_warnings.join("\n");
+    for k in [
+        "core.hookspath",
+        "alias.x",
+        "core.fsmonitor",
+        "post-checkout",
+        "post-merge",
+        "pre-receive",
+    ] {
+        assert!(w.contains(k), "{k} not reported: {w}");
+    }
+    assert!(!w.contains("pre-push") && !w.contains("alias.st"), "{w}");
+}
+
+/// The other files git reads config and hooks from: `config.worktree`, a linked worktree's
+/// `config.worktree`, and a submodule's own git folder under `.git/modules/`.
+#[test]
+fn worktree_config_and_submodule_git_folders_are_cleaned() {
+    let fx = Fx::new();
+    let repo = fx.grant().join("r");
+    std::fs::create_dir_all(repo.join(".git/hooks")).expect("repo");
+    std::fs::write(repo.join(".git/config"), "[core]\n\tbare = false\n").expect("cfg");
+    let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
+    let cmd = "printf '[extensions]\\n\\tworktreeConfig = true\\n' >> .git/config && printf '[core]\\n\\thooksPath = .h\\n[user]\\n\\tname = W\\n' > .git/config.worktree \
+        && mkdir -p .git/worktrees/w && printf '[alias]\\n\\tx = !id\\n' > .git/worktrees/w/config.worktree \
+        && mkdir -p .git/modules/lib/sub/hooks .git/modules/lib/sub/objects .git/modules/lib/sub/refs && echo 'ref: refs/heads/main' > .git/modules/lib/sub/HEAD \
+        && printf '[core]\\n\\tsshCommand = evil\\n' > .git/modules/lib/sub/config && echo x > .git/modules/lib/sub/hooks/post-merge";
+    let rep = r.run(&sh(cmd, &repo)).expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let wt = std::fs::read_to_string(repo.join(".git/config.worktree")).expect("cfg");
+    assert!(wt.contains("name = W") && !wt.contains("hooksPath"), "{wt}");
+    let lw = std::fs::read_to_string(repo.join(".git/worktrees/w/config.worktree")).expect("cfg");
+    assert!(!lw.contains("!id"), "{lw}");
+    let sm = std::fs::read_to_string(repo.join(".git/modules/lib/sub/config")).expect("cfg");
+    assert!(!sm.contains("sshCommand"), "{sm}");
+    assert!(!repo.join(".git/modules/lib/sub/hooks/post-merge").exists());
+    let w = rep.git_warnings.join("\n");
+    for k in ["core.hookspath", "alias.x", "core.sshcommand", "post-merge"] {
+        assert!(w.contains(k), "{k} not reported: {w}");
     }
 }
 
@@ -498,6 +607,51 @@ fn backend_names_are_stable() {
 // ------------------------------------------------------------------------------------------
 // macOS: the real thing (Seatbelt via sandbox-exec)
 // ------------------------------------------------------------------------------------------
+
+/// Real git, run in the grant: risky state in a nested repository, a bare repository,
+/// `config.worktree` and a submodule git folder. Hook writes the sandbox refuses are allowed to
+/// fail (`|| true`); whatever lands must not survive the run.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const GIT_EVERYWHERE: &str = "set -e; git init -q . \
+ && mkdir -p a/b && git init -q a/b && git -C a/b config core.hooksPath .h \
+ && git init -q --bare bare.git && git -C bare.git config alias.x '!id' \
+ && { echo '#!/bin/sh' > bare.git/hooks/post-receive || true; } \
+ && git config extensions.worktreeConfig true && git config --worktree core.fsmonitor ./f \
+ && mkdir -p .git/modules/m/objects .git/modules/m/refs .git/modules/m/hooks && echo 'ref: refs/heads/main' > .git/modules/m/HEAD \
+ && printf '[core]\\n\\tsshCommand = evil\\n' > .git/modules/m/config \
+ && { echo x > .git/modules/m/hooks/post-checkout || true; }";
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn assert_git_everywhere_cleaned(g: &Path, warnings: &[String]) {
+    let read = |p: &str| std::fs::read_to_string(g.join(p)).unwrap_or_default();
+    assert!(
+        !read("a/b/.git/config").contains("hooksPath"),
+        "{}",
+        read("a/b/.git/config")
+    );
+    assert!(
+        !read("bare.git/config").contains("!id"),
+        "{}",
+        read("bare.git/config")
+    );
+    assert!(!g.join("bare.git/hooks/post-receive").exists());
+    assert!(
+        !read(".git/config.worktree").contains("fsmonitor"),
+        "{}",
+        read(".git/config.worktree")
+    );
+    assert!(!read(".git/modules/m/config").contains("sshCommand"));
+    assert!(!g.join(".git/modules/m/hooks/post-checkout").exists());
+    let w = warnings.join("\n");
+    for k in [
+        "core.hookspath",
+        "alias.x",
+        "core.fsmonitor",
+        "core.sshcommand",
+    ] {
+        assert!(w.contains(k), "{k} not reported: {w}");
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -706,6 +860,41 @@ mod macos {
         assert!(hooks.join("pre-commit.sample").exists() || hooks.is_dir());
     }
 
+    /// Real git under Seatbelt: a nested repository, a bare repository (whose `hooks/` is not
+    /// under `.git/`), `config.worktree` and a submodule git folder are all cleaned after the run.
+    #[test]
+    fn git_state_anywhere_in_the_grant_is_cleaned_under_seatbelt() {
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), required());
+        let rep = r.run(&sh(GIT_EVERYWHERE, &fx.grant())).expect("run");
+        assert!(rep.sandbox.enforced);
+        assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
+        assert_git_everywhere_cleaned(&fx.grant(), &rep.git_warnings);
+    }
+
+    /// A hook written through a differently cased `.git` (the Mac's file system ignores case)
+    /// does not survive the run.
+    #[test]
+    fn a_hook_written_through_a_differently_cased_git_folder_does_not_survive() {
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), required());
+        let rep = r.run(&sh("git init -q .", &fx.grant())).expect("init");
+        assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
+        let _ = r
+            .run(&sh(
+                "echo x > .GIT/hooks/pre-commit; echo x > .Git/hooks/post-checkout; true",
+                &fx.grant(),
+            ))
+            .expect("run");
+        let hooks: Vec<String> = std::fs::read_dir(fx.grant().join(".git/hooks"))
+            .expect("hooks")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".sample"))
+            .collect();
+        assert!(hooks.is_empty(), "{hooks:?}");
+    }
+
     /// HGW-W2 (#75): `.env.example` and `.env.sample` (template files, not secrets) are readable;
     /// `.env` and `.env.local` stay unreadable and unwritable.
     #[test]
@@ -809,6 +998,21 @@ mod linux {
         let rep = r.run(&sh(cmd, &fx.grant())).expect("run");
         assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
         assert_eq!(rep.stdout.trim(), "1");
+    }
+
+    #[test]
+    fn git_state_anywhere_in_the_grant_is_cleaned_under_bwrap() {
+        let Some(p) = required() else { return };
+        if !Path::new("/usr/bin/git").exists() {
+            eprintln!("skipping: no /usr/bin/git");
+            return;
+        }
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), p);
+        let rep = r.run(&sh(GIT_EVERYWHERE, &fx.grant())).expect("run");
+        assert!(rep.sandbox.enforced);
+        assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
+        assert_git_everywhere_cleaned(&fx.grant(), &rep.git_warnings);
     }
 
     #[test]
