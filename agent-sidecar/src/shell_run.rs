@@ -7,8 +7,12 @@
 //!
 //! One call:
 //!
-//! 1. **Refused in a tainted session.** Once a session has read untrusted content it never runs a
-//!    command (the loop declines the call; this host checks again).
+//! 1. **After taint, still asked, never automatic (HGW-1).** Once a session has read untrusted
+//!    content, a command is still put in front of the member, with the card saying why it is
+//!    gated (`hicReason`, `taintSources`), but only in a session opened by an HIC-aware app
+//!    (`hicAware: true`). Without one nobody can be asked, so the call is declined with
+//!    [`citrate_agent_loop::cannot_ask_reason`]. An approval releases that one command; the
+//!    session stays tainted.
 //! 2. **Validated before anything is asked.** The model gives `argv` (program first, as a bare
 //!    name resolved from a fixed search path, never a path; argv only, no shell expansion) and an
 //!    absolute `cwd`. The cwd must be covered by live read and write folder grants that reach
@@ -25,7 +29,7 @@
 //!    and stdout/stderr captured up to [`OUTPUT_CAP`] bytes each.
 //! 5. **Reports** a toolchain envelope (`tool: "shell_run"`) with the run facts, the captured
 //!    output and the sandbox; citrate-core adds it to the Activity monitor. The output is
-//!    untrusted, so it taints the session (and the next `shell_run` is then refused).
+//!    untrusted, so it taints the session (and every later effectful call then needs a card).
 //!
 //! Keyless: nothing here holds a key or signs (Rule 3).
 
@@ -169,6 +173,12 @@ pub struct ShellPending {
     pub sandbox: SandboxSummary,
     /// Seconds left before it is declined for want of a decision.
     pub expires_in_secs: u64,
+    /// HGW-1: why this command is gated beyond the usual card, when the session is tainted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hic_reason: Option<String>,
+    /// HGW-1: every tool that brought untrusted content into the session (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub taint_sources: Vec<String>,
 }
 
 struct Waiting {
@@ -260,7 +270,7 @@ impl ShellApprovals {
                 break if a {
                     Ok(())
                 } else {
-                    Err("the member declined this command".to_string())
+                    Err("the member declined this command; ask the member what to do instead of retrying it".to_string())
                 };
             }
             if stopped() {
@@ -319,14 +329,17 @@ impl ShellRunSession {
         &self.approvals
     }
 
-    /// The host for one turn of the session.
-    pub fn host(&self, taint: TaintState, stop: StopFlag) -> ShellRunHost {
+    /// The host for one turn of the session. `hic_aware`: the session was opened by an app that
+    /// always puts a `hic: "required"` card in front of a person, so a tainted session may still
+    /// ask; without it a tainted session's commands are declined.
+    pub fn host(&self, taint: TaintState, stop: StopFlag, hic_aware: bool) -> ShellRunHost {
         ShellRunHost {
             runner: self.runner.clone(),
             approvals: self.approvals.clone(),
             approval_timeout: self.approval_timeout,
             taint,
             stop,
+            hic_aware,
         }
     }
 }
@@ -338,6 +351,7 @@ pub struct ShellRunHost {
     approval_timeout: Duration,
     taint: TaintState,
     stop: StopFlag,
+    hic_aware: bool,
 }
 
 /// The model's proposal.
@@ -499,15 +513,11 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
     )
 }
 
-impl ToolHost for ShellRunHost {
-    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+impl ShellRunHost {
+    /// Validate, ask the member (with the taint reason when there is one), re-check, run.
+    fn ask_and_run(&self, call: &ToolCall, hic_reason: Option<&str>) -> ToolOutcome {
         if call.name != SHELL_RUN_TOOL {
             return ToolOutcome::Error(format!("'{}' is not shell_run", call.name));
-        }
-        if self.taint.is_tainted() {
-            return ToolOutcome::Denied(
-                "this session read untrusted content, so it does not run commands".into(),
-            );
         }
         let proposal = match parse(&call.arguments) {
             Ok(p) => p,
@@ -532,6 +542,12 @@ impl ToolHost for ShellRunHost {
             timeout_secs: plan.timeout.as_secs(),
             sandbox: plan.sandbox.clone(),
             expires_in_secs: 0,
+            hic_reason: hic_reason.map(str::to_string),
+            taint_sources: if hic_reason.is_some() {
+                self.taint.sources().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         };
         let stop = self.stop.clone();
         if let Err(why) = self
@@ -558,6 +574,42 @@ impl ToolHost for ShellRunHost {
             Ok(r) => report(&proposal.argv, &r),
             Err(e) => refusal_for(&e),
         }
+    }
+
+    /// The reason a tainted session's command is gated (the loop's wording, naming the source).
+    fn taint_reason(&self) -> Option<String> {
+        self.taint.record().map(|r| {
+            format!(
+                "this session read untrusted content (from {}), so this action needs your explicit approval",
+                r.source
+            )
+        })
+    }
+}
+
+impl ToolHost for ShellRunHost {
+    fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        // The loop routes tainted calls through `execute_with_explicit_approval`; a session that
+        // became tainted in between is checked again here and never runs a command unasked.
+        match self.taint_reason() {
+            Some(reason) => self.execute_with_explicit_approval(call, &reason),
+            None => self.ask_and_run(call, None),
+        }
+    }
+
+    fn honors_explicit_approval(&self) -> bool {
+        self.hic_aware
+    }
+
+    /// HGW-1: the command's own card is the explicit approval; it carries the reason. Without an
+    /// HIC-aware app nobody can be asked, so nothing is asked or run.
+    fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        if !self.hic_aware {
+            return ToolOutcome::Denied(citrate_agent_loop::cannot_ask_reason(
+                self.taint.record().as_ref().map(|r| r.source.as_str()),
+            ));
+        }
+        self.ask_and_run(call, Some(reason))
     }
 }
 

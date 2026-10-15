@@ -971,7 +971,7 @@ async fn the_file_tool_names_are_reserved_while_file_tools_are_on() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn after_untrusted_content_a_file_write_is_declined_and_nothing_is_written() {
+async fn after_untrusted_content_a_file_write_waits_for_the_member_and_a_decline_writes_nothing() {
     let s = Scratch::new();
     let (tools, store) = s.tools();
     let target = s.proj().join("pwned.txt");
@@ -1012,12 +1012,30 @@ async fn after_untrusted_content_a_file_write_is_declined_and_nothing_is_written
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // HGW-1: the write is not refused for the rest of the session; it waits on an action card.
+    // Nothing is written while it waits, and the member's decline writes nothing.
+    let mut card = None;
+    for _ in 0..500 {
+        if let Some(c) = sess.action_pending().unwrap_or_default().into_iter().next() {
+            card = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let card = card.expect("the tainted write waits for the member");
+    assert_eq!(card.tool, FS_WRITE_TOOL);
+    assert!(card.hic_reason.contains("web_fetch"), "{}", card.hic_reason);
+    assert!(
+        !target.exists(),
+        "nothing is written before the member decides"
+    );
+    sess.action_decide(&card.id, false, &card.subject).unwrap();
     events_until(&mgr, &id, "done", &mut after, &mut all).await;
     let w = all
         .iter()
         .find(|e| e["type"] == "tool_result" && e["call_id"] == "w1")
         .unwrap();
-    assert_ne!(w["status"], "ok", "{w}");
+    assert_eq!(w["status"], "denied", "{w}");
     assert!(!target.exists());
     assert!(store
         .steps(&SessionId::new(&id).unwrap())

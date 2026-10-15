@@ -46,8 +46,9 @@
 //! **Honest scope.** A file changed between the grant check and the write is caught by the
 //! checkpoint's own path checks (no write through a symbolic link, no path through a symlinked
 //! directory), not by an OS sandbox. Taint (HUP-S2.7) is enforced by the loop: these tools are
-//! effectful, so after the session reads untrusted content they are declined. This module never
-//! holds a key and never signs (Rule 3).
+//! effectful, so after the session reads untrusted content each call waits for the member on an
+//! action card (HGW-1, [`crate::action_approvals`]), or is declined where nobody can be asked.
+//! This module never holds a key and never signs (Rule 3).
 
 use std::fs;
 use std::io::{ErrorKind, Read, Write};

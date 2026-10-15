@@ -65,6 +65,13 @@
 //!   session opened with folder grants also offers the sidecar-hosted `shell_run` tool
 //!   ([`crate::shell_run`]): each command waits for the member's decision on the session's
 //!   `/shell` routes and runs only in the OS sandbox. The name is reserved while it is on.
+//! - HGW-1 (owner decision 2026-10-15): taint escalates to HIC approval instead of ending the
+//!   conversation. In a session opened with `hicAware: true`, a tainted effectful sidecar-hosted
+//!   call waits for the member on the session's approval cards (`/sessions/:id/approvals`
+//!   routes, [`crate::action_approvals`]); `shell_run`, MCP and browser calls use their own cards, which
+//!   carry the same reason. Each approval releases one call and the session stays tainted.
+//!   Without `hicAware` nobody can be asked, so such calls are declined with
+//!   [`citrate_agent_loop::cannot_ask_reason`].
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,6 +103,7 @@ use citrate_agent_metering::{MeteringSink, SystemClock};
 use citrate_agent_trajectory::TrajectoryRecorder;
 use serde::{Deserialize, Serialize};
 
+use crate::action_approvals::{ActionApprovals, ActionPending};
 use crate::anchor::AnchorService;
 use crate::decide::DecideService;
 use crate::files::{FileTools, FileToolsHost};
@@ -545,6 +553,10 @@ pub struct Session {
     /// refused), and its MCP approval cards (present only for an HIC-aware client).
     mcp_offered: Option<Arc<HashMap<String, ToolSpec>>>,
     mcp_approvals: Option<Arc<crate::mcp_approvals::McpApprovals>>,
+    /// HGW-1: the cards for tainted effectful sidecar calls (present only for an HIC-aware app).
+    actions: Option<Arc<ActionApprovals>>,
+    /// HUP-S10.3: a scheduled run nobody watches; its taint is never cleared.
+    unattended: bool,
     /// Test seam: runs on the emitting thread right after an event becomes visible to readers, so
     /// a test can act as a core client at the exact moment the event appears.
     #[cfg(test)]
@@ -590,6 +602,28 @@ impl Session {
     /// HUP-S4.1: the member's decision on a waiting MCP card; it must carry the subject shown.
     pub fn mcp_decide(&self, id: &str, allow: bool, subject: &str) -> Result<(), SessionError> {
         let a = self.mcp_approvals.as_ref().ok_or(SessionError::NotFound)?;
+        a.decide(id, allow, subject).map_err(SessionError::Invalid)
+    }
+
+    /// HUP-S10.3: whether this is a scheduled run nobody watches (its taint is never cleared).
+    pub fn is_unattended(&self) -> bool {
+        self.unattended
+    }
+
+    /// HGW-1: the action cards waiting for the member (`None` when the session has none, i.e. it
+    /// was not opened by an HIC-aware app).
+    pub fn action_pending(&self) -> Option<Vec<ActionPending>> {
+        self.actions.as_ref().map(|a| a.pending())
+    }
+
+    /// HGW-1: the waiting action card `id` (for its decision record).
+    pub fn action_waiting(&self, id: &str) -> Option<ActionPending> {
+        self.actions.as_ref().and_then(|a| a.waiting(id))
+    }
+
+    /// HGW-1: the member's decision on a waiting action card; it must carry the subject shown.
+    pub fn action_decide(&self, id: &str, allow: bool, subject: &str) -> Result<(), SessionError> {
+        let a = self.actions.as_ref().ok_or(SessionError::NotFound)?;
         a.decide(id, allow, subject).map_err(SessionError::Invalid)
     }
 
@@ -929,6 +963,11 @@ pub(crate) struct SidecarHost {
     pub(crate) browser: Option<BrowserToolHost>,
     /// US-2.2 AC2: `shell_run`, when on and the session has grants.
     pub(crate) shell: Option<ShellRunHost>,
+    /// HGW-1: the session's action cards (HIC-aware apps only), with its taint and stop, for
+    /// effectful calls after taint.
+    pub(crate) actions: Option<Arc<ActionApprovals>>,
+    pub(crate) taint: TaintState,
+    pub(crate) stop: StopFlag,
 }
 
 impl ToolHost for SidecarHost {
@@ -990,30 +1029,61 @@ impl ToolHost for SidecarHost {
     }
 
     /// HUP-S5.1: the browser can put an action in front of the member (its decision routes);
-    /// HUP-S4.1: so can MCP, through the session's MCP approval cards (HIC-aware clients only).
-    /// Without either this stays false, so the loop declines as before.
+    /// HUP-S4.1: so can MCP, through the session's MCP approval cards (HIC-aware clients only);
+    /// HGW-1: so can every other sidecar tool, through the session's action cards and the
+    /// `shell_run` card (HIC-aware clients only). Without any of them this stays false, so the
+    /// loop declines as before.
     fn honors_explicit_approval(&self) -> bool {
         self.browser.is_some()
+            || self.actions.is_some()
             || self
                 .mcp
                 .as_ref()
                 .is_some_and(|m| m.honors_explicit_approval())
+            || self
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.honors_explicit_approval())
     }
 
     fn execute_with_explicit_approval(&self, call: &ToolCall, reason: &str) -> ToolOutcome {
+        let cannot_ask = || {
+            ToolOutcome::Denied(citrate_agent_loop::cannot_ask_reason(
+                self.taint.record().as_ref().map(|r| r.source.as_str()),
+            ))
+        };
+        // Tools with their own card show it (with the reason) themselves.
+        if call.name == SHELL_RUN_TOOL {
+            return match &self.shell {
+                Some(s) => s.execute_with_explicit_approval(call, reason),
+                None => cannot_ask(),
+            };
+        }
         if let Some(m) = &self.mcp {
-            if m.handles(&call.name) && m.honors_explicit_approval() {
-                return m.execute_with_explicit_approval(call, reason);
+            if m.handles(&call.name) {
+                return if m.honors_explicit_approval() {
+                    m.execute_with_explicit_approval(call, reason)
+                } else {
+                    cannot_ask()
+                };
             }
         }
-        match &self.browser {
-            Some(b) if browser_tools::handles(&call.name) => {
-                b.execute_with_explicit_approval(call, reason)
+        if let Some(b) = &self.browser {
+            if browser_tools::handles(&call.name) {
+                return b.execute_with_explicit_approval(call, reason);
             }
-            _ => ToolOutcome::Denied(
-                "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
-                    .into(),
-            ),
+        }
+        // HGW-1: everything else waits on an action card; an allow releases this one call.
+        let Some(actions) = &self.actions else {
+            return cannot_ask();
+        };
+        let card = ActionPending::for_call(call, reason, self.taint.sources().unwrap_or_default());
+        match actions.request(card, &self.stop) {
+            Ok(()) if self.stop.is_stopped() => {
+                ToolOutcome::Denied("the session was stopped; nothing was done".into())
+            }
+            Ok(()) => self.execute(call),
+            Err(why) => ToolOutcome::Denied(why),
         }
     }
 }
@@ -1525,6 +1595,8 @@ impl SessionManager {
         // HUP-S4.1: MCP approval cards only for a client that shows `hic: required` to a person.
         let mcp_approvals = (self.mcp.is_some() && req.hic_aware)
             .then(|| Arc::new(crate::mcp_approvals::McpApprovals::default()));
+        // HGW-1: action cards only for a client that shows `hic: required` to a person.
+        let actions = req.hic_aware.then(|| Arc::new(ActionApprovals::default()));
         if self.browser.is_some() {
             if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
@@ -1770,6 +1842,8 @@ impl SessionManager {
             decide_llm,
             mcp_offered,
             mcp_approvals,
+            actions,
+            unattended: req.unattended,
             #[cfg(test)]
             event_hook: Mutex::new(None),
         });
@@ -1907,10 +1981,13 @@ impl SessionManager {
                 ),
             ))
         });
-        let shell_host = session
-            .shell
-            .as_ref()
-            .map(|s| s.host(session.taint.clone(), session.stop.clone()));
+        let shell_host = session.shell.as_ref().map(|s| {
+            s.host(
+                session.taint.clone(),
+                session.stop.clone(),
+                session.hic_aware,
+            )
+        });
         if file_host.is_some()
             || shell_host.is_some()
             || skill_host.is_some()
@@ -1936,6 +2013,9 @@ impl SessionManager {
                     learn: learn_host,
                     browser: browser_host,
                     shell: shell_host,
+                    actions: session.actions.clone(),
+                    taint: session.taint.clone(),
+                    stop: session.stop.clone(),
                 }),
             );
         }
