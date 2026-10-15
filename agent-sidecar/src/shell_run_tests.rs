@@ -553,6 +553,42 @@ fn a_tainted_hic_aware_session_asks_with_the_reason_and_runs_only_on_allow() {
     drop(host);
 }
 
+/// HGW-2: a command that leaves git set up to run a program later (outside the sandbox) is
+/// reported to the model and the member: the run facts carry `git_warnings` and the summary says
+/// so.
+#[test]
+fn risky_git_state_left_by_a_command_is_reported() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.proj().join(".git/hooks")).unwrap();
+    let s = session(&fx, &cfg_open());
+    let approvals = s.approvals().clone();
+    let h = spawn(
+        s.host(TaintState::default(), StopFlag::default(), false),
+        call(
+            "c1",
+            &[
+                "sh",
+                "-c",
+                "printf '[core]\\n\\thooksPath = .h\\n' > .git/config",
+            ],
+            &fx.proj(),
+        ),
+    );
+    let p = wait_pending(&approvals);
+    approvals.decide(&p.id, true, &p.argv, &p.cwd).unwrap();
+    let out = h.join().unwrap();
+    let env = envelope(&out);
+    let facts = env.run.expect("run facts");
+    let w = facts["git_warnings"].to_string();
+    assert!(w.contains("core.hookspath"), "{w}");
+    assert!(env.summary.contains("git"), "{}", env.summary);
+    assert!(
+        env.summary.contains("outside the sandbox"),
+        "{}",
+        env.summary
+    );
+}
+
 #[test]
 fn an_untainted_card_has_no_taint_reason() {
     let fx = Fx::new();

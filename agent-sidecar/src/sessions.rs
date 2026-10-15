@@ -358,6 +358,13 @@ pub struct CreateSessionReq {
     /// the same rules as `POST /personas/check`). Never both.
     #[serde(default)]
     pub custom_persona: Option<citrate_agent_loop::personas::CustomPersona>,
+    /// HGW-2: the session's project roots: absolute, existing folders covered by live read and
+    /// write folder grants (subtree), where the file tools may create and change build
+    /// configuration. citrate-core sends the projects Hermes created before (`project_create`
+    /// results it kept) and folders the member marked as projects. Needs `grants`. Absent =
+    /// none (build configuration stays the member's, as before).
+    #[serde(default)]
+    pub project_roots: Vec<String>,
 }
 
 /// HUP-S3.3: what a session did with its persona (`POST /sessions` answers it as `persona`).
@@ -1623,6 +1630,11 @@ impl SessionManager {
                 "the tool name '{SHELL_RUN_TOOL}' is reserved by the sidecar while shell_run is on"
             )));
         }
+        if req.grants.is_none() && !req.project_roots.is_empty() {
+            return Err(SessionError::Invalid(
+                "projectRoots needs folder grants (a grant document) to check them against".into(),
+            ));
+        }
         let grants = match req.grants {
             None => None,
             Some(doc) => {
@@ -1655,6 +1667,13 @@ impl SessionManager {
                 g.replace(&doc).map_err(|e| {
                     SessionError::Invalid(format!("the grant document was refused: {e}"))
                 })?;
+                // HGW-2: the project roots core names, each checked against these grants now.
+                for root in &req.project_roots {
+                    g.add_project_root(std::path::Path::new(root))
+                        .map_err(|e| {
+                            SessionError::Invalid(format!("projectRoots was refused: {e}"))
+                        })?;
+                }
                 specs.extend(crate::grants::file_tool_specs());
                 specs.extend(crate::sheets::sheet_tool_specs());
                 if fs_on_grants {

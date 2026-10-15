@@ -13,7 +13,10 @@
 //! Every call runs in this order:
 //!
 //! 1. **Grant and deny list.** Build configuration (`foundry.toml`, env files and the rest of
-//!    `toolchain_config::build_config_file`) is refused first: the member edits it. Each path
+//!    `toolchain_config::build_config_file`) is refused first: the member edits it. HGW-2:
+//!    inside a session's project root (`SessionGrants::project_root_of`) build configuration
+//!    other than env files may be written; env files and anything inside a `.git` folder are
+//!    refused everywhere (git writes there, through the sandboxed `shell_run`). Each path
 //!    then goes through [`FolderGrants::check`] for a write, which
 //!    asks the agent-guard default-deny list first (credentials, keychains, browser profiles,
 //!    wallet storage, app data, shell history) and then needs a live write grant covering the
@@ -195,16 +198,14 @@ pub(crate) fn checked_whole_file_write(
     if !path.is_absolute() {
         return Err(Refusal::Failed("path must be absolute".into()));
     }
-    if let Some(name) = crate::toolchain_config::build_config_file(path) {
-        return Err(Refusal::Policy(
-            crate::toolchain_config::build_config_refusal(&name),
-        ));
+    // HGW-2: env files and `.git` internals are refused on the path as given, before any I/O;
+    // other build configuration waits for the resolved path (it is allowed in a project root).
+    if let Some(r) = config_refusal_as_given(path) {
+        return Err(Refusal::Policy(r));
     }
     let (file, root) = grants.check_write(path).map_err(Refusal::Policy)?;
-    if let Some(name) = crate::toolchain_config::build_config_file(&file) {
-        return Err(Refusal::Policy(
-            crate::toolchain_config::build_config_refusal(&name),
-        ));
+    if let Some(r) = config_refusal_resolved(path, &file, grants.project_root_of(&file)) {
+        return Err(Refusal::Policy(r));
     }
     if let Some(r) = leaf_refusal(&[path, &file]) {
         return Err(r);
@@ -227,6 +228,27 @@ pub(crate) fn checked_whole_file_write(
         session: undo.session.as_str().to_string(),
         seq,
     })
+}
+
+/// HGW-2: the refusal for a path as given (no I/O yet): `.git` internals and env files always;
+/// other build configuration is decided on the resolved path.
+fn config_refusal_as_given(path: &Path) -> Option<String> {
+    crate::toolchain_config::git_internal_refusal(path)
+        .or_else(|| crate::toolchain_config::env_file_refusal(path))
+}
+
+/// HGW-2: the refusal once the path is resolved: `.git` internals, env files, and other build
+/// configuration outside a project root, checked on the path as given and as resolved (the
+/// project is the one holding the resolved path).
+fn config_refusal_resolved(
+    given: &Path,
+    resolved: &Path,
+    project: Option<PathBuf>,
+) -> Option<String> {
+    let project = project.as_deref();
+    crate::toolchain_config::git_internal_refusal(resolved)
+        .or_else(|| crate::toolchain_config::build_config_write_refusal(given, project))
+        .or_else(|| crate::toolchain_config::build_config_write_refusal(resolved, project))
 }
 
 /// A refusal when a leaf in `paths` is a symbolic link, is not a regular file, or has other hard
@@ -415,6 +437,15 @@ impl FileTools {
         ]
     }
 
+    /// HGW-2: the project root holding `canonical`, when the grants are a session's (only a
+    /// session has project roots).
+    fn project_of(&self, canonical: &Path) -> Option<PathBuf> {
+        match &self.grants {
+            GrantSource::Session(g) => g.project_root_of(canonical),
+            GrantSource::File(_) | GrantSource::Fixed(_) => None,
+        }
+    }
+
     /// The grant set to check against now, and the time to check it at.
     fn load_grants(&self) -> Result<(FolderGrants, u64), Refusal> {
         match &self.grants {
@@ -445,23 +476,23 @@ impl FileTools {
                 "{raw:?} is not an absolute path; use an absolute path inside a folder the member granted"
             )));
         }
-        // Build configuration is the member's to edit: no fs tool creates, changes, moves or
-        // removes it (checked on the path as given and as resolved).
-        if let Some(name) = crate::toolchain_config::build_config_file(p) {
-            return Err(Refusal::Policy(
-                crate::toolchain_config::build_config_refusal(&name),
-            ));
+        // Build configuration is the member's to edit outside a project root (HGW-2): no fs tool
+        // creates, changes, moves or removes it there (checked on the path as given and as
+        // resolved). Env files and `.git` internals are refused everywhere.
+        if let Some(r) = config_refusal_as_given(p) {
+            return Err(Refusal::Policy(r));
         }
         match grants.check(p, Op::Write, now) {
             Decision::Allowed {
                 canonical,
                 grant_id,
             } => {
-                if let Some(name) = crate::toolchain_config::build_config_file(canonical.as_path())
-                {
-                    return Err(Refusal::Policy(
-                        crate::toolchain_config::build_config_refusal(&name),
-                    ));
+                if let Some(r) = config_refusal_resolved(
+                    p,
+                    canonical.as_path(),
+                    self.project_of(canonical.as_path()),
+                ) {
+                    return Err(Refusal::Policy(r));
                 }
                 // A hard link can name a file kept outside the grant (the deny list is
                 // path-based): no fs tool reads, snapshots, edits, moves or removes one.

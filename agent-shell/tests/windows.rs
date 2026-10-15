@@ -287,6 +287,7 @@ fn cleanup_error_makes_serialized_report_fail() {
             readable_extra: Vec::new(),
             summary: "test".into(),
         },
+        git_warnings: Vec::new(),
     };
 
     assert!(!report.passed());

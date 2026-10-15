@@ -75,6 +75,7 @@
 //! That crate is async and tied to the legacy tool trait, so the logic is re-homed here as a
 //! synchronous, dependency-light library.
 
+mod git_state;
 pub mod sandbox;
 #[cfg(windows)]
 mod win;
@@ -847,6 +848,12 @@ pub struct RunReport {
     pub cleanup_error: Option<String>,
     /// Whether (and how) the run was wrapped in the OS sandbox.
     pub sandbox: SandboxSummary,
+    /// HGW-2: git state the run left behind that would start a program the next time the member
+    /// uses git outside the sandbox (a hook, `core.hooksPath`, an alias that runs a shell, …), and
+    /// that was not there before the run. Reported, never changed. Empty (and not serialized)
+    /// when there is nothing new.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub git_warnings: Vec<String>,
 }
 
 impl RunReport {
@@ -1141,6 +1148,9 @@ impl ShellRunner {
             cmd.env(k, v);
         }
 
+        // HGW-2: what git would run later, before the run (only what is new is reported).
+        let repos = git_state::repo_dirs(&plan.cwd, &plan.write_roots);
+        let git_before = git_state::risks(&repos);
         let tree = ProcessTree::prepare().map_err(|e| ShellError::Spawn {
             program: req.program.clone(),
             reason: format!("cannot create the process tree container: {e}"),
@@ -1199,6 +1209,10 @@ impl ShellRunner {
             );
         }
 
+        let git_warnings: Vec<String> = git_state::risks(&repos)
+            .difference(&git_before)
+            .cloned()
+            .collect();
         Ok(RunReport {
             program: req.program.clone(),
             resolved_path: plan.resolved_path,
@@ -1218,6 +1232,7 @@ impl ShellRunner {
             output_incomplete,
             cleanup_error,
             sandbox: plan.sandbox,
+            git_warnings,
         })
     }
 }
@@ -1794,6 +1809,7 @@ mod tests {
             output_incomplete: false,
             cleanup_error: Some("scratch removal failed".into()),
             sandbox: SandboxSummary::not_enforced("test", &[]),
+            git_warnings: Vec::new(),
         };
 
         assert!(!report.passed());

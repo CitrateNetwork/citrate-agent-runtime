@@ -777,6 +777,7 @@ mod tests {
                 readable_extra: Vec::new(),
                 summary: "test".into(),
             },
+            git_warnings: Vec::new(),
         }
     }
 

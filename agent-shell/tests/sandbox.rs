@@ -23,6 +23,7 @@ fn allow() -> Allowlist {
         .allow("sh", ArgPolicy::Any)
         .allow("curl", ArgPolicy::Any)
         .allow("echo", ArgPolicy::Any)
+        .allow("git", ArgPolicy::Any)
 }
 
 /// `base/grant` (the granted folder, with `sub/`), `base/other` (not granted).
@@ -199,6 +200,12 @@ fn seatbelt_profile_denies_by_default_and_never_allows_network() {
     let deny_hooks = p.find(".git/hooks").expect("hooks deny");
     assert!(deny_hooks > allow_w);
     assert!(p.contains("\\.env"));
+    // HGW-2: `.git/config` is writable inside a write root (git init and git config work); the
+    // hooks stay closed: no non-sample hook file, no removing or symlinking the hooks folder.
+    assert!(!p.contains(".git/config"), "{p}");
+    assert!(p.contains("require-not"), "{p}");
+    assert!(p.contains("\\.sample$"), "{p}");
+    assert!(p.contains("vnode-type SYMLINK"), "{p}");
 }
 
 #[test]
@@ -237,6 +244,43 @@ fn bwrap_command_isolates_network_and_binds_only_the_grant_writable() {
     let bind_at = a.iter().position(|x| x == &g).expect("bind");
     let mask_at = a.iter().position(|x| x == &env).expect("mask");
     assert!(mask_at > bind_at);
+    // HGW-2: an existing hooks folder stays read-only; `.git/config` is writable (git config).
+    let hooks = fx.grant().join(".git/hooks").to_string_lossy().into_owned();
+    assert!(has(&["--ro-bind-try", &hooks, &hooks]), "{a:?}");
+    assert!(!a.iter().any(|x| x.ends_with(".git/config")), "{a:?}");
+}
+
+/// HGW-2: a run that leaves git in a state that would run a program the next time the member uses
+/// git in a terminal (a hook, `core.hooksPath`, `core.fsmonitor`, an alias that runs a shell…) is
+/// reported in `git_warnings`. What was already there before the run is not reported again.
+#[test]
+fn new_risky_git_state_is_reported_after_a_run() {
+    let fx = Fx::new();
+    let repo = fx.grant().join("repo");
+    std::fs::create_dir_all(repo.join(".git/hooks")).expect("repo");
+    // Already there before the run (a member's own hook manager): not reported.
+    std::fs::write(repo.join(".git/hooks/pre-push"), "#!/bin/sh\n").expect("hook");
+    std::fs::write(repo.join(".git/config"), "[core]\n\tbare = false\n").expect("config");
+    let r = scoped(fx.grant(), SandboxPolicy::new(SandboxMode::Off));
+    let cmd = "printf '[core]\\n\\thooksPath = .h\\n[alias]\\n\\tx = !sh -c id\\n' >> .git/config; echo '#!/bin/sh' > .git/hooks/post-checkout; echo ok";
+    let rep = r.run(&sh(cmd, &repo)).expect("run");
+    assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+    let w = rep.git_warnings.join("\n");
+    assert!(w.contains("core.hookspath"), "{w}");
+    assert!(w.contains("alias.x"), "{w}");
+    assert!(w.contains("post-checkout"), "{w}");
+    assert!(
+        !w.contains("pre-push"),
+        "pre-existing state is not reported: {w}"
+    );
+    // A run that changes nothing about git reports nothing.
+    let rep = r.run(&sh("echo quiet", &repo)).expect("run");
+    assert!(rep.git_warnings.is_empty(), "{:?}", rep.git_warnings);
+    let v = rep.to_json();
+    assert!(
+        v.get("git_warnings").is_none(),
+        "empty warnings are not serialized: {v}"
+    );
 }
 
 #[test]
@@ -396,6 +440,59 @@ mod macos {
         }
     }
 
+    /// HGW-2: `git init`, `git add` and `git commit` work inside the grant under Seatbelt (they
+    /// write `.git/config` and the sample hooks), and nothing lands outside it.
+    #[test]
+    fn git_init_add_and_commit_work_inside_the_grant() {
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), required());
+        let cmd = "git init -q . && echo hi > a.txt && git add a.txt && git -c user.name=Hermes -c user.email=hermes@example.invalid commit -q -m init && git config user.name Hermes && git log --oneline | wc -l";
+        let rep = r.run(&sh(cmd, &fx.grant())).expect("run");
+        assert!(rep.sandbox.enforced);
+        assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
+        assert_eq!(rep.stdout.trim(), "1");
+        assert!(fx.grant().join(".git/config").is_file());
+        assert!(rep.git_warnings.is_empty(), "{:?}", rep.git_warnings);
+    }
+
+    /// HGW-2: with `.git` writable, hooks stay closed: no hook file but samples, no renaming a
+    /// sample into a hook, no removing the hooks folder, no symlinking a new one in.
+    #[test]
+    fn git_hooks_stay_closed_when_git_is_writable() {
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), required());
+        let rep = r.run(&sh("git init -q .", &fx.grant())).expect("init");
+        assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
+        let hooks = fx.grant().join(".git/hooks");
+        for cmd in [
+            "echo x > .git/hooks/pre-commit",
+            "mv .git/hooks/pre-commit.sample .git/hooks/pre-commit",
+            "cp .git/hooks/pre-commit.sample .git/hooks/post-merge",
+        ] {
+            let rep = r.run(&sh(cmd, &fx.grant())).expect("run");
+            assert_ne!(rep.exit_code, Some(0), "{cmd}");
+        }
+        assert!(!hooks.join("pre-commit").exists());
+        assert!(!hooks.join("post-merge").exists());
+        let _ = r.run(&sh("rm -rf .git/hooks", &fx.grant())).expect("rm");
+        assert!(hooks.is_dir(), "the hooks folder cannot be removed");
+        let _ = r
+            .run(&sh("mv .git/hooks .git/h2", &fx.grant()))
+            .expect("mv");
+        assert!(hooks.is_dir(), "the hooks folder cannot be moved away");
+        std::fs::create_dir_all(fx.grant().join("sub/fresh/.git")).expect("fresh");
+        let rep = r
+            .run(&sh(
+                "mkdir -p ../../h && ln -s ../../h .git/hooks",
+                &fx.grant().join("sub/fresh"),
+            ))
+            .expect("ln");
+        assert_ne!(rep.exit_code, Some(0));
+        assert!(!fx.grant().join("sub/fresh/.git/hooks").exists());
+        // The sample a fresh `git init` writes is fine.
+        assert!(hooks.join("pre-commit.sample").exists() || hooks.is_dir());
+    }
+
     #[test]
     fn plan_shows_the_sandbox_before_anything_runs() {
         let fx = Fx::new();
@@ -412,5 +509,81 @@ mod macos {
             "{}",
             plan.sandbox.summary
         );
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Linux: the real thing (bubblewrap). Runs where bwrap can create a sandbox; the Linux CI lane
+// sets CITRATE_REQUIRE_BWRAP=1 so a missing or broken bwrap fails instead of skipping.
+// ------------------------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+
+    fn required() -> Option<SandboxPolicy> {
+        match citrate_agent_shell::sandbox::detect() {
+            Ok(_) => Some(SandboxPolicy::new(SandboxMode::Required)),
+            Err(why) => {
+                assert!(
+                    std::env::var("CITRATE_REQUIRE_BWRAP").as_deref() != Ok("1"),
+                    "CITRATE_REQUIRE_BWRAP=1 but bwrap is unusable here: {why}"
+                );
+                eprintln!("skipping the bwrap run test: {why}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn writes_outside_the_grant_are_denied_under_bwrap() {
+        let Some(p) = required() else { return };
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), p);
+        let f = fx.other().join("escape.txt");
+        let rep = r
+            .run(&sh(&format!("echo x > '{}'", f.display()), &fx.grant()))
+            .expect("run");
+        assert!(rep.sandbox.enforced);
+        assert_ne!(rep.exit_code, Some(0));
+        assert!(!f.exists());
+        let ok = fx.grant().join("in.txt");
+        let rep = r
+            .run(&sh(&format!("echo x > '{}'", ok.display()), &fx.grant()))
+            .expect("run");
+        assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+        assert!(ok.exists());
+    }
+
+    #[test]
+    fn git_init_add_and_commit_work_inside_the_grant_under_bwrap() {
+        let Some(p) = required() else { return };
+        if !Path::new("/usr/bin/git").exists() {
+            eprintln!("skipping: no /usr/bin/git");
+            return;
+        }
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), p);
+        let cmd = "git init -q . && echo hi > a.txt && git add a.txt && git -c user.name=Hermes -c user.email=hermes@example.invalid commit -q -m init && git config user.name Hermes && git log --oneline | wc -l";
+        let rep = r.run(&sh(cmd, &fx.grant())).expect("run");
+        assert_eq!(rep.exit_code, Some(0), "stderr: {}", rep.stderr);
+        assert_eq!(rep.stdout.trim(), "1");
+    }
+
+    #[test]
+    fn network_is_unshared_under_bwrap() {
+        let Some(p) = required() else { return };
+        let fx = Fx::new();
+        let r = scoped(fx.grant(), p);
+        // Only a loopback interface exists in a fresh network namespace.
+        let rep = r
+            .run(&sh(
+                "cat /proc/net/dev | tail -n +3 | cut -d: -f1 | tr -d ' '",
+                &fx.grant(),
+            ))
+            .expect("run");
+        assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+        let ifaces: Vec<&str> = rep.stdout.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(ifaces, vec!["lo"], "{ifaces:?}");
     }
 }

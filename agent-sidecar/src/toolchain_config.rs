@@ -29,7 +29,11 @@
 //! [`build_config_file`] is the matching rule for the agent's file tools: build configuration
 //! (the files above, plus `foundry.toml`, `remappings.txt`, `package.json`, `aderyn.toml`,
 //! make/just files and `.cargo/config*`) is edited by the member, never created, changed, moved
-//! or removed by the agent.
+//! or removed by the agent, except (HGW-2, owner decision 2026-10-15) inside a project root
+//! ([`build_config_write_refusal`]): a project Hermes created or a folder the member marked as a
+//! project, where the agent sets up its own build. Env files stay the member's everywhere. This
+//! does not loosen the toolchain check above: forge still refuses to run with `ffi` or wide
+//! `fs_permissions`, whoever wrote the file.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -86,8 +90,47 @@ pub(crate) fn build_config_file(path: &Path) -> Option<String> {
 /// The refusal the file tools give for [`build_config_file`].
 pub(crate) fn build_config_refusal(name: &str) -> String {
     format!(
-        "{name} is build configuration, which the member edits; the agent's file tools do not create, change, move or remove it"
+        "{name} is build configuration, which the member edits; the agent's file tools do not create, change, move or remove it outside a project (a folder made with project_create, or one the member marked as a project)"
     )
+}
+
+/// HGW-2: the file tools' rule for one write, given the project root that holds the resolved
+/// path (if any). Env files are always the member's; other build configuration is the agent's
+/// to write only inside a project root. `None` = allowed.
+pub(crate) fn build_config_write_refusal(path: &Path, project: Option<&Path>) -> Option<String> {
+    if let Some(r) = env_file_refusal(path) {
+        return Some(r);
+    }
+    let name = build_config_file(path)?;
+    match project {
+        Some(_) => None,
+        None => Some(build_config_refusal(&name)),
+    }
+}
+
+/// HGW-2: env files are only ever the member's: `Some(refusal)` for one (matching on the last
+/// component, any case).
+pub(crate) fn env_file_refusal(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    env_file(&name).then(|| {
+        format!(
+            "{name} is an env file, build configuration that may hold secrets, which only the member creates or changes; the agent's file tools never write it, in a project or not"
+        )
+    })
+}
+
+/// HGW-2: the file tools never write inside a `.git` folder: git does that through the sandboxed
+/// `shell_run`, whose sandbox keeps hooks out. `Some(refusal)` for such a path.
+pub(crate) fn git_internal_refusal(path: &Path) -> Option<String> {
+    let inside = path
+        .components()
+        .any(|c| matches!(c, Component::Normal(n) if n.eq_ignore_ascii_case(".git")));
+    inside.then(|| {
+        format!(
+            "{} is inside a .git folder; the agent's file tools do not write there (git commands run through shell_run do)",
+            path.display()
+        )
+    })
 }
 
 /// Refuse (with the reason) when the project's build configuration asks for more than the agent

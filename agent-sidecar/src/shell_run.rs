@@ -462,7 +462,17 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
         "output_incomplete": r.output_incomplete,
         "cleanup_error": r.cleanup_error,
         "sandbox": r.sandbox,
+        "git_warnings": r.git_warnings,
     });
+    // HGW-2: git state the command left that would run a program outside the sandbox later.
+    let git_note = if r.git_warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ". Warning: the command left git set up to run a program outside the sandbox the next time git is used ({}); the member should review it",
+            r.git_warnings.join("; ")
+        )
+    };
     let isolation = if r.sandbox.enforced {
         format!("in the {} sandbox, no network", r.sandbox.backend)
     } else {
@@ -504,7 +514,7 @@ fn report(argv: &[String], r: &RunReport) -> ToolOutcome {
             SHELL_RUN_TOOL,
             RunStatus::Completed,
             format!(
-                "{} {ended} after {} ms ({isolation})",
+                "{} {ended} after {} ms ({isolation}){git_note}",
                 r.program, r.duration_ms
             ),
         )
@@ -644,6 +654,7 @@ mod tests {
                 readable_extra: Vec::new(),
                 summary: "test".into(),
             },
+            git_warnings: Vec::new(),
         }
     }
 

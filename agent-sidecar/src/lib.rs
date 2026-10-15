@@ -2362,6 +2362,8 @@ mod decide_route_tests;
 mod deploy_guard_session_tests;
 #[cfg(all(test, unix))]
 mod hgw_support;
+#[cfg(all(test, unix))]
+mod project_policy_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]
