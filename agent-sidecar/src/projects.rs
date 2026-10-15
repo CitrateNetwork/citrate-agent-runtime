@@ -9,8 +9,9 @@
 //!    session's live read and write folder grants over its whole subtree (citrate-core's
 //!    workspace card grants it). `<root>/<name>` must not exist yet. A template id, when given,
 //!    is a plain id and needs a configured renderer.
-//! 2. **HIC, always.** The call waits on the session's action card (`/actions` routes,
-//!    [`crate::action_approvals`]) showing the exact folder, template and parameters. Only an
+//! 2. **HIC, always.** The call waits on the session's approval card
+//!    (`/sessions/:id/approvals` routes, [`crate::action_approvals`]) showing the exact folder,
+//!    template and parameters. Only an
 //!    explicit allow creates anything. A session not opened by an HIC-aware app cannot ask, so it
 //!    creates nothing. In a tainted session the one card carries the taint reason too.
 //! 3. **Creates** `<root>/<name>` (the grants are checked again first), renders the template into
