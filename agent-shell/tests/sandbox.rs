@@ -493,6 +493,34 @@ mod macos {
         assert!(hooks.join("pre-commit.sample").exists() || hooks.is_dir());
     }
 
+    /// HGW-W2 (#75): `.env.example` and `.env.sample` (template files, not secrets) are readable;
+    /// `.env` and `.env.local` stay unreadable and unwritable.
+    #[test]
+    fn env_example_files_are_readable_and_real_env_files_are_not() {
+        let fx = Fx::new();
+        for (name, body) in [
+            (".env.example", "RPC_URL=\n"),
+            (".env.sample", "KEY=\n"),
+            (".env", "SECRET=1\n"),
+            (".env.local", "SECRET=2\n"),
+        ] {
+            std::fs::write(fx.grant().join(name), body).expect("seed");
+        }
+        let r = scoped(fx.grant(), required());
+        let rep = r
+            .run(&sh("cat .env.example .env.sample", &fx.grant()))
+            .expect("run");
+        assert_eq!(rep.exit_code, Some(0), "{}", rep.stderr);
+        assert_eq!(rep.stdout, "RPC_URL=\nKEY=\n");
+        for secret in [".env", ".env.local"] {
+            let rep = r
+                .run(&sh(&format!("cat {secret}"), &fx.grant()))
+                .expect("run");
+            assert_ne!(rep.exit_code, Some(0), "{secret}");
+            assert!(!rep.stdout.contains("SECRET"), "{secret}");
+        }
+    }
+
     #[test]
     fn plan_shows_the_sandbox_before_anything_runs() {
         let fx = Fx::new();

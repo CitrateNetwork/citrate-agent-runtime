@@ -11,7 +11,8 @@
 //!   (HGW-2: `git init`, `git config` and `git commit` work), but a hook file other than git's own
 //!   `*.sample` files cannot be written, the hooks folder cannot be removed or moved, and a
 //!   symbolic link cannot be put in its place (a hook planted there would run later outside the
-//!   sandbox). `.env*` files are neither readable nor writable. Configuration that makes git run
+//!   sandbox). `.env*` files are neither readable nor writable, except `.env.example` and
+//!   `.env.sample`. Configuration that makes git run
 //!   a program cannot be filtered by path, so the runner reports any it finds new after a run
 //!   (`RunReport::git_warnings`).
 //! - **Linux: bubblewrap** (`bwrap`, found only in fixed system directories). The run gets fresh
@@ -378,7 +379,11 @@ pub fn seatbelt_profile(n_read: usize, n_write: usize) -> String {
     p.push_str(
         "(deny file-write-create (require-all (regex #\"/\\.git/hooks$\") (vnode-type SYMLINK)))\n",
     );
-    p.push_str("(deny file-read* file-write* (regex #\"/\\.env[^/]*$\"))\n");
+    // `.env*` files are neither readable nor writable, except the templates' `.env.example` and
+    // `.env.sample` (HGW-W2: not secrets; agent-guard exempts them the same way).
+    p.push_str(
+        "(deny file-read* file-write* (require-all (regex #\"/\\.env[^/]*$\") (require-not (regex #\"/\\.env\\.(example|sample)$\"))))\n",
+    );
     p
 }
 
@@ -460,7 +465,8 @@ pub fn bwrap_command(spec: &SandboxSpec, program: &Path, args: &[String]) -> Vec
     a
 }
 
-/// `.env*` files at the top of each write root (bwrap masks them; Seatbelt denies by pattern).
+/// `.env*` files at the top of each write root (bwrap masks them; Seatbelt denies by pattern),
+/// except the templates' `.env.example` and `.env.sample`.
 pub(crate) fn env_files(write_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for w in write_roots {
@@ -470,7 +476,8 @@ pub(crate) fn env_files(write_roots: &[PathBuf]) -> Vec<PathBuf> {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
             let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
-            if is_file && (name == ".env" || name.starts_with(".env.")) {
+            let template = name == ".env.example" || name == ".env.sample";
+            if is_file && !template && (name == ".env" || name.starts_with(".env.")) {
                 out.push(e.path());
             }
         }
@@ -567,6 +574,9 @@ mod tests {
         std::fs::write(root.join(".env"), "x").expect("w");
         std::fs::write(root.join(".env.local"), "x").expect("w");
         std::fs::write(root.join("env.txt"), "x").expect("w");
+        // HGW-W2 (#75): templates' example files are not secrets (agent-guard exempts them too).
+        std::fs::write(root.join(".env.example"), "x").expect("w");
+        std::fs::write(root.join(".env.sample"), "x").expect("w");
         std::fs::create_dir(root.join(".env.d")).expect("d");
         let got = env_files(std::slice::from_ref(&root));
         assert_eq!(got, vec![root.join(".env"), root.join(".env.local")]);
