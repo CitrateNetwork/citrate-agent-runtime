@@ -344,6 +344,48 @@ fn a_host_that_cannot_ask_a_member_refuses_instead_of_running() {
     assert!(msg.content.starts_with("declined:"), "{}", msg.content);
 }
 
+/// HGW-1: when nobody can be asked (a headless or scheduled session), the refusal says what
+/// tainted the session and why it cannot ask, so the model (and a person reading the log) can
+/// tell a member's "no" from "this run has no member to ask".
+#[test]
+fn a_headless_refusal_names_the_source_and_says_nobody_can_be_asked() {
+    let llm = ScriptLlm::new(vec![
+        AssistantTurn::tools(vec![call("c1", "web_fetch"), call("c2", "write_file")]),
+        AssistantTurn::text("done"),
+    ]);
+    let host = Arc::new(RecHost::new(false, ToolOutcome::Ok("ok".into())));
+    let tools = ToolRegistry::new(catalog()).with_host(HostKind::Core, host.clone());
+    let sink = Sink::default();
+    let mut history = vec![];
+    run_turn(
+        &cfg(),
+        &llm,
+        &tools,
+        &sink,
+        &StopFlag::default(),
+        &mut history,
+        "go",
+    );
+    let msg = history
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c2"))
+        .unwrap();
+    assert!(msg.content.contains("from web_fetch"), "{}", msg.content);
+    assert!(msg.content.contains("explicit approval"), "{}", msg.content);
+    assert!(
+        msg.content.contains("no member can be asked"),
+        "{}",
+        msg.content
+    );
+    assert_eq!(
+        msg.content,
+        format!(
+            "declined: {}. Nothing was done.",
+            cannot_ask_reason(Some("web_fetch"))
+        )
+    );
+}
+
 #[test]
 fn the_taint_persists_across_steps_and_turns() {
     let llm = ScriptLlm::new(vec![

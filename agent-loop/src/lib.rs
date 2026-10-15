@@ -231,6 +231,18 @@ pub trait ToolHost: Send + Sync {
     }
 }
 
+/// HGW-1: why a tainted session's effectful call is declined when no member can be asked: the
+/// host is not one that shows approval cards (a headless or scheduled run, or a client that did
+/// not promise to route `hic: "required"` to a person). Hosts that decline for the same reason
+/// use this text too, so the model and the log read one message. `source` names what tainted the
+/// session, when known.
+pub fn cannot_ask_reason(source: Option<&str>) -> String {
+    let from = source.map(|s| format!(" (from {s})")).unwrap_or_default();
+    format!(
+        "this session read untrusted content{from}, so this action needs a member's explicit approval, and no member can be asked in this session (it was not opened by an app that shows approval cards, for example a headless or scheduled run)"
+    )
+}
+
 /// The record of what tainted a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintRecord {
@@ -912,10 +924,9 @@ pub fn run_turn_with(
                 (None, None) if declined.is_some() => {
                     ToolOutcome::Denied(declined.clone().unwrap_or_default())
                 }
-                (None, None) if refused_hic => ToolOutcome::Denied(
-                    "this session read untrusted content and this action needs a member's explicit approval, which this tool's host cannot ask for"
-                        .into(),
-                ),
+                (None, None) if refused_hic => ToolOutcome::Denied(cannot_ask_reason(
+                    tools.taint().record().as_ref().map(|r| r.source.as_str()),
+                )),
                 (None, None) => {
                     ToolOutcome::Error(format!("'{}' is not available in this session", call.name))
                 }

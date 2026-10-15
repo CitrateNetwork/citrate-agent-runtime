@@ -1,7 +1,8 @@
 //! US-2.2 AC2 — the general `shell_run` tool: the agent proposes an exact argv and cwd, the member
 //! sees exactly that (plus the program it resolves to and the sandbox) and decides, and only an
 //! approved command runs, inside the OS sandbox, in a live folder grant, with a timeout and
-//! capped output. Off by default; refused in a tainted session; fails closed without a sandbox.
+//! capped output. Off by default; after taint asked with the reason (HIC-aware apps) or refused;
+//! fails closed without a sandbox.
 //!
 //! BDD map:
 //! - "Anything else shows the exact command + cwd for approval":
@@ -10,7 +11,9 @@
 //!   `a_decision_must_carry_the_argv_and_cwd_that_were_shown`.
 //! - Grants: `a_cwd_outside_the_grants_is_refused_before_asking`,
 //!   `a_read_only_or_shallow_grant_is_not_enough`, `a_revoked_grant_stops_an_approved_run`.
-//! - Taint: `a_tainted_session_is_refused_and_nothing_is_asked`,
+//! - Taint (HGW-1): `a_tainted_session_without_an_hic_aware_app_is_refused_and_nothing_is_asked`,
+//!   `a_tainted_hic_aware_session_asks_with_the_reason_and_runs_only_on_allow`,
+//!   `an_untainted_card_has_no_taint_reason`,
 //!   `an_unattended_session_never_offers_a_run`.
 //! - Sandbox: `no_sandbox_means_no_run_and_no_question`, `the_approved_run_is_sandboxed` (macOS).
 //! - Timeout + capture: `a_command_past_its_timeout_is_killed_and_reported`,
@@ -207,7 +210,7 @@ fn a_call_waits_for_the_member_and_shows_exactly_what_will_run() {
     let s = session(&fx, &cfg_open());
     let approvals = s.approvals().clone();
     let h = spawn(
-        s.host(TaintState::default(), StopFlag::default()),
+        s.host(TaintState::default(), StopFlag::default(), false),
         call("c1", &["echo", "hello $(id)"], &fx.proj().join("src")),
     );
     let p = wait_pending(&approvals);
@@ -239,7 +242,7 @@ fn an_approved_command_runs_and_reports() {
     let approvals = s.approvals().clone();
     let marker = fx.proj().join("built.txt");
     let h = spawn(
-        s.host(TaintState::default(), StopFlag::default()),
+        s.host(TaintState::default(), StopFlag::default(), false),
         call(
             "c1",
             &[
@@ -275,7 +278,7 @@ fn a_declined_command_never_runs() {
     let approvals = s.approvals().clone();
     let marker = fx.proj().join("never.txt");
     let h = spawn(
-        s.host(TaintState::default(), StopFlag::default()),
+        s.host(TaintState::default(), StopFlag::default(), false),
         call(
             "c1",
             &["sh", "-c", &format!("echo x > '{}'", marker.display())],
@@ -297,7 +300,7 @@ fn a_decision_must_carry_the_argv_and_cwd_that_were_shown() {
     let s = session(&fx, &cfg_open());
     let approvals = s.approvals().clone();
     let h = spawn(
-        s.host(TaintState::default(), StopFlag::default()),
+        s.host(TaintState::default(), StopFlag::default(), false),
         call("c1", &["echo", "a"], &fx.proj()),
     );
     let p = wait_pending(&approvals);
@@ -323,7 +326,7 @@ fn an_unanswered_approval_expires_as_declined() {
     cfg.approval_timeout = Duration::from_millis(200);
     let s = session(&fx, &cfg);
     let out = s
-        .host(TaintState::default(), StopFlag::default())
+        .host(TaintState::default(), StopFlag::default(), false)
         .execute(&call("c1", &["echo", "a"], &fx.proj()));
     match out {
         ToolOutcome::Denied(why) => assert!(why.contains("no decision"), "{why}"),
@@ -339,7 +342,7 @@ fn a_session_stop_declines_a_waiting_command() {
     let approvals = s.approvals().clone();
     let stop = StopFlag::default();
     let h = spawn(
-        s.host(TaintState::default(), stop.clone()),
+        s.host(TaintState::default(), stop.clone(), false),
         call("c1", &["echo", "a"], &fx.proj()),
     );
     wait_pending(&approvals);
@@ -366,7 +369,7 @@ fn refused(out: ToolOutcome, needle: &str) {
 fn bad_arguments_are_refused_before_asking() {
     let fx = Fx::new();
     let s = session(&fx, &cfg_open());
-    let host = s.host(TaintState::default(), StopFlag::default());
+    let host = s.host(TaintState::default(), StopFlag::default(), false);
     let raw = |args: serde_json::Value| {
         host.execute(&ToolCall {
             id: "c".into(),
@@ -416,7 +419,7 @@ fn bad_arguments_are_refused_before_asking() {
 fn a_cwd_outside_the_grants_is_refused_before_asking() {
     let fx = Fx::new();
     let s = session(&fx, &cfg_open());
-    let host = s.host(TaintState::default(), StopFlag::default());
+    let host = s.host(TaintState::default(), StopFlag::default(), false);
     refused(host.execute(&call("c", &["echo"], &fx.other())), "refused");
     refused(host.execute(&call("c", &["echo"], &fx.home())), "refused");
     assert!(s.approvals().pending().is_empty());
@@ -433,7 +436,7 @@ fn a_read_only_or_shallow_grant_is_not_enough() {
     )]);
     let s = ShellRunSession::new(&cfg_open(), fx.grants(&read_only)).unwrap();
     refused(
-        s.host(TaintState::default(), StopFlag::default())
+        s.host(TaintState::default(), StopFlag::default(), false)
             .execute(&call("c", &["echo"], &fx.proj())),
         "refused",
     );
@@ -443,7 +446,7 @@ fn a_read_only_or_shallow_grant_is_not_enough() {
     ]);
     let s = ShellRunSession::new(&cfg_open(), fx.grants(&shallow)).unwrap();
     refused(
-        s.host(TaintState::default(), StopFlag::default())
+        s.host(TaintState::default(), StopFlag::default(), false)
             .execute(&call("c", &["echo"], &fx.proj())),
         "everything below",
     );
@@ -457,7 +460,7 @@ fn a_revoked_grant_stops_an_approved_run() {
     let approvals = s.approvals().clone();
     let marker = fx.proj().join("late.txt");
     let h = spawn(
-        s.host(TaintState::default(), StopFlag::default()),
+        s.host(TaintState::default(), StopFlag::default(), false),
         call(
             "c1",
             &["sh", "-c", &format!("echo x > '{}'", marker.display())],
@@ -474,19 +477,101 @@ fn a_revoked_grant_stops_an_approved_run() {
 }
 
 #[test]
-fn a_tainted_session_is_refused_and_nothing_is_asked() {
+fn a_tainted_session_without_an_hic_aware_app_is_refused_and_nothing_is_asked() {
     let fx = Fx::new();
     let s = session(&fx, &cfg_open());
     let taint = TaintState::default();
     taint.taint("read_url", "a web page");
-    let out = s
-        .host(taint, StopFlag::default())
-        .execute(&call("c1", &["echo", "a"], &fx.proj()));
+    let host = s.host(taint, StopFlag::default(), false);
+    assert!(!host.honors_explicit_approval());
+    let out = host.execute(&call("c1", &["echo", "a"], &fx.proj()));
     match out {
-        ToolOutcome::Denied(why) => assert!(why.contains("untrusted"), "{why}"),
+        ToolOutcome::Denied(why) => {
+            assert!(why.contains("untrusted"), "{why}");
+            assert!(why.contains("from read_url"), "{why}");
+            assert!(why.contains("no member can be asked"), "{why}");
+        }
         other => panic!("{other:?}"),
     }
     assert!(s.approvals().pending().is_empty());
+}
+
+/// HGW-1: after taint, an HIC-aware session still asks; the card says why the command is gated
+/// and names every taint source, and only an explicit allow runs it. Taint is not cleared.
+#[test]
+fn a_tainted_hic_aware_session_asks_with_the_reason_and_runs_only_on_allow() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let approvals = s.approvals().clone();
+    let taint = TaintState::default();
+    taint.taint("read_url", "a web page");
+    taint.taint("shell_run", "output");
+    let marker = fx.proj().join("tainted-run.txt");
+    let host = s.host(taint.clone(), StopFlag::default(), true);
+    assert!(host.honors_explicit_approval());
+    let c = call(
+        "c1",
+        &["sh", "-c", &format!("echo x > '{}'", marker.display())],
+        &fx.proj(),
+    );
+    // Through the loop's explicit-approval path and through a plain execute (taint re-checked).
+    for plain in [false, true] {
+        let h = s.host(taint.clone(), StopFlag::default(), true);
+        let c2 = c.clone();
+        let t = std::thread::spawn(move || {
+            if plain {
+                h.execute(&c2)
+            } else {
+                h.execute_with_explicit_approval(&c2, "gated: read_url")
+            }
+        });
+        let p = wait_pending(&approvals);
+        let reason = p
+            .hic_reason
+            .clone()
+            .expect("a tainted card carries the reason");
+        assert!(reason.contains("read_url"), "{reason}");
+        assert_eq!(p.taint_sources, vec!["read_url", "shell_run"]);
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(
+            v.get("hicReason").is_some() && v.get("taintSources").is_some(),
+            "{v}"
+        );
+        assert!(!marker.exists(), "nothing runs before the member decides");
+        let allow = plain;
+        approvals.decide(&p.id, allow, &p.argv, &p.cwd).unwrap();
+        let out = t.join().unwrap();
+        if allow {
+            assert!(matches!(out, ToolOutcome::Ok(_)), "{out:?}");
+            assert!(marker.exists());
+        } else {
+            assert!(matches!(out, ToolOutcome::Denied(_)), "{out:?}");
+            assert!(!marker.exists());
+        }
+    }
+    assert!(taint.is_tainted(), "an approval never clears the taint");
+    drop(host);
+}
+
+#[test]
+fn an_untainted_card_has_no_taint_reason() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let approvals = s.approvals().clone();
+    let h = spawn(
+        s.host(TaintState::default(), StopFlag::default(), true),
+        call("c1", &["echo", "a"], &fx.proj()),
+    );
+    let p = wait_pending(&approvals);
+    assert!(p.hic_reason.is_none());
+    assert!(p.taint_sources.is_empty());
+    let v = serde_json::to_value(&p).unwrap();
+    assert!(
+        v.get("hicReason").is_none() && v.get("taintSources").is_none(),
+        "{v}"
+    );
+    approvals.decide(&p.id, false, &p.argv, &p.cwd).unwrap();
+    assert!(matches!(h.join().unwrap(), ToolOutcome::Denied(_)));
 }
 
 #[test]
@@ -498,7 +583,7 @@ fn no_sandbox_means_no_run_and_no_question() {
     );
     let s = session(&fx, &cfg);
     let out = s
-        .host(TaintState::default(), StopFlag::default())
+        .host(TaintState::default(), StopFlag::default(), false)
         .execute(&call("c1", &["echo", "a"], &fx.proj()));
     refused(out, "sandbox");
     assert!(s.approvals().pending().is_empty());
@@ -529,7 +614,7 @@ fn a_command_past_its_timeout_is_killed_and_reported() {
     };
     let started = std::time::Instant::now();
     let out = s
-        .host(TaintState::default(), StopFlag::default())
+        .host(TaintState::default(), StopFlag::default(), false)
         .execute(&c);
     a.join().unwrap();
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -545,7 +630,7 @@ fn output_is_capped() {
     let s = session(&fx, &cfg_open());
     let a = approve_next(s.approvals().clone());
     let out = s
-        .host(TaintState::default(), StopFlag::default())
+        .host(TaintState::default(), StopFlag::default(), false)
         .execute(&call(
             "c1",
             &["sh", "-c", "yes x | head -c 200000"],
@@ -571,7 +656,7 @@ fn the_approved_run_is_sandboxed() {
     let inside = fx.proj().join("src/ok.txt");
     let outside = fx.other().join("escape.txt");
     let h = spawn(
-        s.host(TaintState::default(), StopFlag::default()),
+        s.host(TaintState::default(), StopFlag::default(), false),
         call(
             "c1",
             &[
@@ -621,7 +706,7 @@ fn backend_override_reaches_the_card() {
     let approvals = s.approvals().clone();
     let stop = StopFlag::default();
     let h = spawn(
-        s.host(TaintState::default(), stop.clone()),
+        s.host(TaintState::default(), stop.clone(), false),
         call("c1", &["echo", "a"], &fx.proj()),
     );
     let p = wait_pending(&approvals);
@@ -900,7 +985,7 @@ async fn an_unattended_session_never_offers_a_run() {
 
 /// HUP-S2.6: every member decision on a `shell_run` command lands in the decision log the nightly
 /// anchor batches: a refused (mismatched) allow closes as failed, the real allow as completed, and
-/// a deny is recorded as denied. (One command per session: after a run the session is tainted.)
+/// a deny is recorded as denied. (One session per command keeps each log entry easy to find.)
 #[tokio::test(flavor = "multi_thread")]
 async fn shell_run_decisions_are_recorded_for_the_anchor() {
     use citrate_agent_records::{Decision, DecisionLog, Entry, LogConfig, Outcome};

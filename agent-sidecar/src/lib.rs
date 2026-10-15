@@ -18,6 +18,7 @@
 //!
 //! NB — this is NOT `hermes/` (the Discord command-plane bot). Different program, distinct binary.
 
+pub mod action_approvals;
 pub mod anchor;
 pub mod browser;
 pub mod capsule_sandbox;
@@ -299,6 +300,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/shell/decide", post(shell_decide))
         .route("/sessions/:id/mcp/pending", get(mcp_pending))
         .route("/sessions/:id/mcp/decide", post(mcp_decide))
+        .route("/sessions/:id/actions/pending", get(action_pending))
+        .route("/sessions/:id/actions/decide", post(action_decide))
         // HUP-S1.4 — tracks + briefs (the interview every client shares).
         .route("/tracks", get(tracks))
         .route("/briefs", post(create_brief))
@@ -1045,6 +1048,118 @@ async fn mcp_pending(
         .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
     let pending = session.mcp_pending().unwrap_or_default();
     Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
+/// HGW-1: `GET /sessions/:id/actions/pending`: the action cards waiting for the member (tainted
+/// effectful sidecar calls in an HIC-aware session). A session without them has none.
+async fn action_pending(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let pending = session.action_pending().unwrap_or_default();
+    Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
+#[derive(Deserialize)]
+struct ActionDecideReq {
+    id: String,
+    allow: bool,
+    subject: String,
+}
+
+/// HGW-1: `POST /sessions/:id/actions/decide {id, allow, subject}`: the member's decision on one
+/// action card. `subject` must be the arguments that were shown; otherwise 409 and nothing is
+/// decided. Recorded like the other HIC decisions (write-ahead for an allow).
+async fn action_decide(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let session = st
+        .sessions
+        .get(&id)
+        .ok_or_else(|| json_err(StatusCode::NOT_FOUND, "no such session"))?;
+    let req: ActionDecideReq = serde_json::from_slice(&body)
+        .map_err(|_| json_err(StatusCode::BAD_REQUEST, "expected {id, allow, subject}"))?;
+    let card = session
+        .action_waiting(&req.id)
+        .filter(|c| c.subject == req.subject)
+        .ok_or_else(|| {
+            json_err(
+                StatusCode::CONFLICT,
+                "that action is no longer waiting, or the decision does not match what is waiting; nothing was decided",
+            )
+        })?;
+    let subject = format!("{} with {}", card.tool, card.subject);
+    let log = st.sessions.records();
+    let record = |allow: bool, log: &citrate_agent_records::DecisionLog| {
+        hic_records::record_member_decision(
+            log,
+            "sidecar.tool_call",
+            &subject,
+            allow,
+            "the member decided on the exact action shown, in a session that read untrusted content",
+            vec![citrate_agent_records::EvidenceRef {
+                kind: "sidecar_tool_call".to_string(),
+                uri: format!("sidecar:sessions/{id}/actions/{}", req.id),
+                digest: None,
+            }],
+        )
+    };
+    let allow_seq = match &log {
+        Some(log) if req.allow => match record(true, log) {
+            Ok(seq) => Some(seq),
+            Err(e) => return Err(json_err(StatusCode::SERVICE_UNAVAILABLE, &e)),
+        },
+        _ => None,
+    };
+    match session.action_decide(&req.id, req.allow, &req.subject) {
+        Ok(()) => {
+            if let Some(log) = &log {
+                match allow_seq {
+                    Some(seq) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Completed,
+                        "released; the call's own result is in the session",
+                    ),
+                    None => {
+                        if let Err(e) = record(false, log) {
+                            eprintln!("citrate-agent-sidecar: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
+        Err(e) => {
+            if let (Some(log), Some(seq)) = (&log, allow_seq) {
+                hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "not released (no longer waiting, or the subject differed)",
+                );
+            }
+            let msg = match e {
+                sessions::SessionError::Invalid(m) => m,
+                _ => "that action is no longer waiting for a decision".to_string(),
+            };
+            Err(json_err(StatusCode::CONFLICT, &msg))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2156,12 +2271,16 @@ mod tests;
 #[cfg(test)]
 mod verify_probes_tests;
 
+#[cfg(all(test, unix))]
+mod action_approvals_tests;
 #[cfg(test)]
 mod browser_session_tests;
 #[cfg(test)]
 mod decide_route_tests;
 #[cfg(all(test, unix))]
 mod deploy_guard_session_tests;
+#[cfg(all(test, unix))]
+mod hgw_support;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]
