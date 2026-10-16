@@ -54,6 +54,9 @@ impl From<ToolOutcome> for WireOutcome {
     fn from(o: ToolOutcome) -> Self {
         match o {
             ToolOutcome::Ok(s) => WireOutcome::Ok(s),
+            // A vouch is not carried across the process boundary: the sidecar side then
+            // defers to the tool's own trust annotation (fail closed).
+            ToolOutcome::Vouched(s) => WireOutcome::Ok(s),
             ToolOutcome::Untrusted(s) => WireOutcome::Untrusted(s),
             ToolOutcome::Denied(s) => WireOutcome::Denied(s),
             ToolOutcome::Error(s) => WireOutcome::Error(s),

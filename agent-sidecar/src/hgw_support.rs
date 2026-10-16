@@ -89,6 +89,8 @@ pub(crate) fn shell_open() -> shell_run::ShellRunConfig {
         search_path: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
         sandbox: SandboxPolicy::new(SandboxMode::Off),
         approval_timeout: Duration::from_secs(20),
+        auto_approve: None,
+        commit_identity: shell_run::GitIdentity::hermes(),
     }
 }
 
@@ -127,6 +129,29 @@ pub(crate) fn manager_with(
         mgr = mgr.with_shell_run(Arc::new(c));
     }
     mgr
+}
+
+/// `POST /sessions` body with `grants`, `hicAware` and every key of `extra` (an object).
+pub(crate) fn create_req_with(
+    grants: serde_json::Value,
+    hic_aware: bool,
+    extra: serde_json::Value,
+) -> serde_json::Result<sessions::CreateSessionReq> {
+    let mut b = serde_json::json!({
+        "model": "gemma-4",
+        "systemPrompt": "You are Hermes.",
+        "llm": {"baseUrl": "http://127.0.0.1:18080/v1", "bearer": "k"},
+        "tools": [],
+        "maxToolsPerRequest": 8,
+        "hicAware": hic_aware,
+        "grants": grants,
+    });
+    if let (Some(o), Some(e)) = (b.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value(b)
 }
 
 /// `POST /sessions` body with `grants` and `hicAware`.

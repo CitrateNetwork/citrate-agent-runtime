@@ -72,6 +72,10 @@
 //!   carry the same reason. Each approval releases one call and the session stays tainted.
 //!   Without `hicAware` nobody can be asked, so such calls are declined with
 //!   [`citrate_agent_loop::cannot_ask_reason`].
+//! - HGW-3: when projects are on (`CITRATE_HERMES_PROJECTS=1`, default off), every session opened
+//!   with folder grants also offers the sidecar-hosted `project_create` ([`crate::projects`]):
+//!   it creates `<projects root>/<name>` after the member approves the action card, and the new
+//!   folder becomes one of the session's project roots. The name is reserved while it is on.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -144,6 +148,18 @@ pub const MAX_SESSIONS: usize = 8;
 pub const EVENT_LOG_CAP: usize = 2000;
 /// Upper bounds a client may request.
 pub const MAX_STEPS_CAP: u32 = 32;
+/// HGW-4: model calls per turn when neither the session (`maxSteps`) nor the sidecar
+/// (`CITRATE_HERMES_MAX_STEPS`) says otherwise. A build (create, write, run, read the error, fix,
+/// run again) takes more than the old default of 8.
+pub const DEFAULT_MAX_STEPS: u32 = 24;
+
+/// HGW-4: the sidecar-wide default for `maxSteps` from `CITRATE_HERMES_MAX_STEPS`: a whole number,
+/// clamped to 1..=[`MAX_STEPS_CAP`]. Unset or not a number = [`DEFAULT_MAX_STEPS`].
+pub fn max_steps_from_env(v: Option<&str>) -> u32 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| n.clamp(1, u64::from(MAX_STEPS_CAP)) as u32)
+        .unwrap_or(DEFAULT_MAX_STEPS)
+}
 pub const MAX_TOKENS_CAP: u32 = 8192;
 /// Longest a long-poll may wait.
 pub const MAX_WAIT_MS: u64 = 25_000;
@@ -358,6 +374,13 @@ pub struct CreateSessionReq {
     /// the same rules as `POST /personas/check`). Never both.
     #[serde(default)]
     pub custom_persona: Option<citrate_agent_loop::personas::CustomPersona>,
+    /// HGW-2: the session's project roots: absolute, existing folders covered by live read and
+    /// write folder grants (subtree), where the file tools may create and change build
+    /// configuration. citrate-core sends the projects Hermes created before (`project_create`
+    /// results it kept) and folders the member marked as projects. Needs `grants`. Absent =
+    /// none (build configuration stays the member's, as before).
+    #[serde(default)]
+    pub project_roots: Vec<String>,
 }
 
 /// HUP-S3.3: what a session did with its persona (`POST /sessions` answers it as `persona`).
@@ -968,6 +991,8 @@ pub(crate) struct SidecarHost {
     pub(crate) actions: Option<Arc<ActionApprovals>>,
     pub(crate) taint: TaintState,
     pub(crate) stop: StopFlag,
+    /// HGW-3: `project_create`, when projects are on and the session has grants.
+    pub(crate) projects: Option<crate::projects::ProjectCreateHost>,
 }
 
 impl ToolHost for SidecarHost {
@@ -975,6 +1000,11 @@ impl ToolHost for SidecarHost {
         if call.name == SHELL_RUN_TOOL {
             if let Some(s) = &self.shell {
                 return s.execute(call);
+            }
+        }
+        if crate::projects::ProjectCreateHost::handles(&call.name) {
+            if let Some(p) = &self.projects {
+                return p.execute(call);
             }
         }
         if browser_tools::handles(&call.name) {
@@ -1059,6 +1089,14 @@ impl ToolHost for SidecarHost {
                 None => cannot_ask(),
             };
         }
+        if crate::projects::ProjectCreateHost::handles(&call.name) {
+            return match &self.projects {
+                Some(p) if p.honors_explicit_approval() => {
+                    p.execute_with_explicit_approval(call, reason)
+                }
+                _ => cannot_ask(),
+            };
+        }
         if let Some(m) = &self.mcp {
             if m.handles(&call.name) {
                 return if m.honors_explicit_approval() {
@@ -1137,6 +1175,10 @@ pub struct SessionManager {
     uses: AtomicU64,
     /// US-2.2 AC2: `shell_run` for sessions opened with folder grants (default off).
     shell_run: Option<Arc<ShellRunConfig>>,
+    /// HGW-3: `project_create` for sessions opened with folder grants (default off).
+    projects: Option<Arc<crate::projects::ProjectsConfig>>,
+    /// HGW-4: `maxSteps` for a session that does not send one.
+    default_max_steps: u32,
     /// HUP-S2.6: the one writer of the decision records the nightly anchor batches.
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
     /// US-1.3 AC2: ask the model for a self-review of every workflow step attempt and record it
@@ -1172,6 +1214,8 @@ impl SessionManager {
             mcp_registry: None,
             uses: AtomicU64::new(0),
             shell_run: None,
+            projects: None,
+            default_max_steps: DEFAULT_MAX_STEPS,
             records: None,
             self_review: false,
         }
@@ -1217,6 +1261,23 @@ impl SessionManager {
     pub fn with_shell_run(mut self, cfg: Arc<ShellRunConfig>) -> Self {
         self.shell_run = Some(cfg);
         self
+    }
+
+    /// HGW-4: `maxSteps` for sessions that do not send one (clamped to 1..=[`MAX_STEPS_CAP`]).
+    pub fn with_default_max_steps(mut self, n: u32) -> Self {
+        self.default_max_steps = n.clamp(1, MAX_STEPS_CAP);
+        self
+    }
+
+    /// HGW-3: offer `project_create` to every new session opened with folder grants.
+    pub fn with_projects(mut self, cfg: Arc<crate::projects::ProjectsConfig>) -> Self {
+        self.projects = Some(cfg);
+        self
+    }
+
+    /// HGW-W11: the auto-approve list `shell_run` uses (`None` when shell_run or the list is off).
+    pub fn auto_approve_list(&self) -> Option<Arc<crate::auto_approve::AutoApproveList>> {
+        self.shell_run.as_ref().and_then(|c| c.auto_approve.clone())
     }
 
     /// Whether `shell_run` is on.
@@ -1618,10 +1679,25 @@ impl SessionManager {
             }
             specs.push(crate::learn::learn_propose_spec());
         }
+        if self.projects.is_some()
+            && specs
+                .iter()
+                .any(|t| t.name == crate::projects::PROJECT_CREATE_TOOL)
+        {
+            return Err(SessionError::Invalid(format!(
+                "the tool name '{}' is reserved by the sidecar while projects are on",
+                crate::projects::PROJECT_CREATE_TOOL
+            )));
+        }
         if self.shell_run.is_some() && specs.iter().any(|t| t.name == SHELL_RUN_TOOL) {
             return Err(SessionError::Invalid(format!(
                 "the tool name '{SHELL_RUN_TOOL}' is reserved by the sidecar while shell_run is on"
             )));
+        }
+        if req.grants.is_none() && !req.project_roots.is_empty() {
+            return Err(SessionError::Invalid(
+                "projectRoots needs folder grants (a grant document) to check them against".into(),
+            ));
         }
         let grants = match req.grants {
             None => None,
@@ -1655,6 +1731,13 @@ impl SessionManager {
                 g.replace(&doc).map_err(|e| {
                     SessionError::Invalid(format!("the grant document was refused: {e}"))
                 })?;
+                // HGW-2: the project roots core names, each checked against these grants now.
+                for root in &req.project_roots {
+                    g.add_project_root(std::path::Path::new(root))
+                        .map_err(|e| {
+                            SessionError::Invalid(format!("projectRoots was refused: {e}"))
+                        })?;
+                }
                 specs.extend(crate::grants::file_tool_specs());
                 specs.extend(crate::sheets::sheet_tool_specs());
                 if fs_on_grants {
@@ -1663,11 +1746,16 @@ impl SessionManager {
                 Some(Arc::new(g))
             }
         };
+        if self.projects.is_some() && grants.is_some() {
+            specs.push(crate::projects::project_create_spec());
+        }
         let shell = match (&self.shell_run, &grants) {
             (Some(cfg), Some(g)) => {
                 specs.push(shell_run_spec());
                 Some(Arc::new(
-                    ShellRunSession::new(cfg, g.clone()).map_err(SessionError::Invalid)?,
+                    ShellRunSession::new(cfg, g.clone())
+                        .map_err(SessionError::Invalid)?
+                        .with_records(self.records.clone()),
                 ))
             }
             _ => None,
@@ -1747,7 +1835,10 @@ impl SessionManager {
         let cfg = LoopConfig {
             model: req.model,
             system_prompt,
-            max_steps: req.max_steps.unwrap_or(8).clamp(1, MAX_STEPS_CAP),
+            max_steps: req
+                .max_steps
+                .unwrap_or(self.default_max_steps)
+                .clamp(1, MAX_STEPS_CAP),
             max_tool_calls_per_step: req.max_tool_calls_per_step.unwrap_or(4).clamp(1, 16),
             max_tokens: req.max_tokens.unwrap_or(2048).clamp(64, MAX_TOKENS_CAP),
         };
@@ -1988,8 +2079,19 @@ impl SessionManager {
                 session.hic_aware,
             )
         });
+        let projects_host = match (&self.projects, &session.grants) {
+            (Some(cfg), Some(g)) => Some(crate::projects::ProjectCreateHost::new(
+                cfg.clone(),
+                g.clone(),
+                session.actions.clone(),
+                session.taint.clone(),
+                session.stop.clone(),
+            )),
+            _ => None,
+        };
         if file_host.is_some()
             || shell_host.is_some()
+            || projects_host.is_some()
             || skill_host.is_some()
             || capsule_host.is_some()
             || toolchain.is_some()
@@ -2016,6 +2118,7 @@ impl SessionManager {
                     actions: session.actions.clone(),
                     taint: session.taint.clone(),
                     stop: session.stop.clone(),
+                    projects: projects_host,
                 }),
             );
         }

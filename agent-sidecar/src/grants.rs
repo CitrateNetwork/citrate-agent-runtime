@@ -79,6 +79,10 @@ pub struct SessionGrants {
     clock: fn() -> u64,
     inner: RwLock<FolderGrants>,
     ignored: std::sync::atomic::AtomicUsize,
+    /// HGW-2: the session's project roots (canonical): folders where the agent's file tools may
+    /// create and change build configuration. Named by citrate-core (`projectRoots`) or created by
+    /// this session's `project_create`. A marker file alone never adds one.
+    projects: RwLock<Vec<PathBuf>>,
 }
 
 impl std::fmt::Debug for SessionGrants {
@@ -100,7 +104,57 @@ impl SessionGrants {
             home,
             clock: now_secs,
             ignored: std::sync::atomic::AtomicUsize::new(0),
+            projects: RwLock::new(Vec::new()),
         }
+    }
+
+    /// HGW-2: add a project root. It must be an absolute, existing folder covered by live read
+    /// and write folder grants over its whole subtree (the same rule as `shell_run`'s folder).
+    /// Returns its canonical path. The grants are checked again at every write.
+    pub fn add_project_root(&self, root: &Path) -> Result<PathBuf, String> {
+        if !root.is_absolute() {
+            return Err(format!(
+                "the project root {} is not an absolute path",
+                root.display()
+            ));
+        }
+        if !root.is_dir() {
+            return Err(format!(
+                "the project root {} is not an existing folder",
+                root.display()
+            ));
+        }
+        let (canonical, _) = self.shell_scope(root).map_err(|e| {
+            format!(
+                "the project root {} is not inside folders granted for reading and writing: {e}",
+                root.display()
+            )
+        })?;
+        let mut p = self
+            .projects
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !p.contains(&canonical) {
+            p.push(canonical.clone());
+        }
+        Ok(canonical)
+    }
+
+    /// HGW-2: the session's project roots, in the order they were added.
+    pub fn project_roots(&self) -> Vec<PathBuf> {
+        self.projects.read().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    /// HGW-2: the project root that contains `canonical` (an already-resolved path), if any. A
+    /// poisoned lock answers none (build configuration then stays refused).
+    pub fn project_root_of(&self, canonical: &Path) -> Option<PathBuf> {
+        self.projects
+            .read()
+            .ok()?
+            .iter()
+            .filter(|r| canonical.starts_with(r))
+            .max_by_key(|r| r.components().count())
+            .cloned()
     }
 
     /// Use a different clock (tests).

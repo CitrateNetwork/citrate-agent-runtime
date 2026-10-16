@@ -15,6 +15,7 @@ fn show(o: &ToolOutcome) -> String {
     match o {
         ToolOutcome::Ok(s) => format!("ok: {s}"),
         ToolOutcome::Untrusted(s) => format!("untrusted: {s}"),
+        ToolOutcome::Vouched(s) => format!("vouched: {s}"),
         ToolOutcome::Denied(s) => format!("denied: {s}"),
         ToolOutcome::Error(s) => format!("error: {s}"),
     }

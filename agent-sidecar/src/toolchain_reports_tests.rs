@@ -116,7 +116,10 @@ fn call(tool: &str, project: &Path) -> ToolCall {
 
 fn content(o: &ToolOutcome) -> String {
     match o {
-        ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) | ToolOutcome::Error(s) => s.clone(),
+        ToolOutcome::Ok(s)
+        | ToolOutcome::Untrusted(s)
+        | ToolOutcome::Vouched(s)
+        | ToolOutcome::Error(s) => s.clone(),
         ToolOutcome::Denied(s) => panic!("unexpected denial: {s}"),
     }
 }

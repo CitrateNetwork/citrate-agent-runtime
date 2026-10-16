@@ -28,7 +28,8 @@
 //!   `KILL_ON_JOB_CLOSE`); see the Windows section below.
 //! - **Capped capture.** stdout and stderr are captured separately up to per-stream byte caps,
 //!   with a truncation marker and the true byte count, and drained to EOF so a chatty child
-//!   never blocks on a full pipe.
+//!   never blocks on a full pipe. HGW-4: a capped stream keeps its first half-cap and its last
+//!   half-cap of bytes (the first error and the final cause), with the marker between them.
 //! - **A [`RunReport`]** with exit code / signal / timeout / duration that serializes to JSON
 //!   for the S1.3 verifiers (`JsonFieldEquals` on `exit_code`, `passed`, ...).
 //!
@@ -75,6 +76,7 @@
 //! That crate is async and tied to the legacy tool trait, so the logic is re-homed here as a
 //! synchronous, dependency-light library.
 
+mod git_state;
 pub mod sandbox;
 #[cfg(windows)]
 mod win;
@@ -847,6 +849,12 @@ pub struct RunReport {
     pub cleanup_error: Option<String>,
     /// Whether (and how) the run was wrapped in the OS sandbox.
     pub sandbox: SandboxSummary,
+    /// HGW-2: what the run added to git that would start a program the next time git is used
+    /// outside the sandbox (a hook, `core.hooksPath`, an alias, a filter, an include, …), which
+    /// the runner then reverted (owner decision 2026-10-15): one line per revert, or per item it
+    /// could not revert. Empty (and not serialized) when there was nothing to revert.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub git_warnings: Vec<String>,
 }
 
 impl RunReport {
@@ -1141,6 +1149,9 @@ impl ShellRunner {
             cmd.env(k, v);
         }
 
+        // HGW-2: every repository in the run's write roots, before it (what the run adds that
+        // would make git run a program later is reverted after it).
+        let git_before = git_state::snapshot(&plan.write_roots);
         let tree = ProcessTree::prepare().map_err(|e| ShellError::Spawn {
             program: req.program.clone(),
             reason: format!("cannot create the process tree container: {e}"),
@@ -1199,6 +1210,7 @@ impl ShellRunner {
             );
         }
 
+        let git_warnings = git_state::revert_new(&git_before);
         Ok(RunReport {
             program: req.program.clone(),
             resolved_path: plan.resolved_path,
@@ -1218,6 +1230,7 @@ impl ShellRunner {
             output_incomplete,
             cleanup_error,
             sandbox: plan.sandbox,
+            git_warnings,
         })
     }
 }
@@ -1555,9 +1568,12 @@ fn wait_with_deadline(child: &mut Child, tree: &ProcessTree, deadline: Instant) 
 // Output capture
 // ------------------------------------------------------------------------------------------
 
+/// HGW-4: the first half of the cap is kept from the start of the stream and the second half
+/// from its end, so a long failing build keeps both its first error and its final cause.
 #[derive(Default)]
 struct CaptureState {
-    kept: Vec<u8>,
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
     total: u64,
 }
 
@@ -1589,9 +1605,16 @@ impl Capture {
                     Ok(n) => {
                         let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                         s.total += n as u64;
-                        let room = cap.saturating_sub(s.kept.len());
+                        let head_cap = cap.div_ceil(2);
+                        let tail_cap = cap - head_cap;
+                        let room = head_cap.saturating_sub(s.head.len());
                         let take = room.min(n);
-                        s.kept.extend_from_slice(&buf[..take]);
+                        s.head.extend_from_slice(&buf[..take]);
+                        if tail_cap > 0 {
+                            s.tail.extend(&buf[take..n]);
+                            let excess = s.tail.len().saturating_sub(tail_cap);
+                            s.tail.drain(..excess);
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
@@ -1614,15 +1637,24 @@ impl Capture {
                 .is_ok(),
         };
         let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let truncated = s.total > s.kept.len() as u64;
+        let tail: Vec<u8> = s.tail.iter().copied().collect();
+        let kept = (s.head.len() + tail.len()) as u64;
+        let truncated = s.total > kept;
         let text = if truncated {
-            let omitted = s.total.saturating_sub(s.kept.len() as u64);
-            format!(
+            let omitted = s.total.saturating_sub(kept);
+            let mut t = format!(
                 "{}\n[truncated: {omitted} bytes omitted]",
-                lossy_prefix(&s.kept)
-            )
+                lossy_prefix(&s.head)
+            );
+            if !tail.is_empty() {
+                t.push('\n');
+                t.push_str(&lossy_suffix(&tail));
+            }
+            t
         } else {
-            String::from_utf8_lossy(&s.kept).into_owned()
+            let mut all = s.head.clone();
+            all.extend_from_slice(&tail);
+            String::from_utf8_lossy(&all).into_owned()
         };
         Captured {
             text,
@@ -1654,6 +1686,17 @@ fn lossy_prefix(bytes: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&bytes[..keep]).into_owned()
+}
+
+/// Lossy UTF-8 of a capped suffix: continuation bytes of a character cut in half at the start
+/// are dropped rather than rendered as a replacement character.
+fn lossy_suffix(bytes: &[u8]) -> String {
+    let skip = bytes
+        .iter()
+        .take(3)
+        .take_while(|b| (**b & 0xC0) == 0x80)
+        .count();
+    String::from_utf8_lossy(&bytes[skip..]).into_owned()
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1794,6 +1837,7 @@ mod tests {
             output_incomplete: false,
             cleanup_error: Some("scratch removal failed".into()),
             sandbox: SandboxSummary::not_enforced("test", &[]),
+            git_warnings: Vec::new(),
         };
 
         assert!(!report.passed());

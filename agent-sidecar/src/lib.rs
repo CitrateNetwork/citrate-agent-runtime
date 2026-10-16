@@ -20,6 +20,7 @@
 
 pub mod action_approvals;
 pub mod anchor;
+pub mod auto_approve;
 pub mod browser;
 pub mod capsule_sandbox;
 mod chain_routes;
@@ -28,6 +29,7 @@ pub mod decide;
 pub mod deploy_guard;
 pub mod escalation;
 pub mod files;
+pub mod git_identity;
 pub mod grants;
 pub mod hic_records;
 pub mod learn;
@@ -35,6 +37,7 @@ pub mod llm_http;
 pub mod mcp_approvals;
 pub mod mcp_probe;
 pub mod metering;
+pub mod projects;
 pub mod resources;
 pub mod retrieval_http;
 pub mod search;
@@ -298,6 +301,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/shell/pending", get(shell_pending))
         .route("/sessions/:id/toolchain/reports", get(toolchain_reports))
         .route("/sessions/:id/shell/decide", post(shell_decide))
+        .route("/shell/auto-approve", get(auto_approve_list))
         .route("/sessions/:id/mcp/pending", get(mcp_pending))
         .route("/sessions/:id/mcp/decide", post(mcp_decide))
         .route("/sessions/:id/approvals/pending", get(action_pending))
@@ -1378,6 +1382,31 @@ async fn toolchain_reports(
     Ok(Json(serde_json::json!({ "reports": reports })))
 }
 
+/// HGW-W11 (#77): `GET /shell/auto-approve`: the auto-approve list in effect, read-only, for the
+/// app's Settings. Data source: the list `shell_run` was started with (the shipped
+/// `policy/auto_approve.toml`, or the file `CITRATE_HERMES_AUTO_APPROVE` names). `enabled` is
+/// false when shell_run or auto-approval is off; `conditions` are the checks every match must
+/// also pass.
+async fn auto_approve_list(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, JsonErr> {
+    if !authorized(&headers, &st.bearer) {
+        return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let list = st.sessions.auto_approve_list();
+    Ok(Json(serde_json::json!({
+        "enabled": list.is_some(),
+        "conditions": [
+            "the session has not read untrusted content",
+            "the OS sandbox is enforced (no network)",
+            "the folder is inside one of the session's projects",
+            "the run may write only that project",
+        ],
+        "rules": list.map(|l| l.rules.clone()).unwrap_or_default(),
+    })))
+}
+
 #[derive(Deserialize)]
 struct ShellDecideReq {
     id: String,
@@ -1859,6 +1888,29 @@ pub fn production_sessions_with(
     let mgr = mgr.with_self_review(self_review_from_env_var(
         std::env::var("CITRATE_HERMES_SELF_REVIEW").ok().as_deref(),
     ));
+    // HGW-4: turns run up to 24 model calls unless CITRATE_HERMES_MAX_STEPS says otherwise.
+    let mgr = mgr.with_default_max_steps(sessions::max_steps_from_env(
+        std::env::var("CITRATE_HERMES_MAX_STEPS").ok().as_deref(),
+    ));
+    // HGW-3: project_create (off by default; every project needs the member's approval).
+    let mgr = match projects::ProjectsConfig::from_env_vars(
+        |k| std::env::var(k).ok(),
+        projects::production_render_sandbox(),
+    ) {
+        Ok(Some(cfg)) => {
+            eprintln!(
+                "citrate-agent-sidecar: project_create on for sessions with folder grants; projects go in {}{}",
+                cfg.root.display(),
+                if cfg.renderer.is_some() { ", with templates" } else { "" }
+            );
+            mgr.with_projects(Arc::new(cfg))
+        }
+        Ok(None) => mgr,
+        Err(e) => {
+            eprintln!("citrate-agent-sidecar: project_create stays off: {e}");
+            mgr
+        }
+    };
     // US-2.2 AC2: shell_run (off by default; always inside the OS sandbox).
     let mgr = match shell_run::ShellRunConfig::from_env() {
         Some(cfg) => {
@@ -2354,6 +2406,8 @@ mod verify_probes_tests;
 
 #[cfg(all(test, unix))]
 mod action_approvals_tests;
+#[cfg(all(test, unix))]
+mod auto_approve_tests;
 #[cfg(test)]
 mod browser_session_tests;
 #[cfg(test)]
@@ -2361,7 +2415,15 @@ mod decide_route_tests;
 #[cfg(all(test, unix))]
 mod deploy_guard_session_tests;
 #[cfg(all(test, unix))]
+mod e2e_build_tests;
+#[cfg(all(test, unix))]
 mod hgw_support;
+#[cfg(all(test, unix))]
+mod loop_capability_tests;
+#[cfg(all(test, unix))]
+mod project_policy_tests;
+#[cfg(all(test, unix))]
+mod projects_tests;
 #[cfg(test)]
 mod search_session_tests;
 #[cfg(test)]

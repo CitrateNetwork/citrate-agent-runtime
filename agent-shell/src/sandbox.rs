@@ -7,14 +7,19 @@
 //! - **macOS: Seatbelt** through `/usr/bin/sandbox-exec`. The profile is generated per run
 //!   ([`seatbelt_profile`]) and starts from `(deny default)`. It never allows a network
 //!   operation. Every path is passed as a `-D` parameter, never spliced into the profile text,
-//!   so a folder name cannot change the policy. Writes to `.git/hooks`, `.git/config` and
-//!   `.env*` files are denied even inside a granted folder (a hook planted there would run later
-//!   outside the sandbox).
+//!   so a folder name cannot change the policy. Inside a granted folder `.git/` is writable
+//!   (HGW-2: `git init`, `git config` and `git commit` work), but a hook file other than git's own
+//!   `*.sample` files cannot be written, the hooks folder cannot be removed or moved, and a
+//!   symbolic link cannot be put in its place (a hook planted there would run later outside the
+//!   sandbox). `.env*` files are neither readable nor writable, except `.env.example` and
+//!   `.env.sample`. Configuration that makes git run
+//!   a program cannot be filtered by path, so the runner reports any it finds new after a run
+//!   (`RunReport::git_warnings`).
 //! - **Linux: bubblewrap** (`bwrap`, found only in fixed system directories). The run gets fresh
 //!   namespaces with networking unshared (`--unshare-all`), read-only binds of the system and
 //!   toolchain directories, writable binds of the granted folders and the scratch HOME, and
-//!   read-only masks over `.git/hooks`, `.git/config` and the `.env*` files that exist at the top
-//!   of a granted folder ([`bwrap_command`]). A Landlock fallback is not implemented: with no
+//!   read-only masks over `.git/hooks` and the `.env*` files that exist at the top of a granted
+//!   folder ([`bwrap_command`]). `.git/config` is writable (HGW-2), as on macOS. A Landlock fallback is not implemented: with no
 //!   working `bwrap` the backend is unavailable.
 //! - **Windows**: the runner builds and uses a Job Object for bounded process cleanup, but has
 //!   no OS sandbox backend. A Job Object is cleanup containment, not a filesystem, network, or
@@ -364,9 +369,21 @@ pub fn seatbelt_profile(n_read: usize, n_write: usize) -> String {
         "(allow file-write-data (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\"))\n",
     );
     p.push_str("(allow file-ioctl (literal \"/dev/dtracehelper\"))\n");
-    // Later rules win: these hold even inside a granted folder.
-    p.push_str("(deny file-write* (regex #\"/\\.git/hooks(/|$)\") (regex #\"/\\.git/config$\"))\n");
-    p.push_str("(deny file-read* file-write* (regex #\"/\\.env[^/]*$\"))\n");
+    // Later rules win: these hold even inside a granted folder. HGW-2: `.git/` is writable (git
+    // init/config/commit), except a hook that is not one of git's `*.sample` files, removing or
+    // moving the hooks folder, and a symbolic link in its place.
+    p.push_str(
+        "(deny file-write* (require-all (regex #\"/\\.git/hooks/[^/]+$\") (require-not (regex #\"\\.sample$\"))))\n",
+    );
+    p.push_str("(deny file-write-unlink (regex #\"/\\.git/hooks$\"))\n");
+    p.push_str(
+        "(deny file-write-create (require-all (regex #\"/\\.git/hooks$\") (vnode-type SYMLINK)))\n",
+    );
+    // `.env*` files are neither readable nor writable, except the templates' `.env.example` and
+    // `.env.sample` (HGW-W2: not secrets; agent-guard exempts them the same way).
+    p.push_str(
+        "(deny file-read* file-write* (require-all (regex #\"/\\.env[^/]*$\") (require-not (regex #\"/\\.env\\.(example|sample)$\"))))\n",
+    );
     p
 }
 
@@ -436,10 +453,8 @@ pub fn bwrap_command(spec: &SandboxSpec, program: &Path, args: &[String]) -> Vec
     ]);
     // Masks go after the writable binds, so they sit on top of them.
     for w in &spec.write_roots {
-        for sub in [".git/hooks", ".git/config"] {
-            let p = w.join(sub);
-            push(&["--ro-bind-try".as_ref(), p.as_os_str(), p.as_os_str()]);
-        }
+        let p = w.join(".git/hooks");
+        push(&["--ro-bind-try".as_ref(), p.as_os_str(), p.as_os_str()]);
     }
     for f in &spec.masked_files {
         push(&["--ro-bind".as_ref(), "/dev/null".as_ref(), f.as_os_str()]);
@@ -450,7 +465,8 @@ pub fn bwrap_command(spec: &SandboxSpec, program: &Path, args: &[String]) -> Vec
     a
 }
 
-/// `.env*` files at the top of each write root (bwrap masks them; Seatbelt denies by pattern).
+/// `.env*` files at the top of each write root (bwrap masks them; Seatbelt denies by pattern),
+/// except the templates' `.env.example` and `.env.sample`.
 pub(crate) fn env_files(write_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for w in write_roots {
@@ -460,7 +476,8 @@ pub(crate) fn env_files(write_roots: &[PathBuf]) -> Vec<PathBuf> {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
             let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
-            if is_file && (name == ".env" || name.starts_with(".env.")) {
+            let template = name == ".env.example" || name == ".env.sample";
+            if is_file && !template && (name == ".env" || name.starts_with(".env.")) {
                 out.push(e.path());
             }
         }
@@ -557,6 +574,9 @@ mod tests {
         std::fs::write(root.join(".env"), "x").expect("w");
         std::fs::write(root.join(".env.local"), "x").expect("w");
         std::fs::write(root.join("env.txt"), "x").expect("w");
+        // HGW-W2 (#75): templates' example files are not secrets (agent-guard exempts them too).
+        std::fs::write(root.join(".env.example"), "x").expect("w");
+        std::fs::write(root.join(".env.sample"), "x").expect("w");
         std::fs::create_dir(root.join(".env.d")).expect("d");
         let got = env_files(std::slice::from_ref(&root));
         assert_eq!(got, vec![root.join(".env"), root.join(".env.local")]);

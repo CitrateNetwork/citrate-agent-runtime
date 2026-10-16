@@ -129,7 +129,10 @@ fn run(
 ) -> (ToolOutcome, ToolchainEnvelope) {
     let out = host.execute(&call(tool, args));
     let content = match &out {
-        ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) | ToolOutcome::Error(s) => s.clone(),
+        ToolOutcome::Ok(s)
+        | ToolOutcome::Untrusted(s)
+        | ToolOutcome::Vouched(s)
+        | ToolOutcome::Error(s) => s.clone(),
         ToolOutcome::Denied(s) => panic!("unexpected denial: {s}"),
     };
     let env = ToolchainEnvelope::from_content(&content).unwrap();
@@ -138,7 +141,9 @@ fn run(
 
 fn record(tool: &str, out: &ToolOutcome) -> ToolRecord {
     let (content, status) = match out {
-        ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) => (s.clone(), "ok"),
+        ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) | ToolOutcome::Vouched(s) => {
+            (s.clone(), "ok")
+        }
         ToolOutcome::Error(s) => (format!("tool error: {s}"), "error"),
         ToolOutcome::Denied(s) => (format!("declined: {s}"), "denied"),
     };

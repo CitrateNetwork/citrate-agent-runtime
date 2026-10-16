@@ -771,3 +771,51 @@ fn the_loop_records_each_untrusted_tool_as_a_source() {
         "both tools that returned untrusted content are sources"
     );
 }
+
+/// HGW-5: a result its host vouches for (an auto-approved, sandboxed, offline run inside a
+/// project) does not taint, even from a tool annotated untrusted; the same tool's ordinary
+/// output still does.
+#[test]
+fn a_vouched_result_does_not_taint_but_the_same_tools_plain_output_does() {
+    let llm = ScriptLlm::new(vec![
+        AssistantTurn::tools(vec![call("c1", "web_fetch")]),
+        AssistantTurn::tools(vec![call("c2", "write_file")]),
+        AssistantTurn::tools(vec![call("c3", "node_status")]),
+        AssistantTurn::text("done"),
+    ]);
+    let host = Arc::new(PerTool {
+        inner: RecHost::new(true, ToolOutcome::Ok("ok".into())),
+        by_name: vec![("web_fetch", ToolOutcome::Vouched("project output".into()))],
+    });
+    let tools = ToolRegistry::new(catalog()).with_host(HostKind::Core, host.clone());
+    let sink = Sink::default();
+    run_turn(
+        &cfg(),
+        &llm,
+        &tools,
+        &sink,
+        &StopFlag::default(),
+        &mut vec![],
+        "go",
+    );
+    assert!(!tools.taint().is_tainted());
+    assert!(!sink.kinds().contains(&"tainted"));
+    assert_eq!(hic_of(&sink.tool_call("c2")).0, None, "no HIC downgrade");
+    // The same untrusted-annotated tool, answered plainly, taints.
+    let llm = ScriptLlm::new(vec![
+        AssistantTurn::tools(vec![call("c1", "web_fetch")]),
+        AssistantTurn::text("done"),
+    ]);
+    let plain = Arc::new(RecHost::new(true, ToolOutcome::Ok("page".into())));
+    let tools = ToolRegistry::new(catalog()).with_host(HostKind::Core, plain);
+    run_turn(
+        &cfg(),
+        &llm,
+        &tools,
+        &Sink::default(),
+        &StopFlag::default(),
+        &mut vec![],
+        "go",
+    );
+    assert!(tools.taint().is_tainted());
+}

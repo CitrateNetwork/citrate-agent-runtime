@@ -75,6 +75,31 @@ pub fn record_member_decision(
     .map_err(|e| format!("the decision could not be recorded: {e}"))
 }
 
+/// HGW-5: record a run released by a standing rule rather than a card (the auto-approve list,
+/// D-16 as amended): actor `agent`, tier HIC-2 (inside a grant made earlier). Write-ahead: the
+/// caller releases nothing when this fails. Returns the decision's `seq`.
+pub fn record_auto_decision(
+    log: &DecisionLog,
+    kind: &str,
+    subject: &str,
+    reason: &str,
+    evidence: Vec<EvidenceRef>,
+) -> Result<u64, String> {
+    log.record_decision(
+        Actor::agent("hermes"),
+        DecisionEvent {
+            tier: HicTier::Hic2,
+            kind: kind.to_string(),
+            subject: clip(subject, 300),
+            decision: Decision::Approved,
+            reason: clip(reason, 500),
+            evidence,
+        },
+    )
+    .map(|r| r.seq)
+    .map_err(|e| format!("the decision could not be recorded: {e}"))
+}
+
 /// Close an allowing decision with its outcome. A failure is logged (the decision stays open and
 /// the log closes it as `outcome_unknown` when it is next opened).
 pub fn record_outcome(log: &DecisionLog, seq: u64, outcome: Outcome, detail: &str) {

@@ -30,6 +30,18 @@
 //!                               approves, run in the OS sandbox, never without it) in every
 //!                               session opened with folder grants; anything else = off (optional)
 //!   CITRATE_HERMES_SHELL_PATH   shell_run search path override, a path list (optional)
+//!   CITRATE_HERMES_AUTO_APPROVE HGW-5: `0` = every shell_run command asks; an absolute path =
+//!                               that auto-approve list instead of the shipped one; unset = the
+//!                               shipped list (policy/auto_approve.toml) (optional)
+//!   CITRATE_HERMES_MAX_STEPS    HGW-4: model calls per turn for sessions that send no maxSteps;
+//!                               default 24, at most 32 (optional)
+//!   CITRATE_HERMES_PROJECTS     HGW-3: `1` offers project_create (a new project folder, after the
+//!                               member approves it) in sessions opened with folder grants (optional)
+//!   CITRATE_HERMES_PROJECTS_ROOT  absolute folder new projects go in; default ~/Citrate/Projects
+//!   CITRATE_HERMES_TEMPLATE_RENDERER / CITRATE_HERMES_TEMPLATES_ROOT  absolute paths of core's
+//!                               citrate-templates program and the bundled templates folder; both
+//!                               set = project_create can start from a template (optional)
+//!   CITRATE_HERMES_TEMPLATE_TIER  T0 (default), T1 or T2: the tier passed to the renderer
 //!   CITRATE_HERMES_MCP          HUP-S4.1: path to the MCP server allowlist (TOML, or JSON by
 //!                               `.json` extension); unset = no MCP (optional)
 //!   CITRATE_HERMES_MCP_REGISTRY HUP-S4.4: core's owner-only saved MCP server list

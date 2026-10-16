@@ -112,6 +112,8 @@ fn cfg_with(sandbox: SandboxPolicy) -> ShellRunConfig {
         search_path: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
         sandbox,
         approval_timeout: Duration::from_secs(10),
+        auto_approve: None,
+        commit_identity: GitIdentity::hermes(),
     }
 }
 
@@ -146,7 +148,10 @@ fn wait_pending(approvals: &ShellApprovals) -> ShellPending {
 
 fn envelope(o: &ToolOutcome) -> ToolchainEnvelope {
     let s = match o {
-        ToolOutcome::Ok(s) | ToolOutcome::Untrusted(s) | ToolOutcome::Error(s) => s,
+        ToolOutcome::Ok(s)
+        | ToolOutcome::Untrusted(s)
+        | ToolOutcome::Vouched(s)
+        | ToolOutcome::Error(s) => s,
         ToolOutcome::Denied(s) => panic!("unexpected denial: {s}"),
     };
     ToolchainEnvelope::from_content(s).unwrap()
@@ -187,6 +192,15 @@ fn shell_run_is_off_unless_the_env_flag_is_exactly_1() {
     assert_eq!(c.sandbox.mode(), SandboxMode::Required);
     assert_eq!(c.search_path, vec![PathBuf::from("/opt/x/bin")]);
     assert_eq!(c.approval_timeout, APPROVAL_TIMEOUT);
+    // HGW-5: the shipped auto-approve list is on by default; `0` turns it off.
+    assert!(c.auto_approve.is_some());
+    let off = ShellRunConfig::from_env_vars(vars(&[
+        (SHELL_RUN_ENV, "1"),
+        ("HOME", "/h"),
+        (crate::auto_approve::AUTO_APPROVE_ENV, "0"),
+    ]))
+    .unwrap();
+    assert!(off.auto_approve.is_none());
 }
 
 #[test]
@@ -551,6 +565,400 @@ fn a_tainted_hic_aware_session_asks_with_the_reason_and_runs_only_on_allow() {
     }
     assert!(taint.is_tainted(), "an approval never clears the taint");
     drop(host);
+}
+
+/// HGW-4: a failing command hands the model its exit status and the end of its stderr (where
+/// npm, cargo and tsc print the cause), bounded, in the summary it reads first; the full capture
+/// (head and tail) stays in the run facts.
+#[test]
+fn a_failing_command_reports_its_exit_status_and_the_end_of_its_output() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let a = approve_next(s.approvals().clone());
+    let out = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call(
+            "c1",
+            &[
+                "sh",
+                "-c",
+                "echo compiling; seq 1 40000 >&2; echo 'src/index.ts(3,1): error TS2304: Cannot find name foo.' >&2; exit 2",
+            ],
+            &fx.proj(),
+        ));
+    a.join().unwrap();
+    let env = envelope(&out);
+    assert_eq!(env.status, RunStatus::Completed);
+    assert!(
+        env.summary.contains("exited with code 2"),
+        "{}",
+        env.summary
+    );
+    assert!(
+        env.summary.contains("Cannot find name foo"),
+        "the cause is in the summary: {}",
+        env.summary
+    );
+    assert!(
+        env.summary.len() < FAILURE_TAIL_BYTES * 2 + 512,
+        "the summary is bounded: {}",
+        env.summary.len()
+    );
+    let run = env.run.unwrap();
+    assert_eq!(run["exit_code"], 2);
+    assert!(run["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("Cannot find name foo"));
+    let tail = run["stderr_tail"].as_str().unwrap();
+    assert!(
+        tail.ends_with(
+            "Cannot find name foo.
+"
+        ),
+        "{tail}"
+    );
+    assert!(tail.len() <= FAILURE_TAIL_BYTES + 4);
+    // A command that succeeds adds no tail.
+    let a = approve_next(s.approvals().clone());
+    let ok = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call("c2", &["echo", "fine"], &fx.proj()));
+    a.join().unwrap();
+    let env = envelope(&ok);
+    assert!(!env.summary.contains("stderr"), "{}", env.summary);
+    assert!(env.run.unwrap().get("stderr_tail").is_none());
+}
+
+/// HGW (owner decision 2026-10-15): commits made through shell_run are authored by the member's
+/// identity (the app's, else the member's own git config) and fall back to Hermes; programs other
+/// than git get no identity variables.
+#[test]
+fn git_runs_carry_the_commit_identity_and_other_programs_do_not() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let a = approve_next(s.approvals().clone());
+    let out = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call(
+            "c1",
+            &[
+                "sh",
+                "-c",
+                "echo \"[$GIT_AUTHOR_NAME] [$GIT_COMMITTER_EMAIL]\"",
+            ],
+            &fx.proj(),
+        ));
+    a.join().unwrap();
+    assert_eq!(envelope(&out).run.unwrap()["stdout"], "[] []\n");
+    if !std::path::Path::new("/usr/bin/git").exists() {
+        return;
+    }
+    let ident_of = |cfg: &ShellRunConfig| {
+        let s = session(&fx, cfg);
+        let a = approve_next(s.approvals().clone());
+        let out = s
+            .host(TaintState::default(), StopFlag::default(), false)
+            .execute(&call("c2", &["git", "var", "GIT_AUTHOR_IDENT"], &fx.proj()));
+        a.join().unwrap();
+        let run = envelope(&out).run.unwrap();
+        run["stdout"].as_str().unwrap_or_default().to_string()
+    };
+    // The default config (tests): Hermes.
+    assert!(
+        ident_of(&cfg_open()).starts_with(&format!("{GIT_AGENT_NAME} <{GIT_AGENT_EMAIL}>")),
+        "fallback"
+    );
+    let mut member = cfg_open();
+    member.commit_identity =
+        GitIdentity::new("Ada Member", "ada@example.invalid", IdentitySource::App).unwrap();
+    assert!(
+        ident_of(&member).starts_with("Ada Member <ada@example.invalid>"),
+        "member"
+    );
+}
+
+/// HGW (owner decision 2026-10-15): the identity comes from the app (core passes the member's),
+/// else from the member's own global git config (read outside the sandbox), else Hermes. A value
+/// that is not a plain name or address is not used.
+#[test]
+fn the_commit_identity_resolves_app_then_member_git_config_then_hermes() {
+    let cfg_git = || Some(("Git Member".to_string(), "git@example.invalid".to_string()));
+    let app = Some(("App Member".to_string(), "app@example.invalid".to_string()));
+    let id = GitIdentity::resolve(app.clone(), cfg_git);
+    assert_eq!(
+        (id.name.as_str(), id.email.as_str(), id.source),
+        ("App Member", "app@example.invalid", IdentitySource::App)
+    );
+    let id = GitIdentity::resolve(None, cfg_git);
+    assert_eq!(id.source, IdentitySource::MemberGitConfig);
+    assert_eq!(id.name, "Git Member");
+    let id = GitIdentity::resolve(None, || None);
+    assert_eq!(
+        (id.name.as_str(), id.email.as_str(), id.source),
+        (GIT_AGENT_NAME, GIT_AGENT_EMAIL, IdentitySource::Hermes)
+    );
+    // Bad values fall through to the next source.
+    for (n, e) in [
+        ("Evil\nGIT_DIR=/x", "a@b.invalid"),
+        ("<Evil>", "a@b.invalid"),
+        ("", "a@b.invalid"),
+        ("Ok", "not an address"),
+        ("Ok", "a@b.invalid>x"),
+        ("Ok", ""),
+    ] {
+        let id = GitIdentity::resolve(Some((n.to_string(), e.to_string())), cfg_git);
+        assert_eq!(id.source, IdentitySource::MemberGitConfig, "{n:?} {e:?}");
+        let id = GitIdentity::resolve(None, || Some((n.to_string(), e.to_string())));
+        assert_eq!(id.source, IdentitySource::Hermes, "{n:?} {e:?}");
+    }
+    assert!(GitIdentity::new(&"x".repeat(300), "a@b.invalid", IdentitySource::App).is_err());
+}
+
+/// The app passes the member's identity in two variables; both must be present and valid.
+#[test]
+fn the_app_sets_the_commit_identity_through_the_environment() {
+    let c = ShellRunConfig::from_env_vars(vars(&[
+        (SHELL_RUN_ENV, "1"),
+        ("HOME", "/nonexistent-home-for-test"),
+        (GIT_USER_NAME_ENV, "App Member"),
+        (GIT_USER_EMAIL_ENV, "app@example.invalid"),
+    ]))
+    .unwrap();
+    assert_eq!(c.commit_identity.source, IdentitySource::App);
+    assert_eq!(c.commit_identity.name, "App Member");
+    let c = ShellRunConfig::from_env_vars(vars(&[
+        (SHELL_RUN_ENV, "1"),
+        ("HOME", "/nonexistent-home-for-test"),
+        (GIT_USER_NAME_ENV, "App Member"),
+    ]))
+    .unwrap();
+    assert_eq!(c.commit_identity.source, IdentitySource::Hermes);
+}
+
+/// The member's own global git config (`~/.gitconfig`, or `~/.config/git/config`) is read with
+/// the real git, outside the sandbox, with nothing else from the environment.
+#[test]
+fn the_members_global_git_config_is_read_for_the_identity() {
+    let git = PathBuf::from("/usr/bin/git");
+    if !git.exists() {
+        return;
+    }
+    let fx = Fx::new();
+    let home = fx.base.join("member-home");
+    std::fs::create_dir_all(home.join(".config/git")).unwrap();
+    assert_eq!(
+        member_git_config_identity(&[PathBuf::from("/usr/bin")], &home),
+        None
+    );
+    std::fs::write(
+        home.join(".config/git/config"),
+        "[user]\n\tname = Xdg Member\n\temail = xdg@example.invalid\n",
+    )
+    .unwrap();
+    assert_eq!(
+        member_git_config_identity(&[PathBuf::from("/usr/bin")], &home),
+        Some(("Xdg Member".to_string(), "xdg@example.invalid".to_string()))
+    );
+    std::fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Home Member\n\temail = home@example.invalid\n",
+    )
+    .unwrap();
+    assert_eq!(
+        member_git_config_identity(&[PathBuf::from("/usr/bin")], &home),
+        Some((
+            "Home Member".to_string(),
+            "home@example.invalid".to_string()
+        ))
+    );
+    let c = ShellRunConfig::from_env_vars(vars(&[
+        (SHELL_RUN_ENV, "1"),
+        ("HOME", home.to_str().unwrap()),
+        (SHELL_PATH_ENV, "/usr/bin:/bin"),
+    ]))
+    .unwrap();
+    assert_eq!(c.commit_identity.source, IdentitySource::MemberGitConfig);
+    assert_eq!(c.commit_identity.name, "Home Member");
+}
+
+/// HGW (owner decision 2026-10-15): a commit made through shell_run carries the
+/// `Co-authored-by: Hermes` trailer, by the member's identity, even when the repository's config
+/// tries to suppress trailers.
+#[test]
+fn a_commit_carries_the_member_identity_and_the_hermes_trailer() {
+    if !std::path::Path::new("/usr/bin/git").exists() {
+        return;
+    }
+    let fx = Fx::new();
+    let mut cfg = cfg_open();
+    cfg.commit_identity =
+        GitIdentity::new("Ada Member", "ada@example.invalid", IdentitySource::App).unwrap();
+    let s = session(&fx, &cfg);
+    let run = |id: &str, argv: &[&str]| {
+        let a = approve_next(s.approvals().clone());
+        let out = s
+            .host(TaintState::default(), StopFlag::default(), false)
+            .execute(&call(id, argv, &fx.proj()));
+        a.join().unwrap();
+        out
+    };
+    run("c1", &["git", "init", "-q"]);
+    std::fs::write(fx.proj().join("a.txt"), "a\n").unwrap();
+    run("c2", &["git", "add", "a.txt"]);
+    // The repository asks for trailers to be dropped; the run's own config wins.
+    let cfg_path = fx.proj().join(".git/config");
+    let mut c = std::fs::read_to_string(&cfg_path).unwrap();
+    c.push_str("[trailer]\n\tifmissing = doNothing\n[core]\n\tcommentChar = C\n");
+    std::fs::write(&cfg_path, c).unwrap();
+    // `--cleanup` is refused before asking (it could cut the trailer), so commit plainly.
+    let out = s
+        .host(TaintState::default(), StopFlag::default(), false)
+        .execute(&call(
+            "c3",
+            &["git", "commit", "-q", "--cleanup=whitespace", "-m", "first"],
+            &fx.proj(),
+        ));
+    refused(out, "cleanup");
+    let out = run("c4", &["git", "commit", "-q", "-m", "first"]);
+    assert_eq!(
+        envelope(&out).run.unwrap()["exit_code"],
+        0,
+        "{:?}",
+        envelope(&out)
+    );
+    let log = std::process::Command::new("/usr/bin/git")
+        .args(["log", "-1", "--format=%an <%ae>|%cn <%ce>|%B"])
+        .current_dir(fx.proj())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", fx.base.join("no-home"))
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(
+        log.starts_with("Ada Member <ada@example.invalid>|Ada Member <ada@example.invalid>|first"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("\n{HERMES_CO_AUTHOR_TRAILER}")),
+        "{log}"
+    );
+}
+
+/// The author is not the model's to choose: `--author`, `-c user.*`, `-c trailer.*`,
+/// `--cleanup` and the like are refused before the member is asked, saying why.
+#[test]
+fn a_commit_that_would_change_the_author_or_drop_the_trailer_is_refused_before_asking() {
+    let fx = Fx::new();
+    let s = session(&fx, &cfg_open());
+    let host = s.host(TaintState::default(), StopFlag::default(), false);
+    for argv in [
+        vec!["git", "commit", "--author=Someone <s@x.invalid>", "-m", "x"],
+        vec![
+            "git",
+            "commit",
+            "--author",
+            "Someone <s@x.invalid>",
+            "-m",
+            "x",
+        ],
+        vec!["git", "-c", "user.name=Someone", "commit", "-m", "x"],
+        vec!["git", "-c", "User.Email=s@x.invalid", "commit", "-m", "x"],
+        vec!["git", "-c", "author.name=Someone", "commit", "-m", "x"],
+        vec![
+            "git",
+            "-c",
+            "trailer.ifmissing=doNothing",
+            "commit",
+            "-m",
+            "x",
+        ],
+        vec!["git", "-c", "core.commentChar=C", "commit", "-m", "x"],
+        vec!["git", "--config-env=user.name=V", "commit", "-m", "x"],
+        vec![
+            "git",
+            "-C",
+            "src",
+            "commit",
+            "--cleanup=scissors",
+            "-m",
+            "x",
+        ],
+        vec!["git", "-c", "commit.cleanup=scissors", "commit", "-m", "x"],
+        vec!["git", "commit-tree", "HEAD^{tree}", "-m", "x"],
+    ] {
+        let out = host.execute(&call("c", &argv, &fx.proj()));
+        refused(out, "author");
+    }
+    assert!(s.approvals().pending().is_empty(), "nothing was asked");
+}
+
+/// HGW-W11 (#77): git run through shell_run never runs hooks or an fsmonitor (command-scope
+/// config, which outranks the repository's own).
+#[test]
+fn git_runs_have_hooks_and_fsmonitor_off() {
+    if !std::path::Path::new("/usr/bin/git").exists() {
+        return;
+    }
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.proj().join(".git")).unwrap();
+    let s = session(&fx, &cfg_open());
+    for (key, want) in [("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false")] {
+        let a = approve_next(s.approvals().clone());
+        let out = s
+            .host(TaintState::default(), StopFlag::default(), false)
+            .execute(&call("c1", &["git", "config", "--get", key], &fx.proj()));
+        a.join().unwrap();
+        let run = envelope(&out).run.unwrap();
+        assert_eq!(
+            run["stdout"].as_str().unwrap_or_default().trim(),
+            want,
+            "{key}: {run}"
+        );
+    }
+}
+
+/// HGW-2 (owner decision 2026-10-15): git config a command adds that would run a program later
+/// (outside the sandbox) is reverted and
+/// reported to the model and the member: the run facts carry `git_warnings` and the summary says
+/// so.
+#[test]
+fn risky_git_state_left_by_a_command_is_reverted_and_reported() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.proj().join(".git/hooks")).unwrap();
+    let s = session(&fx, &cfg_open());
+    let approvals = s.approvals().clone();
+    let h = spawn(
+        s.host(TaintState::default(), StopFlag::default(), false),
+        call(
+            "c1",
+            &[
+                "sh",
+                "-c",
+                "printf '[core]\\n\\thooksPath = .h\\n' > .git/config",
+            ],
+            &fx.proj(),
+        ),
+    );
+    let p = wait_pending(&approvals);
+    approvals.decide(&p.id, true, &p.argv, &p.cwd).unwrap();
+    let out = h.join().unwrap();
+    let env = envelope(&out);
+    let facts = env.run.expect("run facts");
+    let w = facts["git_warnings"].to_string();
+    assert!(w.contains("core.hookspath"), "{w}");
+    assert!(w.contains("reverted"), "{w}");
+    assert!(env.summary.contains("were undone"), "{}", env.summary);
+    let cfg = std::fs::read_to_string(fx.proj().join(".git/config")).unwrap();
+    assert!(
+        !cfg.contains("hooksPath"),
+        "the risky key was reverted: {cfg}"
+    );
+    assert!(
+        env.summary.contains("outside the sandbox"),
+        "{}",
+        env.summary
+    );
 }
 
 #[test]
