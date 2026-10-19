@@ -239,6 +239,21 @@ struct ApprovalBody {
     to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    /// C1-V3-R: an identical effect was approved earlier and submitted with an unknown outcome.
+    /// Absent otherwise.
+    #[serde(
+        rename = "priorOutcomeUnknown",
+        skip_serializing_if = "Option::is_none"
+    )]
+    prior_outcome_unknown: Option<PriorOutcomeBody>,
+}
+
+/// C1-V3-R: the earlier submission an identical re-proposal must be checked against.
+#[derive(Serialize)]
+struct PriorOutcomeBody {
+    #[serde(rename = "txHash")]
+    tx_hash: Option<String>,
+    message: String,
 }
 
 /// AR-B-024 — refuse a non-loopback control bind unless explicitly opted in.
@@ -570,15 +585,25 @@ async fn approvals(
             .get("data_hex")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // C1-V3-R: a re-proposal of an effect whose earlier submission has an unknown outcome
+        // names that transaction, in the summary the member reads and as a field.
+        let summary = match &p.prior_unknown {
+            Some(u) => format!("{} · {}", p.description, u.reproposal_note()),
+            None => p.description,
+        };
         out.push(ApprovalBody {
             // AR-B-023: expose the stable call-id (not the tool name) so the
             // ceremony can assert "I am approving *this* call" when it posts
             // back to /approvals/approve.
             id: p.id.clone(),
             kind: p.risk_level.clone(),
-            summary: p.description,
+            summary,
             to,
             data,
+            prior_outcome_unknown: p.prior_unknown.map(|u| PriorOutcomeBody {
+                tx_hash: u.tx_hash().map(str::to_string),
+                message: u.message().to_string(),
+            }),
         });
     }
     Ok(Json(out))
@@ -620,10 +645,48 @@ async fn reject_head(
 
 /// Extract the call-id the human reviewed from an approve/reject body. `None` for anything that is
 /// not a JSON object carrying a non-empty string `id` (PBA-L6b-009).
-fn requested_call_id(body: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+fn requested_call_id(v: &serde_json::Value) -> Option<String> {
     let id = v.get("id")?.as_str()?;
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// C1-V3-R: the optional payment outcome on an approve body (data source: citrate-core's
+/// signature ceremony, `hermes_resolve_outcome_unknown`). `Ok(None)` when the body carries no
+/// outcome, which is today's behaviour. `Err` (400) for a malformed outcome, a `txHash` or
+/// `message` without an outcome, or any outcome on a reject: an unknown outcome is never a
+/// rejection, because the member approved it and the transaction went out.
+fn requested_outcome(
+    v: &serde_json::Value,
+    approve: bool,
+) -> Result<Option<citrate_agent_core::hitl::UnknownOutcome>, StatusCode> {
+    let present = |k: &str| v.get(k).is_some_and(|x| !x.is_null());
+    if !present("outcome") {
+        return if present("txHash") || present("message") {
+            Err(StatusCode::BAD_REQUEST)
+        } else {
+            Ok(None)
+        };
+    }
+    if !approve {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if v.get("outcome").and_then(|o| o.as_str())
+        != Some(citrate_agent_core::hitl::OUTCOME_SUBMITTED_UNKNOWN)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let optional_str = |k: &str| -> Result<Option<&str>, StatusCode> {
+        match v.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(StatusCode::BAD_REQUEST),
+        }
+    };
+    let tx_hash = optional_str("txHash")?;
+    let message = optional_str("message")?;
+    citrate_agent_core::hitl::UnknownOutcome::new(tx_hash, message)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 /// Shared approve/reject resolution, always bound to a call-id (AR-B-023 / PBA-L6b-009).
@@ -636,7 +699,10 @@ fn resolve_body(
     if st.estop.is_stopped() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let id = requested_call_id(body).ok_or(StatusCode::BAD_REQUEST)?;
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = requested_call_id(&v).ok_or(StatusCode::BAD_REQUEST)?;
+    // C1-V3-R: validated before anything is recorded or resolved.
+    let unknown = requested_outcome(&v, approve)?;
     // HUP-S2.6: the member's decision on the reviewed head is recorded (write-ahead for an
     // approval; fail closed when the record cannot be written). A resolve that does not match
     // the head records nothing.
@@ -648,39 +714,63 @@ fn resolve_body(
         ),
         _ => None,
     };
-    let res = if approve {
-        st.queue.approve_by_id(&id)
-    } else {
-        st.queue.reject_by_id(&id)
+    let res = match (&unknown, approve) {
+        (Some(u), _) => st.queue.approve_by_id_outcome_unknown(&id, u.clone()),
+        (None, true) => st.queue.approve_by_id(&id),
+        (None, false) => st.queue.reject_by_id(&id),
     };
     match res {
         Ok(()) => {
             if let (Some(log), Some(p)) = (&log, &head) {
-                match pending_record {
-                    Some(seq) => hic_records::record_outcome(
+                match (pending_record, &unknown) {
+                    // C1-V3-R: submitted, outcome unknown. Never "Completed".
+                    (Some(seq), Some(u)) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::OutcomeUnknown,
+                        &u.record_detail(),
+                    ),
+                    (Some(seq), None) => hic_records::record_outcome(
                         log,
                         seq,
                         citrate_agent_records::Outcome::Completed,
                         "released to the capsule; a chain effect was signed and broadcast in core's ceremony first",
                     ),
-                    None => {
+                    (None, _) => {
                         if let Err(e) = record_ceremony_decision(log, p, false) {
                             eprintln!("citrate-agent-sidecar: {e}");
                         }
                     }
                 }
             }
-            Ok(Json(serde_json::json!({ "ok": true, "resolved": true })))
+            let mut out = serde_json::json!({ "ok": true, "resolved": true });
+            if unknown.is_some() {
+                out["outcome"] =
+                    serde_json::json!(citrate_agent_core::hitl::OUTCOME_SUBMITTED_UNKNOWN);
+            }
+            Ok(Json(out))
         }
         // The head is not the call the operator reviewed, or its submitter is gone — refuse.
         Err(_) => {
             if let (Some(log), Some(seq)) = (&log, pending_record) {
-                hic_records::record_outcome(
-                    log,
-                    seq,
-                    citrate_agent_records::Outcome::Failed,
-                    "the call was no longer waiting, so nothing was released",
-                );
+                match &unknown {
+                    // The transaction went out from core even though the capsule was not told.
+                    Some(u) => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::OutcomeUnknown,
+                        &format!(
+                            "{}; the call was no longer waiting, so the capsule was not told",
+                            u.record_detail()
+                        ),
+                    ),
+                    None => hic_records::record_outcome(
+                        log,
+                        seq,
+                        citrate_agent_records::Outcome::Failed,
+                        "the call was no longer waiting, so nothing was released",
+                    ),
+                }
             }
             Err(StatusCode::CONFLICT)
         }
@@ -2387,6 +2477,8 @@ mod learn_session_tests;
 mod mcp_session_tests;
 #[cfg(test)]
 mod metering_session_tests;
+#[cfg(test)]
+mod outcome_unknown_tests;
 #[cfg(test)]
 mod retrieval_http_tests;
 #[cfg(test)]
