@@ -100,6 +100,8 @@ jobs:
         #     websocket TLS to rustls 0.23 upstream.
         #   RUSTSEC-2026-0346, 0349 — the same inert rustls 0.22.4 (fix is
         #     0.23.46, outside 0.22's range); the live rustls is 0.23.46.
+        #   RUSTSEC-2026-0382 — the same inert rustls-webpki 0.102.8 (fix is
+        #     0.103.16, outside 0.102's range); the live one is 0.103.16.
         run: |
           cargo audit \
             --color always \
@@ -124,5 +126,6 @@ jobs:
             --ignore RUSTSEC-2026-0098 \
             --ignore RUSTSEC-2026-0099 \
             --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2026-0382 \
             --ignore RUSTSEC-2026-0346 \
             --ignore RUSTSEC-2026-0349
