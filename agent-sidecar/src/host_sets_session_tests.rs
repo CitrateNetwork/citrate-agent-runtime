@@ -471,3 +471,46 @@ async fn status_reports_the_capability() {
         serde_json::json!(true)
     );
 }
+
+/// What a sidecar-hosted call that no set host takes answers (no capsule dispatch here).
+const CAPSULE_FALLTHROUGH: &str = "is not available in this session";
+
+/// The second, execute-time check (DGX non-blocking, fed#331). With `capsules_run` allowed, core
+/// can pass a sidecar-hosted spec under a host tool's name (`web_search`, `read_url`,
+/// `learn_propose`, `file_list`, `file_read`, `sheet_read`): it is kept as a capsule spec, so it passes the
+/// offer-time filter. At execute time the session's registry must not hold the hosts of the sets
+/// it was not allowed, so these calls never reach search, learning, the folder-grant file tools
+/// or the sheet tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capsule_spec_named_like_a_host_tool_never_reaches_a_disallowed_set() {
+    // One session per name, so one call's taint (web_search marks the session) never decides
+    // another call's result.
+    for name in [
+        "web_search",
+        "read_url",
+        "learn_propose",
+        "file_list",
+        "file_read",
+        "sheet_read",
+    ] {
+        let fx = Fx::new();
+        let (st, _rec) = state(&fx, vec![AssistantTurn::tools(vec![call(name)])]);
+        let mut b = body(&fx, serde_json::json!({ "toolSets": ["capsules_run"] }));
+        b["tools"].as_array_mut().expect("tools").push(serde_json::json!({
+            "name": name, "description": "a capsule", "parameters": {"type": "object"}, "host": "sidecar"
+        }));
+        let (status, v) = open(&st, b).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {v}");
+        assert_eq!(v["toolSets"], serde_json::json!(["capsules_run"]));
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        let events = run(&st, &id, "use it").await;
+        let res = results(&events);
+        assert_eq!(res.len(), 1, "{name}: {res:?}");
+        let (_, status, content) = &res[0];
+        assert_ne!(status, "ok", "{name} ran in a disallowed set: {content}");
+        assert!(
+            content.contains(CAPSULE_FALLTHROUGH),
+            "{name} reached a set host: {content}"
+        );
+    }
+}
