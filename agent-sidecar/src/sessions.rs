@@ -328,9 +328,10 @@ pub struct RetrievalReport {
     pub max_tool_schemas: usize,
 }
 
-/// `POST /sessions` body.
+/// `POST /sessions` body. Fails closed: a key this sidecar does not know refuses the session
+/// (a misspelled `toolSets` must never open one with every host tool set).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateSessionReq {
     pub model: String,
     pub system_prompt: String,
@@ -386,8 +387,8 @@ pub struct CreateSessionReq {
     /// canonical name ([`crate::host_sets::HostSet::name`]). Present = ONLY these sets are offered
     /// and callable (deny by default; `[]` = none); every other set's tools are absent and a call
     /// to one is refused. An unknown name refuses the session. Absent = every set the sidecar runs
-    /// with, as before.
-    #[serde(default)]
+    /// with, as before; an explicit `null` = no sets (never all of them).
+    #[serde(default, deserialize_with = "null_is_no_sets")]
     pub tool_sets: Option<Vec<String>>,
     /// Store daemons (citrate-core #356): `false` = the sidecar adds nothing to the system prompt
     /// core sent (no per-turn skill index, no persona fragment; a persona is then refused).
@@ -398,6 +399,17 @@ pub struct CreateSessionReq {
 
 fn default_true() -> bool {
     true
+}
+
+/// `toolSets` when the key is present: an array of names, or `null`, which is read as `[]` (no
+/// sets). Only an absent key leaves the session unrestricted.
+fn null_is_no_sets<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<Vec<String>>::deserialize(d)?.unwrap_or_default(),
+    ))
 }
 
 /// HUP-S3.3: what a session did with its persona (`POST /sessions` answers it as `persona`).
