@@ -73,6 +73,8 @@ ignore = [
     #   RUSTSEC-2026-0338..0342 quinn-proto 0.11.15 -> 0.11.19
     #   RUSTSEC-2026-0346..0349 rustls      0.23.45 -> 0.23.46 (live path)
     #   RUSTSEC-2026-0352..0364 wasmtime(-wasi) 49.0.2 -> 49.0.3
+    # 2026-10-22 refresh, also fixed in-lock:
+    #   RUSTSEC-2026-0381 webpki-roots 1.0.7 -> 1.0.10; RUSTSEC-2026-0382 rustls-webpki 0.103.15 -> 0.103.16
     #
     # RUSTSEC-2026-0220 — ruint <1.20.0: incorrect overflow flags +
     # truncated shift amounts on Uint shift ops (CWE-682). ruint is
@@ -104,6 +106,9 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    # 2026-10-22: RUSTSEC-2026-0382 (distrusted emSign intermediates) on the same inert
+    # rustls-webpki 0.102.8; the live 0.103.x path is bumped to 0.103.16 in-lock.
+    "RUSTSEC-2026-0382",
 
     # RUSTSEC-2026-0346 / 0349 (2026-10-15 refresh) — rustls `Debug`
     # impls exposing client session secrets; unauthenticated ServerHello
