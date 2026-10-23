@@ -514,3 +514,249 @@ async fn a_capsule_spec_named_like_a_host_tool_never_reaches_a_disallowed_set() 
         );
     }
 }
+
+// ---- The write and exec sets: shell_run, the checkpointed fs_* tools, project_create ----------
+
+/// The manager of [`state`] plus `shell_run` (sandbox off: only the offer and refusal paths run
+/// here), a checkpoint store (the grant session's fs_* tools) and projects.
+fn write_state(fx: &Fx, turns: Vec<AssistantTurn>) -> (Arc<AppState>, Arc<Recorder>) {
+    std::fs::create_dir_all(fx.p("home/projects")).expect("projects root");
+    let rec = Arc::new(Recorder {
+        turns: Mutex::new(turns),
+        seen: Mutex::new(vec![]),
+    });
+    let r2 = rec.clone();
+    let store = Arc::new(
+        citrate_agent_checkpoints::CheckpointStore::open(
+            &fx.p("ckpt"),
+            citrate_agent_checkpoints::Config::default(),
+        )
+        .expect("checkpoint store"),
+    );
+    let shell = crate::shell_run::ShellRunConfig {
+        search_path: vec!["/bin".into(), "/usr/bin".into()],
+        sandbox: citrate_agent_shell::sandbox::SandboxPolicy::new(SandboxMode::Off),
+        approval_timeout: Duration::from_secs(5),
+        auto_approve: None,
+        commit_identity: crate::shell_run::GitIdentity::hermes(),
+    };
+    let mgr = sessions::SessionManager::new(
+        Arc::new(move |_ep: &sessions::LlmEndpoint| r2.clone() as Arc<dyn LlmClient>),
+        Duration::from_secs(5),
+    )
+    .with_grants_home(fx.p("home"))
+    .with_checkpoints(store)
+    .with_shell_run(Arc::new(shell))
+    .with_projects(Arc::new(crate::projects::ProjectsConfig {
+        root: fx.p("home/projects"),
+        renderer: None,
+    }));
+    let st = Arc::new(AppState {
+        estop: EmergencyStop::new(),
+        queue: Arc::new(ApprovalQueue::new()),
+        skills: vec![],
+        dispatch: None,
+        bearer: BEARER.to_string(),
+        run_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SKILLS)),
+        sessions: Arc::new(mgr),
+    });
+    (st, rec)
+}
+
+const SHELL: &str = "shell_run";
+const FS_TOOLS: &[&str] = &["fs_write", "fs_edit", "fs_delete", "fs_rename"];
+const PROJECT: &str = "project_create";
+
+/// What a session with `toolSets` (`None` = absent) offers of the write and exec tools, and what
+/// a call to each one returns.
+async fn write_tools_for(
+    sets: Option<serde_json::Value>,
+) -> (Vec<String>, Vec<(String, String, String)>) {
+    let fx = Fx::new();
+    let mut names = vec![SHELL, PROJECT];
+    names.extend_from_slice(FS_TOOLS);
+    let (st, rec) = write_state(
+        &fx,
+        vec![AssistantTurn::tools(
+            names.iter().map(|n| call(n)).collect(),
+        )],
+    );
+    let extra = match sets {
+        Some(s) => {
+            serde_json::json!({ "toolSets": s, "maxToolCallsPerStep": 16, "maxToolsPerRequest": 64 })
+        }
+        None => serde_json::json!({ "maxToolCallsPerStep": 16, "maxToolsPerRequest": 64 }),
+    };
+    let (status, v) = open(&st, body(&fx, extra)).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let id = v["id"].as_str().unwrap_or_default().to_string();
+    let events = run(&st, &id, "write a file, make a project and run a command").await;
+    (offered(&rec), results(&events))
+}
+
+fn refused(res: &[(String, String, String)], name: &str) -> bool {
+    res.iter()
+        .any(|(n, status, content)| n == name && status != "ok" && content.contains("unknown tool"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_an_allowlist_the_fixture_offers_every_write_and_exec_tool() {
+    let (offered, _) = write_tools_for(None).await;
+    for t in [SHELL, PROJECT].iter().chain(FS_TOOLS) {
+        assert!(
+            offered.contains(&t.to_string()),
+            "{t} missing from {offered:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_allowlist_offers_no_write_or_exec_tool() {
+    let (offered, res) = write_tools_for(Some(serde_json::json!([]))).await;
+    for t in [SHELL, PROJECT].iter().chain(FS_TOOLS) {
+        assert!(
+            !offered.contains(&t.to_string()),
+            "{t} offered: {offered:?}"
+        );
+        assert!(refused(&res, t), "{t} not refused: {res:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_allows_fs_tools_and_project_create_but_not_shell_run() {
+    let (offered, res) = write_tools_for(Some(serde_json::json!(["files"]))).await;
+    for t in [PROJECT].iter().chain(FS_TOOLS) {
+        assert!(
+            offered.contains(&t.to_string()),
+            "{t} missing from {offered:?}"
+        );
+    }
+    assert!(
+        !offered.contains(&SHELL.to_string()),
+        "shell_run offered: {offered:?}"
+    );
+    assert!(refused(&res, SHELL), "shell_run not refused: {res:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_search_leaves_out_fs_tools_project_create_and_shell_run() {
+    let (offered, res) = write_tools_for(Some(serde_json::json!(["web_search"]))).await;
+    for t in [SHELL, PROJECT].iter().chain(FS_TOOLS) {
+        assert!(
+            !offered.contains(&t.to_string()),
+            "{t} offered: {offered:?}"
+        );
+        assert!(refused(&res, t), "{t} not refused: {res:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_run_allows_shell_run_but_not_fs_tools_or_project_create() {
+    let (offered, res) = write_tools_for(Some(serde_json::json!(["shell_run"]))).await;
+    assert!(
+        offered.contains(&SHELL.to_string()),
+        "shell_run missing from {offered:?}"
+    );
+    for t in [PROJECT].iter().chain(FS_TOOLS) {
+        assert!(
+            !offered.contains(&t.to_string()),
+            "{t} offered: {offered:?}"
+        );
+        assert!(refused(&res, t), "{t} not refused: {res:?}");
+    }
+}
+
+/// The execution layer for the write sets: with only `capsules_run`, core-passed capsule specs
+/// named like the fs_* tools and `project_create` reach no file or project host.
+#[tokio::test(flavor = "multi_thread")]
+async fn capsule_specs_named_like_write_tools_reach_no_write_host() {
+    for name in ["fs_write", "fs_delete", PROJECT] {
+        let fx = Fx::new();
+        let (st, _rec) = write_state(&fx, vec![AssistantTurn::tools(vec![call(name)])]);
+        let mut b = body(&fx, serde_json::json!({ "toolSets": ["capsules_run"] }));
+        b["tools"].as_array_mut().expect("tools").push(serde_json::json!({
+            "name": name, "description": "a capsule", "parameters": {"type": "object"}, "host": "sidecar"
+        }));
+        let (status, v) = open(&st, b).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {v}");
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        let res = results(&run(&st, &id, "use it").await);
+        assert_eq!(res.len(), 1, "{name}: {res:?}");
+        assert_ne!(res[0].1, "ok", "{name} ran: {}", res[0].2);
+        assert!(
+            res[0].2.contains(CAPSULE_FALLTHROUGH),
+            "{name} reached a write host: {}",
+            res[0].2
+        );
+    }
+}
+
+// ---- The session body fails closed --------------------------------------------------------------
+
+/// An explicit `toolSets: null` is no tool sets, never all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_allowlist_is_no_tool_sets() {
+    let fx = Fx::new();
+    let (st, rec) = state(
+        &fx,
+        vec![AssistantTurn::tools(
+            HOST_TOOLS.iter().map(|t| call(t)).collect(),
+        )],
+    );
+    let (status, v) = open(
+        &st,
+        body(
+            &fx,
+            serde_json::json!({ "toolSets": null, "maxToolCallsPerStep": 16 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    assert_eq!(
+        v["toolSets"],
+        serde_json::json!([]),
+        "the applied allowlist is echoed: none"
+    );
+    let id = v["id"].as_str().unwrap_or_default().to_string();
+    let events = run(&st, &id, "use every tool you have").await;
+    assert_eq!(offered(&rec), vec!["node_status".to_string()]);
+    for (name, status, content) in results(&events) {
+        assert_ne!(status, "ok", "{name} ran: {content}");
+    }
+}
+
+/// A key the sidecar does not know (a misspelled `toolSets`, say) refuses the session: it is
+/// never opened with the sets the misspelling meant to restrict.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_key_refuses_the_session() {
+    for extra in [
+        serde_json::json!({ "toolsets": [] }),
+        serde_json::json!({ "tool_sets": [] }),
+        serde_json::json!({ "toolSet": ["web_search"] }),
+        serde_json::json!({ "promptsnapshot": false }),
+    ] {
+        let fx = Fx::new();
+        let (st, _rec) = state(&fx, vec![]);
+        let (status, v) = open(&st, body(&fx, extra.clone())).await;
+        assert_ne!(status, StatusCode::CREATED, "{extra}: {v}");
+        assert!(status.is_client_error(), "{extra}: {status}");
+        assert_eq!(st.sessions.count(), 0, "{extra}: no session was opened");
+    }
+}
+
+/// Every key core and the other clients send is still accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_known_key_is_accepted() {
+    let fx = Fx::new();
+    let (st, _rec) = state(&fx, vec![]);
+    let b = body(
+        &fx,
+        serde_json::json!({
+            "maxSteps": 8, "maxTokens": 512, "maxToolCallsPerStep": 4, "maxToolsPerRequest": 16,
+            "contextTokens": 8192, "hicAware": true, "unattended": true, "projectRoots": [],
+            "toolSets": ["web_search"], "promptSnapshot": false
+        }),
+    );
+    let (status, v) = open(&st, b).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+}
