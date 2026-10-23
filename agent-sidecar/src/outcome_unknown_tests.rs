@@ -33,9 +33,12 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
+        Self::new_with(LogConfig::default())
+    }
+
+    fn new_with(cfg: LogConfig) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let (log, _) =
-            DecisionLog::open(&root.path().join("records"), LogConfig::default()).unwrap();
+        let (log, _) = DecisionLog::open(&root.path().join("records"), cfg).unwrap();
         let log = Arc::new(log);
         let client: Arc<dyn LlmClient> = Arc::new(Quiet);
         let mgr = sessions::SessionManager::new(
@@ -384,4 +387,236 @@ async fn a_reproposal_references_the_earlier_tx_and_never_auto_approves() {
         .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(again.await.unwrap(), ApprovalOutcomePublic::Rejected);
+}
+
+// ── Round 2: the outcome survives a failing record and a late callback ────────────────────────
+
+impl Fx {
+    /// A records log that refuses every write after the first: each record needs a new segment,
+    /// and the directory is made read-only, so creating it fails. `heal` restores the directory.
+    fn with_failing_log() -> Self {
+        let fx = Fx::new_with(LogConfig {
+            max_segment_bytes: 1,
+            max_segments: None,
+        });
+        let log = fx.st.sessions.records().expect("a records log");
+        hic_records::record_member_decision(&log, "test.seed", "seed", false, "seed", vec![])
+            .expect("the first record fits the open segment");
+        fx.set_records_writable(false);
+        fx
+    }
+
+    fn set_records_writable(&self, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if writable { 0o700 } else { 0o500 };
+        std::fs::set_permissions(
+            self.root.path().join("records"),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+    }
+
+    /// The ceremony decisions bound to `call_id` (by their evidence), with their closing outcome.
+    fn records_for(&self, call_id: &str) -> Vec<(Decision, Option<(Outcome, String)>)> {
+        let recs = self.records();
+        let uri = format!("sidecar:approval/{call_id}");
+        recs.iter()
+            .filter_map(|r| match &r.record.entry {
+                Entry::Decision(d)
+                    if d.kind == "ceremony.capsule_effect"
+                        && d.evidence.iter().any(|e| e.uri == uri) =>
+                {
+                    let seq = r.record.seq;
+                    let out = recs.iter().find_map(|o| match &o.record.entry {
+                        Entry::Outcome(o) if o.decision_seq == seq => {
+                            Some((o.outcome, o.detail.clone()))
+                        }
+                        _ => None,
+                    });
+                    Some((d.decision, out))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Codex P2 (round 1): the transaction already went out, so a decision record that cannot be
+/// written must not hide the outcome. The capsule is told, the tx is remembered, and the route
+/// says the record is missing instead of refusing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_outcome_is_delivered_even_when_the_record_cannot_be_written() {
+    let fx = Fx::with_failing_log();
+    let q = fx.st.queue.clone();
+    let waiter = tokio::spawn(async move { q.submit_with_resolution(payment("f1")).await });
+    fx.wait_depth(1).await;
+
+    let (s, v) = fx.post("/approvals/approve", unknown_body("f1")).await;
+    fx.set_records_writable(true);
+    assert_eq!(s, StatusCode::OK, "the outcome is not refused: {v}");
+    assert_eq!(v["outcome"], "submitted_outcome_unknown");
+    assert_eq!(v["recorded"], false, "the route says the record is missing");
+    match tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the waiter is told")
+        .unwrap()
+    {
+        citrate_agent_core::hitl::Resolution::SubmittedOutcomeUnknown(u) => {
+            assert_eq!(u.message(), core_message(HASH))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        fx.st
+            .queue
+            .prior_unknown_outcome("f1")
+            .and_then(|u| u.tx_hash().map(str::to_string)),
+        Some(HASH.to_string()),
+        "an identical re-proposal still names the tx"
+    );
+}
+
+/// The write-ahead refusal stays for an ordinary approval: nothing is released unrecorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordinary_approval_is_still_refused_when_the_record_cannot_be_written() {
+    let fx = Fx::with_failing_log();
+    let q = fx.st.queue.clone();
+    let waiter = tokio::spawn(async move { q.submit_with_outcome(payment("f2")).await });
+    fx.wait_depth(1).await;
+    let (s, _) = fx
+        .post("/approvals/approve", serde_json::json!({"id": "f2"}))
+        .await;
+    fx.set_records_writable(true);
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(fx.st.queue.depth(), 1, "nothing was released");
+    assert!(!waiter.is_finished());
+    fx.st.queue.reject_by_id("f2").unwrap();
+    let _ = waiter.await;
+}
+
+/// Codex P2 (round 1): a callback that arrives after the waiter went away still writes the
+/// transaction into the decision log, bound to its call id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_unknown_outcome_is_recorded_after_the_waiter_is_gone() {
+    let fx = Fx::new();
+    let q = fx.st.queue.clone();
+    let waiter = tokio::spawn(async move { q.submit_with_resolution(payment("l1")).await });
+    fx.wait_depth(1).await;
+    waiter.abort();
+    let _ = waiter.await;
+    fx.wait_depth(0).await;
+
+    let (s, _) = fx.post("/approvals/approve", unknown_body("l1")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "the capsule was not told");
+    let rows = fx.records_for("l1");
+    assert_eq!(rows.len(), 1, "one receipt for the submitted tx: {rows:?}");
+    assert_eq!(rows[0].0, Decision::Approved);
+    let (outcome, detail) = rows[0].1.clone().expect("closed");
+    assert_eq!(outcome, Outcome::OutcomeUnknown);
+    assert!(detail.contains(HASH), "{detail}");
+    assert!(detail.contains("not told"), "{detail}");
+    assert!(fx.st.queue.prior_unknown_outcome("l1").is_some());
+}
+
+/// A late callback for a call that is no longer pending, while another call is at the head, is
+/// recorded for its own id and resolves nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_unknown_outcome_never_touches_the_current_head() {
+    let fx = Fx::new();
+    let q = fx.st.queue.clone();
+    let other = tokio::spawn(async move { q.submit_with_outcome(payment("h1")).await });
+    fx.wait_depth(1).await;
+
+    let (s, _) = fx.post("/approvals/approve", unknown_body("gone")).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(fx.st.queue.depth(), 1, "the head is untouched");
+    assert!(!other.is_finished());
+    assert!(
+        fx.records_for("h1").is_empty(),
+        "nothing recorded for the head"
+    );
+    let rows = fx.records_for("gone");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].1.as_ref().map(|o| o.0),
+        Some(Outcome::OutcomeUnknown)
+    );
+
+    let (s, _) = fx
+        .post("/approvals/reject", serde_json::json!({"id": "h1"}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(other.await.unwrap(), ApprovalOutcomePublic::Rejected);
+}
+
+/// Tripwire: for every state the queue and the log can be in when core's well-formed
+/// unknown-outcome callback arrives, the sidecar never refuses it with 503, always remembers the
+/// tx, never resolves a different call, and writes a receipt naming the tx whenever the log can
+/// be written. A new early return on that path fails one of these rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_unknown_outcome_callback_keeps_the_transaction() {
+    #[derive(Debug, Clone, Copy)]
+    enum Head {
+        Waiting,
+        Gone,
+        Other,
+    }
+    #[derive(Debug, Clone, Copy)]
+    enum Log {
+        Writable,
+        Failing,
+    }
+    for head in [Head::Waiting, Head::Gone, Head::Other] {
+        for log in [Log::Writable, Log::Failing] {
+            let why = format!("{head:?}/{log:?}");
+            let fx = match log {
+                Log::Writable => Fx::new(),
+                Log::Failing => Fx::with_failing_log(),
+            };
+            let q = fx.st.queue.clone();
+            let id = match head {
+                Head::Other => "x-other",
+                _ => "x-pay",
+            };
+            let waiter = tokio::spawn(async move { q.submit_with_resolution(payment(id)).await });
+            fx.wait_depth(1).await;
+            if let Head::Gone = head {
+                waiter.abort();
+                fx.wait_depth(0).await;
+            }
+            let (s, v) = fx.post("/approvals/approve", unknown_body("x-pay")).await;
+            fx.set_records_writable(true);
+            assert_ne!(s, StatusCode::SERVICE_UNAVAILABLE, "{why}: {v}");
+            assert!(
+                fx.st.queue.prior_unknown_outcome("x-pay").is_some(),
+                "{why}: the tx is remembered"
+            );
+            match head {
+                Head::Waiting => {
+                    assert_eq!(s, StatusCode::OK, "{why}");
+                    assert!(matches!(
+                        waiter.await.unwrap(),
+                        citrate_agent_core::hitl::Resolution::SubmittedOutcomeUnknown(_)
+                    ));
+                }
+                Head::Gone => assert_eq!(s, StatusCode::CONFLICT, "{why}"),
+                Head::Other => {
+                    assert_eq!(s, StatusCode::CONFLICT, "{why}");
+                    assert_eq!(fx.st.queue.depth(), 1, "{why}: the other call still waits");
+                    fx.st.queue.reject_by_id("x-other").unwrap();
+                    let _ = waiter.await;
+                }
+            }
+            let rows = fx.records_for("x-pay");
+            match log {
+                Log::Writable => {
+                    assert_eq!(rows.len(), 1, "{why}: {rows:?}");
+                    let (o, d) = rows[0].1.clone().expect("closed");
+                    assert_eq!(o, Outcome::OutcomeUnknown, "{why}");
+                    assert!(d.contains(HASH), "{why}: {d}");
+                }
+                Log::Failing => assert!(rows.is_empty(), "{why}: nothing could be written"),
+            }
+        }
+    }
 }
