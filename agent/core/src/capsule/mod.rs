@@ -3032,6 +3032,86 @@ tier = "bundled"
         );
     }
 
+    /// C1-V3-R — a gate whose effect core already submitted with an unknown outcome.
+    #[cfg(test)]
+    struct UnknownOutcomeGate {
+        message: String,
+    }
+
+    #[cfg(test)]
+    impl dispatcher::ApprovalGate for UnknownOutcomeGate {
+        fn request(&self, _req: dispatcher::ApprovalRequest) -> Result<(), String> {
+            Err(self.message.clone())
+        }
+        fn decide(&self, _req: dispatcher::ApprovalRequest) -> dispatcher::GateDecision {
+            dispatcher::GateDecision::SubmittedOutcomeUnknown(self.message.clone())
+        }
+    }
+
+    /// C1-V3-R — the member approved, core broadcast, the outcome is unknown. The capsule gets
+    /// exactly core's message under the non-final `ChainSendOutcomeUnknown` class (never a tx
+    /// hash as success), and the dispatcher is never consulted, so nothing is sent twice.
+    #[test]
+    fn eth_send_capsule_reports_an_unknown_outcome_and_never_dispatches() {
+        use std::sync::Arc;
+
+        let message = "submitted, outcome unknown, tx 0x8f3c2a1b9d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8, check before retrying".to_string();
+        let gate = Arc::new(UnknownOutcomeGate {
+            message: message.clone(),
+        });
+        let dispatcher_impl = Arc::new(MockSendDispatcher {
+            calls: std::sync::Mutex::new(Vec::new()),
+            tx_hash: [0xeeu8; 32],
+        });
+        let (mut store, instance) = load_eth_sender_capsule_with(
+            ETH_SENDER_MANIFEST_OK,
+            Some(gate),
+            Some(dispatcher_impl.clone()),
+        );
+        let authorized =
+            hex::decode("4a86659BDab24dc444C72fbbaD4cd83491820E40").unwrap();
+        let result = invoke_eth_sender_send(&mut store, instance, authorized, vec![0x01]);
+        let err = result.expect_err("an unknown outcome is not success");
+        assert_eq!(
+            err,
+            format!("{}: {message}", dispatcher::CHAIN_SEND_OUTCOME_UNKNOWN)
+        );
+        assert_eq!(
+            dispatcher_impl.calls.lock().unwrap().len(),
+            0,
+            "core already broadcast it; the host must not send it again"
+        );
+    }
+
+    /// A gate that only implements `request` keeps its meaning through the default `decide`.
+    #[test]
+    fn the_default_decide_mirrors_request() {
+        let allow = MockGate {
+            decisions: std::sync::Mutex::new(Vec::new()),
+            allow: true,
+            reason: String::new(),
+        };
+        let deny = MockGate {
+            decisions: std::sync::Mutex::new(Vec::new()),
+            allow: false,
+            reason: "no".to_string(),
+        };
+        let req = || dispatcher::ApprovalRequest {
+            capsule_name: "c".to_string(),
+            method: "eth-send".to_string(),
+            to: [0u8; 20],
+            data: vec![],
+            tier: manifest::RiskTier::Low,
+            required_roles: vec![],
+        };
+        use dispatcher::ApprovalGate;
+        assert_eq!(allow.decide(req()), dispatcher::GateDecision::Approved);
+        assert_eq!(
+            deny.decide(req()),
+            dispatcher::GateDecision::Refused("no".to_string())
+        );
+    }
+
     // ────────────────────── (end CIT-AGENT-9c-write-host) ─────────
 
     // ────────────────── CIT-AGENT-9c-write-tools (5+6+7) ──────────

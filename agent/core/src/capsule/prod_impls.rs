@@ -11,11 +11,11 @@
 
 use crate::audit::recorder::RecorderClient;
 use crate::capsule::dispatcher::{
-    ApprovalGate, ApprovalRequest, EthSendDispatcher,
+    ApprovalGate, ApprovalRequest, EthSendDispatcher, GateDecision,
 };
 use crate::capsule::wasm::Address;
 use crate::hitl::quorum::Quorum;
-use crate::hitl::{ApprovalOutcomePublic, ApprovalQueue, Signer, ToolCall};
+use crate::hitl::{ApprovalOutcomePublic, ApprovalQueue, Resolution, Signer, ToolCall};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -61,7 +61,18 @@ impl QueuedApprovalGate {
 }
 
 impl ApprovalGate for QueuedApprovalGate {
+    /// The plain form of [`decide`](ApprovalGate::decide): only an approval is `Ok`. An unknown
+    /// outcome is `Err(message)`, so a caller of `request` never performs an effect that
+    /// citrate-core already submitted.
     fn request(&self, req: ApprovalRequest) -> Result<(), String> {
+        match self.decide(req) {
+            GateDecision::Approved => Ok(()),
+            GateDecision::Refused(reason) => Err(reason),
+            GateDecision::SubmittedOutcomeUnknown(message) => Err(message),
+        }
+    }
+
+    fn decide(&self, req: ApprovalRequest) -> GateDecision {
         // Build the ToolCall the queue's UI surfaces will display.
         // call_id is derived from the (capsule, to, data) tuple via
         // SHA3 so retries with identical args collide on the same
@@ -108,11 +119,17 @@ impl ApprovalGate for QueuedApprovalGate {
 
         if matches!(quorum, Quorum::AutoApprove) {
             // Tier-low: the legacy FIFO fast path is acceptable.
-            let outcome = tokio::task::block_in_place(move || {
+            // C1-V3-R: the FIFO track can carry an unknown outcome from core's ceremony.
+            let resolution = tokio::task::block_in_place(move || {
                 let handle = tokio::runtime::Handle::current();
-                handle.block_on(async move { queue.submit_with_outcome(call).await })
+                handle.block_on(async move { queue.submit_with_resolution(call).await })
             });
-            return outcome_to_result(outcome);
+            return match resolution {
+                Resolution::Decided(o) => outcome_to_decision(o),
+                Resolution::SubmittedOutcomeUnknown(u) => {
+                    GateDecision::SubmittedOutcomeUnknown(u.message().to_string())
+                }
+            };
         }
 
         // Tier medium/high/critical: route through the role-aware quorum.
@@ -125,7 +142,7 @@ impl ApprovalGate for QueuedApprovalGate {
         // propose, so refuse now rather than park the effect (and block this
         // worker) for the 5-minute timeout.
         let Some(proposer) = self.proposer.clone() else {
-            return Err(format!(
+            return GateDecision::Refused(format!(
                 "{} effect from capsule {:?} refused: tier {:?} needs a role quorum and no \
                  invoking human is bound to this approval gate",
                 req.method, req.capsule_name, req.tier
@@ -140,7 +157,7 @@ impl ApprovalGate for QueuedApprovalGate {
                     .await
             })
         });
-        outcome_to_result(outcome)
+        outcome_to_decision(outcome)
     }
 }
 
@@ -159,12 +176,18 @@ fn signing_payload(req: &ApprovalRequest) -> Vec<u8> {
     .into_bytes()
 }
 
-fn outcome_to_result(outcome: ApprovalOutcomePublic) -> Result<(), String> {
+fn outcome_to_decision(outcome: ApprovalOutcomePublic) -> GateDecision {
     match outcome {
-        ApprovalOutcomePublic::Approved => Ok(()),
-        ApprovalOutcomePublic::AutoApproved => Ok(()),
-        ApprovalOutcomePublic::Rejected => Err("rejected by operator".to_string()),
-        ApprovalOutcomePublic::TimedOut => Err("approval timed out (5min)".to_string()),
+        ApprovalOutcomePublic::Approved => GateDecision::Approved,
+        ApprovalOutcomePublic::AutoApproved => GateDecision::Approved,
+        ApprovalOutcomePublic::Rejected => GateDecision::Refused("rejected by operator".to_string()),
+        ApprovalOutcomePublic::TimedOut => {
+            GateDecision::Refused("approval timed out (5min)".to_string())
+        }
+        // Reached only without the details (the role track); fail closed, never approved.
+        ApprovalOutcomePublic::SubmittedOutcomeUnknown => GateDecision::SubmittedOutcomeUnknown(
+            "submitted, outcome unknown, check recent transactions before retrying".to_string(),
+        ),
     }
 }
 
@@ -382,6 +405,50 @@ mod tests {
         );
         queue.reject_action(&call_id).expect("cleanup");
         assert!(h.await.expect("join").is_err());
+    }
+
+    /// C1-V3-R: a tier-low effect released by core as submitted with an unknown outcome reaches
+    /// the host as `SubmittedOutcomeUnknown` with core's exact words; `request` is never `Ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_gate_passes_an_unknown_outcome_through() {
+        let queue = Arc::new(ApprovalQueue::new());
+        let gate = Arc::new(QueuedApprovalGate::new(queue.clone()));
+        let tx = "0x8f3c2a1b9d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8";
+        let words = format!("submitted, outcome unknown, tx {tx}, check before retrying");
+        let (addr, data) = ([0xa8u8; 20], vec![7u8]);
+        let call_id = call_id_for("pay", "eth-send", &addr, &data);
+        let req = || ApprovalRequest {
+            capsule_name: "pay".to_string(),
+            method: "eth-send".to_string(),
+            to: addr,
+            data: data.clone(),
+            tier: RiskTier::Low,
+            required_roles: vec![],
+        };
+        for use_decide in [true, false] {
+            let g = gate.clone();
+            let r = req();
+            let h = tokio::spawn(async move {
+                if use_decide {
+                    Ok(g.decide(r))
+                } else {
+                    g.request(r).map(|_| GateDecision::Approved)
+                }
+            });
+            while queue.depth() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let u = crate::hitl::UnknownOutcome::new(Some(tx), Some(&words)).unwrap();
+            queue
+                .approve_by_id_outcome_unknown(&call_id, u)
+                .expect("the head matches");
+            let got = h.await.expect("join");
+            if use_decide {
+                assert_eq!(got, Ok(GateDecision::SubmittedOutcomeUnknown(words.clone())));
+            } else {
+                assert_eq!(got, Err(words.clone()), "request() must never read it as approved");
+            }
+        }
     }
 
     /// PBA-L6b-012 tripwire: the production gate must never again record a

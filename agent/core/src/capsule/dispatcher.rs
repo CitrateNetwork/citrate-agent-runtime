@@ -114,7 +114,34 @@ pub trait ApprovalGate: Send + Sync {
     /// when rejected. Blocks the calling thread until the decision
     /// is made (or a timeout fires, surfaced as `Err`).
     fn request(&self, req: ApprovalRequest) -> Result<(), String>;
+
+    /// C1-V3-R — the full decision, including an effect the member approved that citrate-core
+    /// already submitted with an unknown outcome. The eth-send host fn calls this. The default
+    /// mirrors [`request`](Self::request), so a gate that cannot see outcomes keeps its meaning.
+    fn decide(&self, req: ApprovalRequest) -> GateDecision {
+        match self.request(req) {
+            Ok(()) => GateDecision::Approved,
+            Err(reason) => GateDecision::Refused(reason),
+        }
+    }
 }
+
+/// C1-V3-R — what an [`ApprovalGate`] decided about one effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateDecision {
+    /// Approved: the host performs the effect.
+    Approved,
+    /// Rejected or timed out, with the reason.
+    Refused(String),
+    /// Approved, and citrate-core already submitted the transaction; its outcome is unknown.
+    /// The host must NOT perform the effect (that would send it twice) and reports the message,
+    /// exactly as core sent it, as a non-final result.
+    SubmittedOutcomeUnknown(String),
+}
+
+/// C1-V3-R — the error class an eth-send result carries when the transaction was submitted with
+/// an unknown outcome. Not success and not a failure: check the transaction before retrying.
+pub const CHAIN_SEND_OUTCOME_UNKNOWN: &str = "ChainSendOutcomeUnknown";
 
 /// Pluggable dispatcher for the `citrate:chain/eth-send` host
 /// function. Production impls sign + submit the calldata via
