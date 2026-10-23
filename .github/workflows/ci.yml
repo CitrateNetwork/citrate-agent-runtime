@@ -123,3 +123,17 @@ jobs:
         run: |
           python3 scripts/check_hic_terminology.py --self-test
           python3 scripts/check_hic_terminology.py
+
+  tool-write-paths:
+    name: Tool-layer write paths go through safe_write (no symlink follow)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: path-based writes in agent-code/src/tools
+        run: |
+          python3 scripts/check_tool_write_paths.py --self-test
+          python3 scripts/check_tool_write_paths.py
