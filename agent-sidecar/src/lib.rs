@@ -705,13 +705,25 @@ fn resolve_body(
     let unknown = requested_outcome(&v, approve)?;
     // HUP-S2.6: the member's decision on the reviewed head is recorded (write-ahead for an
     // approval; fail closed when the record cannot be written). A resolve that does not match
-    // the head records nothing.
+    // the head records nothing, except an unknown outcome (below).
+    //
+    // C1-V3-R: an unknown outcome is different. Core already broadcast the transaction, so
+    // refusing here would only hide it: the outcome is delivered and remembered whatever the
+    // record or the queue says, and a receipt naming the tx is written for its call id even
+    // when the waiter is gone. Nothing is released by it, so write-ahead does not apply.
     let head = st.queue.peek().filter(|p| p.id == id);
     let log = st.sessions.records();
     let pending_record = match (&log, &head) {
-        (Some(log), Some(p)) if approve => Some(
-            record_ceremony_decision(log, p, true).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
-        ),
+        (Some(log), Some(p)) if approve => {
+            match record_ceremony_decision(log, &p.id, &ceremony_subject(p), true) {
+                Ok(seq) => Some(seq),
+                Err(e) if unknown.is_some() => {
+                    eprintln!("citrate-agent-sidecar: {e}");
+                    None
+                }
+                Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            }
+        }
         _ => None,
     };
     let res = match (&unknown, approve) {
@@ -719,25 +731,55 @@ fn resolve_body(
         (None, true) => st.queue.approve_by_id(&id),
         (None, false) => st.queue.reject_by_id(&id),
     };
+    let told = res.is_ok();
+    // C1-V3-R: the receipt of a submitted tx, whether or not the capsule was told.
+    let unknown_recorded = match (&log, &unknown) {
+        (Some(log), Some(u)) => {
+            let detail = if told {
+                u.record_detail()
+            } else {
+                format!(
+                    "{}; the call was no longer waiting, so the capsule was not told",
+                    u.record_detail()
+                )
+            };
+            let seq = pending_record.or_else(|| {
+                let subject = head
+                    .as_ref()
+                    .map(ceremony_subject)
+                    .unwrap_or_else(|| format!("approval {id}: no longer pending"));
+                match record_ceremony_decision(log, &id, &subject, true) {
+                    Ok(seq) => Some(seq),
+                    Err(e) => {
+                        eprintln!("citrate-agent-sidecar: {e}");
+                        None
+                    }
+                }
+            });
+            match seq {
+                Some(seq) => hic_records::try_record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::OutcomeUnknown,
+                    &detail,
+                ),
+                None => false,
+            }
+        }
+        _ => false,
+    };
     match res {
         Ok(()) => {
-            if let (Some(log), Some(p)) = (&log, &head) {
-                match (pending_record, &unknown) {
-                    // C1-V3-R: submitted, outcome unknown. Never "Completed".
-                    (Some(seq), Some(u)) => hic_records::record_outcome(
-                        log,
-                        seq,
-                        citrate_agent_records::Outcome::OutcomeUnknown,
-                        &u.record_detail(),
-                    ),
-                    (Some(seq), None) => hic_records::record_outcome(
+            if let (Some(log), Some(p), None) = (&log, &head, &unknown) {
+                match pending_record {
+                    Some(seq) => hic_records::record_outcome(
                         log,
                         seq,
                         citrate_agent_records::Outcome::Completed,
                         "released to the capsule; a chain effect was signed and broadcast in core's ceremony first",
                     ),
-                    (None, _) => {
-                        if let Err(e) = record_ceremony_decision(log, p, false) {
+                    None => {
+                        if let Err(e) = record_ceremony_decision(log, &p.id, &ceremony_subject(p), false) {
                             eprintln!("citrate-agent-sidecar: {e}");
                         }
                     }
@@ -747,46 +789,41 @@ fn resolve_body(
             if unknown.is_some() {
                 out["outcome"] =
                     serde_json::json!(citrate_agent_core::hitl::OUTCOME_SUBMITTED_UNKNOWN);
+                out["recorded"] = serde_json::json!(unknown_recorded);
             }
             Ok(Json(out))
         }
         // The head is not the call the operator reviewed, or its submitter is gone — refuse.
         Err(_) => {
-            if let (Some(log), Some(seq)) = (&log, pending_record) {
-                match &unknown {
-                    // The transaction went out from core even though the capsule was not told.
-                    Some(u) => hic_records::record_outcome(
-                        log,
-                        seq,
-                        citrate_agent_records::Outcome::OutcomeUnknown,
-                        &format!(
-                            "{}; the call was no longer waiting, so the capsule was not told",
-                            u.record_detail()
-                        ),
-                    ),
-                    None => hic_records::record_outcome(
-                        log,
-                        seq,
-                        citrate_agent_records::Outcome::Failed,
-                        "the call was no longer waiting, so nothing was released",
-                    ),
-                }
+            if let (Some(log), Some(seq), None) = (&log, pending_record, &unknown) {
+                hic_records::record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::Failed,
+                    "the call was no longer waiting, so nothing was released",
+                );
             }
             Err(StatusCode::CONFLICT)
         }
     }
 }
 
-/// HUP-S2.6: one ceremony-bridge decision on the reviewed call `p`.
+/// HUP-S2.6: what a ceremony decision on the pending call `p` is about.
+fn ceremony_subject(p: &citrate_agent_core::hitl::PendingView) -> String {
+    format!("{}: {}", p.name, p.description)
+}
+
+/// HUP-S2.6: one ceremony-bridge decision on the call `call_id`, bound to it by its evidence.
 fn record_ceremony_decision(
     log: &citrate_agent_records::DecisionLog,
-    p: &citrate_agent_core::hitl::PendingView,
+    call_id: &str,
+    subject: &str,
     allow: bool,
 ) -> Result<u64, String> {
     hic_records::record_member_decision(
         log,
         "ceremony.capsule_effect",
-        &format!("{}: {}", p.name, p.description),
+        subject,
         allow,
         if allow {
             "the member approved this effect in core's ceremony"
@@ -795,7 +832,7 @@ fn record_ceremony_decision(
         },
         vec![citrate_agent_records::EvidenceRef {
             kind: "approval_call".to_string(),
-            uri: format!("sidecar:approval/{}", p.id),
+            uri: format!("sidecar:approval/{call_id}"),
             digest: None,
         }],
     )
