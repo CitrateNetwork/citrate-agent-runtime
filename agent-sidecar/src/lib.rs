@@ -32,6 +32,7 @@ pub mod files;
 pub mod git_identity;
 pub mod grants;
 pub mod hic_records;
+pub mod host_sets;
 pub mod learn;
 pub mod llm_http;
 pub mod mcp_approvals;
@@ -225,6 +226,18 @@ struct StatusBody {
     /// PBA-L6b-032: skills currently running.
     #[serde(rename = "runningSkills")]
     running_skills: usize,
+    /// Store daemons (citrate-core #356): what `POST /sessions` supports, so core can detect it.
+    capabilities: Capabilities,
+}
+
+/// What this sidecar's session API supports (`GET /status` → `capabilities`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Capabilities {
+    /// The host tool-set names `toolSets` accepts (a per-session allowlist, deny by default).
+    session_tool_sets: Vec<&'static str>,
+    /// `promptSnapshot: false` is honoured (the sidecar adds nothing to core's system prompt).
+    session_prompt_snapshot: bool,
 }
 
 #[derive(Serialize)]
@@ -239,6 +252,21 @@ struct ApprovalBody {
     to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    /// C1-V3-R: an identical effect was approved earlier and submitted with an unknown outcome.
+    /// Absent otherwise.
+    #[serde(
+        rename = "priorOutcomeUnknown",
+        skip_serializing_if = "Option::is_none"
+    )]
+    prior_outcome_unknown: Option<PriorOutcomeBody>,
+}
+
+/// C1-V3-R: the earlier submission an identical re-proposal must be checked against.
+#[derive(Serialize)]
+struct PriorOutcomeBody {
+    #[serde(rename = "txHash")]
+    tx_hash: Option<String>,
+    message: String,
 }
 
 /// AR-B-024 — refuse a non-loopback control bind unless explicitly opted in.
@@ -424,6 +452,10 @@ async fn status(
         pending_approvals: st.queue.depth(),
         role_pending_approvals: st.queue.role_pending_depth(),
         running_skills: MAX_CONCURRENT_SKILLS.saturating_sub(st.run_slots.available_permits()),
+        capabilities: Capabilities {
+            session_tool_sets: host_sets::set_names(),
+            session_prompt_snapshot: true,
+        },
     }))
 }
 
@@ -570,15 +602,25 @@ async fn approvals(
             .get("data_hex")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // C1-V3-R: a re-proposal of an effect whose earlier submission has an unknown outcome
+        // names that transaction, in the summary the member reads and as a field.
+        let summary = match &p.prior_unknown {
+            Some(u) => format!("{} · {}", p.description, u.reproposal_note()),
+            None => p.description,
+        };
         out.push(ApprovalBody {
             // AR-B-023: expose the stable call-id (not the tool name) so the
             // ceremony can assert "I am approving *this* call" when it posts
             // back to /approvals/approve.
             id: p.id.clone(),
             kind: p.risk_level.clone(),
-            summary: p.description,
+            summary,
             to,
             data,
+            prior_outcome_unknown: p.prior_unknown.map(|u| PriorOutcomeBody {
+                tx_hash: u.tx_hash().map(str::to_string),
+                message: u.message().to_string(),
+            }),
         });
     }
     Ok(Json(out))
@@ -620,10 +662,48 @@ async fn reject_head(
 
 /// Extract the call-id the human reviewed from an approve/reject body. `None` for anything that is
 /// not a JSON object carrying a non-empty string `id` (PBA-L6b-009).
-fn requested_call_id(body: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+fn requested_call_id(v: &serde_json::Value) -> Option<String> {
     let id = v.get("id")?.as_str()?;
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// C1-V3-R: the optional payment outcome on an approve body (data source: citrate-core's
+/// signature ceremony, `hermes_resolve_outcome_unknown`). `Ok(None)` when the body carries no
+/// outcome, which is today's behaviour. `Err` (400) for a malformed outcome, a `txHash` or
+/// `message` without an outcome, or any outcome on a reject: an unknown outcome is never a
+/// rejection, because the member approved it and the transaction went out.
+fn requested_outcome(
+    v: &serde_json::Value,
+    approve: bool,
+) -> Result<Option<citrate_agent_core::hitl::UnknownOutcome>, StatusCode> {
+    let present = |k: &str| v.get(k).is_some_and(|x| !x.is_null());
+    if !present("outcome") {
+        return if present("txHash") || present("message") {
+            Err(StatusCode::BAD_REQUEST)
+        } else {
+            Ok(None)
+        };
+    }
+    if !approve {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if v.get("outcome").and_then(|o| o.as_str())
+        != Some(citrate_agent_core::hitl::OUTCOME_SUBMITTED_UNKNOWN)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let optional_str = |k: &str| -> Result<Option<&str>, StatusCode> {
+        match v.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(StatusCode::BAD_REQUEST),
+        }
+    };
+    let tx_hash = optional_str("txHash")?;
+    let message = optional_str("message")?;
+    citrate_agent_core::hitl::UnknownOutcome::new(tx_hash, message)
+        .map(Some)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 /// Shared approve/reject resolution, always bound to a call-id (AR-B-023 / PBA-L6b-009).
@@ -636,26 +716,78 @@ fn resolve_body(
     if st.estop.is_stopped() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let id = requested_call_id(body).ok_or(StatusCode::BAD_REQUEST)?;
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = requested_call_id(&v).ok_or(StatusCode::BAD_REQUEST)?;
+    // C1-V3-R: validated before anything is recorded or resolved.
+    let unknown = requested_outcome(&v, approve)?;
     // HUP-S2.6: the member's decision on the reviewed head is recorded (write-ahead for an
     // approval; fail closed when the record cannot be written). A resolve that does not match
-    // the head records nothing.
+    // the head records nothing, except an unknown outcome (below).
+    //
+    // C1-V3-R: an unknown outcome is different. Core already broadcast the transaction, so
+    // refusing here would only hide it: the outcome is delivered and remembered whatever the
+    // record or the queue says, and a receipt naming the tx is written for its call id even
+    // when the waiter is gone. Nothing is released by it, so write-ahead does not apply.
     let head = st.queue.peek().filter(|p| p.id == id);
     let log = st.sessions.records();
     let pending_record = match (&log, &head) {
-        (Some(log), Some(p)) if approve => Some(
-            record_ceremony_decision(log, p, true).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
-        ),
+        (Some(log), Some(p)) if approve => {
+            match record_ceremony_decision(log, &p.id, &ceremony_subject(p), true) {
+                Ok(seq) => Some(seq),
+                Err(e) if unknown.is_some() => {
+                    eprintln!("citrate-agent-sidecar: {e}");
+                    None
+                }
+                Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            }
+        }
         _ => None,
     };
-    let res = if approve {
-        st.queue.approve_by_id(&id)
-    } else {
-        st.queue.reject_by_id(&id)
+    let res = match (&unknown, approve) {
+        (Some(u), _) => st.queue.approve_by_id_outcome_unknown(&id, u.clone()),
+        (None, true) => st.queue.approve_by_id(&id),
+        (None, false) => st.queue.reject_by_id(&id),
+    };
+    let told = res.is_ok();
+    // C1-V3-R: the receipt of a submitted tx, whether or not the capsule was told.
+    let unknown_recorded = match (&log, &unknown) {
+        (Some(log), Some(u)) => {
+            let detail = if told {
+                u.record_detail()
+            } else {
+                format!(
+                    "{}; the call was no longer waiting, so the capsule was not told",
+                    u.record_detail()
+                )
+            };
+            let seq = pending_record.or_else(|| {
+                let subject = head
+                    .as_ref()
+                    .map(ceremony_subject)
+                    .unwrap_or_else(|| format!("approval {id}: no longer pending"));
+                match record_ceremony_decision(log, &id, &subject, true) {
+                    Ok(seq) => Some(seq),
+                    Err(e) => {
+                        eprintln!("citrate-agent-sidecar: {e}");
+                        None
+                    }
+                }
+            });
+            match seq {
+                Some(seq) => hic_records::try_record_outcome(
+                    log,
+                    seq,
+                    citrate_agent_records::Outcome::OutcomeUnknown,
+                    &detail,
+                ),
+                None => false,
+            }
+        }
+        _ => false,
     };
     match res {
         Ok(()) => {
-            if let (Some(log), Some(p)) = (&log, &head) {
+            if let (Some(log), Some(p), None) = (&log, &head, &unknown) {
                 match pending_record {
                     Some(seq) => hic_records::record_outcome(
                         log,
@@ -664,17 +796,23 @@ fn resolve_body(
                         "released to the capsule; a chain effect was signed and broadcast in core's ceremony first",
                     ),
                     None => {
-                        if let Err(e) = record_ceremony_decision(log, p, false) {
+                        if let Err(e) = record_ceremony_decision(log, &p.id, &ceremony_subject(p), false) {
                             eprintln!("citrate-agent-sidecar: {e}");
                         }
                     }
                 }
             }
-            Ok(Json(serde_json::json!({ "ok": true, "resolved": true })))
+            let mut out = serde_json::json!({ "ok": true, "resolved": true });
+            if unknown.is_some() {
+                out["outcome"] =
+                    serde_json::json!(citrate_agent_core::hitl::OUTCOME_SUBMITTED_UNKNOWN);
+                out["recorded"] = serde_json::json!(unknown_recorded);
+            }
+            Ok(Json(out))
         }
         // The head is not the call the operator reviewed, or its submitter is gone — refuse.
         Err(_) => {
-            if let (Some(log), Some(seq)) = (&log, pending_record) {
+            if let (Some(log), Some(seq), None) = (&log, pending_record, &unknown) {
                 hic_records::record_outcome(
                     log,
                     seq,
@@ -687,16 +825,22 @@ fn resolve_body(
     }
 }
 
-/// HUP-S2.6: one ceremony-bridge decision on the reviewed call `p`.
+/// HUP-S2.6: what a ceremony decision on the pending call `p` is about.
+fn ceremony_subject(p: &citrate_agent_core::hitl::PendingView) -> String {
+    format!("{}: {}", p.name, p.description)
+}
+
+/// HUP-S2.6: one ceremony-bridge decision on the call `call_id`, bound to it by its evidence.
 fn record_ceremony_decision(
     log: &citrate_agent_records::DecisionLog,
-    p: &citrate_agent_core::hitl::PendingView,
+    call_id: &str,
+    subject: &str,
     allow: bool,
 ) -> Result<u64, String> {
     hic_records::record_member_decision(
         log,
         "ceremony.capsule_effect",
-        &format!("{}: {}", p.name, p.description),
+        subject,
         allow,
         if allow {
             "the member approved this effect in core's ceremony"
@@ -705,7 +849,7 @@ fn record_ceremony_decision(
         },
         vec![citrate_agent_records::EvidenceRef {
             kind: "approval_call".to_string(),
-            uri: format!("sidecar:approval/{}", p.id),
+            uri: format!("sidecar:approval/{call_id}"),
             digest: None,
         }],
     )
@@ -854,6 +998,9 @@ async fn create_session(
             let session = st.sessions.get(&id);
             // HUP-S3.3: say what the persona did (offered skills, missing ones, pinned tools).
             let persona = session.as_ref().and_then(|s| s.persona().cloned());
+            // Store daemons (citrate-core #356): echo the allowlist as applied.
+            let tool_sets = session.as_ref().and_then(|s| s.tool_sets());
+            let prompt_snapshot = session.as_ref().map(|s| s.prompt_snapshot());
             // HUP-S1.2: say how tokens are counted and tools ranked (probed once, off the
             // async runtime: the probes are blocking HTTP calls to the session's own endpoints).
             let retrieval = match session {
@@ -865,6 +1012,12 @@ async fn create_session(
             let mut body = serde_json::json!({ "id": id });
             if let Some(p) = persona {
                 body["persona"] = serde_json::json!(p);
+            }
+            if let Some(t) = tool_sets {
+                body["toolSets"] = serde_json::json!(t);
+            }
+            if prompt_snapshot == Some(false) {
+                body["promptSnapshot"] = serde_json::json!(false);
             }
             if let Some(r) = retrieval {
                 body["tokenCounting"] = serde_json::json!(r.token_counting);
@@ -2388,6 +2541,8 @@ mod mcp_session_tests;
 #[cfg(test)]
 mod metering_session_tests;
 #[cfg(test)]
+mod outcome_unknown_tests;
+#[cfg(test)]
 mod retrieval_http_tests;
 #[cfg(test)]
 mod session_reattach_tests;
@@ -2418,6 +2573,8 @@ mod deploy_guard_session_tests;
 mod e2e_build_tests;
 #[cfg(all(test, unix))]
 mod hgw_support;
+#[cfg(test)]
+mod host_sets_session_tests;
 #[cfg(all(test, unix))]
 mod loop_capability_tests;
 #[cfg(all(test, unix))]
