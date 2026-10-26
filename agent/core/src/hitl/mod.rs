@@ -21,12 +21,17 @@
 //! description}). Until then they stay here as the agreed defaults.
 
 pub mod break_glass;
+pub mod outcome;
 pub mod quorum;
 pub mod roles;
 pub mod signing;
 
 pub use break_glass::{
     BreakGlassEntry, BreakGlassError, BreakGlassPhase, BreakGlassRegistry, AFFIRMATION_WINDOW,
+};
+pub use outcome::{
+    is_tx_hash, UnknownOutcome, MAX_OUTCOME_MESSAGE, OUTCOME_SUBMITTED_UNKNOWN,
+    REMEMBERED_UNKNOWN_OUTCOMES,
 };
 pub use quorum::Quorum;
 pub use roles::{can_approve, is_conflict};
@@ -77,6 +82,9 @@ pub struct PendingView {
     pub description: String,
     pub risk_level: String,
     pub args_pretty: String,
+    /// C1-V3-R: an identical call was approved earlier and submitted with an unknown outcome.
+    /// The approval card names that transaction so the member checks it before approving again.
+    pub prior_unknown: Option<UnknownOutcome>,
 }
 
 // ── Approval queue ─────────────────────────────────────────────────
@@ -91,10 +99,12 @@ struct PendingEntry {
     nonce: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ApprovalOutcome {
     Approved,
     Rejected,
+    /// C1-V3-R: approved; citrate-core submitted the transaction and its outcome is unknown.
+    SubmittedOutcomeUnknown(UnknownOutcome),
 }
 
 /// BFR-INT-12b WP-5 — default Pending deadline. If the operator
@@ -116,6 +126,21 @@ pub enum ApprovalOutcomePublic {
     Rejected,
     TimedOut,
     AutoApproved,
+    /// C1-V3-R: the member approved and the transaction was submitted (by citrate-core's
+    /// ceremony), but its outcome is unknown. Not success and not final: the submitter must not
+    /// perform or re-send the effect. [`ApprovalQueue::submit_with_resolution`] carries the hash
+    /// and the message.
+    SubmittedOutcomeUnknown,
+}
+
+/// C1-V3-R: how a FIFO submission ended, with the details an unknown outcome carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// Approved, auto-approved, rejected or timed out.
+    Decided(ApprovalOutcomePublic),
+    /// Approved and submitted by citrate-core, outcome unknown: the submitter is told exactly
+    /// [`UnknownOutcome::message`] and does not perform the effect itself.
+    SubmittedOutcomeUnknown(UnknownOutcome),
 }
 
 // ── CIT-AGENT-4a: Signer / Signature types ─────────────────────────
@@ -268,6 +293,10 @@ pub struct ApprovalQueue {
     // PBA-L6b-010 — set by the emergency stop. While frozen every new
     // submission is refused at once (never parked) and the queue is empty.
     frozen: std::sync::atomic::AtomicBool,
+    // C1-V3-R — call ids approved and submitted with an unknown outcome, oldest first, at most
+    // `REMEMBERED_UNKNOWN_OUTCOMES`. An identical re-proposal is never auto-granted and its
+    // pending view names the earlier transaction.
+    unknown_outcomes: Mutex<VecDeque<(String, UnknownOutcome)>>,
 }
 
 /// PBA-L6b-009 — removes a FIFO submission's entry when its waiter goes away
@@ -328,17 +357,30 @@ impl ApprovalQueue {
     }
 
     /// Same as [`submit`] but returns the rich outcome so callers
-    /// can write a faithful decision-log row.
+    /// can write a faithful decision-log row. An unknown outcome is
+    /// [`ApprovalOutcomePublic::SubmittedOutcomeUnknown`]; use
+    /// [`submit_with_resolution`](Self::submit_with_resolution) for its hash and message.
     pub async fn submit_with_outcome(&self, call: ToolCall) -> ApprovalOutcomePublic {
+        match self.submit_with_resolution(call).await {
+            Resolution::Decided(o) => o,
+            Resolution::SubmittedOutcomeUnknown(_) => ApprovalOutcomePublic::SubmittedOutcomeUnknown,
+        }
+    }
+
+    /// C1-V3-R — submit a tool call and learn how it ended, including an approved effect that
+    /// citrate-core submitted with an unknown outcome (with the hash and the message to report).
+    pub async fn submit_with_resolution(&self, call: ToolCall) -> Resolution {
+        use ApprovalOutcomePublic as P;
         // PBA-L6b-010: after an emergency stop nothing new is queued — not
         // even an auto-granted call.
         if self.is_frozen() {
-            return ApprovalOutcomePublic::Rejected;
+            return Resolution::Decided(P::Rejected);
         }
         // BFR-INT-12b WP-4 — auto-grant fast path. Resolved before
-        // the queue is touched.
-        if self.is_trusted(&call.name) {
-            return ApprovalOutcomePublic::AutoApproved;
+        // the queue is touched. C1-V3-R: never for a call whose earlier identical submission has
+        // an unknown outcome; a member must look at it again (no unattended re-send).
+        if self.is_trusted(&call.name) && self.prior_unknown_outcome(&call.call_id).is_none() {
+            return Resolution::Decided(P::AutoApproved);
         }
         let (tx, rx) = oneshot::channel();
         // AR-B-023: remember which entry this future owns so a timeout evicts
@@ -351,18 +393,18 @@ impl ApprovalQueue {
         {
             let mut q = match self.pending.lock() {
                 Ok(q) => q,
-                Err(_) => return ApprovalOutcomePublic::Rejected,
+                Err(_) => return Resolution::Decided(P::Rejected),
             };
             // PBA-L6b-010: re-check under the lock so a submission racing
             // `freeze_and_drain` cannot slip in after the drain.
             if self.is_frozen() {
-                return ApprovalOutcomePublic::Rejected;
+                return Resolution::Decided(P::Rejected);
             }
             // PBA-L6b-012: an identical effect (same call_id) is already
             // waiting for a human. Refuse the duplicate instead of queueing a
             // second entry an id-bound approve could not tell apart.
             if q.iter().any(|e| e.call.call_id == call_id) {
-                return ApprovalOutcomePublic::Rejected;
+                return Resolution::Decided(P::Rejected);
             }
             q.push_back(PendingEntry {
                 call,
@@ -380,10 +422,13 @@ impl ApprovalQueue {
         // BFR-INT-12b WP-5 — race the resolver against the 5-min
         // timeout.
         match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
-            Ok(Ok(ApprovalOutcome::Approved)) => ApprovalOutcomePublic::Approved,
-            Ok(Ok(ApprovalOutcome::Rejected)) => ApprovalOutcomePublic::Rejected,
-            Ok(Err(_)) => ApprovalOutcomePublic::Rejected, // sender dropped
-            Err(_) => ApprovalOutcomePublic::TimedOut,
+            Ok(Ok(ApprovalOutcome::Approved)) => Resolution::Decided(P::Approved),
+            Ok(Ok(ApprovalOutcome::Rejected)) => Resolution::Decided(P::Rejected),
+            Ok(Ok(ApprovalOutcome::SubmittedOutcomeUnknown(u))) => {
+                Resolution::SubmittedOutcomeUnknown(u)
+            }
+            Ok(Err(_)) => Resolution::Decided(P::Rejected), // sender dropped
+            Err(_) => Resolution::Decided(P::TimedOut),
         }
     }
 
@@ -433,6 +478,43 @@ impl ApprovalQueue {
     /// decision can never land on an unreviewed action.
     pub fn approve_by_id(&self, call_id: &str) -> Result<(), SignatureError> {
         self.resolve_head_by_id(call_id, ApprovalOutcome::Approved)
+    }
+
+    /// C1-V3-R — approve a specific pending call by id (exactly as [`approve_by_id`]) whose chain
+    /// effect citrate-core already submitted with an unknown outcome. The submitter receives
+    /// [`Resolution::SubmittedOutcomeUnknown`] (never plain approval, so it does not perform the
+    /// effect again), and the call id is remembered so an identical re-proposal is never
+    /// auto-granted and names the earlier transaction. The transaction went out whatever the
+    /// queue's state, so the call id is remembered even when the head no longer matches.
+    pub fn approve_by_id_outcome_unknown(
+        &self,
+        call_id: &str,
+        outcome: UnknownOutcome,
+    ) -> Result<(), SignatureError> {
+        self.remember_unknown_outcome(call_id, outcome.clone());
+        self.resolve_head_by_id(call_id, ApprovalOutcome::SubmittedOutcomeUnknown(outcome))
+    }
+
+    /// C1-V3-R — the unknown outcome of an earlier identical call, if one is remembered.
+    pub fn prior_unknown_outcome(&self, call_id: &str) -> Option<UnknownOutcome> {
+        let m = self.unknown_outcomes.lock().ok()?;
+        m.iter().find(|(id, _)| id == call_id).map(|(_, u)| u.clone())
+    }
+
+    /// C1-V3-R — how many unknown outcomes are remembered (at most
+    /// [`REMEMBERED_UNKNOWN_OUTCOMES`]).
+    pub fn remembered_unknown_outcomes(&self) -> usize {
+        self.unknown_outcomes.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn remember_unknown_outcome(&self, call_id: &str, outcome: UnknownOutcome) {
+        if let Ok(mut m) = self.unknown_outcomes.lock() {
+            m.retain(|(id, _)| id != call_id);
+            m.push_back((call_id.to_string(), outcome));
+            while m.len() > REMEMBERED_UNKNOWN_OUTCOMES {
+                m.pop_front();
+            }
+        }
     }
 
     /// AR-B-023 — reject a specific pending call by id (see [`approve_by_id`]).
@@ -495,11 +577,15 @@ impl ApprovalQueue {
         let entry = q.front()?;
         let args_pretty = serde_json::to_string_pretty(&entry.call.args)
             .unwrap_or_else(|_| entry.call.args.to_string());
+        let id = entry.call.call_id.clone();
+        let name = entry.call.name.clone();
+        drop(q);
         Some(PendingView {
-            id: entry.call.call_id.clone(),
-            name: entry.call.name.clone(),
-            description: describe(&entry.call.name),
-            risk_level: risk_level(&entry.call.name).to_string(),
+            prior_unknown: self.prior_unknown_outcome(&id),
+            description: describe(&name),
+            risk_level: risk_level(&name).to_string(),
+            id,
+            name,
             args_pretty,
         })
     }
@@ -593,6 +679,11 @@ impl ApprovalQueue {
         let outcome = match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
             Ok(Ok(ApprovalOutcome::Approved)) => ApprovalOutcomePublic::Approved,
             Ok(Ok(ApprovalOutcome::Rejected)) => ApprovalOutcomePublic::Rejected,
+            // Only the FIFO track's approve route carries an outcome; the role track never
+            // receives one. Read it as not approved (fail closed).
+            Ok(Ok(ApprovalOutcome::SubmittedOutcomeUnknown(_))) => {
+                ApprovalOutcomePublic::SubmittedOutcomeUnknown
+            }
             Ok(Err(_)) => ApprovalOutcomePublic::Rejected,
             Err(_) => ApprovalOutcomePublic::TimedOut,
         };
@@ -1517,5 +1608,122 @@ mod tests {
         assert_eq!(risk_level("anchor_session"), "medium");
         assert_eq!(risk_level("revoke_role"), "medium");
         assert_eq!(risk_level("provision_user"), "high");
+    }
+
+    // ── C1-V3-R: approved, submitted, outcome unknown ─────────────────
+
+    const TX: &str = "0x8f3c2a1b9d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8";
+
+    fn unknown() -> UnknownOutcome {
+        UnknownOutcome::new(
+            Some(TX),
+            Some(&format!("submitted, outcome unknown, tx {TX}, check before retrying")),
+        )
+        .expect("core's words are valid")
+    }
+
+    #[tokio::test]
+    async fn an_unknown_outcome_reaches_the_submitter_with_its_message() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit_with_resolution(mkcall("pay")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        q.approve_by_id_outcome_unknown("call_pay", unknown())
+            .expect("the head matches");
+        assert_eq!(h.await.unwrap(), Resolution::SubmittedOutcomeUnknown(unknown()));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_outcome_is_never_a_plain_approval() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit(mkcall("pay_bool")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        q.approve_by_id_outcome_unknown("call_pay_bool", unknown())
+            .expect("the head matches");
+        assert!(!h.await.unwrap(), "submit() must not report an unknown outcome as approved");
+
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit_with_outcome(mkcall("pay_rich")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        q.approve_by_id_outcome_unknown("call_pay_rich", unknown())
+            .expect("the head matches");
+        assert_eq!(h.await.unwrap(), ApprovalOutcomePublic::SubmittedOutcomeUnknown);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_outcome_on_a_different_head_resolves_nothing() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit_with_outcome(mkcall("head")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            q.approve_by_id_outcome_unknown("call_other", unknown()),
+            Err(SignatureError::UnknownCallId)
+        );
+        assert_eq!(q.depth(), 1);
+        q.reject_by_id("call_head").expect("cleanup");
+        assert_eq!(h.await.unwrap(), ApprovalOutcomePublic::Rejected);
+    }
+
+    /// No auto-retry: after an unknown outcome the identical call is never auto-granted, and the
+    /// pending view names the earlier transaction.
+    #[tokio::test]
+    async fn a_reproposal_after_an_unknown_outcome_waits_for_a_human() {
+        let q = Arc::new(ApprovalQueue::new());
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit_with_outcome(mkcall("again")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(q.peek().unwrap().prior_unknown.is_none(), "first proposal: no history");
+        q.approve_by_id_outcome_unknown("call_again", unknown())
+            .expect("the head matches");
+        let _ = h.await;
+        assert_eq!(q.prior_unknown_outcome("call_again"), Some(unknown()));
+
+        q.add_grant("again");
+        let qa = q.clone();
+        let h = tokio::spawn(async move { qa.submit_with_outcome(mkcall("again")).await });
+        while q.depth() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let view = q.peek().expect("the re-proposal is pending, not auto-granted");
+        assert_eq!(view.prior_unknown, Some(unknown()));
+        q.reject_by_id("call_again").expect("cleanup");
+        assert_eq!(h.await.unwrap(), ApprovalOutcomePublic::Rejected);
+
+        // An unrelated granted tool still takes the fast path.
+        q.add_grant("other");
+        assert_eq!(
+            q.submit_with_outcome(mkcall("other")).await,
+            ApprovalOutcomePublic::AutoApproved
+        );
+    }
+
+    #[test]
+    fn unknown_outcomes_are_remembered_within_a_bound() {
+        let q = ApprovalQueue::new();
+        for i in 0..(REMEMBERED_UNKNOWN_OUTCOMES + 10) {
+            // Nothing is pending, so each resolve fails, but the submitted tx is still remembered.
+            let _ = q.approve_by_id_outcome_unknown(&format!("c{i}"), unknown());
+        }
+        assert!(q.prior_unknown_outcome("c0").is_none(), "the oldest is dropped");
+        assert!(q
+            .prior_unknown_outcome(&format!("c{}", REMEMBERED_UNKNOWN_OUTCOMES + 9))
+            .is_some());
+        assert_eq!(q.remembered_unknown_outcomes(), REMEMBERED_UNKNOWN_OUTCOMES);
+        // The same id twice is one entry.
+        let _ = q.approve_by_id_outcome_unknown("c300", unknown());
+        let _ = q.approve_by_id_outcome_unknown("c300", unknown());
+        assert_eq!(q.remembered_unknown_outcomes(), REMEMBERED_UNKNOWN_OUTCOMES);
     }
 }
