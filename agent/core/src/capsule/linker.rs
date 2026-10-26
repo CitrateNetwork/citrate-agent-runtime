@@ -455,8 +455,19 @@ impl LinkerBuilder {
                     tier: store.data().risk_tier(),
                     required_roles: store.data().required_roles().to_vec(),
                 };
-                if let Err(reason) = gate.request(req) {
-                    return Ok((Err(format!("ChainSendApprovalRejected: {reason}")),));
+                match gate.decide(req) {
+                    crate::capsule::dispatcher::GateDecision::Approved => {}
+                    crate::capsule::dispatcher::GateDecision::Refused(reason) => {
+                        return Ok((Err(format!("ChainSendApprovalRejected: {reason}")),));
+                    }
+                    // C1-V3-R: approved and already submitted by citrate-core, outcome unknown.
+                    // Report core's words as a non-final result; never dispatch (no double send).
+                    crate::capsule::dispatcher::GateDecision::SubmittedOutcomeUnknown(message) => {
+                        return Ok((Err(format!(
+                            "{}: {message}",
+                            crate::capsule::dispatcher::CHAIN_SEND_OUTCOME_UNKNOWN
+                        )),));
+                    }
                 }
 
                 // Approval granted. Resolve the tx hash:

@@ -103,6 +103,12 @@ pub fn record_auto_decision(
 /// Close an allowing decision with its outcome. A failure is logged (the decision stays open and
 /// the log closes it as `outcome_unknown` when it is next opened).
 pub fn record_outcome(log: &DecisionLog, seq: u64, outcome: Outcome, detail: &str) {
+    let _written = try_record_outcome(log, seq, outcome, detail);
+}
+
+/// [`record_outcome`], saying whether the outcome was written (C1-V3-R: the approve route reports
+/// a missing receipt for a submitted transaction instead of hiding it).
+pub fn try_record_outcome(log: &DecisionLog, seq: u64, outcome: Outcome, detail: &str) -> bool {
     if let Err(e) = log.record_outcome(
         Actor::member("member"),
         OutcomeEvent {
@@ -114,7 +120,9 @@ pub fn record_outcome(log: &DecisionLog, seq: u64, outcome: Outcome, detail: &st
         eprintln!(
             "citrate-agent-sidecar: the outcome of decision {seq} could not be recorded: {e}"
         );
+        return false;
     }
+    true
 }
 
 /// Control characters removed, then cut at a character boundary to at most `max` bytes (the

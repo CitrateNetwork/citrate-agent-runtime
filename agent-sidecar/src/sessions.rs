@@ -112,6 +112,7 @@ use crate::anchor::AnchorService;
 use crate::decide::DecideService;
 use crate::files::{FileTools, FileToolsHost};
 use crate::grants::{FileToolHost, GrantSummary, SessionGrants};
+use crate::host_sets::{HostSet, HostSets};
 use crate::metering::{MeteredLlm, MeteringStore, TeeSink};
 use crate::sheets::SheetToolHost;
 use crate::shell_run::{
@@ -327,9 +328,10 @@ pub struct RetrievalReport {
     pub max_tool_schemas: usize,
 }
 
-/// `POST /sessions` body.
+/// `POST /sessions` body. Fails closed: a key this sidecar does not know refuses the session
+/// (a misspelled `toolSets` must never open one with every host tool set).
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateSessionReq {
     pub model: String,
     pub system_prompt: String,
@@ -381,6 +383,33 @@ pub struct CreateSessionReq {
     /// none (build configuration stays the member's, as before).
     #[serde(default)]
     pub project_roots: Vec<String>,
+    /// Store daemons (citrate-core #356): the sidecar-hosted tool sets this session may use, by
+    /// canonical name ([`crate::host_sets::HostSet::name`]). Present = ONLY these sets are offered
+    /// and callable (deny by default; `[]` = none); every other set's tools are absent and a call
+    /// to one is refused. An unknown name refuses the session. Absent = every set the sidecar runs
+    /// with, as before; an explicit `null` = no sets (never all of them).
+    #[serde(default, deserialize_with = "null_is_no_sets")]
+    pub tool_sets: Option<Vec<String>>,
+    /// Store daemons (citrate-core #356): `false` = the sidecar adds nothing to the system prompt
+    /// core sent (no per-turn skill index, no persona fragment; a persona is then refused).
+    /// Absent or `true` = as before.
+    #[serde(default = "default_true")]
+    pub prompt_snapshot: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `toolSets` when the key is present: an array of names, or `null`, which is read as `[]` (no
+/// sets). Only an absent key leaves the session unrestricted.
+fn null_is_no_sets<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<Vec<String>>::deserialize(d)?.unwrap_or_default(),
+    ))
 }
 
 /// HUP-S3.3: what a session did with its persona (`POST /sessions` answers it as `persona`).
@@ -580,6 +609,10 @@ pub struct Session {
     actions: Option<Arc<ActionApprovals>>,
     /// HUP-S10.3: a scheduled run nobody watches; its taint is never cleared.
     unattended: bool,
+    /// Store daemons (citrate-core #356): the host tool sets this session may use.
+    host_sets: HostSets,
+    /// Store daemons: false when the sidecar adds nothing to core's system prompt.
+    prompt_snapshot: bool,
     /// Test seam: runs on the emitting thread right after an event becomes visible to readers, so
     /// a test can act as a core client at the exact moment the event appears.
     #[cfg(test)]
@@ -631,6 +664,17 @@ impl Session {
     /// HUP-S10.3: whether this is a scheduled run nobody watches (its taint is never cleared).
     pub fn is_unattended(&self) -> bool {
         self.unattended
+    }
+
+    /// Store daemons (citrate-core #356): the host tool sets this session was limited to, in
+    /// canonical order (`None` = no allowlist, every set the sidecar runs with).
+    pub fn tool_sets(&self) -> Option<Vec<&'static str>> {
+        self.host_sets.names()
+    }
+
+    /// Store daemons: false when the session was opened with `promptSnapshot: false`.
+    pub fn prompt_snapshot(&self) -> bool {
+        self.prompt_snapshot
     }
 
     /// HGW-1: the action cards waiting for the member (`None` when the session has none, i.e. it
@@ -1529,6 +1573,14 @@ impl SessionManager {
         if req.model.trim().is_empty() {
             return Err(SessionError::Invalid("model is required".into()));
         }
+        // Store daemons (citrate-core #356): the host tool sets this session may use.
+        let host_sets =
+            HostSets::from_allowlist(req.tool_sets.as_deref()).map_err(SessionError::Invalid)?;
+        if !req.prompt_snapshot && (req.persona.is_some() || req.custom_persona.is_some()) {
+            return Err(SessionError::Invalid(
+                "promptSnapshot: false keeps the system prompt exactly as sent, so it cannot carry a persona".into(),
+            ));
+        }
         let persona = citrate_agent_loop::personas::session_persona(
             req.persona.as_deref(),
             req.custom_persona.as_ref(),
@@ -1538,7 +1590,11 @@ impl SessionManager {
         // allowlist with nothing installed offers no skills (and no `skill_load`), never others.
         // One snapshot of the (reloadable) library for the allowlist, the prompt section and
         // the session's `skill_load` host.
-        let base_skills = self.skills();
+        let base_skills = if host_sets.allows(HostSet::SkillsRead) {
+            self.skills()
+        } else {
+            None
+        };
         let allow = persona
             .as_ref()
             .filter(|p| p.restricts_skills())
@@ -1578,6 +1634,11 @@ impl SessionManager {
             },
         });
         let mut specs = req.tools;
+        // Every sidecar-hosted spec core passes is an installed capsule (the sidecar host sends
+        // any name it does not own to the capsule dispatch).
+        if !host_sets.allows(HostSet::CapsulesRun) {
+            specs.retain(|t| t.host != HostKind::Sidecar);
+        }
         let mut system_prompt = req.system_prompt;
         // L-23: the persona's prompt fragment is rendered here from the checked persona (a shipped
         // id or a custom persona that passed `CustomPersona::check`), never taken from app state.
@@ -1600,16 +1661,20 @@ impl SessionManager {
                 )));
             }
             // US-3.2 AC1: each turn carries the at most SKILLS_PER_TURN skills that match it,
-            // ranked over the (persona-restricted) library; never the whole index.
-            turn_context.push(Arc::new(LiveSkillTurnIndex {
-                live: live.clone(),
-                k: SKILLS_PER_TURN,
-                ranker: retriever.clone(),
-            }));
+            // ranked over the (persona-restricted) library; never the whole index. Not with
+            // `promptSnapshot: false` (the prompt stays exactly as core sent it).
+            if req.prompt_snapshot {
+                turn_context.push(Arc::new(LiveSkillTurnIndex {
+                    live: live.clone(),
+                    k: SKILLS_PER_TURN,
+                    ranker: retriever.clone(),
+                }));
+            }
             specs.push(skill_load_spec());
             pinned_tools.push(SKILL_LOAD_TOOL.to_string());
         }
-        if self.toolchain.is_some() {
+        let toolchain_on = self.toolchain.is_some() && host_sets.allows(HostSet::Toolchain);
+        if toolchain_on {
             if let Some(t) = specs.iter().find(|t| ToolchainHost::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{}' is reserved by the sidecar while the toolchain is enabled",
@@ -1618,7 +1683,7 @@ impl SessionManager {
             }
             specs.extend(ToolchainHost::specs());
         }
-        if self.search.is_some() {
+        if self.search.is_some() && host_sets.allows(HostSet::WebSearch) {
             if let Some(t) = specs.iter().find(|t| SearchHost::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{}' is reserved by the sidecar while search is enabled",
@@ -1627,7 +1692,8 @@ impl SessionManager {
             }
             specs.extend(SearchHost::specs());
         }
-        if self.files.is_some() {
+        let files_on = host_sets.allows(HostSet::Files);
+        if self.files.is_some() && files_on {
             if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{}' is reserved by the sidecar while the file tools are enabled",
@@ -1637,7 +1703,8 @@ impl SessionManager {
             specs.extend(FileTools::specs());
         }
         let mut mcp_offered = None;
-        if let Some(mcp) = &self.mcp {
+        let mcp_on = self.mcp.is_some() && host_sets.allows(HostSet::Mcp);
+        if let Some(mcp) = self.mcp.as_ref().filter(|_| mcp_on) {
             if let Some(t) = specs.iter().find(|t| McpHost::reserved(&t.name)) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{}' is in the 'mcp__' namespace, which is reserved while MCP servers are configured",
@@ -1654,11 +1721,11 @@ impl SessionManager {
             specs.extend(offered);
         }
         // HUP-S4.1: MCP approval cards only for a client that shows `hic: required` to a person.
-        let mcp_approvals = (self.mcp.is_some() && req.hic_aware)
+        let mcp_approvals = (mcp_on && req.hic_aware)
             .then(|| Arc::new(crate::mcp_approvals::McpApprovals::default()));
         // HGW-1: action cards only for a client that shows `hic: required` to a person.
         let actions = req.hic_aware.then(|| Arc::new(ActionApprovals::default()));
-        if self.browser.is_some() {
+        if self.browser.is_some() && host_sets.allows(HostSet::WebBrowse) {
             if let Some(t) = specs.iter().find(|t| browser_tools::handles(&t.name)) {
                 return Err(SessionError::Invalid(format!(
                     "the tool name '{}' is reserved by the sidecar while the browser is enabled",
@@ -1667,7 +1734,7 @@ impl SessionManager {
             }
             specs.extend(browser_tools::specs());
         }
-        if self.learn.is_some() {
+        if self.learn.is_some() && host_sets.allows(HostSet::LearnPropose) {
             if specs
                 .iter()
                 .any(|t| t.name == crate::learn::LEARN_PROPOSE_TOOL)
@@ -1680,6 +1747,7 @@ impl SessionManager {
             specs.push(crate::learn::learn_propose_spec());
         }
         if self.projects.is_some()
+            && files_on
             && specs
                 .iter()
                 .any(|t| t.name == crate::projects::PROJECT_CREATE_TOOL)
@@ -1689,7 +1757,8 @@ impl SessionManager {
                 crate::projects::PROJECT_CREATE_TOOL
             )));
         }
-        if self.shell_run.is_some() && specs.iter().any(|t| t.name == SHELL_RUN_TOOL) {
+        let shell_on = self.shell_run.is_some() && host_sets.allows(HostSet::ShellRun);
+        if shell_on && specs.iter().any(|t| t.name == SHELL_RUN_TOOL) {
             return Err(SessionError::Invalid(format!(
                 "the tool name '{SHELL_RUN_TOOL}' is reserved by the sidecar while shell_run is on"
             )));
@@ -1707,10 +1776,9 @@ impl SessionManager {
                         "folder grants need the member's home directory, which the sidecar does not know".into(),
                     )
                 })?;
-                if let Some(t) = specs
-                    .iter()
-                    .find(|t| crate::grants::handles(&t.name) || crate::sheets::handles(&t.name))
-                {
+                if let Some(t) = specs.iter().find(|t| {
+                    files_on && (crate::grants::handles(&t.name) || crate::sheets::handles(&t.name))
+                }) {
                     return Err(SessionError::Invalid(format!(
                         "the tool name '{}' is reserved by the sidecar while folder grants are given",
                         t.name
@@ -1718,7 +1786,7 @@ impl SessionManager {
                 }
                 // HUP-S2.9: with an undo store, a grant session also gets the checkpointed fs_*
                 // tools, checked against this same grant document.
-                let fs_on_grants = self.checkpoints.is_some() && self.files.is_none();
+                let fs_on_grants = files_on && self.checkpoints.is_some() && self.files.is_none();
                 if fs_on_grants {
                     if let Some(t) = specs.iter().find(|t| FileTools::handles(&t.name)) {
                         return Err(SessionError::Invalid(format!(
@@ -1738,18 +1806,20 @@ impl SessionManager {
                             SessionError::Invalid(format!("projectRoots was refused: {e}"))
                         })?;
                 }
-                specs.extend(crate::grants::file_tool_specs());
-                specs.extend(crate::sheets::sheet_tool_specs());
+                if files_on {
+                    specs.extend(crate::grants::file_tool_specs());
+                    specs.extend(crate::sheets::sheet_tool_specs());
+                }
                 if fs_on_grants {
                     specs.extend(FileTools::specs());
                 }
                 Some(Arc::new(g))
             }
         };
-        if self.projects.is_some() && grants.is_some() {
+        if self.projects.is_some() && files_on && grants.is_some() {
             specs.push(crate::projects::project_create_spec());
         }
-        let shell = match (&self.shell_run, &grants) {
+        let shell = match (self.shell_run.as_ref().filter(|_| shell_on), &grants) {
             (Some(cfg), Some(g)) => {
                 specs.push(shell_run_spec());
                 Some(Arc::new(
@@ -1783,11 +1853,12 @@ impl SessionManager {
                 pinned_tools: pinned,
             }
         });
-        let toolchain: Option<Arc<dyn ToolHost>> = match (&self.toolchain, &grants) {
-            (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
-            (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
-            (None, _) => None,
-        };
+        let toolchain: Option<Arc<dyn ToolHost>> =
+            match (self.toolchain.as_ref().filter(|_| toolchain_on), &grants) {
+                (Some(t), Some(g)) => Some(t.scoped_to(g.clone()).map_err(SessionError::Invalid)?),
+                (Some(t), None) => Some(t.clone() as Arc<dyn ToolHost>),
+                (None, _) => None,
+            };
         // HUP-S6.3 → S6.4: keep each run's raw report for core's deploy gate; the model sees the
         // result without it.
         let toolchain_reports = toolchain
@@ -1802,6 +1873,7 @@ impl SessionManager {
         // HUP-S2.9: a grant session's fs_* tools check the session's grant document (core's
         // grant store), not a grants file.
         let files = match (&grants, &self.checkpoints) {
+            _ if !files_on => None,
             (Some(g), Some(store)) => Some(Arc::new(FileTools::new(
                 store.clone(),
                 crate::files::GrantSource::Session(g.clone()),
@@ -1935,6 +2007,8 @@ impl SessionManager {
             mcp_approvals,
             actions,
             unattended: req.unattended,
+            host_sets,
+            prompt_snapshot: req.prompt_snapshot,
             #[cfg(test)]
             event_hook: Mutex::new(None),
         });
@@ -2019,10 +2093,13 @@ impl SessionManager {
             registry = registry.with_policy(Arc::new(guard));
         }
         let skill_host = session.skills.as_ref().map(|l| SkillHost::new(l.current()));
-        let capsule_host = capsules.map(|d| CapsuleHost {
-            dispatch: d,
-            sandbox: session.capsule_sandbox.clone(),
-        });
+        let sets = session.host_sets;
+        let capsule_host = capsules
+            .filter(|_| sets.allows(HostSet::CapsulesRun))
+            .map(|d| CapsuleHost {
+                dispatch: d,
+                sandbox: session.capsule_sandbox.clone(),
+            });
         let toolchain = session.toolchain.clone();
         let files = session
             .files
@@ -2034,44 +2111,64 @@ impl SessionManager {
             .checkpoints
             .clone()
             .and_then(|st| crate::files::UndoScope::new(st, &session.id));
-        let file_host = session.grants.clone().map(|g| {
-            let h = FileToolHost::new(g);
-            match &undo {
-                Some(u) => h.with_undo(u.clone()),
-                None => h,
-            }
-        });
-        let sheet_host = session.grants.clone().map(|g| {
-            let h = SheetToolHost::new(g);
-            match &undo {
-                Some(u) => h.with_undo(u.clone()),
-                None => h,
-            }
-        });
-        let search = self.search.clone();
-        let mcp_host = self.mcp.clone().map(|h| {
-            let mut t = McpToolHost::new(h, session.stop.clone());
-            if let Some(o) = &session.mcp_offered {
-                t = t.with_offered(o.clone());
-            }
-            if let Some(a) = &session.mcp_approvals {
-                t = t.with_approver(a.clone());
-            }
-            t
-        });
+        let file_host = session
+            .grants
+            .clone()
+            .filter(|_| sets.allows(HostSet::Files))
+            .map(|g| {
+                let h = FileToolHost::new(g);
+                match &undo {
+                    Some(u) => h.with_undo(u.clone()),
+                    None => h,
+                }
+            });
+        let sheet_host = session
+            .grants
+            .clone()
+            .filter(|_| sets.allows(HostSet::Files))
+            .map(|g| {
+                let h = SheetToolHost::new(g);
+                match &undo {
+                    Some(u) => h.with_undo(u.clone()),
+                    None => h,
+                }
+            });
+        let search = self
+            .search
+            .clone()
+            .filter(|_| sets.allows(HostSet::WebSearch));
+        let mcp_host = self
+            .mcp
+            .clone()
+            .filter(|_| sets.allows(HostSet::Mcp))
+            .map(|h| {
+                let mut t = McpToolHost::new(h, session.stop.clone());
+                if let Some(o) = &session.mcp_offered {
+                    t = t.with_offered(o.clone());
+                }
+                if let Some(a) = &session.mcp_approvals {
+                    t = t.with_approver(a.clone());
+                }
+                t
+            });
         let learn_host = self
             .learn
             .clone()
+            .filter(|_| sets.allows(HostSet::LearnPropose))
             .map(|svc| crate::learn::LearnToolHost::new(svc, session.clone()));
-        let browser_host = self.browser.clone().map(|b| {
-            BrowserToolHost::new(b, session.stop.clone()).with_picker(Arc::new(
-                crate::decide::SessionPicker::new(
-                    self.decide.clone(),
-                    session.decide_llm.clone(),
-                    &session.cfg.model,
-                ),
-            ))
-        });
+        let browser_host = self
+            .browser
+            .clone()
+            .filter(|_| sets.allows(HostSet::WebBrowse))
+            .map(|b| {
+                BrowserToolHost::new(b, session.stop.clone()).with_picker(Arc::new(
+                    crate::decide::SessionPicker::new(
+                        self.decide.clone(),
+                        session.decide_llm.clone(),
+                        &session.cfg.model,
+                    ),
+                ))
+            });
         let shell_host = session.shell.as_ref().map(|s| {
             s.host(
                 session.taint.clone(),
@@ -2080,13 +2177,15 @@ impl SessionManager {
             )
         });
         let projects_host = match (&self.projects, &session.grants) {
-            (Some(cfg), Some(g)) => Some(crate::projects::ProjectCreateHost::new(
-                cfg.clone(),
-                g.clone(),
-                session.actions.clone(),
-                session.taint.clone(),
-                session.stop.clone(),
-            )),
+            (Some(cfg), Some(g)) if sets.allows(HostSet::Files) => {
+                Some(crate::projects::ProjectCreateHost::new(
+                    cfg.clone(),
+                    g.clone(),
+                    session.actions.clone(),
+                    session.taint.clone(),
+                    session.stop.clone(),
+                ))
+            }
             _ => None,
         };
         if file_host.is_some()
