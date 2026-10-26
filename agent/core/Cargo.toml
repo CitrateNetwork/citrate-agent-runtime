@@ -51,7 +51,9 @@ serde_json = "1"
 # CIT-AGENT-3a — capsule manifest schema + .cps archive read.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-zstd = "0.13"
+# 0.14.3 / zstd-safe 8.2.0 carry the fixes for RUSTSEC-2026-0391/0398/0403.
+# The .cps format is unchanged: tests/zstd_frame_compat.rs pins it.
+zstd = "0.14.3"
 tar = "0.4"
 sha2 = "0.10"
 # CIT-AGENT-5a — canonical CBOR for audit-chain record encoding.
@@ -78,7 +80,37 @@ ed25519-dalek = { version = "2.1", features = ["std"] }
 # The component-model feature is required for the WASM Component Model
 # that capsules use. wasmtime-wasi provides the standard WASI host
 # implementations we wire selectively per manifest in CIT-AGENT-3d.
-wasmtime = { version = "49.0.2", features = ["component-model"] }
+# Default features minus `cache`: the runtime never configures wasmtime's
+# on-disk compilation cache (no `Config::cache` / `CacheConfig` call), and
+# the cache crate holds zstd at 0.13 (RUSTSEC-2026-0391/0398/0403). Every
+# other default is kept so engine behaviour is unchanged.
+wasmtime = { version = "49.0.2", default-features = false, features = [
+    "addr2line",
+    "anyhow",
+    "async",
+    "backtrace",
+    "compile-time-builtins",
+    "component-model",
+    "component-model-async",
+    "coredump",
+    "cranelift",
+    "debug",
+    "debug-builtins",
+    "demangle",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "parallel-compilation",
+    "pooling-allocator",
+    "profiling",
+    "runtime",
+    "stack-switching",
+    "std",
+    "threads",
+    "wat",
+    "wit-parser",
+] }
 wasmtime-wasi = "49.0.2"
 # wasmtime-wasi-io is a peer crate of wasmtime-wasi that hosts the
 # `wasi:io/error` binding. Required to wire io::error per-subsystem
