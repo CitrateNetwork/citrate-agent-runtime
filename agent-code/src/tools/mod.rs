@@ -1,6 +1,7 @@
 mod file_read;
 mod file_write;
 mod safe_write;
+mod scratch_home;
 mod file_edit;
 pub mod shell_exec;
 mod git_operations;

@@ -49,6 +49,7 @@
 
 use citrate_agent_core::error::AgentError;
 use citrate_agent_core::tool::{AgentTool, RiskLevel, ToolContext, ToolResult};
+use super::scratch_home::ScratchHome;
 use std::time::Duration;
 
 pub struct ShellExec;
@@ -121,10 +122,6 @@ const MAX_TIMEOUT_MS: u64 = 300_000;
 
 /// Maximum output size we return: 64 KiB.
 const MAX_OUTPUT_BYTES: usize = 65_536;
-
-/// AR-B-022: per-exec counter for the isolated scratch HOME directory name, so
-/// concurrent invocations get distinct empty homes.
-static SCRATCH_HOME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Tokenize a command string into (binary, args). Rejects:
 ///   - shell metacharacters anywhere in the string
@@ -284,19 +281,15 @@ impl AgentTool for ShellExec {
         // shell_exec re-auth gate. Point HOME at a fresh, isolated, empty scratch
         // dir so no attacker-plantable home config is on the search path. Also
         // pin git's global/system config to /dev/null as belt-and-braces.
-        let scratch_home = std::env::temp_dir().join(format!(
-            "citrate-shell-home-{}-{}",
-            std::process::id(),
-            SCRATCH_HOME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        // write-path-ok: tool-owned scratch HOME under the temp dir, not a model-chosen path
-        let _ = std::fs::create_dir_all(&scratch_home);
+        // Created fresh (random name, mode 0700, never an existing path or link); removed
+        // when `scratch_home` drops.
+        let scratch_home = ScratchHome::create("citrate-shell-home-")?;
         let mut cmd = tokio::process::Command::new(&binary);
         cmd.args(&args)
             .current_dir(&ctx.workspace_dir)
             .env_clear()
             .env("PATH", SAFE_PATH)
-            .env("HOME", &scratch_home)
+            .env("HOME", scratch_home.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null");
 
@@ -306,8 +299,7 @@ impl AgentTool for ShellExec {
         )
         .await;
 
-        // AR-B-022: best-effort cleanup of the isolated scratch HOME.
-        let _ = std::fs::remove_dir_all(&scratch_home);
+        drop(scratch_home);
 
         match result {
             Err(_) => Err(AgentError::Timeout(timeout_ms)),
