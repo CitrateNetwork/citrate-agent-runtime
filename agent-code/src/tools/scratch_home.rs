@@ -2,18 +2,26 @@
 //!
 //! Data source: the local filesystem under the process temp directory.
 //!
-//! STUB (red commit): reproduces the current behaviour — a name built from the process id and a
-//! counter, created with `create_dir_all` — so the tests below compile and fail on assertions.
+//! Policy (pinned by the tests below and `agent-code/tests/scratch_home_fresh.rs`):
+//! * The directory name carries a random suffix (`tempfile::Builder`), not the process id and a
+//!   counter, so the name cannot be guessed in advance.
+//! * It is created with a single `mkdir(2)`, which fails if anything (a directory, a file, a
+//!   symlink, dangling or not) already sits at that name; nothing pre-existing is ever reused and
+//!   no link is followed. On a collision `tempfile` retries with a fresh random name.
+//! * The mode is 0700 on Unix (owner only).
+//! * The directory and everything in it is removed when the value is dropped, including when the
+//!   subprocess times out.
+//! * Failure to create it is an error: the tool does not run the subprocess with an unprepared
+//!   HOME.
 
 use citrate_agent_core::error::AgentError;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Random characters in the directory name (on top of the fixed prefix).
+const RAND_CHARS: usize = 16;
 
-#[allow(dead_code)] // red-commit stub; wired in by the fix
-/// A scratch HOME directory, removed when dropped.
-pub(crate) struct ScratchHome(PathBuf);
+/// A freshly created, owner-only scratch HOME directory, removed when dropped.
+pub(crate) struct ScratchHome(tempfile::TempDir);
 
 impl ScratchHome {
     /// Create a scratch HOME under the process temp directory.
@@ -23,24 +31,20 @@ impl ScratchHome {
 
     /// Create a scratch HOME under `parent`.
     pub(crate) fn create_in(parent: &Path, prefix: &str) -> Result<Self, AgentError> {
-        let p = parent.join(format!(
-            "{prefix}{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        // write-path-ok: red-commit stub of the current behaviour
-        let _ = std::fs::create_dir_all(&p);
-        Ok(ScratchHome(p))
+        let mut b = tempfile::Builder::new();
+        b.prefix(prefix).rand_bytes(RAND_CHARS);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            b.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        b.tempdir_in(parent).map(ScratchHome).map_err(|e| {
+            AgentError::ExecutionFailed(format!("could not create a scratch HOME directory: {e}"))
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for ScratchHome {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 
@@ -48,6 +52,7 @@ impl Drop for ScratchHome {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt};
+    use std::path::PathBuf;
 
     const PREFIX: &str = "citrate-test-home-";
     /// How many predictable names each test plants (pid plus every counter value up to this).
@@ -81,7 +86,9 @@ mod tests {
             home.path().display()
         );
         assert_eq!(
-            std::fs::read_dir(home.path()).expect("read scratch home").count(),
+            std::fs::read_dir(home.path())
+                .expect("read scratch home")
+                .count(),
             0,
             "the scratch HOME must start empty"
         );
@@ -117,10 +124,16 @@ mod tests {
             "a planted symlink was followed"
         );
         drop(home);
-        assert!(elsewhere.join("keep").exists(), "the link target was touched");
+        assert!(
+            elsewhere.join("keep").exists(),
+            "the link target was touched"
+        );
         for seq in 0..PLANTED {
             let m = std::fs::symlink_metadata(predictable(&parent, seq)).expect("planted link");
-            assert!(m.file_type().is_symlink(), "a planted link was removed or replaced");
+            assert!(
+                m.file_type().is_symlink(),
+                "a planted link was removed or replaced"
+            );
         }
     }
 

@@ -75,13 +75,17 @@ impl Env {
     fn planted_home(&self, name: &str) -> PathBuf {
         let h = self.root.path().join(name);
         std::fs::create_dir_all(h.join(".config").join("git")).expect("mkdir planted config");
-        std::fs::write(h.join(".config").join("git").join("ignore"), b"marker.txt\n")
-            .expect("write planted ignore");
+        std::fs::write(
+            h.join(".config").join("git").join("ignore"),
+            b"marker.txt\n",
+        )
+        .expect("write planted ignore");
         h
     }
 
     fn predictable(&self, prefix: &str, seq: u64) -> PathBuf {
-        self.tmp.join(format!("{prefix}{}-{seq}", std::process::id()))
+        self.tmp
+            .join(format!("{prefix}{}-{seq}", std::process::id()))
     }
 }
 
@@ -136,9 +140,16 @@ fn assert_planted_links_intact(env: &Env, prefix: &str, home: &Path) {
     for seq in 0..PLANTED {
         let p = env.predictable(prefix, seq);
         let m = std::fs::symlink_metadata(&p).expect("planted link still there");
-        assert!(m.file_type().is_symlink(), "planted link {} replaced", p.display());
+        assert!(
+            m.file_type().is_symlink(),
+            "planted link {} replaced",
+            p.display()
+        );
     }
-    assert!(home.join(".config/git/ignore").is_file(), "link target was touched");
+    assert!(
+        home.join(".config/git/ignore").is_file(),
+        "link target was touched"
+    );
 }
 
 async fn git_ops_status(env: &Env) -> String {
@@ -179,7 +190,10 @@ async fn control_planted_home_hides_marker() {
         .output()
         .expect("run git status");
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(!s.contains("marker.txt"), "control: planted ignore not honoured: {s}");
+    assert!(
+        !s.contains("marker.txt"),
+        "control: planted ignore not honoured: {s}"
+    );
 }
 
 #[tokio::test]
