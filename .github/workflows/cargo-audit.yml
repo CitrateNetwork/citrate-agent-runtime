@@ -73,6 +73,11 @@ jobs:
             echo "::warning::CITRATE_CHAIN_DEPLOY_KEY secret not set. cargo will fail to fetch citrate-wallet-core. See REM-22 in the federation audit."
           fi
 
+      - name: RUSTSEC-2026-0387 ignore guard (blocking)
+        run: |
+          python3 scripts/check_crypto_bigint_users.py --self-test
+          python3 scripts/check_crypto_bigint_users.py
+
       - name: Run cargo audit
         # See audit.toml for the documented reason for each --ignore.
         # When any of these closes upstream, REMOVE the --ignore here
@@ -102,6 +107,12 @@ jobs:
         #     0.23.46, outside 0.22's range); the live rustls is 0.23.46.
         #   RUSTSEC-2026-0382 — the same inert rustls-webpki 0.102.8 (fix is
         #     0.103.16, outside 0.102's range); the live one is 0.103.16.
+        #
+        # RUSTSEC-2026-0387 (EXPIRES 2026-11-09; see audit.toml):
+        #   crypto-bigint < 0.7.6 timing variability. 0.5.5 comes in only
+        #   through elliptic-curve 0.13 (k256 / p256 0.13); no 0.13.x curve
+        #   release takes crypto-bigint 0.7. The guard step above fails if
+        #   another crate pulls it, if it leaves the lock, or after expiry.
         run: |
           cargo audit \
             --color always \
@@ -128,4 +139,5 @@ jobs:
             --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2026-0382 \
             --ignore RUSTSEC-2026-0346 \
-            --ignore RUSTSEC-2026-0349
+            --ignore RUSTSEC-2026-0349 \
+            --ignore RUSTSEC-2026-0387
