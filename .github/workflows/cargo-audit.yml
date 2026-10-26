@@ -73,6 +73,11 @@ jobs:
             echo "::warning::CITRATE_CHAIN_DEPLOY_KEY secret not set. cargo will fail to fetch citrate-wallet-core. See REM-22 in the federation audit."
           fi
 
+      - name: RUSTSEC-2026-0387 ignore guard (blocking)
+        run: |
+          python3 scripts/ci/test_check_crypto_bigint_users.py
+          python3 scripts/ci/check-crypto-bigint-users.py
+
       - name: Run cargo audit
         # See audit.toml for the documented reason for each --ignore.
         # When any of these closes upstream, REMOVE the --ignore here
