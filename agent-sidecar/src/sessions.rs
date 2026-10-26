@@ -244,6 +244,12 @@ pub struct LlmEndpoint {
     pub base_url: String,
     #[serde(default)]
     pub bearer: String,
+    /// citrate-core D-11: the endpoint is core's loopback model proxy in front of a cloud model,
+    /// not the local llama-server. The session then uses neither the endpoint's tokenizer nor its
+    /// embeddings (the proxy serves chat completions only, and tool or skill text is not sent to
+    /// a cloud model for ranking). Absent = false (an older core).
+    #[serde(default)]
+    pub proxied: bool,
 }
 
 impl std::fmt::Debug for LlmEndpoint {
@@ -251,6 +257,7 @@ impl std::fmt::Debug for LlmEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmEndpoint")
             .field("base_url", &self.base_url)
+            .field("proxied", &self.proxied)
             .finish_non_exhaustive()
     }
 }
