@@ -125,7 +125,7 @@ jobs:
           python3 scripts/check_hic_terminology.py
 
   tool-write-paths:
-    name: Tool-layer write paths go through safe_write (no symlink follow)
+    name: Tool-layer write paths go through safe_write; scratch dirs through scratch_home
     runs-on: ubuntu-latest
     permissions:
       contents: read
