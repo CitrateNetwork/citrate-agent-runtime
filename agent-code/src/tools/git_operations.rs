@@ -34,6 +34,7 @@ async fn run_git(
         std::process::id(),
         GITOPS_HOME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    // write-path-ok: tool-owned scratch HOME under the temp dir, not a model-chosen path
     let _ = std::fs::create_dir_all(&scratch_home);
     let output = tokio::time::timeout(
         Duration::from_millis(GIT_TIMEOUT_MS),

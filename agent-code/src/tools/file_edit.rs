@@ -1,38 +1,17 @@
 //! FileEdit tool — replace an exact string occurrence in a file.
 //!
-//! Data source: local filesystem via `tokio::fs::read_to_string` + `tokio::fs::write`.
+//! Data source: local filesystem; the file is opened once through
+//! [`super::safe_write`] (`openat` + `O_NOFOLLOW` from the workspace root), read
+//! and rewritten through that one descriptor. Symbolic links in any component
+//! and files with more than one hard link are refused.
 //! The old_string must appear exactly once in the file to avoid ambiguous edits.
 
 use citrate_agent_core::error::AgentError;
 use citrate_agent_core::tool::{AgentTool, RiskLevel, ToolContext, ToolResult};
-use std::path::{Path, PathBuf};
+use super::safe_write;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub struct FileEdit;
-
-/// Resolve a path relative to the workspace, requiring it to exist.
-fn resolve_existing_path(workspace: &str, path: &str) -> Result<PathBuf, AgentError> {
-    let workspace = Path::new(workspace)
-        .canonicalize()
-        .map_err(|e| AgentError::ExecutionFailed(format!("invalid workspace dir: {e}")))?;
-
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        workspace.join(path)
-    };
-
-    let resolved = candidate
-        .canonicalize()
-        .map_err(|e| AgentError::ExecutionFailed(format!("cannot resolve path '{}': {e}", path)))?;
-
-    if !resolved.starts_with(&workspace) {
-        return Err(AgentError::ExecutionFailed(
-            "path traversal outside workspace is not allowed".into(),
-        ));
-    }
-
-    Ok(resolved)
-}
 
 #[async_trait::async_trait]
 impl AgentTool for FileEdit {
@@ -93,29 +72,33 @@ impl AgentTool for FileEdit {
             ));
         }
 
-        let resolved = resolve_existing_path(&ctx.workspace_dir, path)?;
-        let content = tokio::fs::read_to_string(&resolved)
-            .await
-            .map_err(|e| AgentError::ExecutionFailed(format!("failed to read '{}': {e}", path)))?;
+        let target = safe_write::resolve(&ctx.workspace_dir, path)?;
+        let (shown, old, new) = (path.to_owned(), old_string.to_owned(), new_string.to_owned());
+        tokio::task::spawn_blocking(move || -> Result<(), AgentError> {
+            let fail = AgentError::ExecutionFailed;
+            let mut file = safe_write::open_for_edit(&target)?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)
+                .map_err(|e| fail(format!("failed to read '{shown}': {e}")))?;
 
-        let match_count = content.matches(old_string).count();
-        if match_count == 0 {
-            return Err(AgentError::ExecutionFailed(format!(
-                "old_string not found in '{}'",
-                path
-            )));
-        }
-        if match_count > 1 {
-            return Err(AgentError::ExecutionFailed(format!(
-                "old_string found {} times in '{}' — must be unique",
-                match_count, path
-            )));
-        }
+            let match_count = content.matches(old.as_str()).count();
+            if match_count == 0 {
+                return Err(fail(format!("old_string not found in '{shown}'")));
+            }
+            if match_count > 1 {
+                return Err(fail(format!(
+                    "old_string found {match_count} times in '{shown}' — must be unique"
+                )));
+            }
 
-        let new_content = content.replacen(old_string, new_string, 1);
-        tokio::fs::write(&resolved, &new_content)
-            .await
-            .map_err(|e| AgentError::ExecutionFailed(format!("failed to write '{}': {e}", path)))?;
+            let new_content = content.replacen(old.as_str(), new.as_str(), 1);
+            file.set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| file.write_all(new_content.as_bytes()))
+                .map_err(|e| fail(format!("failed to write '{shown}': {e}")))
+        })
+        .await
+        .map_err(|e| AgentError::ExecutionFailed(format!("edit task failed: {e}")))??;
 
         Ok(ToolResult::ok_with_data(
             format!("Edited {}: replaced 1 occurrence", path),
