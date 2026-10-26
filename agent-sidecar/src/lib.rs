@@ -32,6 +32,7 @@ pub mod files;
 pub mod git_identity;
 pub mod grants;
 pub mod hic_records;
+pub mod host_sets;
 pub mod learn;
 pub mod llm_http;
 pub mod mcp_approvals;
@@ -225,6 +226,18 @@ struct StatusBody {
     /// PBA-L6b-032: skills currently running.
     #[serde(rename = "runningSkills")]
     running_skills: usize,
+    /// Store daemons (citrate-core #356): what `POST /sessions` supports, so core can detect it.
+    capabilities: Capabilities,
+}
+
+/// What this sidecar's session API supports (`GET /status` → `capabilities`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Capabilities {
+    /// The host tool-set names `toolSets` accepts (a per-session allowlist, deny by default).
+    session_tool_sets: Vec<&'static str>,
+    /// `promptSnapshot: false` is honoured (the sidecar adds nothing to core's system prompt).
+    session_prompt_snapshot: bool,
 }
 
 #[derive(Serialize)]
@@ -439,6 +452,10 @@ async fn status(
         pending_approvals: st.queue.depth(),
         role_pending_approvals: st.queue.role_pending_depth(),
         running_skills: MAX_CONCURRENT_SKILLS.saturating_sub(st.run_slots.available_permits()),
+        capabilities: Capabilities {
+            session_tool_sets: host_sets::set_names(),
+            session_prompt_snapshot: true,
+        },
     }))
 }
 
@@ -981,6 +998,9 @@ async fn create_session(
             let session = st.sessions.get(&id);
             // HUP-S3.3: say what the persona did (offered skills, missing ones, pinned tools).
             let persona = session.as_ref().and_then(|s| s.persona().cloned());
+            // Store daemons (citrate-core #356): echo the allowlist as applied.
+            let tool_sets = session.as_ref().and_then(|s| s.tool_sets());
+            let prompt_snapshot = session.as_ref().map(|s| s.prompt_snapshot());
             // HUP-S1.2: say how tokens are counted and tools ranked (probed once, off the
             // async runtime: the probes are blocking HTTP calls to the session's own endpoints).
             let retrieval = match session {
@@ -992,6 +1012,12 @@ async fn create_session(
             let mut body = serde_json::json!({ "id": id });
             if let Some(p) = persona {
                 body["persona"] = serde_json::json!(p);
+            }
+            if let Some(t) = tool_sets {
+                body["toolSets"] = serde_json::json!(t);
+            }
+            if prompt_snapshot == Some(false) {
+                body["promptSnapshot"] = serde_json::json!(false);
             }
             if let Some(r) = retrieval {
                 body["tokenCounting"] = serde_json::json!(r.token_counting);
@@ -2547,6 +2573,8 @@ mod deploy_guard_session_tests;
 mod e2e_build_tests;
 #[cfg(all(test, unix))]
 mod hgw_support;
+#[cfg(test)]
+mod host_sets_session_tests;
 #[cfg(all(test, unix))]
 mod loop_capability_tests;
 #[cfg(all(test, unix))]
