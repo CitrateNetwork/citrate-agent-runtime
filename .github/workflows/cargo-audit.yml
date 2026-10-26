@@ -107,6 +107,13 @@ jobs:
         #     0.23.46, outside 0.22's range); the live rustls is 0.23.46.
         #   RUSTSEC-2026-0382 — the same inert rustls-webpki 0.102.8 (fix is
         #     0.103.16, outside 0.102's range); the live one is 0.103.16.
+        #
+        # Time-boxed, EXPIRES 2027-01-31 (enforced by the guard step above):
+        #   RUSTSEC-2026-0387 — crypto-bigint < 0.7.6, library-level timing
+        #     variability in operations meant to be constant-time. 0.5.5 comes in
+        #     only through elliptic-curve 0.13 (k256 / p256 0.13); no patched 0.5.x
+        #     exists and no 0.13 curve release accepts 0.7. Blocked upstream (revm's
+        #     precompiles and the chain pin require k256 / p256 0.13). See audit.toml.
         run: |
           cargo audit \
             --color always \
@@ -133,4 +140,5 @@ jobs:
             --ignore RUSTSEC-2026-0104 \
             --ignore RUSTSEC-2026-0382 \
             --ignore RUSTSEC-2026-0346 \
-            --ignore RUSTSEC-2026-0349
+            --ignore RUSTSEC-2026-0349 \
+            --ignore RUSTSEC-2026-0387
