@@ -194,6 +194,8 @@ mod imp {
         }
 
         let (fd, created) = open_leaf(&dir, leaf, create)?;
+        #[cfg(test)]
+        super::tests::after_leaf_open();
         let undo = |msg: String| -> AgentError {
             if created {
                 let _ = unlinkat(&dir, leaf, AtFlags::empty());
@@ -237,5 +239,155 @@ mod imp {
         Err(fail(
             "file writes are not supported on this platform (no O_NOFOLLOW/openat)",
         ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    //! The opened descriptor must still be inside the workspace when the
+    //! location check runs, on every Unix target the runtime ships for. A
+    //! test-only seam runs a closure between opening the leaf and checking it.
+    use super::{open_for_edit, open_for_write, resolve, OUTSIDE};
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_LEAF_OPEN: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_leaf_open() {
+        if let Some(f) = AFTER_LEAF_OPEN.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    fn set_hook(f: impl FnOnce() + 'static) {
+        AFTER_LEAF_OPEN.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    struct Tree {
+        _root: tempfile::TempDir,
+        ws: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    fn tree() -> Tree {
+        let root = tempfile::Builder::new()
+            .prefix("fxsec-sw-")
+            .tempdir()
+            .expect("temp tree");
+        let ws = root.path().join("ws");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&ws).expect("mkdir ws");
+        std::fs::create_dir(&outside).expect("mkdir outside");
+        Tree {
+            _root: root,
+            ws,
+            outside,
+        }
+    }
+
+    fn err_text<T>(r: Result<T, citrate_agent_core::error::AgentError>) -> String {
+        match r {
+            Ok(_) => panic!("expected the open to be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The directory holding a new file is moved out of the workspace after the
+    /// file is opened: the write is refused and the created file is removed.
+    #[test]
+    fn new_file_whose_directory_moves_out_is_refused_and_removed() {
+        let t = tree();
+        std::fs::create_dir(t.ws.join("sub")).expect("mkdir sub");
+        let wp = resolve(t.ws.to_str().expect("utf8"), "sub/new.txt").expect("resolve");
+        let (from, to) = (t.ws.join("sub"), t.outside.join("sub"));
+        let to2 = to.clone();
+        set_hook(move || std::fs::rename(&from, &to2).expect("move dir out"));
+        let msg = err_text(open_for_write(&wp));
+        assert!(msg.contains(OUTSIDE), "unexpected refusal: {msg}");
+        assert!(
+            !to.join("new.txt").exists(),
+            "a file created by a refused write must be removed"
+        );
+    }
+
+    /// Same, for an existing file opened for writing: refused, and its content
+    /// is not truncated.
+    #[test]
+    fn existing_file_whose_directory_moves_out_is_refused_and_untouched() {
+        let t = tree();
+        std::fs::create_dir(t.ws.join("sub")).expect("mkdir sub");
+        std::fs::write(t.ws.join("sub/keep.txt"), "KEEP").expect("seed");
+        let wp = resolve(t.ws.to_str().expect("utf8"), "sub/keep.txt").expect("resolve");
+        let (from, to) = (t.ws.join("sub"), t.outside.join("sub"));
+        let to2 = to.clone();
+        set_hook(move || std::fs::rename(&from, &to2).expect("move dir out"));
+        let msg = err_text(open_for_write(&wp));
+        assert!(msg.contains(OUTSIDE), "unexpected refusal: {msg}");
+        assert_eq!(
+            std::fs::read_to_string(to.join("keep.txt")).expect("read"),
+            "KEEP"
+        );
+    }
+
+    /// The edit path (no create, no truncate) gets the same check.
+    #[test]
+    fn edit_target_whose_directory_moves_out_is_refused() {
+        let t = tree();
+        std::fs::create_dir(t.ws.join("sub")).expect("mkdir sub");
+        std::fs::write(t.ws.join("sub/e.txt"), "E").expect("seed");
+        let wp = resolve(t.ws.to_str().expect("utf8"), "sub/e.txt").expect("resolve");
+        let (from, to) = (t.ws.join("sub"), t.outside.join("sub"));
+        set_hook(move || std::fs::rename(&from, &to).expect("move dir out"));
+        let msg = err_text(open_for_edit(&wp));
+        assert!(msg.contains(OUTSIDE), "unexpected refusal: {msg}");
+    }
+
+    /// A sibling whose name merely starts with the workspace name is outside
+    /// (component-wise prefix, not string prefix).
+    #[test]
+    fn move_to_a_name_prefixed_sibling_is_refused() {
+        let t = tree();
+        std::fs::create_dir(t.ws.join("sub")).expect("mkdir sub");
+        let evil = t.ws.with_file_name("ws-sibling");
+        std::fs::create_dir(&evil).expect("mkdir sibling");
+        let wp = resolve(t.ws.to_str().expect("utf8"), "sub/n.txt").expect("resolve");
+        let (from, to) = (t.ws.join("sub"), evil.join("sub"));
+        set_hook(move || std::fs::rename(&from, &to).expect("move dir out"));
+        let msg = err_text(open_for_write(&wp));
+        assert!(msg.contains(OUTSIDE), "unexpected refusal: {msg}");
+    }
+
+    /// A move that stays inside the workspace is still accepted.
+    #[test]
+    fn move_within_the_workspace_is_accepted() {
+        let t = tree();
+        std::fs::create_dir(t.ws.join("sub")).expect("mkdir sub");
+        let wp = resolve(t.ws.to_str().expect("utf8"), "sub/in.txt").expect("resolve");
+        let (from, to) = (t.ws.join("sub"), t.ws.join("moved"));
+        set_hook(move || std::fs::rename(&from, &to).expect("move dir within"));
+        let mut f = open_for_write(&wp).expect("inside the workspace is fine");
+        f.write_all(b"ok").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(t.ws.join("moved/in.txt")).expect("read"),
+            "ok"
+        );
+    }
+
+    /// A workspace reached through a symlinked path (e.g. /tmp on macOS) is
+    /// compared in canonical form, so ordinary writes are not refused.
+    #[test]
+    fn workspace_reached_through_a_symlink_still_writes() {
+        let t = tree();
+        let link = t.ws.with_file_name("ws-link");
+        std::os::unix::fs::symlink(&t.ws, &link).expect("symlink ws");
+        let wp = resolve(link.to_str().expect("utf8"), "a/b.txt").expect("resolve");
+        let mut f = open_for_write(&wp).expect("write through canonical root");
+        f.write_all(b"x").expect("write");
+        assert!(Path::new(&t.ws.join("a/b.txt")).exists());
     }
 }
