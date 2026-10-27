@@ -15,9 +15,11 @@
 //! * The final component must be a regular file with exactly one hard link. A
 //!   file with more links is refused, since another name for it may be outside the
 //!   workspace.
-//! * On Linux the opened descriptor's path (`/proc/self/fd/N`) is re-checked to be
-//!   inside the workspace before any byte is written; a file this call created is
-//!   removed again if that check fails. The check fails closed if `/proc` is absent.
+//! * The opened descriptor's current path (`/proc/self/fd/N` on Linux,
+//!   `fcntl(F_GETPATH)` on macOS) is re-checked to be inside the canonical
+//!   workspace root before any byte is written; a file this call created is
+//!   removed again if that check fails. The check fails closed when the path
+//!   cannot be read, and on Unix targets with no way to read it.
 //! * On platforms without `O_NOFOLLOW` / `openat` (non-Unix) every write is refused.
 
 use citrate_agent_core::error::AgentError;
@@ -100,7 +102,7 @@ mod imp {
     use rustix::io::Errno;
     use std::ffi::OsStr;
     use std::fs::File;
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::OwnedFd;
 
     const SYMLINK: &str = "refusing to write through a symbolic link";
 
@@ -165,16 +167,33 @@ mod imp {
     /// Linux: confirm the opened descriptor really lives inside the workspace.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn fd_inside(fd: &OwnedFd, root: &std::path::Path) -> Result<bool, AgentError> {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
         let real = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()))
             .map_err(|e| fail(format!("cannot confirm the opened file's location: {e}")))?;
         Ok(real.starts_with(root))
     }
 
-    /// Elsewhere the descriptor chain from the workspace root is the guarantee.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// Apple platforms: `fcntl(F_GETPATH)` reports where the descriptor is now.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn fd_inside(fd: &OwnedFd, root: &std::path::Path) -> Result<bool, AgentError> {
+        use std::os::unix::ffi::OsStrExt;
+        let real = rustix::fs::getpath(fd)
+            .map_err(|e| fail(format!("cannot confirm the opened file's location: {e}")))?;
+        Ok(std::path::Path::new(OsStr::from_bytes(real.as_bytes())).starts_with(root))
+    }
+
+    /// Other Unix targets have no supported way to ask where a descriptor is,
+    /// so the check fails closed.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
     fn fd_inside(_fd: &OwnedFd, _root: &std::path::Path) -> Result<bool, AgentError> {
-        Ok(true)
+        Err(fail(
+            "cannot confirm the opened file's location on this platform; refusing",
+        ))
     }
 
     pub(super) fn open(wp: &WorkspacePath, create: bool) -> Result<File, AgentError> {
@@ -389,5 +408,21 @@ mod tests {
         let mut f = open_for_write(&wp).expect("write through canonical root");
         f.write_all(b"x").expect("write");
         assert!(Path::new(&t.ws.join("a/b.txt")).exists());
+    }
+
+    /// Tripwire: no platform variant of the location check may accept
+    /// unconditionally. A new target must read the descriptor's path or refuse.
+    #[test]
+    fn no_location_check_variant_accepts_unconditionally() {
+        let src = include_str!("safe_write.rs");
+        let accept_all = concat!("Ok(", "true)");
+        let body_start = src.find("fn fd_inside").expect("location check present");
+        let body_end = src.find("pub(super) fn open(").expect("open present");
+        let checks = &src[body_start..body_end];
+        assert!(
+            !checks.contains(accept_all),
+            "a location-check variant accepts every descriptor without looking"
+        );
+        assert!(checks.matches("fn fd_inside").count() >= 3);
     }
 }
