@@ -220,10 +220,12 @@ fn the_production_embedder_only_reaches_endpoints_it_may() {
     let local = sessions::LlmEndpoint {
         base_url: "http://127.0.0.1:18080/v1".into(),
         bearer: String::new(),
+        proxied: false,
     };
     let remote = sessions::LlmEndpoint {
         base_url: "https://gateway.example/v1".into(),
         bearer: String::new(),
+        proxied: false,
     };
     assert!(production_embedder(None)(&local).is_ok());
     let err = production_embedder(None)(&remote).err().unwrap();
@@ -240,6 +242,38 @@ fn the_production_embedder_only_reaches_endpoints_it_may() {
     assert!(production_tokenizer()(&local).is_ok());
     let err = production_tokenizer()(&remote).err().unwrap();
     assert!(err.contains("estimated"), "{err}");
+}
+
+/// citrate-core D-11: a cloud model reached through core's loopback proxy is not the local
+/// llama-server: no tokenizer and no embeddings from it (the proxy serves chat only, and tool or
+/// skill text is never sent to a cloud model for ranking). A named embedding server still applies.
+#[test]
+fn a_proxied_cloud_endpoint_is_not_treated_as_the_local_server() {
+    let proxied = sessions::LlmEndpoint {
+        base_url: "http://127.0.0.1:41234/v1".into(),
+        bearer: "cmp_route".into(),
+        proxied: true,
+    };
+    let err = production_tokenizer()(&proxied).err().unwrap();
+    assert!(
+        err.contains("cloud model") && err.contains("estimated"),
+        "{err}"
+    );
+    let err = production_embedder(None)(&proxied).err().unwrap();
+    assert!(err.contains("cloud model"), "{err}");
+    assert!(production_embedder(Some("http://127.0.0.1:18081".into()))(&proxied).is_ok());
+    // The flag arrives in the session body's `llm` object; absent means false.
+    let v: sessions::LlmEndpoint =
+        serde_json::from_str(r#"{"baseUrl":"http://127.0.0.1:1/v1","bearer":"k","proxied":true}"#)
+            .unwrap();
+    assert!(v.proxied);
+    let v: sessions::LlmEndpoint =
+        serde_json::from_str(r#"{"baseUrl":"http://127.0.0.1:1/v1"}"#).unwrap();
+    assert!(!v.proxied);
+    assert!(
+        !format!("{v:?}").contains("bearer: "),
+        "Debug never prints the bearer"
+    );
 }
 
 // ---- Sessions report how they count and rank --------------------------------------------------

@@ -1860,11 +1860,26 @@ pub fn production_sessions() -> Arc<sessions::SessionManager> {
     production_sessions_with(None)
 }
 
+/// citrate-core D-11: why a cloud session (core's loopback model proxy) estimates and ranks
+/// lexically.
+pub const PROXIED_ENDPOINT_REASON: &str =
+    "the model is a cloud model reached through citrate-core's proxy, so tokens are estimated and tools are ranked lexically";
+
+/// The session's own chat endpoint is the local llama-server: loopback http, and not core's model
+/// proxy in front of a cloud model (`llm.proxied`).
+fn is_local_server(ep: &sessions::LlmEndpoint) -> bool {
+    !ep.proxied && retrieval_http::is_loopback_http(&ep.base_url)
+}
+
 /// HUP-S1.2: llama-server `/tokenize` for a loopback chat endpoint; any other endpoint (an https
-/// gateway) has no tokenizer the sidecar can reach, so its sessions estimate.
+/// gateway, or citrate-core's proxy for a cloud model) has no tokenizer the sidecar can reach, so
+/// its sessions estimate.
 pub fn production_tokenizer() -> sessions::TokenizerFactory {
     Arc::new(|ep: &sessions::LlmEndpoint| {
-        if retrieval_http::is_loopback_http(&ep.base_url) {
+        if ep.proxied {
+            return Err(PROXIED_ENDPOINT_REASON.into());
+        }
+        if is_local_server(ep) {
             Ok(Arc::new(retrieval_http::LlamaTokenizer::new(
                 &ep.base_url,
                 &ep.bearer,
@@ -1904,9 +1919,11 @@ pub fn production_embedder_with_key(
             Ok(Arc::new(retrieval_http::HttpEmbedder::new(url, &key))
                 as Arc<dyn citrate_agent_loop::retrieval::Embedder>)
         }
-        None if retrieval_http::is_loopback_http(&ep.base_url) => Ok(Arc::new(
-            retrieval_http::HttpEmbedder::new(&ep.base_url, &ep.bearer),
-        )
+        None if ep.proxied => Err(PROXIED_ENDPOINT_REASON.to_string()),
+        None if is_local_server(ep) => Ok(Arc::new(retrieval_http::HttpEmbedder::new(
+            &ep.base_url,
+            &ep.bearer,
+        ))
             as Arc<dyn citrate_agent_loop::retrieval::Embedder>),
         None => Err(format!(
             "no embedding endpoint: {} is not set and the model endpoint is not local",
