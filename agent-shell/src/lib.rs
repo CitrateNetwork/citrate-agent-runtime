@@ -80,6 +80,8 @@ mod git_state;
 pub mod sandbox;
 #[cfg(windows)]
 mod win;
+#[cfg(all(test, windows))]
+mod windows_job_acceptance_tests;
 
 use sandbox::{Backend, SandboxMode, SandboxPolicy, SandboxSpec, SandboxSummary};
 use serde::Serialize;
