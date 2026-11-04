@@ -6,7 +6,7 @@ license.workspace = true
 # .agentile/planset/2026-05-14-citrate-agent/01_CRATE_STRUCTURE.md.
 #
 # This crate stays as the Hermes-era agent infrastructure (approval/
-# audit/tool/budget primitives) consumed by agent-chain, agent-code,
+# audit/tool/budget primitives) consumed by agent-code,
 # agent-cron, citrate_desktop_app, citrate_gui_native. It migrates to
 # the new crate via CIT-AGENT-8 (defense_prime shell dep switch) and the
 # dependent agent-* crates over CIT-AGENT-3..7.

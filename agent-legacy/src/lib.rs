@@ -7,7 +7,7 @@
 //! - `AuditTrail` for immutable execution logging
 //! - `EmergencyStop` for kill-switch functionality
 //!
-//! Each agent crate (agent-chain, agent-cron, agent-code) depends only
+//! Each agent crate (agent-cron, agent-code) depends only
 //! on this crate — never on each other. This ensures composability.
 
 pub mod adapters;

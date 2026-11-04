@@ -1071,18 +1071,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrate-agent-chain"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "citrate-agent-legacy",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "citrate-agent-checkpoints"
 version = "0.4.0"
 dependencies = [

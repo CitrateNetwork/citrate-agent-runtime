@@ -1,12 +1,11 @@
 [workspace]
-# Agent runtime: agent (cli + core), agent-chain, agent-cron,
+# Agent runtime: agent (cli + core), agent-cron,
 # agent-code, agent-legacy, capsules. Split from the Citrate
 # monorepo on 2026-05-18. citrate-wallet-core is consumed from
 # CitrateNetwork/citrate-chain via SSH deploy key.
 members = [
     "agent/cli",
     "agent/core",
-    "agent-chain",
     "agent-cron",
     "agent-code",
     "agent-legacy",

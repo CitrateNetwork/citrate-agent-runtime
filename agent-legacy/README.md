@@ -5,7 +5,7 @@ Shared agent primitives: tool registry, approval flow, budget tracking, audit tr
 ## Overview
 
 The foundational types and traits for the Citrate agent system.
-Every agent crate (`agent-chain`, `agent-code`, `agent-cron`) depends on this crate
+Every agent crate (`agent-code`, `agent-cron`) depends on this crate
 and never on each other, keeping them composable. Tools implement the `AgentTool` trait,
 register with a shared `ToolRegistry`, and execute through a risk-tiered approval flow.
 
