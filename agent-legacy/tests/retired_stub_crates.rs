@@ -18,19 +18,30 @@ fn workspace_root() -> PathBuf {
 
 /// The `members = [...]` entries of the workspace manifest.
 fn workspace_members() -> Vec<String> {
-    let manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml")).expect("workspace Cargo.toml");
+    let manifest =
+        std::fs::read_to_string(workspace_root().join("Cargo.toml")).expect("workspace Cargo.toml");
     let start = manifest.find("members = [").expect("a members list");
     let rest = &manifest[start + "members = [".len()..];
     let end = rest.find(']').expect("the members list closes");
     rest[..end]
         .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim().trim_end_matches(',').trim_matches('"').to_string())
+        .map(|l| {
+            l.split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(',')
+                .trim_matches('"')
+                .to_string()
+        })
         .filter(|l| !l.is_empty())
         .collect()
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -47,7 +58,10 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn the_echo_only_agent_chain_crate_is_not_a_workspace_member() {
     let members = workspace_members();
-    assert!(members.len() > 5, "could not read the workspace members: {members:?}");
+    assert!(
+        members.len() > 5,
+        "could not read the workspace members: {members:?}"
+    );
     assert!(
         !members.iter().any(|m| m == "agent-chain"),
         "agent-chain is a workspace member again; its tools echoed their inputs (Rule 1)"
