@@ -96,6 +96,16 @@ impl Job {
         self.handle.as_raw_handle() as HANDLE
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_handle_for_test(handle: OwnedHandle) -> Self {
+        Self { handle }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_for_test(&self) -> HANDLE {
+        self.raw()
+    }
+
     /// Put a child spawned with [`CREATION_FLAGS`] (so still suspended) into the job, then
     /// resume it. On error the caller must kill and reap the child: it never ran.
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
