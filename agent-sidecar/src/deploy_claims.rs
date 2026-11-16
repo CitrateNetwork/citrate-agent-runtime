@@ -177,6 +177,8 @@ pub struct DeployEvidence {
     pub context_strings: HashSet<String>,
     /// "zero" | "short".
     pub unfunded: Option<&'static str>,
+    /// The member's latest message asks for a deploy ("deploy my token").
+    pub deploy_requested: bool,
 }
 
 /// What the code read says about an address.
@@ -465,6 +467,13 @@ fn re(p: &str) -> Regex {
     Regex::new(&p).expect("deploy-claims pattern")
 }
 
+/// A member message that asks for a deploy ("deploy my token", "please deploy the vault").
+static DEPLOY_ASK: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)\b(?:deploy|redeploy|launch)\s+(?:my|the|a|an|it|this|that|our|your|these|those|them)\b|\bplease\s+(?:re)?deploy\b|^\W*(?:re)?deploy\b",
+    )
+});
+
 static UNFUNDED_SHORT: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r"(?i)insufficient funds|not enough (?:salt|funds|balance)|balance is (?:too low|short)|cannot pay (?:the |for )?(?:deploy )?gas|can't pay (?:the |for )?(?:deploy )?gas",
@@ -713,6 +722,9 @@ pub fn collect_deploy_evidence(
         member_strings,
         context_strings,
         unfunded,
+        deploy_requested: member_texts
+            .last()
+            .is_some_and(|t| DEPLOY_ASK.is_match(&fold(&plain_text(t)))),
     }
 }
 
@@ -725,7 +737,7 @@ static NOT_A_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DONE_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|^\W*(?:all\s+|both\s+)?deployed\b",
+        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|\b(?:deploy(?:ment)?|contract)\s+(?:is\s+|was\s+|has been\s+)?confirmed\b|\b(?:it|it's|it is|that's|that is|they're|they are|everything is|we're|we are)\s+(?:now\s+)?live\b|\b(?:it|that|everything)\s+went\s+through\b|^\W*(?:now\s+)?live\b|^\W*(?:all\s+|both\s+)?deployed\b",
     )
 });
 static DEPLOY_WORD: LazyLock<Regex> = LazyLock::new(|| {
@@ -745,6 +757,10 @@ static SUBJECTLESS: LazyLock<Regex> = LazyLock::new(|| {
         r"(?i)^\W*(?:(?:all|both|successfully)\s+)?(?:deployed|deployment|deploy\s+(?:done|complete|succeeded)|done|success)\b",
     )
 });
+/// A claim about "the deployment", "it", "the contract": in a turn where the member asked for a
+/// deploy and none was attempted, that is Hermes reporting its own (nonexistent) deploy.
+static DEFINITE: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?i)^\W*(?:the|it|it's|its|this|that|they|they're|everything|all)\b"));
 static LABEL: LazyLock<Regex> =
     LazyLock::new(|| re(r"^\s*(?:[-*+|>]|\d+[.)]\s)|^[^.!?:\n]{0,60}:\s*\S"));
 static LIST_LINE: LazyLock<Regex> = LazyLock::new(|| re(r"^\s*(?:[-*+|]|\d+[.)]\s)"));
@@ -933,6 +949,7 @@ pub fn check_deploy_claims(
                 || (label && DEPLOY_WORD.is_match(&around_claim)));
         let own = OWN.is_match(&claim)
             || SUBJECTLESS.is_match(&claim)
+            || (ev.deploy_requested && !attempted && DEFINITE.is_match(&claim))
             || (label
                 && (OWN.is_match(&around_claim)
                     || SUBJECTLESS.is_match(&claim_text(&prev))

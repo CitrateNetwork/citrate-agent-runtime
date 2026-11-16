@@ -19,7 +19,7 @@ use tower::ServiceExt;
 
 const CASES: &str = include_str!("../tests/fixtures/deploy_claims_cases.json");
 /// The same value citrate-core's `src/agent/deployClaims.shared.test.ts` pins.
-const CASES_SHA256: &str = "0945f4efaccc61192be9d41ae9c70f84d5c6846ab8a1bf68a8e5db1c5f97c0ad";
+const CASES_SHA256: &str = "3327f7b948c7168da692d4a0dde351d2d64fe5c236ce1fc4818e3e8a88710d88";
 
 struct MapReader {
     code: Option<HashMap<String, u64>>,
@@ -786,4 +786,35 @@ fn the_ledger_keeps_at_most_max_tool_strings() {
         &[],
     );
     assert_eq!(ledger.tool_strings.len(), MAX_TOOL_STRINGS);
+}
+
+#[test]
+fn a_deploy_asked_for_and_never_attempted_is_never_reported_done() {
+    let check = |answer: &str, asked: &str| {
+        let ev = collect_deploy_evidence(
+            &[],
+            &mut DeployLedger::default(),
+            &[asked.to_string()],
+            None,
+            &[],
+        );
+        check_deploy_claims(answer, &ev, &NoChain)
+    };
+    for answer in [
+        "The deployment is complete.",
+        "The deploy went through.",
+        "It's live!",
+        "Deployment confirmed.",
+        "The contract is confirmed on chain.",
+    ] {
+        let r = check(answer, "deploy my token");
+        assert!(r.changed, "{answer}");
+        assert!(
+            r.text.contains("No deploy ran in this conversation turn"),
+            "{answer} -> {}",
+            r.text
+        );
+    }
+    let third = "The Uniswap deployment is complete on mainnet.";
+    assert_eq!(check(third, "what's new on Ethereum?").text, third);
 }
