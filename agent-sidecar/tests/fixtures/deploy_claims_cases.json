@@ -2222,6 +2222,438 @@
      }
     }
    ]
+  },
+  {
+   "name": "asked, not attempted: it's deployed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "It's deployed.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"It's deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: your token's deployed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your token's deployed.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Your token's deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: it's been deployed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "It's been deployed.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"It's been deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: a curly apostrophe",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "It’s live!",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"It's live!\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: a curly apostrophe in a contraction",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your token’s deployed.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Your token's deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: after Great,",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Great, it's live!",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Great, it's live!\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: after OK,",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "OK, the deployment is complete.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"OK, the deployment is complete.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: after Done and a dash",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Done — your contract is live.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Done — your contract is live.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: after a leading clause",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "As you asked, it's on chain now.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"As you asked, it's on chain now.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: token deployed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Token deployed.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Token deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: shipped",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Shipped!",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Shipped!\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "asked, not attempted: is on chain",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is on chain.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Your contract is on chain.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "a bare yes after Hermes offered to deploy",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "write me an ERC-20",
+      "yes"
+     ],
+     "assistantTexts": [
+      "Here is the contract. Shall I deploy it?"
+     ],
+     "answer": "It's live!",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"It's live!\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "a deploy asked two messages ago",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token",
+      "what will gas cost?"
+     ],
+     "answer": "The deployment is complete.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"The deployment is complete.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "a bare yes to something else is not a deploy request",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "what's the Uniswap news?",
+      "yes"
+     ],
+     "assistantTexts": [
+      "Want me to summarise it?"
+     ],
+     "answer": "The Uniswap deployment is complete on mainnet.",
+     "expect": {
+      "text": "The Uniswap deployment is complete on mainnet.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "keep: once the deployment is complete",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Once the deployment is complete, you'll get an address.",
+     "expect": {
+      "text": "Once the deployment is complete, you'll get an address.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "keep: when it's live",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "When it's live, I'll send you the address.",
+     "expect": {
+      "text": "When it's live, I'll send you the address.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "keep: after the deploy goes through",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "After the deploy goes through, check CitrateScan for the address.",
+     "expect": {
+      "text": "After the deploy goes through, check CitrateScan for the address.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "keep: if the deployment is confirmed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "If the deployment is confirmed, you'll see it in Activity.",
+     "expect": {
+      "text": "If the deployment is confirmed, you'll see it in Activity.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "keep: as soon as it's deployed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "As soon as it's deployed, the address will show here.",
+     "expect": {
+      "text": "As soon as it's deployed, the address will show here.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
   }
  ]
 }

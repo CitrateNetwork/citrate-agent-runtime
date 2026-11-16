@@ -319,6 +319,8 @@ pub fn plain_text(text: &str) -> String {
             let u = c as u32;
             if odd_space(c) {
                 ' '
+            } else if matches!(c as u32, 0x2018 | 0x2019 | 0x02BC | 0x2032) {
+                '\''
             } else if (0xFF01..=0xFF5E).contains(&u) {
                 char::from_u32(u - 0xFEE0).unwrap_or(c)
             } else {
@@ -474,6 +476,21 @@ static DEPLOY_ASK: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
+/// A short yes ("yes", "go ahead", "do it"): a deploy request when Hermes had just offered one.
+static AFFIRM: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)^\W*(?:yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|please do|go for it|sounds good|y)\b",
+    )
+});
+/// Hermes offering to deploy ("Shall I deploy it?", "Want me to deploy this?").
+static DEPLOY_OFFER: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)\b(?:shall|should|can|may)\s+i\s+(?:go ahead and\s+)?(?:re)?deploy\b|\bwant me to\s+(?:re)?deploy\b|\bready to deploy\b[^.!\n]*\?|\b(?:re)?deploy\s+(?:it|this|that|the|your)\b[^.!\n]*\?",
+    )
+});
+/// How many of the member's latest messages a deploy request is read from.
+const REQUEST_LOOKBACK: usize = 3;
+
 static UNFUNDED_SHORT: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r"(?i)insufficient funds|not enough (?:salt|funds|balance)|balance is (?:too low|short)|cannot pay (?:the |for )?(?:deploy )?gas|can't pay (?:the |for )?(?:deploy )?gas",
@@ -533,6 +550,7 @@ pub fn collect_deploy_evidence(
     outputs: &[TurnToolOutput],
     ledger: &mut DeployLedger,
     member_texts: &[String],
+    assistant_texts: &[String],
     member_wallet: Option<&str>,
     context_texts: &[String],
 ) -> DeployEvidence {
@@ -722,22 +740,35 @@ pub fn collect_deploy_evidence(
         member_strings,
         context_strings,
         unfunded,
-        deploy_requested: member_texts
-            .last()
-            .is_some_and(|t| DEPLOY_ASK.is_match(&fold(&plain_text(t)))),
+        deploy_requested: deploy_requested(member_texts, assistant_texts),
     }
+}
+
+/// Read from the recent turns: one of the member's last [`REQUEST_LOOKBACK`] messages asks for a
+/// deploy, or the member said yes to Hermes's offer of one.
+fn deploy_requested(member_texts: &[String], assistant_texts: &[String]) -> bool {
+    let read = |t: &String| fold(&plain_text(t));
+    let texts: Vec<String> = member_texts.iter().map(read).collect();
+    let asked_recently = texts
+        .iter()
+        .skip(texts.len().saturating_sub(REQUEST_LOOKBACK))
+        .any(|t| DEPLOY_ASK.is_match(t));
+    let offered = assistant_texts
+        .last()
+        .is_some_and(|t| DEPLOY_OFFER.is_match(&read(t)));
+    asked_recently || (offered && texts.last().is_some_and(|t| AFFIRM.is_match(t)))
 }
 
 // ---- claims ----
 
 static NOT_A_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?deployed\b|\b\w+n't\s+(?:yet\s+)?(?:been\s+)?deployed\b|\bno (?:contract|deploy(?:ment)?)\s+(?:was|is|has been|happened|ran)(?:\s+deployed)?\b|\b(?:will|would|can|could|should|may|might|to)\s+be\s+deployed\b|\b(?:once|until|after|before|when|if|unless)\s+(?:it(?:'s| is)?|they(?:'re| are)?|the contract (?:is )?|your contract (?:is )?)?\s*deployed\b|\bnot (?:yet )?(?:live|on[- ]?chain)\b|\bready to (?:be )?deploy(?:ed)?\b|\bdeployed nothing\b|\bnothing (?:was |has been |got )?deployed\b",
+        r"(?i)\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?deployed\b|\b\w+n't\s+(?:yet\s+)?(?:been\s+)?deployed\b|\bno (?:contract|deploy(?:ment)?)\s+(?:was|is|has been|happened|ran)(?:\s+deployed)?\b|\b(?:will|would|can|could|should|may|might|to)\s+be\s+deployed\b|\b(?:once|until|after|before|when|if|unless)\s+(?:it(?:'s| is)?|they(?:'re| are)?|the contract (?:is )?|your contract (?:is )?)?\s*deployed\b|\bnot (?:yet )?(?:live|on[- ]?chain)\b|\bready to (?:be )?deploy(?:ed)?\b|\bdeployed nothing\b|\bnothing (?:was |has been |got )?deployed\b|\b(?:once|when|whenever|after|if|until|unless|before|as soon as)\b[^.!?\n,;]*",
     )
 });
 static DONE_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|\b(?:deploy(?:ment)?|contract)\s+(?:is\s+|was\s+|has been\s+)?confirmed\b|\b(?:it|it's|it is|that's|that is|they're|they are|everything is|we're|we are)\s+(?:now\s+)?live\b|\b(?:it|that|everything)\s+went\s+through\b|^\W*(?:now\s+)?live\b|^\W*(?:all\s+|both\s+)?deployed\b",
+        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|\b(?:deploy(?:ment)?|contract)\s+(?:is\s+|was\s+|has been\s+)?confirmed\b|\b(?:it|it's|it is|that's|that is|they're|they are|everything is|we're|we are)\s+(?:now\s+)?live\b|\b(?:it|that|everything)\s+went\s+through\b|^\W*(?:now\s+)?live\b|\b(?:contract|token|it|they|deployment|vault|everything)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\b|\b(?:has been|was|is|got)\s+shipped\b|^\W*(?:shipped|launched)\b|^\W*(?:the\s+|your\s+|my\s+)?(?:[\w'-]+\s+){0,2}(?:deployed|shipped|launched)\W*$|^\W*(?:all\s+|both\s+)?deployed\b",
     )
 });
 static DEPLOY_WORD: LazyLock<Regex> = LazyLock::new(|| {
@@ -754,13 +785,31 @@ static OWN: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\b(?:i|i've|i'm|we|we've|our|you|you've|your|my|me|us)\b"));
 static SUBJECTLESS: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)^\W*(?:(?:all|both|successfully)\s+)?(?:deployed|deployment|deploy\s+(?:done|complete|succeeded)|done|success)\b",
+        r"(?i)^\W*(?:(?:all|both|successfully)\s+)?(?:deployed|deployment|deploy\s+(?:done|complete|succeeded)|done|success|shipped|launched|live)\b",
     )
 });
 /// A claim about "the deployment", "it", "the contract": in a turn where the member asked for a
 /// deploy and none was attempted, that is Hermes reporting its own (nonexistent) deploy.
 static DEFINITE: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)^\W*(?:the|it|it's|its|this|that|they|they're|everything|all)\b"));
+/// A headline-style claim ("Token deployed.", "Contract shipped!"): Hermes's own report.
+static HEADLINE: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"(?i)^\W*(?:the\s+|your\s+|my\s+)?(?:[\w'-]+\s+){0,2}(?:deployed|shipped|launched)\W*$")
+});
+/// A leading interjection or short clause ("Great,", "OK,", "Done \u{2014}", "As you asked,"):
+/// the claim after it is read as if the sentence started there.
+static LEAD_IN: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)^\W*(?:(?:great|ok|okay|done|all set|perfect|awesome|good news|alright|nice|excellent|sure|yes|yep|yeah|congrats|congratulations|so|and|well|success|boom|there you go|here you go)\b[\s,!.:;\u2014\u2013-]*)+|^[^,.!?:;\n\u2014\u2013]{1,30}[,:;\u2014\u2013]\s*",
+    )
+});
+/// `'s` read as is/has before a deploy word ("It's deployed", "Your token's been deployed").
+static HAS_BEEN: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)\b(\w+)'s\s+been\b"));
+static IS_DONE: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)\b(\w+)'s\s+((?:now\s+|already\s+|successfully\s+|officially\s+|fully\s+)*(?:deployed|live|on[- ]?chain|done|complete|completed|confirmed|shipped|launched|up)\b)",
+    )
+});
 static LABEL: LazyLock<Regex> =
     LazyLock::new(|| re(r"^\s*(?:[-*+|>]|\d+[.)]\s)|^[^.!?:\n]{0,60}:\s*\S"));
 static LIST_LINE: LazyLock<Regex> = LazyLock::new(|| re(r"^\s*(?:[-*+|]|\d+[.)]\s)"));
@@ -801,7 +850,15 @@ pub fn sentences(text: &str) -> Vec<&str> {
 }
 
 fn claim_text(sentence: &str) -> String {
-    NOT_A_CLAIM.replace_all(&fold(sentence), " ").into_owned()
+    let f = fold(sentence);
+    let f = HAS_BEEN.replace_all(&f, "${1} has been");
+    let f = IS_DONE.replace_all(&f, "${1} is ${2}");
+    NOT_A_CLAIM.replace_all(&f, " ").into_owned()
+}
+
+/// The claim with a leading interjection or short clause taken off.
+fn claim_core(claim: &str) -> String {
+    LEAD_IN.replace(claim, "").into_owned()
 }
 
 fn clip_chars(s: &str, n: usize) -> String {
@@ -941,7 +998,8 @@ pub fn check_deploy_claims(
                 .filter(|t| address_shape(t) != Shape::Other)
                 .collect()
         };
-        let deploy_claimed = DONE_CLAIM.is_match(&claim);
+        let core = claim_core(&claim);
+        let deploy_claimed = DONE_CLAIM.is_match(&claim) || DONE_CLAIM.is_match(&core);
         let ctx_claimed = deploy_claimed || (label && DONE_CLAIM.is_match(&around_claim));
         let in_claim = !tokens.is_empty()
             && (ctx_claimed
@@ -949,7 +1007,11 @@ pub fn check_deploy_claims(
                 || (label && DEPLOY_WORD.is_match(&around_claim)));
         let own = OWN.is_match(&claim)
             || SUBJECTLESS.is_match(&claim)
-            || (ev.deploy_requested && !attempted && DEFINITE.is_match(&claim))
+            || SUBJECTLESS.is_match(&core)
+            || HEADLINE.is_match(&core)
+            || (ev.deploy_requested
+                && !attempted
+                && (DEFINITE.is_match(&claim) || DEFINITE.is_match(&core)))
             || (label
                 && (OWN.is_match(&around_claim)
                     || SUBJECTLESS.is_match(&claim_text(&prev))
@@ -1239,6 +1301,7 @@ pub struct ClaimGuardSink<'a> {
     ledger: &'a Mutex<DeployLedger>,
     reader: &'a dyn CodeReader,
     member_texts: Vec<String>,
+    assistant_texts: Vec<String>,
     context_texts: Vec<String>,
     origin: OriginFn<'a>,
     names: Mutex<HashMap<String, (String, Origin)>>,
@@ -1252,6 +1315,7 @@ impl<'a> ClaimGuardSink<'a> {
         ledger: &'a Mutex<DeployLedger>,
         reader: &'a dyn CodeReader,
         member_texts: Vec<String>,
+        assistant_texts: Vec<String>,
         context_texts: Vec<String>,
         origin: OriginFn<'a>,
     ) -> Self {
@@ -1260,6 +1324,7 @@ impl<'a> ClaimGuardSink<'a> {
             ledger,
             reader,
             member_texts,
+            assistant_texts,
             context_texts,
             origin,
             names: Mutex::new(HashMap::new()),
@@ -1283,6 +1348,7 @@ impl<'a> ClaimGuardSink<'a> {
                 &outputs,
                 &mut l,
                 &self.member_texts,
+                &self.assistant_texts,
                 None,
                 &self.context_texts,
             ),
@@ -1290,6 +1356,7 @@ impl<'a> ClaimGuardSink<'a> {
                 &outputs,
                 &mut DeployLedger::default(),
                 &self.member_texts,
+                &self.assistant_texts,
                 None,
                 &self.context_texts,
             ),

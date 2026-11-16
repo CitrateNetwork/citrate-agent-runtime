@@ -19,7 +19,7 @@ use tower::ServiceExt;
 
 const CASES: &str = include_str!("../tests/fixtures/deploy_claims_cases.json");
 /// The same value citrate-core's `src/agent/deployClaims.shared.test.ts` pins.
-const CASES_SHA256: &str = "3327f7b948c7168da692d4a0dde351d2d64fe5c236ce1fc4818e3e8a88710d88";
+const CASES_SHA256: &str = "a1b6a5604fece4ea661662c9cfaa0998a658c4a4dedd224094a6fefac254ea11";
 
 struct MapReader {
     code: Option<HashMap<String, u64>>,
@@ -92,10 +92,15 @@ fn every_shared_case_gives_the_same_result_as_citrate_core() {
                 .iter()
                 .map(|m| m.as_str().unwrap().to_string())
                 .collect();
+            let assistants: Vec<String> = t["assistantTexts"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default();
             let ev = collect_deploy_evidence(
                 &outputs_of(&t["outputs"]),
                 &mut ledger,
                 &members,
+                &assistants,
                 wallet,
                 &context,
             );
@@ -238,6 +243,7 @@ fn the_guard_corrects_a_final_answer_before_any_reader_sees_it() {
         &NoChain,
         vec!["deploy my token".into()],
         vec![],
+        vec![],
         core_only(),
     );
     let call = ToolCall {
@@ -294,7 +300,15 @@ fn the_guard_corrects_a_final_answer_before_any_reader_sees_it() {
 fn an_answer_without_claims_passes_through_unchanged() {
     let inner = VecSink::default();
     let ledger = Mutex::new(DeployLedger::default());
-    let guard = ClaimGuardSink::new(&inner, &ledger, &NoChain, vec![], vec![], core_only());
+    let guard = ClaimGuardSink::new(
+        &inner,
+        &ledger,
+        &NoChain,
+        vec![],
+        vec![],
+        vec![],
+        core_only(),
+    );
     guard.emit(Event::Final {
         content: "Height 6,310.".into(),
     });
@@ -589,6 +603,7 @@ fn guarded(
         reader,
         vec!["deploy my token".into()],
         vec![],
+        vec![],
         origin,
     );
     for (id, name, host, content) in calls {
@@ -699,7 +714,15 @@ fn a_result_with_no_announced_call_is_not_evidence() {
     let inner = VecSink::default();
     let ledger = Mutex::new(DeployLedger::default());
     let reader = with_code();
-    let guard = ClaimGuardSink::new(&inner, &ledger, &reader, vec![], vec![], core_only());
+    let guard = ClaimGuardSink::new(
+        &inner,
+        &ledger,
+        &reader,
+        vec![],
+        vec![],
+        vec![],
+        core_only(),
+    );
     guard.emit(Event::ToolResult {
         step: 1,
         call_id: "ghost".into(),
@@ -754,7 +777,7 @@ fn code_reads_are_bounded_per_answer() {
     let answer: String = (0..40)
         .map(|i| format!("WrappedSALT{i} lives at 0x{:040x}. ", i + 1))
         .collect();
-    let ev = collect_deploy_evidence(&[], &mut DeployLedger::default(), &[], None, &[]);
+    let ev = collect_deploy_evidence(&[], &mut DeployLedger::default(), &[], &[], None, &[]);
     let r = check_deploy_claims(&answer, &ev, &reader);
     assert_eq!(
         reader.0.load(std::sync::atomic::Ordering::SeqCst),
@@ -782,6 +805,7 @@ fn the_ledger_keeps_at_most_max_tool_strings() {
         }],
         &mut ledger,
         &[],
+        &[],
         None,
         &[],
     );
@@ -795,6 +819,7 @@ fn a_deploy_asked_for_and_never_attempted_is_never_reported_done() {
             &[],
             &mut DeployLedger::default(),
             &[asked.to_string()],
+            &[],
             None,
             &[],
         );
@@ -817,4 +842,45 @@ fn a_deploy_asked_for_and_never_attempted_is_never_reported_done() {
     }
     let third = "The Uniswap deployment is complete on mainnet.";
     assert_eq!(check(third, "what's new on Ethereum?").text, third);
+}
+
+#[test]
+fn round_three_phrasings_and_conditionals() {
+    let check = |answer: &str, members: &[&str], assistants: &[&str]| {
+        let m: Vec<String> = members.iter().map(|s| s.to_string()).collect();
+        let a: Vec<String> = assistants.iter().map(|s| s.to_string()).collect();
+        let ev = collect_deploy_evidence(&[], &mut DeployLedger::default(), &m, &a, None, &[]);
+        check_deploy_claims(answer, &ev, &NoChain)
+    };
+    for answer in [
+        "It's deployed.",
+        "Your token's deployed.",
+        "It\u{2019}s live!",
+        "Great, it's live!",
+        "Done \u{2014} your contract is live.",
+        "Token deployed.",
+        "Shipped!",
+        "Your contract is on chain.",
+    ] {
+        assert!(check(answer, &["deploy my token"], &[]).changed, "{answer}");
+    }
+    // A bare yes to Hermes's offer is a deploy request; a yes to something else is not.
+    assert!(
+        check(
+            "It's live!",
+            &["write me an ERC-20", "yes"],
+            &["Shall I deploy it?"]
+        )
+        .changed
+    );
+    let third = "The Uniswap deployment is complete on mainnet.";
+    assert!(!check(third, &["news?", "yes"], &["Want me to summarise it?"]).changed);
+    // Conditionals stay as written.
+    for keep in [
+        "Once the deployment is complete, you'll get an address.",
+        "When it's live, I'll send you the address.",
+        "If the deployment is confirmed, you'll see it in Activity.",
+    ] {
+        assert!(!check(keep, &["deploy my token"], &[]).changed, "{keep}");
+    }
 }

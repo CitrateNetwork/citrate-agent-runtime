@@ -2310,6 +2310,7 @@ impl SessionManager {
                 &s.claims,
                 s.claim_reader.as_ref(),
                 member_texts(&history, None),
+                assistant_texts(&history),
                 vec![s.cfg.system_prompt.clone()],
                 claim_origins(mcp.clone(), core_exe.clone()),
             );
@@ -2398,6 +2399,7 @@ impl SessionManager {
                 &s.claims,
                 s.claim_reader.as_ref(),
                 member_texts(&history, Some(&text)),
+                assistant_texts(&history),
                 vec![s.cfg.system_prompt.clone()],
                 claim_origins(mcp.clone(), core_exe.clone()),
             );
@@ -2476,6 +2478,16 @@ fn claim_origins(
         let server = mcp.as_ref().and_then(|m| m.server_for(name));
         crate::deploy_claims::evidence_origin(host, server.as_ref(), core_exe.as_deref())
     })
+}
+
+/// core#681 review 3: Hermes's earlier replies in this conversation (a "yes" to "Shall I deploy
+/// it?" is a deploy request).
+fn assistant_texts(history: &[Message]) -> Vec<String> {
+    history
+        .iter()
+        .filter(|m| m.role == citrate_agent_loop::Role::Assistant && !m.content.is_empty())
+        .map(|m| m.content.clone())
+        .collect()
 }
 
 /// core#681: what the member wrote in this conversation (earlier user messages, and `current`).
