@@ -23,7 +23,7 @@
 //!   member's per-origin opt-in (TLA+ `formal/DecideEgress.tla`).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -588,6 +588,12 @@ pub enum Event {
     StepEnd {
         step: u32,
     },
+    /// #691: a member message sent while the turn was running, added to the conversation at the
+    /// start of `step` (after the previous step's tool results, before its model call).
+    Steered {
+        step: u32,
+        text: String,
+    },
     /// HUP-S2.7: the session just became tainted by `source`'s output. Emitted once per flip.
     Tainted {
         step: u32,
@@ -660,6 +666,7 @@ impl Event {
             Event::ToolCall { .. } => "tool_call",
             Event::ToolResult { .. } => "tool_result",
             Event::StepEnd { .. } => "step_end",
+            Event::Steered { .. } => "steered",
             Event::Tainted { .. } => "tainted",
             Event::AssistantDelta { .. } => "assistant_delta",
             Event::Final { .. } => "final",
@@ -689,6 +696,155 @@ impl StopFlag {
     }
     pub fn is_stopped(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// #691: the longest steering message accepted (characters).
+pub const MAX_STEER_CHARS: usize = 4_000;
+/// #691: at most this many steering messages wait for the next step.
+pub const MAX_STEER_QUEUE: usize = 4;
+
+/// #691: why a steering message was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerError {
+    /// No chat turn is running that can still take it (idle, a workflow, or the turn has answered).
+    NotRunning,
+    /// [`MAX_STEER_QUEUE`] messages already wait for the next step.
+    Full,
+    /// The message was written for another run (one that has ended), not the one running now.
+    WrongRun,
+    Empty,
+    TooLong,
+}
+
+impl std::fmt::Display for SteerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SteerError::NotRunning => write!(
+                f,
+                "no turn is running that can take this message; send it as a new message"
+            ),
+            SteerError::Full => write!(
+                f,
+                "{MAX_STEER_QUEUE} messages already wait for the next step"
+            ),
+            SteerError::WrongRun => write!(
+                f,
+                "this message was for a run that has ended; send it as a new message"
+            ),
+            SteerError::Empty => write!(f, "the message is empty"),
+            SteerError::TooLong => {
+                write!(f, "the message is longer than {MAX_STEER_CHARS} characters")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SteerState {
+    open: bool,
+    /// The run steers are accepted for ([`SteerInbox::begin`]); `None` between runs.
+    run: Option<String>,
+    queue: VecDeque<String>,
+}
+
+/// #691: a session's steering inbox. While a chat turn runs it is open: a member message pushed
+/// here joins the conversation at the next step boundary (an [`Event::Steered`] marks where).
+/// The turn closes it atomically with its final answer, so an accepted message is never silently
+/// dropped by an answer: a message that arrived during the last model call makes the loop take one
+/// more step instead. A turn that ends any other way (stopped, failed, step limit) closes it and
+/// discards what waits; a client sees no `steered` event for those and sends them as a new turn.
+/// Every run is named ([`SteerInbox::begin`]) and a steer names the run it was written for, so a
+/// message meant for a run that has just ended is refused rather than taken by the next one.
+#[derive(Debug, Clone, Default)]
+pub struct SteerInbox(Arc<Mutex<SteerState>>);
+
+impl SteerInbox {
+    fn state(&self) -> std::sync::MutexGuard<'_, SteerState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Name the run the next turn is (the id its client was given). Only a steer that names this
+    /// run is taken, so a message written for a run that has ended never lands in the next one.
+    pub fn begin(&self, run: &str) {
+        let mut s = self.state();
+        s.run = Some(run.to_string());
+        s.open = false;
+        s.queue.clear();
+    }
+
+    /// Queue a message for the running turn `run`. Returns how many messages now wait.
+    pub fn push(&self, run: &str, text: &str) -> Result<usize, SteerError> {
+        let t = text.trim();
+        if t.is_empty() {
+            return Err(SteerError::Empty);
+        }
+        if t.chars().count() > MAX_STEER_CHARS {
+            return Err(SteerError::TooLong);
+        }
+        let mut s = self.state();
+        if !s.open {
+            return Err(SteerError::NotRunning);
+        }
+        if s.run.as_deref() != Some(run) {
+            return Err(SteerError::WrongRun);
+        }
+        if s.queue.len() >= MAX_STEER_QUEUE {
+            return Err(SteerError::Full);
+        }
+        s.queue.push_back(t.to_string());
+        Ok(s.queue.len())
+    }
+
+    /// Whether a running turn takes messages now.
+    pub fn is_open(&self) -> bool {
+        self.state().open
+    }
+
+    fn open(&self) {
+        let mut s = self.state();
+        s.open = true;
+        s.queue.clear();
+    }
+
+    fn take(&self) -> Vec<String> {
+        self.state().queue.drain(..).collect()
+    }
+
+    /// Close if nothing waits; otherwise hand back what waits and stay open.
+    fn close_if_empty(&self) -> Result<(), Vec<String>> {
+        let mut s = self.state();
+        if s.queue.is_empty() {
+            s.open = false;
+            Ok(())
+        } else {
+            Err(s.queue.drain(..).collect())
+        }
+    }
+
+    fn close(&self) {
+        let mut s = self.state();
+        s.open = false;
+        s.run = None;
+        s.queue.clear();
+    }
+}
+
+/// Closes the inbox however the turn returns.
+struct CloseSteer<'a>(Option<&'a SteerInbox>);
+
+impl Drop for CloseSteer<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.0 {
+            s.close();
+        }
+    }
+}
+
+fn apply_steers(sink: &dyn EventSink, history: &mut Vec<Message>, step: u32, texts: Vec<String>) {
+    for text in texts {
+        history.push(Message::user(text.clone()));
+        sink.emit(Event::Steered { step, text });
     }
 }
 
@@ -772,9 +928,18 @@ pub fn run_turn_with(
 ) -> RunOutcome {
     let system_prompt = turn_system_prompt(cfg, opts, user, history);
     history.push(Message::user(user));
+    let steer = opts.steer.as_ref();
+    if let Some(s) = steer {
+        s.open();
+    }
+    let _close_steer = CloseSteer(steer);
     for step in 1..=cfg.max_steps {
         if stop.is_stopped() {
             return finish(sink, RunOutcome::Stopped);
+        }
+        // #691: messages the member sent during the previous step join before this model call.
+        if let Some(s) = steer {
+            apply_steers(sink, history, step, s.take());
         }
         sink.emit(Event::StepStart { step });
         let mut messages = Vec::with_capacity(history.len() + 1);
@@ -842,6 +1007,19 @@ pub fn run_turn_with(
             tool_call_id: None,
         });
         if turn.tool_calls.is_empty() {
+            // #691: a message that arrived during this model call is not lost to the answer: the
+            // loop takes one more step with it (or, at the step limit, the turn ends without it).
+            if let Some(s) = steer {
+                if let Err(waiting) = s.close_if_empty() {
+                    if step < cfg.max_steps {
+                        apply_steers(sink, history, step + 1, waiting);
+                        continue;
+                    }
+                    // At the step limit: close now, so nothing more is accepted for this run
+                    // (the client resends what was never taken).
+                    s.close();
+                }
+            }
             sink.emit(Event::Final {
                 content: turn.content.clone(),
             });
@@ -1012,6 +1190,9 @@ pub struct TurnOptions {
     /// retrieval. `None` keeps the plain `max_tools_per_request` rule (pinned tools and tools in
     /// use ride outside it).
     pub max_tools_total: Option<usize>,
+    /// #691: the session's steering inbox, for chat turns. `None` takes no steering (workflow
+    /// attempts, and clients that never steer).
+    pub steer: Option<SteerInbox>,
 }
 
 /// HUP-S3.2: per-turn context for the system prompt. `section` sees the turn's user message and

@@ -96,8 +96,8 @@ use citrate_agent_loop::skills::{
 };
 use citrate_agent_loop::{
     run_turn_with, ContextBudget, Event, EventSink, HostKind, LlmClient, LlmSelfReviewer,
-    LoopConfig, Message, SelfReviewer, StopFlag, TaintState, ToolCall, ToolHost, ToolOutcome,
-    ToolRegistry, ToolSpec, TurnContext, TurnOptions, Workflow,
+    LoopConfig, Message, SelfReviewer, SteerError, SteerInbox, StopFlag, TaintState, ToolCall,
+    ToolHost, ToolOutcome, ToolRegistry, ToolSpec, TurnContext, TurnOptions, Workflow,
 };
 
 /// US-1.3 AC2: the most tokens one recorded self-review may use.
@@ -408,6 +408,66 @@ pub struct CreateSessionReq {
     /// Absent or `true` = as before.
     #[serde(default = "default_true")]
     pub prompt_snapshot: bool,
+    /// Earlier turns of a conversation the member branched in citrate-core, loaded as the
+    /// session's history before its first turn: at most [`MAX_SEED_MESSAGES`] messages of at most
+    /// [`MAX_SEED_CHARS`] characters, `user` and `assistant` only (anything else refuses the
+    /// session). Absent or empty = a fresh conversation, as before. An older sidecar refuses the
+    /// unknown key, so a client never loses the branch silently.
+    #[serde(default)]
+    pub history: Vec<SeedMessage>,
+    /// Matr0xshka on #109: the sidecar sessions `history` came from (the conversation the member
+    /// branched). A seeded session starts with their taint, read here, never claimed by the
+    /// client. Fail closed: with `history` and no `branchOf`, or a session not found or not
+    /// readable, it starts tainted. At most [`MAX_BRANCH_PARENTS`] ids. Ignored without `history`.
+    #[serde(default)]
+    pub branch_of: Vec<String>,
+}
+
+/// At most this many sessions a branch traces its earlier turns to.
+pub const MAX_BRANCH_PARENTS: usize = 16;
+/// The taint source of a branched session whose earlier turns cannot be traced to a clean session.
+pub const UNTRACED_BRANCH_TAINT_SOURCE: &str =
+    "earlier turns from a conversation whose sessions cannot be checked";
+
+/// At most this many earlier messages seed a session.
+pub const MAX_SEED_MESSAGES: usize = 40;
+/// Longest seeded message (characters).
+pub const MAX_SEED_CHARS: usize = 4_000;
+
+/// One earlier message of a branched conversation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// The seeded history, checked: only user and assistant turns, bounded in count and length.
+pub fn seed_history(seed: &[SeedMessage]) -> Result<Vec<Message>, String> {
+    if seed.len() > MAX_SEED_MESSAGES {
+        return Err(format!(
+            "history has {} messages; at most {MAX_SEED_MESSAGES}",
+            seed.len()
+        ));
+    }
+    seed.iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if m.content.chars().count() > MAX_SEED_CHARS {
+                return Err(format!("history message {i} is longer than {MAX_SEED_CHARS} characters"));
+            }
+            match m.role.as_str() {
+                "user" => Ok(Message::user(m.content.clone())),
+                "assistant" => Ok(Message {
+                    role: citrate_agent_loop::Role::Assistant,
+                    content: m.content.clone(),
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                }),
+                other => Err(format!("history message {i} has role {other:?}; only \"user\" and \"assistant\" are accepted")),
+            }
+        })
+        .collect()
 }
 
 fn default_true() -> bool {
@@ -575,6 +635,8 @@ pub struct Session {
     log: Mutex<EventLog>,
     notify: tokio::sync::Notify,
     pub stop: StopFlag,
+    /// #691: messages the member sends while a chat turn runs (taken at the next step boundary).
+    steer: SteerInbox,
     busy: AtomicBool,
     pending: Arc<Mutex<HashMap<String, mpsc::Sender<ToolOutcome>>>>,
     /// HUP-S3.2: present when this session was opened with skills (it then offers `skill_load`).
@@ -1197,6 +1259,8 @@ pub enum SessionError {
     Invalid(String),
     /// HUP-S2.1: the session was opened without a grant document, so it has no grants to replace.
     NoGrants,
+    /// #691: no running chat turn can take a steering message now (or its queue is full).
+    NotSteerable(String),
 }
 
 /// All sessions.
@@ -1611,6 +1675,18 @@ impl SessionManager {
         if req.model.trim().is_empty() {
             return Err(SessionError::Invalid("model is required".into()));
         }
+        let seeded = seed_history(&req.history).map_err(SessionError::Invalid)?;
+        if req.branch_of.len() > MAX_BRANCH_PARENTS {
+            return Err(SessionError::Invalid(format!(
+                "branchOf names at most {MAX_BRANCH_PARENTS} sessions"
+            )));
+        }
+        // Read before the session table is locked below (a parent lookup takes that lock).
+        let branch_sources = if seeded.is_empty() {
+            Vec::new()
+        } else {
+            self.branch_taint_sources(&req.branch_of)
+        };
         // Store daemons (citrate-core #356): the host tool sets this session may use.
         let host_sets =
             HostSets::from_allowlist(req.tool_sets.as_deref()).map_err(SessionError::Invalid)?;
@@ -1985,6 +2061,8 @@ impl SessionManager {
             // US-1.4 AC1: at most TOOL_SCHEMA_CEILING schemas per request, pinned and in-use
             // tools included (or the session's own `maxToolsPerRequest`, if it asked for more).
             max_tools_total: Some(max_tools.max(TOOL_SCHEMA_CEILING)),
+            // #691: set per chat turn in `send` (workflow attempts take no steering).
+            steer: None,
         };
         // D-27: the store attaches its machine sampler and energy model to the session's sink.
         let metering = Arc::new(self.metering.sink(
@@ -1995,6 +2073,15 @@ impl SessionManager {
         ));
         // HUP-S10.3: a daemon run (`unattended`) starts tainted.
         let taint = initial_taint(req.unattended);
+        // Matr0xshka on #109: a branch carries its parents' taint (fail closed).
+        for src in &branch_sources {
+            let reason = if src == UNTRACED_BRANCH_TAINT_SOURCE {
+                "this conversation was branched from one whose sessions cannot be checked, so a change needs the member's explicit decision"
+            } else {
+                "carried over from the conversation this one was branched from"
+            };
+            taint.taint(src, reason);
+        }
         let trajectory = self.trajectories.as_ref().map(|c| {
             (
                 Arc::new(TrajectoryRecorder::new(
@@ -2018,13 +2105,14 @@ impl SessionManager {
             hic_aware: req.hic_aware,
             taint,
             llm,
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(seeded),
             log: Mutex::new(EventLog {
                 next_seq: 0,
                 events: VecDeque::new(),
             }),
             notify: tokio::sync::Notify::new(),
             stop: StopFlag::default(),
+            steer: SteerInbox::default(),
             busy: AtomicBool::new(false),
             pending: Arc::new(Mutex::new(HashMap::new())),
             skills,
@@ -2095,6 +2183,30 @@ impl SessionManager {
             .unwrap_or_default();
         let mut out: Vec<SessionSummary> = sessions.iter().map(|s| s.summary()).collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// A branched session's starting taint sources: every source of every parent session, read
+    /// here. Untraceable earlier turns (no parent named, one not found, or its taint not readable)
+    /// give [`UNTRACED_BRANCH_TAINT_SOURCE`]. Empty = every parent is live and clean.
+    fn branch_taint_sources(&self, parents: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        if parents.is_empty() {
+            out.push(UNTRACED_BRANCH_TAINT_SOURCE.to_string());
+        }
+        for id in parents {
+            let Some(p) = self.get(id) else {
+                out.push(UNTRACED_BRANCH_TAINT_SOURCE.to_string());
+                continue;
+            };
+            if !p.taint().is_tainted() {
+                continue;
+            }
+            match p.taint().sources() {
+                Some(srcs) if !srcs.is_empty() => out.extend(srcs),
+                _ => out.push(UNTRACED_BRANCH_TAINT_SOURCE.to_string()),
+            }
+        }
         out
     }
 
@@ -2367,7 +2479,7 @@ impl SessionManager {
         id: &str,
         text: String,
         capsules: Option<Arc<CapsuleDispatch>>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<String, SessionError> {
         let session = self.get(id).ok_or(SessionError::NotFound)?;
         if text.trim().is_empty() {
             return Err(SessionError::Invalid("message text is empty".into()));
@@ -2379,6 +2491,9 @@ impl SessionManager {
         {
             return Err(SessionError::Busy);
         }
+        // #691: the run's id, returned to the client; a steer must name it.
+        let run_id = format!("t-{}", self.run_ids.fetch_add(1, Ordering::SeqCst) + 1);
+        session.steer.begin(&run_id);
         let registry = self.registry_for(&session, capsules);
         let s = session.clone();
         let (mcp, core_exe) = (self.mcp.clone(), self.core_exe.clone());
@@ -2408,9 +2523,14 @@ impl SessionManager {
             match s.deploy_guard().and_then(|g| g.answer_to(&text)) {
                 Some(refusal) => answer_without_model(&sink, &mut history, &text, refusal),
                 None => {
+                    // #691: chat turns take steering; workflow attempts (s.opts) do not.
+                    let opts = TurnOptions {
+                        steer: Some(s.steer.clone()),
+                        ..s.opts.clone()
+                    };
                     run_turn_with(
                         &s.cfg,
-                        &s.opts,
+                        &opts,
                         s.llm.as_ref(),
                         &registry,
                         &sink,
@@ -2429,7 +2549,21 @@ impl SessionManager {
             s.busy.store(false, Ordering::SeqCst);
             s.notify.notify_waiters();
         });
-        Ok(())
+        Ok(run_id)
+    }
+
+    /// #691: add a member message to the chat turn `run` (the id [`SessionManager::send`]
+    /// returned) running in this session, at its next step boundary. Refused with [`SessionError::NotSteerable`] when no chat turn can take it (the
+    /// session is idle, runs a workflow, or the turn has answered); the client then sends it as a
+    /// new message. Returns how many messages wait for the next step.
+    pub fn steer(&self, id: &str, run: &str, text: &str) -> Result<usize, SessionError> {
+        let s = self.get(id).ok_or(SessionError::NotFound)?;
+        s.steer.push(run, text).map_err(|e| match e {
+            SteerError::NotRunning | SteerError::Full | SteerError::WrongRun => {
+                SessionError::NotSteerable(e.to_string())
+            }
+            SteerError::Empty | SteerError::TooLong => SessionError::Invalid(e.to_string()),
+        })
     }
 
     pub fn stop(&self, id: &str) -> Result<(), SessionError> {
