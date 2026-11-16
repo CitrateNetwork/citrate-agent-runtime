@@ -390,6 +390,12 @@ pub struct CreateSessionReq {
     /// none (build configuration stays the member's, as before).
     #[serde(default)]
     pub project_roots: Vec<String>,
+    /// V1 (owner decision 2026-11-16): the projects where the member turned on an opt-in
+    /// auto-approve rule (`node <file>`, `npm run`, `git commit`), each with the rules turned on.
+    /// Checked against the auto-approve list; an unknown or default rule id refuses the session.
+    /// Absent = none: those commands ask everywhere.
+    #[serde(default)]
+    pub auto_approve_opt_ins: Vec<crate::auto_approve::OptInDoc>,
     /// Store daemons (citrate-core #356): the sidecar-hosted tool sets this session may use, by
     /// canonical name ([`crate::host_sets::HostSet::name`]). Present = ONLY these sets are offered
     /// and callable (deny by default; `[]` = none); every other set's tools are absent and a call
@@ -1856,6 +1862,8 @@ impl SessionManager {
                 specs.push(shell_run_spec());
                 Some(Arc::new(
                     ShellRunSession::new(cfg, g.clone())
+                        .map_err(SessionError::Invalid)?
+                        .with_opt_ins(&req.auto_approve_opt_ins)
                         .map_err(SessionError::Invalid)?
                         .with_records(self.records.clone()),
                 ))

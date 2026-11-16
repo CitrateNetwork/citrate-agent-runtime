@@ -7,8 +7,9 @@
 //! 1. creates a project (`project_create`, one approval card, HGW-3);
 //! 2. writes `package.json`, a build script and a source file with a bug (HGW-2: build
 //!    configuration is the agent's inside its project);
-//! 3. runs `git init`, `git add`, `git commit` without cards (HGW-2 sandbox git, HGW-5 list);
-//! 4. runs `npm run build` (offline, sandboxed, auto-approved), which fails;
+//! 3. runs `git init`, `git add`, `git commit` without cards (HGW-2 sandbox git, HGW-5 list; the
+//!    member turned `git commit` and `npm run` on for the projects folder, V1);
+//! 4. runs `npm run build` (offline, sandboxed, auto-approved by that opt-in), which fails;
 //! 5. reads the failing build's stderr in the tool result (HGW-4), finds the undefined name, and
 //!    fixes it with `fs_edit`;
 //! 6. builds again (passes) and commits;
@@ -221,10 +222,17 @@ async fn hermes_creates_builds_reads_the_failure_fixes_it_and_commits() {
     );
     // The member granted the projects folder (core's workspace card) and nothing else.
     let id = mgr
-        .create(create_req(
-            fx.rw_doc_for(std::slice::from_ref(&projects_root)),
-            true,
-        ))
+        .create(
+            create_req_with(
+                fx.rw_doc_for(std::slice::from_ref(&projects_root)),
+                true,
+                // V1: the member turned `npm run`, `git add` and `git commit` on for their projects folder.
+                serde_json::json!({ "autoApproveOptIns": [
+                    { "root": projects_root, "rules": ["npm-run", "git-add", "git-commit"] }
+                ] }),
+            )
+            .expect("req"),
+        )
         .expect("session");
     let s = mgr.get(&id).expect("session");
     let app = app_for(mgr.clone());

@@ -1540,7 +1540,7 @@ async fn toolchain_reports(
 /// app's Settings. Data source: the list `shell_run` was started with (the shipped
 /// `policy/auto_approve.toml`, or the file `CITRATE_HERMES_AUTO_APPROVE` names). `enabled` is
 /// false when shell_run or auto-approval is off; `conditions` are the checks every match must
-/// also pass.
+/// also pass. A rule with `opt_in: true` (V1) also needs the member's per-project opt-in.
 async fn auto_approve_list(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1556,6 +1556,7 @@ async fn auto_approve_list(
             "the OS sandbox is enforced (no network)",
             "the folder is inside one of the session's projects",
             "the run may write only that project",
+            "an opt-in rule (opt_in: true) runs only in a project the member turned it on for",
         ],
         "rules": list.map(|l| l.rules.clone()).unwrap_or_default(),
     })))
