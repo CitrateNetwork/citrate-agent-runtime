@@ -268,3 +268,19 @@ fn a_malformed_run_id_is_refused_before_it_reaches_a_url() {
     let mut out = Vec::new();
     assert!(c.run_workflow("s1-ab", "hello-mint", true, &mut out).is_err());
 }
+
+#[test]
+fn an_answer_the_sidecar_corrected_is_printed_whole_after_the_notice() {
+    let mut p = EventPrinter::default();
+    let mut out = Vec::new();
+    for ev in [
+        json!({"type": "assistant_delta", "step": 1, "text": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7."}),
+        json!({"type": "answer_check", "findings": ["removed a deploy claim at 0x5290…"]}),
+        json!({"type": "final", "content": "No contract is deployed yet."}),
+    ] {
+        p.print(&ev, &mut out);
+    }
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("\n  answer check: 1 unsupported deploy claim removed; the checked answer follows\nNo contract is deployed yet.\n"), "{s}");
+    assert_eq!(render_event(&json!({"type": "answer_check", "findings": ["a", "b"]})).unwrap(), "  answer check: 2 unsupported deploy claims removed; the checked answer follows");
+}

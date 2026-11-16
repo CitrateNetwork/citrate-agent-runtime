@@ -262,6 +262,7 @@ impl MeteringSink {
             Event::StepEnd { .. }
             | Event::AssistantDelta { .. }
             | Event::Final { .. }
+            | Event::AnswerCheck { .. }
             | Event::Error { .. } => {}
             Event::Verifier { .. } | Event::SelfReview { .. } | Event::Plan { .. } => {}
             // Usage reaches the record through the metered client (`record_usage`). Counting it

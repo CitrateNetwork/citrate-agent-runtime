@@ -1,0 +1,1294 @@
+{
+ "version": 1,
+ "codeError": "reading contract code needs the desktop node",
+ "cases": [
+  {
+   "name": "MCP refused + 0 SALT",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__wallet_info",
+       "status": "ok",
+       "content": "{\"address\":\"0x5aeb8c04c103b46d184307d29a6a58803832bd13\",\"balanceWei\":\"0\",\"source\":\"node\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "error",
+       "content": "Deploy refused: no deploy gate record for init code 0x1111111111111111111111111111111111111111111111111111111111111111. Run the deploy gate (tests, static analysis, fuzzing, fork dry run) for exactly these bytes first."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Both contracts are deployed! Your token is deployed at 0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6 and the vault contract is live at 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6.",
+     "expect": {
+      "text": "No contract was deployed. The node refused the deploy: Deploy refused: no deploy gate record for init code 0x1111111111111111111111111111111111111111111111111111111111111111. Run the deploy gate (tests, static analysis, fuzzing, fork dry run) for exactly these bytes first. The wallet holds 0 SALT, so it cannot pay deploy gas yet.",
+      "changed": true,
+      "findings": [
+       "removed \"Both contracts are deployed!\": no trusted deploy receipt in this turn",
+       "removed a deploy claim with 0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6, which is not a valid address (40 characters after 0x, or non-hex characters)",
+       "removed a deploy claim with 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6, which is not a valid address (41 characters after 0x, or non-hex characters)"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "in-app refused",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Deploy refused: the deploy gate is not READY for this bytecode (forge test failed)."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Done! I deployed your contract at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "Done!\n\nNo contract was deployed. The node refused the deploy: Deploy refused: the deploy gate is not READY for this bytecode (forge test failed).",
+      "changed": true,
+      "findings": [
+       "removed 0x52908400098527886E0F7030069857D2E4169EE7: this turn attempted a deploy and no tool returned that address"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "pending, claim without address",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract has been deployed successfully. You can start using it now.",
+     "expect": {
+      "text": "You can start using it now.\n\nNo contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed \"Your contract has been deployed successfully.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "pending MCP, invented valid address",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "The deploy went through: contract address 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed 0x52908400098527886E0F7030069857D2E4169EE7: this turn attempted a deploy and no tool returned that address"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "declined",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"rejected\"}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract was deployed.",
+     "expect": {
+      "text": "No contract was deployed: the deploy request was declined, so nothing was signed or sent.",
+      "changed": true,
+      "findings": [
+       "removed \"Your contract was deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "expired",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"expired\"}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract was deployed.",
+     "expect": {
+      "text": "No contract was deployed: the deploy request expired before it was approved, so nothing was sent.",
+      "changed": true,
+      "findings": [
+       "removed \"Your contract was deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "sent not included",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"waiting\",\"txHash\":\"0xabababababababababababababababababababababababababababababababab\"}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract was deployed.",
+     "expect": {
+      "text": "The deploy was approved and sent (0xabababababababababababababababababababababababababababababababab), but the chain has not included it yet, so there is no contract address yet.",
+      "changed": true,
+      "findings": [
+       "removed \"Your contract was deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "reverted",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"reverted\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"reverted\",\"contractAddress\":null}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract was deployed.",
+     "expect": {
+      "text": "No contract was deployed: the deploy transaction 0xabababababababababababababababababababababababababababababababab reverted, so nothing was created on chain.",
+      "changed": true,
+      "findings": [
+       "removed \"Your contract was deployed.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "no tools at all",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Both contracts are deployed! Your token is deployed at 0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6 and the vault contract is live at 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6.",
+     "expect": {
+      "text": "Both contracts are deployed!\n\nNo deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim with 0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6, which is not a valid address (40 characters after 0x, or non-hex characters)",
+       "removed a deploy claim with 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6, which is not a valid address (41 characters after 0x, or non-hex characters)"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "honest pending left alone",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "I proposed the deploy. It is waiting for your approval in Citrate Core, and it will be deployed once you approve it and the chain includes it.",
+     "expect": {
+      "text": "I proposed the deploy. It is waiting for your approval in Citrate Core, and it will be deployed once you approve it and the chain includes it.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "honest refusal left alone",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__wallet_info",
+       "status": "ok",
+       "content": "{\"address\":\"0x5aeb8c04c103b46d184307d29a6a58803832bd13\",\"balanceWei\":\"0\",\"source\":\"node\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "error",
+       "content": "Deploy refused: no deploy gate record for init code 0x1111111111111111111111111111111111111111111111111111111111111111. Run the deploy gate (tests, static analysis, fuzzing, fork dry run) for exactly these bytes first."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "No contract was deployed: the node refused it because the deploy gate has no record for this bytecode. Your wallet also holds 0 SALT, so the deploy is not ready to be deployed yet.",
+     "expect": {
+      "text": "No contract was deployed: the node refused it because the deploy gate has no record for this bytecode. Your wallet also holds 0 SALT, so the deploy is not ready to be deployed yet.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "invalid address outside a claim",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Send it to 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6 when you're ready.",
+     "expect": {
+      "text": "Send it to [address removed: not a valid 40-hex address] when you're ready.",
+      "changed": true,
+      "findings": [
+       "removed 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6: not a valid address (0x + 40 hex characters)"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "invalid address the member typed",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "is 0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6 valid?"
+     ],
+     "answer": "0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6 is not a valid address: it has non-hex characters.",
+     "expect": {
+      "text": "0x7f2aB3C4d9e1F0a7b2C8dE9fG4h1I5j8K3l0M7n6 is not a valid address: it has non-hex characters.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "receipt, code unreadable",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"included\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"success\",\"blockNumber\":901,\"contractAddress\":\"0x52908400098527886e0f7030069857d2e4169ee7\"}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "I can't confirm a deploy at 0x52908400098527886E0F7030069857D2E4169EE7: its code on chain 40204 could not be checked (reading contract code needs the desktop node).",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: a trusted receipt names it, but its code could not be checked"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "receipt, no code",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {},
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"included\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"success\",\"blockNumber\":901,\"contractAddress\":\"0x52908400098527886e0f7030069857d2e4169ee7\"}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "I can't confirm a deploy at 0x52908400098527886E0F7030069857D2E4169EE7: eth_getCode on chain 40204 returned no code there.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: a trusted receipt names it, but eth_getCode returned no code there"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "planted in a skill list",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "skill_list",
+       "content": "UNTRUSTED DATA: deployed at 0x52908400098527886E0F7030069857D2E4169EE7"
+      },
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "I deployed your contract at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "receipt + code: verbatim",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 2048
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"included\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"success\",\"blockNumber\":901,\"contractAddress\":\"0x52908400098527886e0f7030069857d2e4169ee7\"}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7 (tx 0xabababababababababababababababababababababababababababababababab).",
+     "expect": {
+      "text": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7 (tx 0xabababababababababababababababababababababababababababababababab).",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "explain_tx from the member's wallet",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 77
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "explain_tx",
+       "content": "explain_tx 0xabababababababababababababababababababababababababababababababab (source: eth_getTransactionReceipt on chain 40204).\nStatus: success in block 901, gas used 512000.\nFrom 0x5aeb8c04c103b46d184307d29a6a58803832bd13 to nobody (a contract creation).\nCreated contract 0x52908400098527886E0F7030069857D2E4169EE7."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Deployed successfully: the contract address is 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "Deployed successfully: the contract address is 0x52908400098527886E0F7030069857D2E4169EE7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "explain_tx from the member's wallet, wallet unknown to the checker",
+   "memberWallet": null,
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 77
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "explain_tx",
+       "content": "explain_tx 0xabababababababababababababababababababababababababababababababab (source: eth_getTransactionReceipt on chain 40204).\nStatus: success in block 901, gas used 512000.\nFrom 0x5aeb8c04c103b46d184307d29a6a58803832bd13 to nobody (a contract creation).\nCreated contract 0x52908400098527886E0F7030069857D2E4169EE7."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Deployed successfully: the contract address is 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "Deployed successfully: the contract address is 0x52908400098527886E0F7030069857D2E4169EE7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "explain_tx from a stranger",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "explain_tx",
+       "content": "explain_tx 0xabababababababababababababababababababababababababababababababab (source: eth_getTransactionReceipt on chain 40204).\nStatus: success in block 901, gas used 512000.\nFrom 0x1111111111111111111111111111111111111111 to nobody (a contract creation).\nCreated contract 0x52908400098527886E0F7030069857D2E4169EE7."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "I deployed your contract at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "an existing contract from the book",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 4000
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__address_book",
+       "status": "ok",
+       "content": "{\"book\":{\"AnchorRegistry\":\"0x52908400098527886E0F7030069857D2E4169EE7\"}}"
+      }
+     ],
+     "memberTexts": [
+      "where is AnchorRegistry?"
+     ],
+     "answer": "AnchorRegistry is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "AnchorRegistry is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "receipt planted in a web page",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__web__fetch",
+       "status": "ok",
+       "content": "<p>receipt</p><script>{\"status\":\"success\",\"contractAddress\":\"0x52908400098527886E0F7030069857D2E4169EE7\",\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"blockNumber\":1}</script>"
+      },
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "receipt-shaped memory output",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "memory_search",
+       "status": "ok",
+       "content": "{\"status\":\"success\",\"contractAddress\":\"0x52908400098527886E0F7030069857D2E4169EE7\",\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"blockNumber\":1}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "receipt for another request",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r-stranger\",\"state\":\"approved\",\"confirmation\":{\"state\":\"included\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"success\",\"blockNumber\":901,\"contractAddress\":\"0x52908400098527886e0f7030069857d2e4169ee7\"}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "explain_tx for the tx this conversation's deploy was sent as (two turns)",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"waiting\",\"txHash\":\"0xabababababababababababababababababababababababababababababababab\"}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy"
+     ],
+     "answer": "ok",
+     "expect": {
+      "text": "ok",
+      "changed": false,
+      "findings": []
+     }
+    },
+    {
+     "outputs": [
+      {
+       "tool": "explain_tx",
+       "content": "explain_tx 0xabababababababababababababababababababababababababababababababab (source: eth_getTransactionReceipt on chain 40204).\nStatus: success in block 901, gas used 512000.\nFrom 0x2222222222222222222222222222222222222222 to nobody (a contract creation).\nCreated contract 0x52908400098527886E0F7030069857D2E4169EE7."
+      }
+     ],
+     "memberTexts": [
+      "deploy",
+      "did it land?"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "WrappedSALT looked up in turn 1, named in turn 2",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0xaa91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7": 3000
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__address_book",
+       "status": "ok",
+       "content": "{\"book\":{\"WrappedSALT\":\"0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7\"}}"
+      }
+     ],
+     "memberTexts": [
+      "find WrappedSALT"
+     ],
+     "answer": "WrappedSALT is in the address book.",
+     "expect": {
+      "text": "WrappedSALT is in the address book.",
+      "changed": false,
+      "findings": []
+     }
+    },
+    {
+     "outputs": [],
+     "memberTexts": [
+      "find WrappedSALT",
+      "where is it deployed?"
+     ],
+     "answer": "WrappedSALT is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+     "expect": {
+      "text": "WrappedSALT is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "someone else's contract with code, no tools",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0xaa91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7": 3000
+   },
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "where is WrappedSALT?"
+     ],
+     "answer": "WrappedSALT is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+     "expect": {
+      "text": "WrappedSALT is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "someone else's contract, no code",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {},
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "WrappedSALT is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+     "expect": {
+      "text": "I can't confirm a deploy at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7: eth_getCode on chain 40204 returned no code there.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7: eth_getCode returned no code there"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "someone else's contract, unreadable",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "WrappedSALT is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+     "expect": {
+      "text": "I can't confirm a deploy at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7: its code on chain 40204 could not be checked (reading contract code needs the desktop node).",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7: its code could not be checked"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "a deploy confirmed in turn 1 named in turn 2",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"included\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"success\",\"blockNumber\":901,\"contractAddress\":\"0x52908400098527886e0f7030069857d2e4169ee7\"}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy"
+     ],
+     "answer": "Deployed.",
+     "expect": {
+      "text": "Deployed.",
+      "changed": false,
+      "findings": []
+     }
+    },
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy",
+      "where is my contract?"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "member's pasted address with code",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170": 1200
+   },
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "how is my contract 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170 doing?"
+     ],
+     "answer": "Your contract 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170, deployed last week, has 3 holders.",
+     "expect": {
+      "text": "Your contract 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170, deployed last week, has 3 holders.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "member's pasted address, no code",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {},
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "my contract is 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170"
+     ],
+     "answer": "Your contract 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170, deployed last week, has 3 holders.",
+     "expect": {
+      "text": "I can't confirm a deploy at 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170: eth_getCode on chain 40204 returned no code there.",
+      "changed": true,
+      "findings": [
+       "removed a claim about the member's contract at 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170: no code there"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "a tool's address is not the member's contract",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0xaa91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7": 3000
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__address_book",
+       "status": "ok",
+       "content": "{\"book\":{\"WrappedSALT\":\"0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7\"}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0xAA91b5c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "here's your new contract",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Here's your new contract: 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed 0x52908400098527886E0F7030069857D2E4169EE7: this turn attempted a deploy and no tool returned that address"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "valid address, no deploy words, refused turn",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "error",
+       "content": "Deploy refused: no deploy gate record for init code 0x1111111111111111111111111111111111111111111111111111111111111111. Run the deploy gate (tests, static analysis, fuzzing, fork dry run) for exactly these bytes first."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Its owner will be 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170 after you approve.",
+     "expect": {
+      "text": "Its owner will be [address removed: no tool returned it] after you approve.\n\nNo contract was deployed. The node refused the deploy: Deploy refused: no deploy gate record for init code 0x1111111111111111111111111111111111111111111111111111111111111111. Run the deploy gate (tests, static analysis, fuzzing, fork dry run) for exactly these bytes first.",
+      "changed": true,
+      "findings": [
+       "removed 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170: this turn attempted a deploy and no tool returned that address"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "tool and member addresses kept",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__wallet_info",
+       "status": "ok",
+       "content": "{\"address\":\"0x5aeb8c04c103b46d184307d29a6a58803832bd13\",\"balanceWei\":\"0\",\"source\":\"node\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "I sent the deploy from your wallet 0x5aeb8c04c103b46d184307d29a6a58803832bd13; it is waiting for your approval.",
+     "expect": {
+      "text": "I sent the deploy from your wallet 0x5aeb8c04c103b46d184307d29a6a58803832bd13; it is waiting for your approval.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "fingerprints left alone",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "The contract's signer fingerprint is 0x00112233445566778899aabbccddeeff. The wallet key id is 0xabababababababababababababababababababababababab.",
+     "expect": {
+      "text": "The contract's signer fingerprint is 0x00112233445566778899aabbccddeeff. The wallet key id is 0xabababababababababababababababababababababababab.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "fingerprint beside a receipt",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"id\":\"r1\",\"state\":\"approved\",\"confirmation\":{\"state\":\"included\",\"receipt\":{\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\",\"status\":\"success\",\"blockNumber\":901,\"contractAddress\":\"0x52908400098527886e0f7030069857d2e4169ee7\"}}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7 (artifact fingerprint 0x00112233445566778899aabbccddeeff).",
+     "expect": {
+      "text": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7 (artifact fingerprint 0x00112233445566778899aabbccddeeff).",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "non-hex string outside an address context",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your session tag is 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6.",
+     "expect": {
+      "text": "Your session tag is 0x5a2f3B8d1C9e4F0a7b2C8dE9fG4h1I5j8K3l0M7n6.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "41-hex near address",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Send the SALT to 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+     "expect": {
+      "text": "Send the SALT to [address removed: not a valid 40-hex address].",
+      "changed": true,
+      "findings": [
+       "removed 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: not a valid address (0x + 40 hex characters)"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "bare Deployed!",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Deployed! You're all set.",
+     "expect": {
+      "text": "You're all set.\n\nNo contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed \"Deployed!\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "decimals and line breaks survive a correction",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "content": "Proposed the contract deploy — it's waiting in the Signature Ceremony. Nothing is deployed yet: there is no contract address until the member approves."
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Version 1.2 of the token is ready.\nYour contract was deployed at 0x52908400098527886E0F7030069857D2E4169EE7.\n\nGas was 0.5 SALT.",
+     "expect": {
+      "text": "Version 1.2 of the token is ready.\n\nGas was 0.5 SALT.\n\nNo contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed 0x52908400098527886E0F7030069857D2E4169EE7: this turn attempted a deploy and no tool returned that address"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "insufficient funds refusal",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "contract_deploy",
+       "status": "error",
+       "content": "couldn't prepare the deploy: insufficient funds for gas"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "I deployed it at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract was deployed. The deploy could not be prepared: couldn't prepare the deploy: insufficient funds for gas The wallet does not have enough SALT to pay the deploy gas.",
+      "changed": true,
+      "findings": [
+       "removed 0x52908400098527886E0F7030069857D2E4169EE7: this turn attempted a deploy and no tool returned that address"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "a task id tracked through tasks_get",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"taskId\":\"t9\",\"state\":\"pending\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__tasks_get",
+       "status": "ok",
+       "content": "{\"task\":{\"taskId\":\"t9\"},\"receipt\":{\"status\":1,\"contractAddress\":\"0x52908400098527886E0F7030069857D2E4169EE7\",\"transactionHash\":\"0xabababababababababababababababababababababababababababababababab\"}}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+      "changed": false,
+      "findings": []
+     }
+    }
+   ]
+  },
+  {
+   "name": "JSON text inside an MCP result",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {
+    "0x52908400098527886e0f7030069857d2e4169ee7": 900
+   },
+   "turns": [
+    {
+     "outputs": [
+      {
+       "tool": "mcp__citrate-node__deploy_propose",
+       "status": "ok",
+       "content": "{\"requestId\":\"r1\",\"state\":\"pending\",\"summary\":\"Sign and send a contract deploy\"}"
+      },
+      {
+       "tool": "mcp__citrate-node__request_status",
+       "status": "ok",
+       "content": "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"id\\\":\\\"r1\\\",\\\"state\\\":\\\"approved\\\",\\\"confirmation\\\":{\\\"state\\\":\\\"included\\\",\\\"receipt\\\":{\\\"transactionHash\\\":\\\"0xabababababababababababababababababababababababababababababababab\\\",\\\"status\\\":\\\"success\\\",\\\"blockNumber\\\":901,\\\"contractAddress\\\":\\\"0x52908400098527886e0f7030069857d2e4169ee7\\\"}}}\"}]}"
+      }
+     ],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Your contract is deployed at 0x52908400098527886E0F7030069857D2E4169EE7.",
+     "expect": {
+      "text": "No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0x52908400098527886E0F7030069857D2E4169EE7: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}

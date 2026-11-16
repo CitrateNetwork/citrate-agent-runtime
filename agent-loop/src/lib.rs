@@ -604,6 +604,12 @@ pub enum Event {
     Final {
         content: String,
     },
+    /// citrate-core #681: the sidecar's final-answer check removed deploy claims that no receipt
+    /// or chain read supports. Emitted just before the corrected `final`, so a client that already
+    /// streamed the model's text knows the final answer replaces it.
+    AnswerCheck {
+        findings: Vec<String>,
+    },
     /// HUP-S7.6 (US-7.4 AC1): the token usage the provider reported for the model call of `step`.
     /// Emitted only when the provider reported usage; a call without it emits nothing (unknown,
     /// never zero).
@@ -657,6 +663,7 @@ impl Event {
             Event::Tainted { .. } => "tainted",
             Event::AssistantDelta { .. } => "assistant_delta",
             Event::Final { .. } => "final",
+            Event::AnswerCheck { .. } => "answer_check",
             Event::Usage { .. } => "usage",
             Event::Plan { .. } => "plan",
             Event::Verifier { .. } => "verifier",

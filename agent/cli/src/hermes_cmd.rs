@@ -299,6 +299,21 @@ pub fn render_sessions(list: &Value) -> Vec<String> {
 #[derive(Default)]
 pub struct EventPrinter {
     streamed: String,
+    /// core#681: the sidecar's answer check corrected the answer, so the final is printed whole.
+    corrected: bool,
+}
+
+/// core#681: the line printed when the sidecar's answer check corrected an answer.
+pub fn answer_check_line(ev: &Value) -> String {
+    let n = ev
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    format!(
+        "  answer check: {n} unsupported deploy claim{} removed; the checked answer follows",
+        if n == 1 { "" } else { "s" }
+    )
 }
 
 impl EventPrinter {
@@ -310,6 +325,20 @@ impl EventPrinter {
                 self.streamed.push_str(t);
                 let _ = write!(out, "{t}");
                 let _ = out.flush();
+            }
+            "answer_check" => {
+                if !self.streamed.is_empty() {
+                    let _ = writeln!(out);
+                }
+                let _ = writeln!(out, "{}", answer_check_line(ev));
+                self.corrected = true;
+            }
+            "final" if self.corrected => {
+                // The streamed text was not the answer: print the checked answer whole.
+                let fin = ev.get("content").and_then(Value::as_str).unwrap_or("");
+                let _ = writeln!(out, "{fin}");
+                self.streamed.clear();
+                self.corrected = false;
             }
             "final" if !self.streamed.is_empty() => {
                 let fin = ev.get("content").and_then(Value::as_str).unwrap_or("");
@@ -427,6 +456,7 @@ pub fn render_event(ev: &Value) -> Option<String> {
     let s = |k: &str| ev.get(k).and_then(Value::as_str).unwrap_or("");
     match s("type") {
         "final" => Some(s("content").to_string()),
+        "answer_check" => Some(answer_check_line(ev)),
         "tool_call" => {
             let name = ev
                 .pointer("/call/name")

@@ -620,6 +620,11 @@ pub struct Session {
     host_sets: HostSets,
     /// Store daemons: false when the sidecar adds nothing to core's system prompt.
     prompt_snapshot: bool,
+    /// core#681: what this conversation established about deploys (request ids, sent hashes,
+    /// trusted receipts, tool-returned addresses), for the final-answer check.
+    claims: Mutex<crate::deploy_claims::DeployLedger>,
+    /// core#681: where the final-answer check reads `eth_getCode`.
+    claim_reader: Arc<dyn crate::deploy_claims::CodeReader>,
     /// Test seam: runs on the emitting thread right after an event becomes visible to readers, so
     /// a test can act as a core client at the exact moment the event appears.
     #[cfg(test)]
@@ -1235,6 +1240,9 @@ pub struct SessionManager {
     /// US-1.3 AC2: ask the model for a self-review of every workflow step attempt and record it
     /// in the session's event log as an opinion (never part of the verdict).
     self_review: bool,
+    /// core#681: `eth_getCode` for the final-answer deploy-claim check (the configured chain RPC,
+    /// or a reader that always fails, so nothing unverified counts as code).
+    claim_reader: Arc<dyn crate::deploy_claims::CodeReader>,
 }
 
 impl SessionManager {
@@ -1269,7 +1277,14 @@ impl SessionManager {
             default_max_steps: DEFAULT_MAX_STEPS,
             records: None,
             self_review: false,
+            claim_reader: crate::deploy_claims::reader_from_env(),
         }
+    }
+
+    /// core#681: read `eth_getCode` for the final-answer check through `reader` (tests).
+    pub fn with_claim_reader(mut self, reader: Arc<dyn crate::deploy_claims::CodeReader>) -> Self {
+        self.claim_reader = reader;
+        self
     }
 
     /// HUP-S4.4: core's saved MCP server list (`mcp_probe::MCP_REGISTRY_ENV`).
@@ -2016,6 +2031,8 @@ impl SessionManager {
             unattended: req.unattended,
             host_sets,
             prompt_snapshot: req.prompt_snapshot,
+            claims: Mutex::new(crate::deploy_claims::DeployLedger::default()),
+            claim_reader: self.claim_reader.clone(),
             #[cfg(test)]
             event_hook: Mutex::new(None),
         });
@@ -2263,11 +2280,18 @@ impl SessionManager {
             // HUP-S7.5 (D-27): a workflow's attempts are metered like chat turns, so their verifier
             // verdicts and self-review opinions reach the daily report.
             let session_sink = SessionSink(s.clone());
-            let sink = TeeSink {
+            let tee = TeeSink {
                 observers: vec![s.metering.as_ref()],
                 last: &session_sink,
             };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            // core#681: a workflow attempt's final answer gets the same deploy-claim check.
+            let sink = crate::deploy_claims::ClaimGuardSink::new(
+                &tee,
+                &s.claims,
+                s.claim_reader.as_ref(),
+                member_texts(&history, None),
+            );
             let reviewer =
                 LlmSelfReviewer::new(s.llm.as_ref(), s.cfg.model.clone(), SELF_REVIEW_MAX_TOKENS);
             let out = run_verified_workflow_reviewed(
@@ -2286,6 +2310,7 @@ impl SessionManager {
                     None
                 },
             );
+            crate::deploy_claims::apply_corrections(&mut history, &sink.corrections());
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
@@ -2340,11 +2365,18 @@ impl SessionManager {
             if let Some((rec, _)) = &s.trajectory {
                 observers.push(rec.as_ref());
             }
-            let sink = TeeSink {
+            let tee = TeeSink {
                 observers,
                 last: &session_sink,
             };
             let mut history = s.history.lock().map(|h| h.clone()).unwrap_or_default();
+            // core#681: every final answer is checked for deploy claims before anyone reads it.
+            let sink = crate::deploy_claims::ClaimGuardSink::new(
+                &tee,
+                &s.claims,
+                s.claim_reader.as_ref(),
+                member_texts(&history, Some(&text)),
+            );
             // US-6.1 AC2 / US-6.2: a deploy request while the gate blocks is answered with the
             // refusal, the findings and the proposed fix, without a model call or any tool call.
             match s.deploy_guard().and_then(|g| g.answer_to(&text)) {
@@ -2362,6 +2394,7 @@ impl SessionManager {
                     );
                 }
             }
+            crate::deploy_claims::apply_corrections(&mut history, &sink.corrections());
             if let Ok(mut h) = s.history.lock() {
                 *h = history;
             }
@@ -2406,6 +2439,16 @@ impl SessionManager {
     pub fn count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
     }
+}
+
+/// core#681: what the member wrote in this conversation (earlier user messages, and `current`).
+fn member_texts(history: &[Message], current: Option<&str>) -> Vec<String> {
+    history
+        .iter()
+        .filter(|m| m.role == citrate_agent_loop::Role::User)
+        .map(|m| m.content.clone())
+        .chain(current.map(str::to_string))
+        .collect()
 }
 
 /// A turn the sidecar answers itself (the deploy guard's refusal): the same events a model turn

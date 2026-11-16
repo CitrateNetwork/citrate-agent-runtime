@@ -28,6 +28,8 @@ citrate-agent-metering = { path = "../agent-metering" }
 citrate-agent-trajectory = { path = "../agent-trajectory" }
 citrate-agent-anchor = { path = "../agent-anchor" }
 hex = "0.4"
+# core#681: the final-answer deploy-claim check (ASCII patterns, a port of deployClaims.ts).
+regex = "1"
 # HUP-S6.3 → S6.4: source and bytecode digests for the deploy gate hand-over.
 sha2 = "0.10"
 citrate-agent-escalation = { path = "../agent-escalation" }

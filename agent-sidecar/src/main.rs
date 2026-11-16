@@ -89,6 +89,9 @@
 //!   CITRATE_HERMES_SELF_REVIEW  US-1.3 AC2: `0` stops recording the model's self-review of each
 //!                               workflow step attempt (an opinion in the session's event log that
 //!                               never decides an outcome); anything else or unset = on (optional)
+//!   CITRATE_HERMES_CHAIN_RPC    core#681: the 40204 JSON-RPC URL the final-answer deploy-claim
+//!                               check reads eth_getCode from; unset = no code can be checked, so
+//!                               every unverified deploy address is removed (optional)
 //!   CITRATE_HERMES_BROWSER      HUP-S5.1: `1` offers the browser_* tools in every session and
 //!                               serves the /browser control routes; anything else = off (optional)
 //!   CITRATE_BROWSER_CHROMIUM    the managed Chromium executable (installed by the component
