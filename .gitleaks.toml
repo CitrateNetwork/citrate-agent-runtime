@@ -1,0 +1,8 @@
+# gitleaks config for the merge-gate secret-scan (merge-gate.yml picks this file up).
+# The default rules apply. Exceptions are test fixtures whose values are provably not credentials.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "core#681 deploy-claim check cases, shared byte for byte with citrate-core (both pin its sha256). Public 40204 contract addresses and model answers only; a label such as Token next to a 40-hex address matches the generic-api-key rule"
+paths = ['''^agent-sidecar/tests/fixtures/deploy_claims_cases\.json$''']
