@@ -1243,6 +1243,9 @@ pub struct SessionManager {
     /// core#681: `eth_getCode` for the final-answer deploy-claim check (the configured chain RPC,
     /// or a reader that always fails, so nothing unverified counts as code).
     claim_reader: Arc<dyn crate::deploy_claims::CodeReader>,
+    /// core#681: the citrate-core executable; core's node MCP server runs as it, which is how
+    /// that server is told from a same-named one (`None` = no MCP result is evidence).
+    core_exe: Option<std::path::PathBuf>,
 }
 
 impl SessionManager {
@@ -1278,7 +1281,14 @@ impl SessionManager {
             records: None,
             self_review: false,
             claim_reader: crate::deploy_claims::reader_from_env(),
+            core_exe: crate::deploy_claims::core_exe_from_env(),
         }
+    }
+
+    /// core#681: the citrate-core executable core's node MCP server runs as (tests).
+    pub fn with_core_exe(mut self, exe: impl Into<std::path::PathBuf>) -> Self {
+        self.core_exe = Some(exe.into());
+        self
     }
 
     /// core#681: read `eth_getCode` for the final-answer check through `reader` (tests).
@@ -2276,6 +2286,7 @@ impl SessionManager {
         let s = session.clone();
         let rid = run_id.clone();
         let self_review = self.self_review;
+        let (mcp, core_exe) = (self.mcp.clone(), self.core_exe.clone());
         tokio::task::spawn_blocking(move || {
             // HUP-S7.5 (D-27): a workflow's attempts are metered like chat turns, so their verifier
             // verdicts and self-review opinions reach the daily report.
@@ -2291,6 +2302,8 @@ impl SessionManager {
                 &s.claims,
                 s.claim_reader.as_ref(),
                 member_texts(&history, None),
+                vec![s.cfg.system_prompt.clone()],
+                claim_origins(mcp.clone(), core_exe.clone()),
             );
             let reviewer =
                 LlmSelfReviewer::new(s.llm.as_ref(), s.cfg.model.clone(), SELF_REVIEW_MAX_TOKENS);
@@ -2359,6 +2372,7 @@ impl SessionManager {
         }
         let registry = self.registry_for(&session, capsules);
         let s = session.clone();
+        let (mcp, core_exe) = (self.mcp.clone(), self.core_exe.clone());
         tokio::task::spawn_blocking(move || {
             let session_sink = SessionSink(s.clone());
             let mut observers: Vec<&dyn EventSink> = vec![s.metering.as_ref()];
@@ -2376,6 +2390,8 @@ impl SessionManager {
                 &s.claims,
                 s.claim_reader.as_ref(),
                 member_texts(&history, Some(&text)),
+                vec![s.cfg.system_prompt.clone()],
+                claim_origins(mcp.clone(), core_exe.clone()),
             );
             // US-6.1 AC2 / US-6.2: a deploy request while the gate blocks is answered with the
             // refusal, the findings and the proposed fix, without a model call or any tool call.
@@ -2439,6 +2455,19 @@ impl SessionManager {
     pub fn count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
     }
+}
+
+/// core#681: where each call of a turn ran, for the deploy-claim check: core-hosted calls are
+/// core's, and an MCP tool is the node server's only when the server the MCP host registered for
+/// that name is core's own node entry (see [`crate::deploy_claims::evidence_origin`]).
+fn claim_origins(
+    mcp: Option<Arc<McpHost>>,
+    core_exe: Option<std::path::PathBuf>,
+) -> crate::deploy_claims::OriginFn<'static> {
+    Box::new(move |name, host| {
+        let server = mcp.as_ref().and_then(|m| m.server_for(name));
+        crate::deploy_claims::evidence_origin(host, server.as_ref(), core_exe.as_deref())
+    })
 }
 
 /// core#681: what the member wrote in this conversation (earlier user messages, and `current`).

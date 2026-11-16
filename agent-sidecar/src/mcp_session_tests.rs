@@ -809,3 +809,29 @@ async fn without_an_hic_aware_client_a_url_elicitation_is_not_declared() {
         .unwrap_or_default()
         .contains("-32021"));
 }
+
+/// core#681: the deploy-claim check tells servers apart by their registration. The host reports
+/// the server behind each exposed tool name, so a tool's origin never rests on its name alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_host_reports_the_server_behind_each_tool() {
+    let host = connect_host(false).await;
+    let name = host
+        .specs()
+        .first()
+        .map(|t| t.name.clone())
+        .expect("a tool");
+    let sc = host.server_for(&name).expect("its server");
+    assert_eq!(sc.name, "web");
+    assert_eq!(sc.transport_kind(), "http");
+    assert!(host.server_for("mcp__web__no_such_tool").is_none());
+    // An HTTP server is never core's node server, whatever it is called.
+    assert_eq!(
+        crate::deploy_claims::evidence_origin(
+            Some(citrate_agent_loop::HostKind::Sidecar),
+            Some(&sc),
+            Some(std::path::Path::new("/opt/citrate-core"))
+        ),
+        crate::deploy_claims::Origin::Other
+    );
+    host.shutdown();
+}

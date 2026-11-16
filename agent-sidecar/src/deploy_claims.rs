@@ -7,32 +7,74 @@
 //! same wording and runs the same shared cases (`tests/fixtures/deploy_claims_cases.json`, pinned
 //! by sha256 on both sides). In short:
 //!
-//! - Evidence is kept per session in a [`DeployLedger`]. It holds the deploy request ids the
-//!   node's `deploy_propose` returned and the transaction hashes those requests were sent as. A
-//!   receipt is TRUSTED only when it comes from the tool that produces it and is bound to this
-//!   conversation: a `request_status` / `tasks_get` result for one of those request ids, or an
-//!   `explain_tx` result for one of those hashes (or sent from the member's wallet as `wallet_info`
-//!   read it). The ledger also keeps every address-like string a tool returned.
+//! - Evidence is kept per session in a [`DeployLedger`]. It counts only from core's own tools,
+//!   identified by where the call ran ([`Origin`]): a core-hosted call, or the node MCP server core
+//!   registered (see [`evidence_origin`]). A same-named tool on any other MCP server contributes
+//!   only the address-like strings it returned. A receipt is TRUSTED only when it sits at its fixed
+//!   place in the top-level object of a `request_status` / `tasks_get` result for one of this
+//!   conversation's deploy request ids, or in an `explain_tx` result for one of their transaction
+//!   hashes (or sent from the member's wallet as `wallet_info` read it).
+//! - The answer is read the way it is meant, not by its exact words: invisible characters are
+//!   removed and look-alike letters folded; each sentence is read with the one before it and, for
+//!   a list item or table row, the line that introduces it. A valid address nothing in this
+//!   conversation produced is kept only where `eth_getCode` shows code and it is not called the
+//!   member's or Hermes's own deploy, however it is worded.
 //! - An address in a deployment claim stays only when one of these holds:
 //!   - a trusted receipt names it and `eth_getCode` on 40204 returns code there now;
 //!   - for someone else's contract, `eth_getCode` shows code;
 //!   - in a turn that attempted no deploy, the member wrote it and there is code.
 //!
-//!   A malformed address is removed. A claimed deploy with no receipt is replaced by where the
-//!   deploy really stands.
+//!   A malformed address is removed. A claimed deploy with no receipt, or while this turn's deploy
+//!   is not confirmed, is replaced by where the deploy really stands.
 //! - `eth_getCode` goes through [`CodeReader`]. With no chain RPC configured
 //!   (`CITRATE_HERMES_CHAIN_RPC`), every read fails, so the code "could not be checked". It never
-//!   counts as code (fail closed).
+//!   counts as code (fail closed). One answer reads at most [`MAX_CODE_READS`] addresses, within
+//!   [`CODE_CHECK_BUDGET`].
 
-use citrate_agent_loop::{Event, EventSink};
-use regex::bytes::Regex;
+use citrate_agent_loop::{Event, EventSink, HostKind};
+use citrate_agent_mcp_host::config::{ServerConfig, TransportConfig};
+use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where the sidecar reads `eth_getCode` for the check (set by citrate-core to the 40204 RPC).
 pub const CHAIN_RPC_ENV: &str = "CITRATE_HERMES_CHAIN_RPC";
+/// The citrate-core executable (set by citrate-core): the node MCP server core registers runs as
+/// this program with [`NODE_MCP_STDIO_FLAG`].
+pub const CORE_EXE_ENV: &str = "CITRATE_HERMES_CORE_EXE";
+/// The name core's allowlist gives its node MCP server (citrate-core `NODE_SERVER_NAME`).
+pub const NODE_SERVER_NAME: &str = "node";
+/// The argument that runs citrate-core as its node MCP server (citrate-core `STDIO_FLAG`).
+pub const NODE_MCP_STDIO_FLAG: &str = "--mcp-stdio";
+
+/// Most address-like strings a conversation's ledger keeps from tool output.
+pub const MAX_TOOL_STRINGS: usize = 4096;
+/// Most distinct addresses one answer's check reads code for; the rest "could not be checked".
+pub const MAX_CODE_READS: usize = 16;
+/// Longest one answer's code reads may take together; later reads "could not be checked".
+pub const CODE_CHECK_BUDGET: Duration = Duration::from_secs(20);
+
+/// Where a tool ran: core itself, the node MCP server core registered, or anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Core,
+    Node,
+    Other,
+}
+
+impl Origin {
+    pub fn parse(s: &str) -> Option<Origin> {
+        match s {
+            "core" => Some(Origin::Core),
+            "node" => Some(Origin::Node),
+            "other" => Some(Origin::Other),
+            _ => None,
+        }
+    }
+}
 
 /// One tool result from the turn, in the order it arrived.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +84,58 @@ pub struct TurnToolOutput {
     /// "ok" | "error" | "denied" when known.
     pub status: Option<String>,
     pub content: String,
+    /// Where the call ran. `None`: read from the name, as core does (no `mcp__` prefix = core,
+    /// `mcp__node__` = the node server, any other server = other). The session always sets it.
+    pub origin: Option<Origin>,
+}
+
+/// Where the call ran: its recorded origin, or the one its name implies.
+pub fn origin_of(o: &TurnToolOutput) -> Origin {
+    if let Some(x) = o.origin {
+        return x;
+    }
+    if !o.tool.starts_with("mcp__") {
+        Origin::Core
+    } else if o.tool.starts_with("mcp__node__") {
+        Origin::Node
+    } else {
+        Origin::Other
+    }
+}
+
+/// Where a call the session ran came from. A core-hosted call is core's. An MCP tool is the node
+/// server's only when the server that offers it (`server`, from the MCP host's registration of
+/// that exposed name) is core's node entry: named [`NODE_SERVER_NAME`], run over stdio as the
+/// citrate-core executable `core_exe` with [`NODE_MCP_STDIO_FLAG`]. Without `core_exe` no MCP
+/// server is trusted. Everything else (sidecar tools, capsules, any other server) is other.
+pub fn evidence_origin(
+    host: Option<HostKind>,
+    server: Option<&ServerConfig>,
+    core_exe: Option<&Path>,
+) -> Origin {
+    if host == Some(HostKind::Core) {
+        return Origin::Core;
+    }
+    let (Some(sc), Some(exe)) = (server, core_exe) else {
+        return Origin::Other;
+    };
+    match &sc.transport {
+        TransportConfig::Stdio { command, args, .. }
+            if sc.name == NODE_SERVER_NAME
+                && command.as_path() == exe
+                && args.first().map(String::as_str) == Some(NODE_MCP_STDIO_FLAG) =>
+        {
+            Origin::Node
+        }
+        _ => Origin::Other,
+    }
+}
+
+/// The citrate-core executable this sidecar was started by, if core said so.
+pub fn core_exe_from_env() -> Option<PathBuf> {
+    std::env::var_os(CORE_EXE_ENV)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
 }
 
 /// Where the turn's latest deploy attempt stands.
@@ -68,6 +162,7 @@ pub struct DeployLedger {
     pub tx_hashes: HashSet<String>,
     /// Trusted receipt addresses (lowercase) -> their transaction hash.
     pub receipts: HashMap<String, Option<String>>,
+    /// At most [`MAX_TOOL_STRINGS`]; later ones are not kept, so they count as unreturned.
     pub tool_strings: HashSet<String>,
     pub wallet: Option<String>,
 }
@@ -78,6 +173,8 @@ pub struct DeployEvidence {
     pub receipts: HashMap<String, Option<String>>,
     pub tool_strings: HashSet<String>,
     pub member_strings: HashSet<String>,
+    /// Address-like strings in what core told Hermes (the member's wallet, the system prompt).
+    pub context_strings: HashSet<String>,
     /// "zero" | "short".
     pub unfunded: Option<&'static str>,
 }
@@ -104,6 +201,9 @@ pub struct DeployClaimCheck {
 
 pub const REMOVED_ADDRESS: &str = "[address removed: not a valid 40-hex address]";
 pub const REMOVED_UNGROUNDED: &str = "[address removed: no tool returned it]";
+pub const REMOVED_NO_CODE: &str = "[address removed: no tool returned it and no contract is there]";
+pub const REMOVED_UNCHECKED: &str =
+    "[address removed: no tool returned it and its code could not be checked]";
 
 // ---- tokens ----
 
@@ -190,6 +290,108 @@ pub fn address_shape(t: &str) -> Shape {
     }
 }
 
+// ---- reading the text the way it is meant ----
+
+/// Characters that render as nothing (soft hyphen, zero-width and direction marks, BOM).
+fn invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFE00..=0xFE0F | 0xFEFF)
+}
+
+/// Spaces other than U+0020.
+fn odd_space(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0085 | 0x00A0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000
+    )
+}
+
+/// The answer with invisible characters removed, odd spaces made plain, and full-width ASCII made
+/// ASCII. A sentence the check rewrites is written from this text.
+pub fn plain_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !invisible(*c))
+        .map(|c| {
+            let u = c as u32;
+            if odd_space(c) {
+                ' '
+            } else if (0xFF01..=0xFF5E).contains(&u) {
+                char::from_u32(u - 0xFEE0).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Cyrillic and Greek letters that look like Latin ones, folded only for reading claims.
+const LOOKALIKE: &[(char, char)] = &[
+    ('\u{0430}', 'a'),
+    ('\u{0435}', 'e'),
+    ('\u{043E}', 'o'),
+    ('\u{0440}', 'p'),
+    ('\u{0441}', 'c'),
+    ('\u{0443}', 'y'),
+    ('\u{0445}', 'x'),
+    ('\u{0456}', 'i'),
+    ('\u{0458}', 'j'),
+    ('\u{0455}', 's'),
+    ('\u{0501}', 'd'),
+    ('\u{04CF}', 'l'),
+    ('\u{0410}', 'A'),
+    ('\u{0412}', 'B'),
+    ('\u{0415}', 'E'),
+    ('\u{041A}', 'K'),
+    ('\u{041C}', 'M'),
+    ('\u{041D}', 'H'),
+    ('\u{041E}', 'O'),
+    ('\u{0420}', 'P'),
+    ('\u{0421}', 'C'),
+    ('\u{0422}', 'T'),
+    ('\u{0425}', 'X'),
+    ('\u{03B1}', 'a'),
+    ('\u{03B5}', 'e'),
+    ('\u{03BF}', 'o'),
+    ('\u{03C1}', 'p'),
+    ('\u{03BD}', 'v'),
+    ('\u{0391}', 'A'),
+    ('\u{0392}', 'B'),
+    ('\u{0395}', 'E'),
+    ('\u{0397}', 'H'),
+    ('\u{0399}', 'I'),
+    ('\u{039A}', 'K'),
+    ('\u{039C}', 'M'),
+    ('\u{039D}', 'N'),
+    ('\u{039F}', 'O'),
+    ('\u{03A1}', 'P'),
+    ('\u{03A4}', 'T'),
+    ('\u{03A5}', 'Y'),
+    ('\u{03A7}', 'X'),
+    ('\u{0396}', 'Z'),
+];
+
+/// `text` with look-alike letters folded to Latin and markdown emphasis taken out (for reading).
+fn fold(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '*' | '_' | '`' | '~') {
+            continue;
+        }
+        out.push(
+            LOOKALIKE
+                .iter()
+                .find(|(k, _)| *k == c)
+                .map(|(_, v)| *v)
+                .unwrap_or(c),
+        );
+    }
+    out
+}
+
+// ---- evidence ----
+
 /// The tool name without the sidecar's `mcp__<server>__` prefix.
 fn base_name(tool: &str) -> &str {
     if let Some(rest) = tool.strip_prefix("mcp__") {
@@ -206,48 +408,34 @@ fn base_name(tool: &str) -> &str {
     tool
 }
 
-// ---- JSON ----
+type Obj = serde_json::Map<String, Value>;
 
-fn json_values(content: &str) -> Vec<Value> {
-    fn visit(raw: &str, depth: usize, out: &mut Vec<Value>) {
-        let t = raw.trim();
-        if depth > 3 || !(t.starts_with('{') || t.starts_with('[')) {
-            return;
+/// The result's top-level object. An MCP result may carry it as the text of its one content item;
+/// that one wrapper is opened, nothing deeper.
+fn top_object(content: &str) -> Option<Obj> {
+    fn parse(s: &str) -> Option<Obj> {
+        let t = s.trim();
+        if !t.starts_with('{') {
+            return None;
         }
-        let Ok(v) = serde_json::from_str::<Value>(t) else {
-            return;
-        };
-        out.push(v.clone());
-        let mut strings = Vec::new();
-        collect_strings(&v, &mut strings);
-        for s in strings {
-            visit(&s, depth + 1, out);
+        match serde_json::from_str::<Value>(t) {
+            Ok(Value::Object(m)) => Some(m),
+            _ => None,
         }
     }
-    let mut out = Vec::new();
-    visit(content, 0, &mut out);
-    out
-}
-
-fn collect_strings(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
-        Value::Object(m) => m.values().for_each(|x| collect_strings(x, out)),
-        _ => {}
-    }
-}
-
-/// Every object inside `v`, itself included, outermost first.
-fn objects_of<'a>(v: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>>) {
-    match v {
-        Value::Array(a) => a.iter().for_each(|x| objects_of(x, out)),
-        Value::Object(m) => {
-            out.push(m);
-            m.values().for_each(|x| objects_of(x, out));
+    let v = parse(content)?;
+    if let Some(Value::Array(items)) = v.get("content") {
+        if items.len() == 1 {
+            if let Some(item) = items[0].as_object() {
+                if item.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        return parse(text);
+                    }
+                }
+            }
         }
-        _ => {}
     }
+    Some(v)
 }
 
 fn receipt_ok(v: &Value) -> bool {
@@ -266,9 +454,15 @@ fn lower_str(v: Option<&Value>) -> Option<String> {
     v.and_then(Value::as_str).map(str::to_lowercase)
 }
 
+/// A pattern written in JavaScript's dialect (`\b`, `\w` and `\d` ASCII, as in the TS original;
+/// `\s` and counted repeats over characters, as JavaScript counts BMP text).
 fn re(p: &str) -> Regex {
-    // ASCII semantics, like the JavaScript originals.
-    Regex::new(&format!("(?-u){p}")).expect("deploy-claims pattern")
+    let p = p
+        .replace(r"\b", r"(?-u:\b)")
+        .replace(r"\W", "[^0-9A-Za-z_]")
+        .replace(r"\w", "[0-9A-Za-z_]")
+        .replace(r"\d", "[0-9]");
+    Regex::new(&p).expect("deploy-claims pattern")
 }
 
 static UNFUNDED_SHORT: LazyLock<Regex> = LazyLock::new(|| {
@@ -290,14 +484,13 @@ static EXPLAIN_TX: LazyLock<Regex> = LazyLock::new(|| re(r"(?m)^explain_tx (0x[0
 static FROM: LazyLock<Regex> = LazyLock::new(|| re(r"(?m)^From (0x[0-9a-fA-F]{40})\b"));
 
 fn cap1(r: &Regex, s: &str) -> Option<String> {
-    r.captures(s.as_bytes())
+    r.captures(s)
         .and_then(|c| c.get(1))
-        .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+        .map(|m| m.as_str().to_string())
 }
 
-/// The request/task id a request_status or tasks_get result is about (its top-level object).
-fn request_id_of(objects: &[&serde_json::Map<String, Value>]) -> Option<String> {
-    let top = objects.first()?;
+/// The request/task id a result's top-level object names.
+fn id_of(top: &Obj) -> Option<String> {
     for k in ["id", "requestId", "taskId"] {
         if let Some(s) = top.get(k).and_then(Value::as_str) {
             return Some(s.to_string());
@@ -309,6 +502,22 @@ fn request_id_of(objects: &[&serde_json::Map<String, Value>]) -> Option<String> 
         .map(str::to_string)
 }
 
+/// The receipts at their fixed places: the object itself, `receipt`, `confirmation.receipt`,
+/// `task.receipt`.
+fn receipts_of(top: &Obj) -> Vec<&Obj> {
+    let nested = |k: &str| top.get(k).and_then(|v| v.get("receipt"));
+    [
+        Some(top),
+        top.get("receipt").and_then(Value::as_object),
+        nested("confirmation").and_then(Value::as_object),
+        nested("task").and_then(Value::as_object),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|o| o.contains_key("contractAddress"))
+    .collect()
+}
+
 /// Read where the turn's deploys stand from its tool results, in order, on top of what the
 /// conversation already established (`ledger`, updated in place).
 pub fn collect_deploy_evidence(
@@ -316,35 +525,45 @@ pub fn collect_deploy_evidence(
     ledger: &mut DeployLedger,
     member_texts: &[String],
     member_wallet: Option<&str>,
+    context_texts: &[String],
 ) -> DeployEvidence {
     let mut state = DeployState::None;
     let mut unfunded: Option<&'static str> = None;
+    let wallet_of = |l: &DeployLedger| {
+        l.wallet
+            .clone()
+            .or_else(|| member_wallet.map(str::to_lowercase))
+    };
     for o in outputs {
         let name = base_name(&o.tool);
         let content = o.content.as_str();
         for t in address_like_tokens(content) {
+            if ledger.tool_strings.len() >= MAX_TOOL_STRINGS {
+                break;
+            }
             ledger.tool_strings.insert(t.to_lowercase());
         }
-        let values = json_values(content);
-        let mut objects = Vec::new();
-        for v in &values {
-            objects_of(v, &mut objects);
+        // Only core's own tools speak for a deploy, a balance or a receipt.
+        let origin = origin_of(o);
+        if origin == Origin::Other {
+            continue;
         }
+        let top = top_object(content);
         let failed = matches!(o.status.as_deref(), Some("error") | Some("denied"));
 
         if name == "wallet_info" || name == "get_balance" || name == "wallet_balance" {
-            for obj in &objects {
-                let wei = obj.get("balanceWei").or_else(|| obj.get("balance_wei"));
-                if matches!(wei, Some(Value::String(s)) if s == "0")
-                    || wei.and_then(Value::as_f64) == Some(0.0)
-                {
-                    unfunded = Some("zero");
-                }
+            let wei = top
+                .as_ref()
+                .and_then(|t| t.get("balanceWei").or_else(|| t.get("balance_wei")));
+            if matches!(wei, Some(Value::String(s)) if s == "0")
+                || wei.and_then(Value::as_f64) == Some(0.0)
+            {
+                unfunded = Some("zero");
             }
             if name == "wallet_info" && !failed {
-                if let Some(a) = objects
-                    .first()
-                    .and_then(|o| o.get("address"))
+                if let Some(a) = top
+                    .as_ref()
+                    .and_then(|t| t.get("address"))
                     .and_then(Value::as_str)
                 {
                     if is_well_formed_address(a) {
@@ -353,22 +572,22 @@ pub fn collect_deploy_evidence(
                 }
             }
         }
-        if UNFUNDED_SHORT.is_match(content.as_bytes()) {
+        if UNFUNDED_SHORT.is_match(content) {
             unfunded = unfunded.or(Some("short"));
         }
 
         if name == "contract_deploy" {
-            if DEPLOY_REFUSED.is_match(content.as_bytes()) {
+            if DEPLOY_REFUSED.is_match(content) {
                 state = DeployState::Refused(content.to_string());
-            } else if EXPIRED.is_match(content.as_bytes()) && !content.starts_with("Proposed") {
+            } else if EXPIRED.is_match(content) && !content.starts_with("Proposed") {
                 state = DeployState::Expired;
             } else if content.starts_with("Proposed the contract deploy") {
                 state = DeployState::Pending;
-            } else if failed || PREPARE_FAILED.is_match(content.as_bytes()) {
+            } else if failed || PREPARE_FAILED.is_match(content) {
                 state = DeployState::Failed(content.to_string());
             }
         } else if name == "deploy_propose" {
-            let refused = REFUSED.is_match(content.as_bytes());
+            let refused = REFUSED.is_match(content);
             if failed || refused {
                 state = if refused {
                     DeployState::Refused(content.to_string())
@@ -376,43 +595,43 @@ pub fn collect_deploy_evidence(
                     DeployState::Failed(content.to_string())
                 };
             } else {
-                for obj in &objects {
+                if let Some(t) = &top {
                     for k in ["requestId", "taskId", "id"] {
-                        if let Some(s) = obj.get(k).and_then(Value::as_str) {
+                        if let Some(s) = t.get(k).and_then(Value::as_str) {
                             ledger.request_ids.insert(s.to_string());
                         }
+                    }
+                    if let Some(s) = t
+                        .get("task")
+                        .and_then(|x| x.get("taskId"))
+                        .and_then(Value::as_str)
+                    {
+                        ledger.request_ids.insert(s.to_string());
                     }
                 }
                 state = DeployState::Pending;
             }
         } else if matches!(name, "request_status" | "tasks_get" | "task_status") {
-            let Some(id) = request_id_of(&objects) else {
-                continue;
-            };
+            let Some(top) = &top else { continue };
+            let Some(id) = id_of(top) else { continue };
             if !ledger.request_ids.contains(&id) {
                 continue;
             }
-            let confirmation = objects
-                .iter()
-                .find_map(|x| x.get("confirmation").filter(|c| c.is_object()))
-                .and_then(Value::as_object);
+            let confirmation = top.get("confirmation").and_then(Value::as_object);
             let sent_hash = lower_str(confirmation.and_then(|c| c.get("txHash")))
                 .or_else(|| first_tx_hash(content).map(|h| h.to_lowercase()));
             if let Some(h) = &sent_hash {
                 ledger.tx_hashes.insert(h.clone());
             }
             let mut confirmed = false;
-            for obj in &objects {
-                if !obj.contains_key("contractAddress") {
-                    continue;
-                }
+            for r in receipts_of(top) {
                 let tx_hash =
-                    lower_str(obj.get("transactionHash")).or_else(|| lower_str(obj.get("txHash")));
+                    lower_str(r.get("transactionHash")).or_else(|| lower_str(r.get("txHash")));
                 if let Some(h) = &tx_hash {
                     ledger.tx_hashes.insert(h.clone());
                 }
-                let status = obj.get("status").cloned().unwrap_or(Value::Null);
-                let addr = obj.get("contractAddress").and_then(Value::as_str);
+                let status = r.get("status").cloned().unwrap_or(Value::Null);
+                let addr = r.get("contractAddress").and_then(Value::as_str);
                 if receipt_ok(&status) && addr.is_some_and(is_well_formed_address) {
                     let a = addr.unwrap_or_default();
                     ledger.receipts.insert(a.to_lowercase(), tx_hash.clone());
@@ -429,10 +648,7 @@ pub fn collect_deploy_evidence(
             if confirmed {
                 continue;
             }
-            let st = objects
-                .first()
-                .and_then(|o| o.get("state"))
-                .and_then(Value::as_str);
+            let st = top.get("state").and_then(Value::as_str);
             let conf_state = confirmation
                 .and_then(|c| c.get("state"))
                 .and_then(Value::as_str);
@@ -443,53 +659,59 @@ pub fn collect_deploy_evidence(
                 Some("failed") => state = DeployState::Failed(content.to_string()),
                 _ => {
                     if matches!(conf_state, Some("waiting") | Some("unknown"))
-                        || WAITING_INCLUDE.is_match(content.as_bytes())
+                        || WAITING_INCLUDE.is_match(content)
                     {
                         state = DeployState::Sent(sent_hash);
-                    } else if conf_state == Some("reverted")
-                        || REVERTED_WORD.is_match(content.as_bytes())
-                    {
+                    } else if conf_state == Some("reverted") || REVERTED_WORD.is_match(content) {
                         state = DeployState::Reverted(sent_hash);
                     }
                 }
             }
-        } else if name == "explain_tx" && STATUS_SUCCESS.is_match(content.as_bytes()) {
+        } else if name == "explain_tx" && origin == Origin::Core && STATUS_SUCCESS.is_match(content)
+        {
+            // Only a transaction this conversation's deploy was sent as makes it this turn's
+            // confirmed deploy; an old deploy from the member's wallet is a receipt, not news.
             let Some(created) = cap1(&CREATED, content) else {
                 continue;
             };
             let tx_hash = cap1(&EXPLAIN_TX, content).map(|h| h.to_lowercase());
             let from = cap1(&FROM, content).map(|h| h.to_lowercase());
-            let wallet = ledger
-                .wallet
-                .clone()
-                .or_else(|| member_wallet.map(str::to_lowercase));
-            let own = tx_hash
+            let bound = tx_hash
                 .as_ref()
-                .is_some_and(|h| ledger.tx_hashes.contains(h))
-                || (from.is_some() && from == wallet);
-            if !own {
+                .is_some_and(|h| ledger.tx_hashes.contains(h));
+            let wallet = wallet_of(ledger);
+            if !bound && !(from.is_some() && from == wallet) {
                 continue;
             }
             ledger
                 .receipts
                 .insert(created.to_lowercase(), tx_hash.clone());
-            state = DeployState::Confirmed {
-                address: created,
-                tx_hash,
-            };
+            if bound {
+                state = DeployState::Confirmed {
+                    address: created,
+                    tx_hash,
+                };
+            }
         }
     }
-    let mut member_strings = HashSet::new();
-    for t in member_texts {
-        for a in address_like_tokens(t) {
-            member_strings.insert(a.to_lowercase());
-        }
+    let tokens_of = |texts: &[String]| -> HashSet<String> {
+        texts
+            .iter()
+            .flat_map(|t| address_like_tokens(&plain_text(t)))
+            .map(|a| a.to_lowercase())
+            .collect()
+    };
+    let member_strings = tokens_of(member_texts);
+    let mut context_strings = tokens_of(context_texts);
+    if let Some(w) = wallet_of(ledger) {
+        context_strings.insert(w);
     }
     DeployEvidence {
         state,
         receipts: ledger.receipts.clone(),
         tool_strings: ledger.tool_strings.clone(),
         member_strings,
+        context_strings,
         unfunded,
     }
 }
@@ -498,17 +720,17 @@ pub fn collect_deploy_evidence(
 
 static NOT_A_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?deployed\b|\b\w+n't\s+(?:yet\s+)?(?:been\s+)?deployed\b|\bno (?:contract|deploy(?:ment)?)\s+(?:was|is|has been|happened|ran)(?:\s+deployed)?\b|\b(?:will|would|can|could|should|may|might|to)\s+be\s+deployed\b|\b(?:once|until|after|before|when|if|unless)\s+(?:it(?:'s| is)?|they(?:'re| are)?|the contract (?:is )?|your contract (?:is )?)?\s*deployed\b|\bnot (?:yet )?live\b|\bready to (?:be )?deploy(?:ed)?\b",
+        r"(?i)\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?deployed\b|\b\w+n't\s+(?:yet\s+)?(?:been\s+)?deployed\b|\bno (?:contract|deploy(?:ment)?)\s+(?:was|is|has been|happened|ran)(?:\s+deployed)?\b|\b(?:will|would|can|could|should|may|might|to)\s+be\s+deployed\b|\b(?:once|until|after|before|when|if|unless)\s+(?:it(?:'s| is)?|they(?:'re| are)?|the contract (?:is )?|your contract (?:is )?)?\s*deployed\b|\bnot (?:yet )?(?:live|on[- ]?chain)\b|\bready to (?:be )?deploy(?:ed)?\b|\bdeployed nothing\b|\bnothing (?:was |has been |got )?deployed\b",
     )
 });
 static DONE_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeployment\s+(?:succeeded|is complete|completed|was successful|went through|is done)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\blive\s+(?:at|on)\s+0x|^\W*(?:all\s+|both\s+)?deployed\b",
+        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|^\W*(?:all\s+|both\s+)?deployed\b",
     )
 });
 static DEPLOY_WORD: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\bdeployed\b|\bdeployment address(?:es)?\b|\blive\s+(?:at|on)\b|\bcontract address(?:es)?\b|\bcreated contract\b|\bnew contract\b",
+        r"(?i)\bdeployed\b|\bdeployment address(?:es)?\b|\b(?:your|my|our)\s+(?:new\s+)?(?:\w+\s+)?contracts?\b|\blive\s+(?:at|on)\b|\bcontract(?:'s)?\s+address(?:es)?\b|\btoken(?:'s)?\s+(?:contract\s+)?address\b|\bcreated contract\b|\bnew contract\b|\bon[- ]?chain\s+at\b|\b(?:located|lives|available|found)\s+at\b|\bfind\s+(?:it|them)\s+at\b|\bcontract\s+(?:is\s+)?at\b",
     )
 });
 static ADDRESS_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
@@ -518,6 +740,20 @@ static ADDRESS_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static OWN: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\b(?:i|i've|i'm|we|we've|our|you|you've|your|my|me|us)\b"));
+static SUBJECTLESS: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)^\W*(?:(?:all|both|successfully)\s+)?(?:deployed|deployment|deploy\s+(?:done|complete|succeeded)|done|success)\b",
+    )
+});
+static LABEL: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^\s*(?:[-*+|>]|\d+[.)]\s)|^[^.!?:\n]{0,60}:\s*\S"));
+static LIST_LINE: LazyLock<Regex> = LazyLock::new(|| re(r"^\s*(?:[-*+|]|\d+[.)]\s)"));
+static OWN_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"^\s*I can\x27t confirm a deploy at 0x[0-9a-fA-F]{40}: (?:eth_getCode on chain \d+ returned no code there|its code on chain \d+ could not be checked)",
+    )
+});
+static NEWLINE_END: LazyLock<Regex> = LazyLock::new(|| re(r"\n\s*$"));
 static THREE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| re(r"\n{3,}"));
 static SPACES: LazyLock<Regex> = LazyLock::new(|| re(r"\s+"));
 
@@ -535,7 +771,7 @@ pub fn sentences(text: &str) -> Vec<&str> {
             || (matches!(c, b'.' | b'!' | b'?') && (i + 1 >= b.len() || !alnum(b[i + 1])));
         i += 1;
         if end {
-            while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+            while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\x0c' | b'\r') {
                 i += 1;
             }
             out.push(&text[start..i]);
@@ -549,11 +785,7 @@ pub fn sentences(text: &str) -> Vec<&str> {
 }
 
 fn claim_text(sentence: &str) -> String {
-    String::from_utf8_lossy(&NOT_A_CLAIM.replace_all(sentence.as_bytes(), &b" "[..])).into_owned()
-}
-
-fn is(r: &Regex, s: &str) -> bool {
-    r.is_match(s.as_bytes())
+    NOT_A_CLAIM.replace_all(&fold(sentence), " ").into_owned()
 }
 
 fn clip_chars(s: &str, n: usize) -> String {
@@ -569,17 +801,21 @@ fn gas_line(ev: &DeployEvidence) -> &'static str {
 }
 
 fn squash(s: &str) -> String {
-    String::from_utf8_lossy(&SPACES.replace_all(s.as_bytes(), &b" "[..]))
-        .trim()
-        .to_string()
+    SPACES.replace_all(s, " ").trim().to_string()
 }
 
 /// The plain statement of where the deploy stands, said in place of a removed claim.
 pub fn deploy_status_line(ev: &DeployEvidence) -> String {
     let gas = gas_line(ev);
     match &ev.state {
-        DeployState::Refused(r) => format!("No contract was deployed. The node refused the deploy: {}{gas}", clip_chars(&squash(r), 400)),
-        DeployState::Failed(r) => format!("No contract was deployed. The deploy could not be prepared: {}{gas}", clip_chars(&squash(r), 400)),
+        DeployState::Refused(r) => format!(
+            "No contract was deployed. The node refused the deploy: {}{gas}",
+            clip_chars(&squash(r), 400)
+        ),
+        DeployState::Failed(r) => format!(
+            "No contract was deployed. The deploy could not be prepared: {}{gas}",
+            clip_chars(&squash(r), 400)
+        ),
         DeployState::Pending => format!("No contract is deployed yet. The deploy is waiting for your approval in Citrate Core; nothing is signed or sent until you approve it, and there is no contract address until the chain includes the deploy.{gas}"),
         DeployState::Declined => format!("No contract was deployed: the deploy request was declined, so nothing was signed or sent.{gas}"),
         DeployState::Expired => format!("No contract was deployed: the deploy request expired before it was approved, so nothing was sent.{gas}"),
@@ -591,7 +827,9 @@ pub fn deploy_status_line(ev: &DeployEvidence) -> String {
             "No contract was deployed: the deploy transaction{} reverted, so nothing was created on chain.{gas}",
             h.as_ref().map(|h| format!(" {h}")).unwrap_or_default()
         ),
-        DeployState::Confirmed { address, .. } => format!("The only deploy confirmed in this turn is {address}.{gas}"),
+        DeployState::Confirmed { address, .. } => {
+            format!("The only deploy confirmed in this turn is {address}.{gas}")
+        }
         DeployState::None => format!("No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.{gas}"),
     }
 }
@@ -609,7 +847,17 @@ fn code_line(addr: &str, v: &Verdict) -> String {
             "I can't confirm a deploy at {addr}: its code on chain 40204 could not be checked ({}).",
             clip_chars(why, 200)
         ),
-        _ => format!("I can't confirm a deploy at {addr}: eth_getCode on chain 40204 returned no code there."),
+        _ => format!(
+            "I can't confirm a deploy at {addr}: eth_getCode on chain 40204 returned no code there."
+        ),
+    }
+}
+
+fn verdict_words(v: &Verdict) -> &'static str {
+    if matches!(v, Verdict::Empty) {
+        "eth_getCode returned no code there"
+    } else {
+        "its code could not be checked"
     }
 }
 
@@ -619,20 +867,36 @@ pub fn check_deploy_claims(
     ev: &DeployEvidence,
     reader: &dyn CodeReader,
 ) -> DeployClaimCheck {
+    let started = Instant::now();
     let mut cache: HashMap<String, Verdict> = HashMap::new();
     let mut code = |addr: &str| -> Verdict {
         let k = addr.to_lowercase();
-        cache
-            .entry(k)
-            .or_insert_with(|| match reader.read_code(addr) {
+        if let Some(v) = cache.get(&k) {
+            return v.clone();
+        }
+        let v = if cache.len() >= MAX_CODE_READS {
+            Verdict::Unknown(format!(
+                "this answer names more than {MAX_CODE_READS} addresses"
+            ))
+        } else if started.elapsed() >= CODE_CHECK_BUDGET {
+            Verdict::Unknown("the code check ran out of time".into())
+        } else {
+            match reader.read_code(addr) {
                 Ok(c) if c.is_contract && c.code_size > 0 => Verdict::Code,
                 Ok(_) => Verdict::Empty,
                 Err(e) => Verdict::Unknown(e),
-            })
-            .clone()
+            }
+        };
+        cache.insert(k, v.clone());
+        v
     };
     let attempted = ev.state != DeployState::None;
-    let written = |k: &str| ev.tool_strings.contains(k) || ev.member_strings.contains(k);
+    let confirmed = matches!(ev.state, DeployState::Confirmed { .. });
+    let written = |k: &str| {
+        ev.tool_strings.contains(k)
+            || ev.member_strings.contains(k)
+            || ev.context_strings.contains(k)
+    };
     let mut findings: Vec<String> = Vec::new();
     let mut status: Vec<String> = Vec::new();
     let say = |status: &mut Vec<String>, line: String| {
@@ -641,16 +905,38 @@ pub fn check_deploy_claims(
         }
     };
     let mut out: Vec<String> = Vec::new();
+    let text = plain_text(answer);
+    let mut prev = String::new();
+    let mut lead = String::new();
 
-    for sentence in sentences(answer) {
+    for sentence in sentences(&text) {
         let claim = claim_text(sentence);
-        let tokens: Vec<String> = address_like_tokens(sentence)
-            .into_iter()
-            .filter(|t| address_shape(t) != Shape::Other)
-            .collect();
-        let deploy_claimed = is(&DONE_CLAIM, &claim);
-        let in_claim = !tokens.is_empty() && (deploy_claimed || is(&DEPLOY_WORD, &claim));
-        let own = is(&OWN, &claim);
+        let list_line = LIST_LINE.is_match(sentence);
+        // The sentence before, and the line that introduces a list or table, give a bare
+        // "Address: 0x…" or a table cell its meaning.
+        let around = format!("{prev} {}", if list_line { lead.as_str() } else { "" });
+        let around_claim = claim_text(&around);
+        let label = LABEL.is_match(sentence);
+        let tokens: Vec<String> = if OWN_STATUS.is_match(sentence) {
+            Vec::new()
+        } else {
+            address_like_tokens(sentence)
+                .into_iter()
+                .filter(|t| address_shape(t) != Shape::Other)
+                .collect()
+        };
+        let deploy_claimed = DONE_CLAIM.is_match(&claim);
+        let ctx_claimed = deploy_claimed || (label && DONE_CLAIM.is_match(&around_claim));
+        let in_claim = !tokens.is_empty()
+            && (ctx_claimed
+                || DEPLOY_WORD.is_match(&claim)
+                || (label && DEPLOY_WORD.is_match(&around_claim)));
+        let own = OWN.is_match(&claim)
+            || SUBJECTLESS.is_match(&claim)
+            || (label
+                && (OWN.is_match(&around_claim)
+                    || SUBJECTLESS.is_match(&claim_text(&prev))
+                    || SUBJECTLESS.is_match(&claim_text(&lead))));
         let mut drop = false;
         let mut replace: HashMap<String, &'static str> = HashMap::new();
 
@@ -667,7 +953,7 @@ pub fn check_deploy_claims(
                     ));
                     say(&mut status, deploy_status_line(ev));
                     drop = true;
-                } else if is(&ADDRESS_CONTEXT, sentence) {
+                } else if ADDRESS_CONTEXT.is_match(&fold(sentence)) {
                     findings.push(format!(
                         "removed {t}: not a valid address (0x + 40 hex characters)"
                     ));
@@ -685,11 +971,7 @@ pub fn check_deploy_claims(
                 }
                 findings.push(format!(
                     "removed a deploy claim at {t}: a trusted receipt names it, but {}",
-                    if matches!(v, Verdict::Empty) {
-                        "eth_getCode returned no code there"
-                    } else {
-                        "its code could not be checked"
-                    }
+                    verdict_words(&v)
                 ));
                 say(&mut status, code_line(t, &v));
                 drop = true;
@@ -707,10 +989,15 @@ pub fn check_deploy_claims(
                 }
                 continue;
             }
-            if !in_claim {
+            if in_claim && ctx_claimed && attempted && !confirmed {
+                findings.push(format!(
+                    "removed a deploy claim at {t}: this turn's deploy is not confirmed"
+                ));
+                say(&mut status, deploy_status_line(ev));
+                drop = true;
                 continue;
             }
-            if own {
+            if in_claim && own {
                 if !attempted && ev.member_strings.contains(&k) {
                     let v = code(t);
                     if matches!(v, Verdict::Code) {
@@ -728,28 +1015,45 @@ pub fn check_deploy_claims(
                     drop = true;
                     continue;
                 }
-                findings.push(format!("removed a deploy claim at {t}: no trusted deploy receipt in this conversation names it"));
+                findings.push(format!(
+                    "removed a deploy claim at {t}: no trusted deploy receipt in this conversation names it"
+                ));
                 say(&mut status, deploy_status_line(ev));
                 drop = true;
                 continue;
             }
+            if !in_claim && written(&k) {
+                continue;
+            }
+            // Someone else's contract, or an address nothing in this conversation produced,
+            // however it is worded: grounded only when there is code at it.
             let v = code(t);
             if matches!(v, Verdict::Code) {
                 continue;
             }
-            findings.push(format!(
-                "removed a deploy claim at {t}: {}",
-                if matches!(v, Verdict::Empty) {
-                    "eth_getCode returned no code there"
-                } else {
-                    "its code could not be checked"
-                }
-            ));
-            say(&mut status, code_line(t, &v));
-            drop = true;
+            if in_claim {
+                findings.push(format!(
+                    "removed a deploy claim at {t}: {}",
+                    verdict_words(&v)
+                ));
+                say(&mut status, code_line(t, &v));
+                drop = true;
+            } else {
+                findings.push(format!(
+                    "removed {t}: no tool returned it and {}",
+                    verdict_words(&v)
+                ));
+                replace.insert(
+                    t.clone(),
+                    if matches!(v, Verdict::Empty) {
+                        REMOVED_NO_CODE
+                    } else {
+                        REMOVED_UNCHECKED
+                    },
+                );
+            }
         }
 
-        let confirmed = matches!(ev.state, DeployState::Confirmed { .. });
         if !drop
             && tokens.is_empty()
             && deploy_claimed
@@ -765,12 +1069,15 @@ pub fn check_deploy_claims(
             drop = true;
         }
 
+        if !sentence.trim().is_empty() {
+            prev = sentence.to_string();
+            if !list_line {
+                lead = sentence.to_string();
+            }
+        }
         if drop {
-            // `/\n\s*$/`: the sentence's line break is kept so the answer keeps its shape.
-            let keeps_break = sentence
-                .rfind('\n')
-                .is_some_and(|p| sentence[p..].trim().is_empty());
-            out.push(if keeps_break {
+            // Keep the sentence's line break so the rest of the answer keeps its shape.
+            out.push(if NEWLINE_END.is_match(sentence) {
                 "\n".into()
             } else {
                 String::new()
@@ -801,10 +1108,10 @@ pub fn check_deploy_claims(
         };
     }
     let joined = out.concat();
-    let mut text =
-        String::from_utf8_lossy(&THREE_NEWLINES.replace_all(joined.as_bytes(), &b"\n\n"[..]))
-            .trim()
-            .to_string();
+    let mut text = THREE_NEWLINES
+        .replace_all(&joined, "\n\n")
+        .trim()
+        .to_string();
     if !status.is_empty() {
         let mut line = status.join(" ");
         if !status.iter().any(|s| s.contains("SALT")) {
@@ -903,8 +1210,11 @@ pub fn reader_from_env() -> std::sync::Arc<dyn CodeReader> {
 
 // ---- the guard on a session's event stream ----
 
-/// Wraps a turn's event sink. It keeps the turn's tool results (named by their `tool_call`) and
-/// checks every `final` answer before any reader sees it. A changed answer is preceded by an
+/// Says where a call ran from its exposed name and the host its `tool_call` announced.
+pub type OriginFn<'a> = Box<dyn Fn(&str, Option<HostKind>) -> Origin + Send + Sync + 'a>;
+
+/// Wraps a turn's event sink. It keeps the turn's tool results (named by their `tool_call`, with
+/// where each call ran) and checks every `final` answer before any reader sees it. A changed answer is preceded by an
 /// `answer_check` event, and the corrected text is what is emitted (and what
 /// [`ClaimGuardSink::corrections`] reports, so the session history gets it too).
 pub struct ClaimGuardSink<'a> {
@@ -912,7 +1222,9 @@ pub struct ClaimGuardSink<'a> {
     ledger: &'a Mutex<DeployLedger>,
     reader: &'a dyn CodeReader,
     member_texts: Vec<String>,
-    names: Mutex<HashMap<String, String>>,
+    context_texts: Vec<String>,
+    origin: OriginFn<'a>,
+    names: Mutex<HashMap<String, (String, Origin)>>,
     outputs: Mutex<Vec<TurnToolOutput>>,
     corrections: Mutex<Vec<(String, String)>>,
 }
@@ -923,12 +1235,16 @@ impl<'a> ClaimGuardSink<'a> {
         ledger: &'a Mutex<DeployLedger>,
         reader: &'a dyn CodeReader,
         member_texts: Vec<String>,
+        context_texts: Vec<String>,
+        origin: OriginFn<'a>,
     ) -> Self {
         ClaimGuardSink {
             inner,
             ledger,
             reader,
             member_texts,
+            context_texts,
+            origin,
             names: Mutex::new(HashMap::new()),
             outputs: Mutex::new(Vec::new()),
             corrections: Mutex::new(Vec::new()),
@@ -946,12 +1262,19 @@ impl<'a> ClaimGuardSink<'a> {
     fn check(&self, content: &str) -> DeployClaimCheck {
         let outputs = self.outputs.lock().map(|o| o.clone()).unwrap_or_default();
         let ev = match self.ledger.lock() {
-            Ok(mut l) => collect_deploy_evidence(&outputs, &mut l, &self.member_texts, None),
+            Ok(mut l) => collect_deploy_evidence(
+                &outputs,
+                &mut l,
+                &self.member_texts,
+                None,
+                &self.context_texts,
+            ),
             Err(_) => collect_deploy_evidence(
                 &outputs,
                 &mut DeployLedger::default(),
                 &self.member_texts,
                 None,
+                &self.context_texts,
             ),
         };
         check_deploy_claims(content, &ev, self.reader)
@@ -961,9 +1284,10 @@ impl<'a> ClaimGuardSink<'a> {
 impl EventSink for ClaimGuardSink<'_> {
     fn emit(&self, ev: Event) {
         match &ev {
-            Event::ToolCall { call, .. } => {
+            Event::ToolCall { call, host, .. } => {
+                let origin = (self.origin)(&call.name, *host);
                 if let Ok(mut n) = self.names.lock() {
-                    n.insert(call.id.clone(), call.name.clone());
+                    n.insert(call.id.clone(), (call.name.clone(), origin));
                 }
             }
             Event::ToolResult {
@@ -972,17 +1296,19 @@ impl EventSink for ClaimGuardSink<'_> {
                 content,
                 ..
             } => {
-                let tool = self
+                // A result with no announced call is nobody's evidence.
+                let (tool, origin) = self
                     .names
                     .lock()
                     .ok()
                     .and_then(|n| n.get(call_id).cloned())
-                    .unwrap_or_default();
+                    .unwrap_or((String::new(), Origin::Other));
                 if let Ok(mut o) = self.outputs.lock() {
                     o.push(TurnToolOutput {
                         tool,
                         status: Some((*status).to_string()),
                         content: content.clone(),
+                        origin: Some(origin),
                     });
                 }
             }
