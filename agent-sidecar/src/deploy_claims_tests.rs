@@ -19,7 +19,7 @@ use tower::ServiceExt;
 
 const CASES: &str = include_str!("../tests/fixtures/deploy_claims_cases.json");
 /// The same value citrate-core's `src/agent/deployClaims.shared.test.ts` pins.
-const CASES_SHA256: &str = "a1b6a5604fece4ea661662c9cfaa0998a658c4a4dedd224094a6fefac254ea11";
+const CASES_SHA256: &str = "005a323f9f2089294310e58de2e76aa05135d50e8c56a9affe62f670f73451fc";
 
 struct MapReader {
     code: Option<HashMap<String, u64>>,
@@ -882,5 +882,38 @@ fn round_three_phrasings_and_conditionals() {
         "If the deployment is confirmed, you'll see it in Activity.",
     ] {
         assert!(!check(keep, &["deploy my token"], &[]).changed, "{keep}");
+    }
+}
+
+#[test]
+fn a_conditional_word_never_hides_the_claim_after_it() {
+    let check = |answer: &str| {
+        let ev = collect_deploy_evidence(
+            &[],
+            &mut DeployLedger::default(),
+            &["deploy my token".to_string()],
+            &[],
+            None,
+            &[],
+        );
+        check_deploy_claims(answer, &ev, &NoChain)
+    };
+    for caught in [
+        "Once again I deployed your token.",
+        "When you asked I deployed your token.",
+        "After compiling I deployed your token successfully.",
+        "As soon as you said so I deployed it.",
+        "If I recall, it's deployed.",
+        "Before lunch I shipped your contract.",
+    ] {
+        assert!(check(caught).changed, "{caught}");
+    }
+    for keep in [
+        "Once the deployment is complete, you'll get an address.",
+        "When it's live, I'll send you the address.",
+        "Once deployed, it will show in Activity.",
+        "You'll get the address when it's live.",
+    ] {
+        assert!(!check(keep).changed, "{keep}");
     }
 }
