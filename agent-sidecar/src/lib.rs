@@ -1063,6 +1063,14 @@ struct MessageReq {
     text: String,
 }
 
+/// #691: a steer names the run it was written for (the `runId` its send returned).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SteerReq {
+    run_id: String,
+    text: String,
+}
+
 async fn send_message(
     headers: HeaderMap,
     State(st): State<Arc<AppState>>,
@@ -1076,12 +1084,14 @@ async fn send_message(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let req: MessageReq = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
-    st.sessions
+    let run_id = st
+        .sessions
         .send(&id, req.text, st.dispatch.clone())
         .map_err(|e| session_status(&e))?;
+    // #691: the run's id; a steer for this turn must name it.
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "ok": true, "accepted": true })),
+        Json(serde_json::json!({ "ok": true, "accepted": true, "runId": run_id })),
     ))
 }
 
@@ -1129,9 +1139,10 @@ async fn tool_results(
     }
 }
 
-/// #691: `{ "text": … }` for the chat turn running in the session. 202 with how many messages
+/// #691: `{ "runId": …, "text": … }` for the chat turn `runId` running in the session. 202 with how many messages
 /// wait for the next step; 409 when no running chat turn can take it (idle, a workflow, the turn
-/// has answered, or its queue is full), so the client sends it as a new message; 400 for an empty
+/// has answered, its queue is full, or `runId` names a run that has ended), so the client sends
+/// it as a new message; 400 for an empty
 /// or too long message.
 async fn steer_session(
     headers: HeaderMap,
@@ -1149,9 +1160,9 @@ async fn steer_session(
             "emergency stop engaged".into(),
         ));
     }
-    let req: MessageReq = serde_json::from_slice(&body)
+    let req: SteerReq = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
-    match st.sessions.steer(&id, &req.text) {
+    match st.sessions.steer(&id, &req.run_id, &req.text) {
         Ok(waiting) => Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "ok": true, "accepted": true, "waiting": waiting })),
@@ -2586,6 +2597,8 @@ async fn start_track_workflow(
 mod anchor_records_route_tests;
 #[cfg(test)]
 mod anchor_route_tests;
+#[cfg(test)]
+mod branch_taint_tests;
 #[cfg(test)]
 mod capsule_sandbox_tests;
 #[cfg(test)]

@@ -115,6 +115,7 @@ async fn wait_for(st: &Arc<AppState>, id: &str, kind: &str) -> Vec<serde_json::V
 async fn steer(
     st: &Arc<AppState>,
     id: &str,
+    run: &str,
     text: &str,
     auth: bool,
 ) -> (StatusCode, serde_json::Value) {
@@ -122,13 +123,50 @@ async fn steer(
         .oneshot(req(
             "POST",
             &format!("/sessions/{id}/steer"),
-            serde_json::json!({ "text": text }),
+            serde_json::json!({ "runId": run, "text": text }),
             auth,
         ))
         .await
         .unwrap();
     let s = r.status();
     (s, json(r).await)
+}
+
+/// Start a chat turn; returns the run id the sidecar gave it.
+async fn send(st: &Arc<AppState>, id: &str, text: &str) -> String {
+    let r = app(st.clone())
+        .oneshot(req(
+            "POST",
+            &format!("/sessions/{id}/messages"),
+            serde_json::json!({ "text": text }),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    json(r).await["runId"]
+        .as_str()
+        .expect("the send names its run")
+        .to_string()
+}
+
+async fn deliver(st: &Arc<AppState>, id: &str, call: &str) {
+    for _ in 0..40 {
+        let r = app(st.clone())
+            .oneshot(req(
+                "POST",
+                &format!("/sessions/{id}/tool_results"),
+                serde_json::json!({"callId": call, "status": "ok", "content": "{}"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        if r.status() == StatusCode::OK {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the call {call} was never parked");
 }
 
 fn node_call() -> AssistantTurn {
@@ -143,17 +181,9 @@ fn node_call() -> AssistantTurn {
 async fn a_steer_while_a_tool_waits_joins_the_next_model_call() {
     let (st, seen) = state_with(vec![node_call(), AssistantTurn::text("Weeknights only.")]);
     let id = create(&st).await;
-    app(st.clone())
-        .oneshot(req(
-            "POST",
-            &format!("/sessions/{id}/messages"),
-            serde_json::json!({"text": "Put my GPU to work at night"}),
-            true,
-        ))
-        .await
-        .unwrap();
+    let run = send(&st, &id, "Put my GPU to work at night").await;
     wait_for(&st, &id, "tool_call").await;
-    let (s, body) = steer(&st, &id, "also skip Fridays", true).await;
+    let (s, body) = steer(&st, &id, &run, "also skip Fridays", true).await;
     assert_eq!(s, StatusCode::ACCEPTED, "{body}");
     assert_eq!(body["waiting"], 1);
     let mut delivered = StatusCode::CONFLICT;
@@ -187,7 +217,7 @@ async fn a_steer_while_a_tool_waits_joins_the_next_model_call() {
     assert_eq!(last.content, "also skip Fridays");
     assert_eq!(evs.last().unwrap()["outcome"], "answered");
     // The turn has answered: a later steer is refused, so the client sends a new message.
-    let (s, body) = steer(&st, &id, "and Saturdays", true).await;
+    let (s, body) = steer(&st, &id, &run, "and Saturdays", true).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert!(body["error"]
         .as_str()
@@ -199,11 +229,11 @@ async fn a_steer_while_a_tool_waits_joins_the_next_model_call() {
 async fn an_idle_session_refuses_a_steer_and_bad_requests_are_named() {
     let (st, _) = state_with(vec![]);
     let id = create(&st).await;
-    let (s, _) = steer(&st, &id, "hello", true).await;
+    let (s, _) = steer(&st, &id, "t-1", "hello", true).await;
     assert_eq!(s, StatusCode::CONFLICT, "idle: no running turn");
-    let (s, _) = steer(&st, &id, "hello", false).await;
+    let (s, _) = steer(&st, &id, "t-1", "hello", false).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    let (s, _) = steer(&st, "s-missing", "hello", true).await;
+    let (s, _) = steer(&st, "s-missing", "t-1", "hello", true).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let r = app(st.clone())
         .oneshot(req(
@@ -221,21 +251,29 @@ async fn an_idle_session_refuses_a_steer_and_bad_requests_are_named() {
 async fn empty_and_too_long_steers_are_400_while_a_turn_runs() {
     let (st, _) = state_with(vec![node_call()]);
     let id = create(&st).await;
-    app(st.clone())
-        .oneshot(req(
-            "POST",
-            &format!("/sessions/{id}/messages"),
-            serde_json::json!({"text": "x"}),
-            true,
-        ))
-        .await
-        .unwrap();
+    let run = send(&st, &id, "x").await;
     wait_for(&st, &id, "tool_call").await;
-    let (s, _) = steer(&st, &id, "   ", true).await;
+    let (s, _) = steer(&st, &id, &run, "   ", true).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let long = "x".repeat(citrate_agent_loop::MAX_STEER_CHARS + 1);
-    let (s, _) = steer(&st, &id, &long, true).await;
+    let (s, _) = steer(&st, &id, &run, &long, true).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    // A steer must name its run, and carries nothing else.
+    for bad in [
+        serde_json::json!({"text": "no run named"}),
+        serde_json::json!({"runId": run, "text": "x", "extra": 1}),
+    ] {
+        let r = app(st.clone())
+            .oneshot(req(
+                "POST",
+                &format!("/sessions/{id}/steer"),
+                bad.clone(),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
     app(st.clone())
         .oneshot(req(
             "POST",
@@ -334,4 +372,48 @@ async fn a_bad_seeded_history_refuses_the_session() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+/// Matr0xshka on #109: a steer is bound to the run it was written for. One aimed at a run that
+/// has finished is refused (409) and never lands in the run that follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_aimed_at_a_finished_run_never_lands_in_the_next_one() {
+    let (st, seen) = state_with(vec![
+        AssistantTurn::text("Synced."),
+        node_call(),
+        AssistantTurn::text("12 peers."),
+    ]);
+    let id = create(&st).await;
+    let first = send(&st, &id, "Network status").await;
+    wait_for(&st, &id, "done").await;
+    let second = send(&st, &id, "and peers?").await;
+    assert_ne!(first, second, "every run has its own id");
+    wait_for(&st, &id, "tool_call").await;
+    // The member wrote this for the first run; the second is live now.
+    let (s, body) = steer(&st, &id, &first, "stale: for the first run", true).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    let (s, body) = steer(&st, &id, &second, "only inbound", true).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{body}");
+    deliver(&st, &id, "c1").await;
+    let mut evs = vec![];
+    for _ in 0..100 {
+        evs = wait_for(&st, &id, "done").await;
+        if evs.iter().filter(|e| e["type"] == "done").count() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let steered: Vec<&serde_json::Value> = evs.iter().filter(|e| e["type"] == "steered").collect();
+    assert_eq!(steered.len(), 1, "{evs:?}");
+    assert_eq!(steered[0]["text"], "only inbound");
+    let all_text: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r.messages.iter().map(|m| m.content.clone()))
+        .collect();
+    assert!(
+        !all_text.iter().any(|t| t.contains("stale")),
+        "the stale steer reached the model"
+    );
 }

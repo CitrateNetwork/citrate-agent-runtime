@@ -704,6 +704,8 @@ pub enum SteerError {
     NotRunning,
     /// [`MAX_STEER_QUEUE`] messages already wait for the next step.
     Full,
+    /// The message was written for another run (one that has ended), not the one running now.
+    WrongRun,
     Empty,
     TooLong,
 }
@@ -719,6 +721,10 @@ impl std::fmt::Display for SteerError {
                 f,
                 "{MAX_STEER_QUEUE} messages already wait for the next step"
             ),
+            SteerError::WrongRun => write!(
+                f,
+                "this message was for a run that has ended; send it as a new message"
+            ),
             SteerError::Empty => write!(f, "the message is empty"),
             SteerError::TooLong => {
                 write!(f, "the message is longer than {MAX_STEER_CHARS} characters")
@@ -730,6 +736,8 @@ impl std::fmt::Display for SteerError {
 #[derive(Debug, Default)]
 struct SteerState {
     open: bool,
+    /// The run steers are accepted for ([`SteerInbox::begin`]); `None` between runs.
+    run: Option<String>,
     queue: VecDeque<String>,
 }
 
@@ -739,6 +747,8 @@ struct SteerState {
 /// dropped by an answer: a message that arrived during the last model call makes the loop take one
 /// more step instead. A turn that ends any other way (stopped, failed, step limit) closes it and
 /// discards what waits; a client sees no `steered` event for those and sends them as a new turn.
+/// Every run is named ([`SteerInbox::begin`]) and a steer names the run it was written for, so a
+/// message meant for a run that has just ended is refused rather than taken by the next one.
 #[derive(Debug, Clone, Default)]
 pub struct SteerInbox(Arc<Mutex<SteerState>>);
 
@@ -747,8 +757,17 @@ impl SteerInbox {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Queue a message for the running turn. Returns how many messages now wait.
-    pub fn push(&self, text: &str) -> Result<usize, SteerError> {
+    /// Name the run the next turn is (the id its client was given). Only a steer that names this
+    /// run is taken, so a message written for a run that has ended never lands in the next one.
+    pub fn begin(&self, run: &str) {
+        let mut s = self.state();
+        s.run = Some(run.to_string());
+        s.open = false;
+        s.queue.clear();
+    }
+
+    /// Queue a message for the running turn `run`. Returns how many messages now wait.
+    pub fn push(&self, run: &str, text: &str) -> Result<usize, SteerError> {
         let t = text.trim();
         if t.is_empty() {
             return Err(SteerError::Empty);
@@ -759,6 +778,9 @@ impl SteerInbox {
         let mut s = self.state();
         if !s.open {
             return Err(SteerError::NotRunning);
+        }
+        if s.run.as_deref() != Some(run) {
+            return Err(SteerError::WrongRun);
         }
         if s.queue.len() >= MAX_STEER_QUEUE {
             return Err(SteerError::Full);
@@ -796,6 +818,7 @@ impl SteerInbox {
     fn close(&self) {
         let mut s = self.state();
         s.open = false;
+        s.run = None;
         s.queue.clear();
     }
 }
@@ -985,6 +1008,9 @@ pub fn run_turn_with(
                         apply_steers(sink, history, step + 1, waiting);
                         continue;
                     }
+                    // At the step limit: close now, so nothing more is accepted for this run
+                    // (the client resends what was never taken).
+                    s.close();
                 }
             }
             sink.emit(Event::Final {

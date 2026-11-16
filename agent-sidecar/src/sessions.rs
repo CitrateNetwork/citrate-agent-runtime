@@ -409,7 +409,19 @@ pub struct CreateSessionReq {
     /// unknown key, so a client never loses the branch silently.
     #[serde(default)]
     pub history: Vec<SeedMessage>,
+    /// Matr0xshka on #109: the sidecar sessions `history` came from (the conversation the member
+    /// branched). A seeded session starts with their taint, read here, never claimed by the
+    /// client. Fail closed: with `history` and no `branchOf`, or a session not found or not
+    /// readable, it starts tainted. At most [`MAX_BRANCH_PARENTS`] ids. Ignored without `history`.
+    #[serde(default)]
+    pub branch_of: Vec<String>,
 }
+
+/// At most this many sessions a branch traces its earlier turns to.
+pub const MAX_BRANCH_PARENTS: usize = 16;
+/// The taint source of a branched session whose earlier turns cannot be traced to a clean session.
+pub const UNTRACED_BRANCH_TAINT_SOURCE: &str =
+    "earlier turns from a conversation whose sessions cannot be checked";
 
 /// At most this many earlier messages seed a session.
 pub const MAX_SEED_MESSAGES: usize = 40;
@@ -1633,6 +1645,17 @@ impl SessionManager {
             return Err(SessionError::Invalid("model is required".into()));
         }
         let seeded = seed_history(&req.history).map_err(SessionError::Invalid)?;
+        if req.branch_of.len() > MAX_BRANCH_PARENTS {
+            return Err(SessionError::Invalid(format!(
+                "branchOf names at most {MAX_BRANCH_PARENTS} sessions"
+            )));
+        }
+        // Read before the session table is locked below (a parent lookup takes that lock).
+        let branch_sources = if seeded.is_empty() {
+            Vec::new()
+        } else {
+            self.branch_taint_sources(&req.branch_of)
+        };
         // Store daemons (citrate-core #356): the host tool sets this session may use.
         let host_sets =
             HostSets::from_allowlist(req.tool_sets.as_deref()).map_err(SessionError::Invalid)?;
@@ -2017,6 +2040,15 @@ impl SessionManager {
         ));
         // HUP-S10.3: a daemon run (`unattended`) starts tainted.
         let taint = initial_taint(req.unattended);
+        // Matr0xshka on #109: a branch carries its parents' taint (fail closed).
+        for src in &branch_sources {
+            let reason = if src == UNTRACED_BRANCH_TAINT_SOURCE {
+                "this conversation was branched from one whose sessions cannot be checked, so a change needs the member's explicit decision"
+            } else {
+                "carried over from the conversation this one was branched from"
+            };
+            taint.taint(src, reason);
+        }
         let trajectory = self.trajectories.as_ref().map(|c| {
             (
                 Arc::new(TrajectoryRecorder::new(
@@ -2116,6 +2148,30 @@ impl SessionManager {
             .unwrap_or_default();
         let mut out: Vec<SessionSummary> = sessions.iter().map(|s| s.summary()).collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// A branched session's starting taint sources: every source of every parent session, read
+    /// here. Untraceable earlier turns (no parent named, one not found, or its taint not readable)
+    /// give [`UNTRACED_BRANCH_TAINT_SOURCE`]. Empty = every parent is live and clean.
+    fn branch_taint_sources(&self, parents: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        if parents.is_empty() {
+            out.push(UNTRACED_BRANCH_TAINT_SOURCE.to_string());
+        }
+        for id in parents {
+            let Some(p) = self.get(id) else {
+                out.push(UNTRACED_BRANCH_TAINT_SOURCE.to_string());
+                continue;
+            };
+            if !p.taint().is_tainted() {
+                continue;
+            }
+            match p.taint().sources() {
+                Some(srcs) if !srcs.is_empty() => out.extend(srcs),
+                _ => out.push(UNTRACED_BRANCH_TAINT_SOURCE.to_string()),
+            }
+        }
         out
     }
 
@@ -2376,7 +2432,7 @@ impl SessionManager {
         id: &str,
         text: String,
         capsules: Option<Arc<CapsuleDispatch>>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<String, SessionError> {
         let session = self.get(id).ok_or(SessionError::NotFound)?;
         if text.trim().is_empty() {
             return Err(SessionError::Invalid("message text is empty".into()));
@@ -2388,6 +2444,9 @@ impl SessionManager {
         {
             return Err(SessionError::Busy);
         }
+        // #691: the run's id, returned to the client; a steer must name it.
+        let run_id = format!("t-{}", self.run_ids.fetch_add(1, Ordering::SeqCst) + 1);
+        session.steer.begin(&run_id);
         let registry = self.registry_for(&session, capsules);
         let s = session.clone();
         tokio::task::spawn_blocking(move || {
@@ -2431,17 +2490,19 @@ impl SessionManager {
             s.busy.store(false, Ordering::SeqCst);
             s.notify.notify_waiters();
         });
-        Ok(())
+        Ok(run_id)
     }
 
-    /// #691: add a member message to the chat turn running in this session, at its next step
-    /// boundary. Refused with [`SessionError::NotSteerable`] when no chat turn can take it (the
+    /// #691: add a member message to the chat turn `run` (the id [`SessionManager::send`]
+    /// returned) running in this session, at its next step boundary. Refused with [`SessionError::NotSteerable`] when no chat turn can take it (the
     /// session is idle, runs a workflow, or the turn has answered); the client then sends it as a
     /// new message. Returns how many messages wait for the next step.
-    pub fn steer(&self, id: &str, text: &str) -> Result<usize, SessionError> {
+    pub fn steer(&self, id: &str, run: &str, text: &str) -> Result<usize, SessionError> {
         let s = self.get(id).ok_or(SessionError::NotFound)?;
-        s.steer.push(text).map_err(|e| match e {
-            SteerError::NotRunning | SteerError::Full => SessionError::NotSteerable(e.to_string()),
+        s.steer.push(run, text).map_err(|e| match e {
+            SteerError::NotRunning | SteerError::Full | SteerError::WrongRun => {
+                SessionError::NotSteerable(e.to_string())
+            }
             SteerError::Empty | SteerError::TooLong => SessionError::Invalid(e.to_string()),
         })
     }
