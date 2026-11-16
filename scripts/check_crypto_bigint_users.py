@@ -13,6 +13,10 @@ stops being true:
    delete it, and this check with it);
 3. today is after EXPIRES (decide again; do not renew by reflex).
 
+EXPIRES moved from 2026-11-09 to 2026-12-16 by owner decision 2026-11-16 (30 days; record:
+citrate-security audits/2026-11-16-crypto-bigint-0387-extension). The fix stays the 0.14 curve
+line (citrate-chain#379).
+
 Usage: check_crypto_bigint_users.py [--lock Cargo.lock] [--self-test]
 """
 import argparse
@@ -21,7 +25,7 @@ import tomllib
 from datetime import date
 
 ADVISORY = "RUSTSEC-2026-0387"
-EXPIRES = date(2026, 11, 9)
+EXPIRES = date(2026, 12, 16)
 FIXED = (0, 7, 6)
 ALLOWED_USER = "elliptic-curve"
 ALLOWED_USER_LINE = (0, 13)
@@ -68,11 +72,13 @@ def _lock(*pkgs: tuple[str, str, list[str]]) -> dict:
 
 
 def self_test() -> None:
-    ok_day = date(2026, 10, 25)
+    # Dates derive from EXPIRES, so moving the window never leaves the self-test asserting a past
+    # expiry (the day itself still passes; the day after fails).
+    ok_day = EXPIRES
     base = [("crypto-bigint", "0.5.5", []), ("elliptic-curve", "0.13.8", ["crypto-bigint"])]
     cases = [
         ("allowed user only", _lock(*base), ok_day, 0),
-        ("expired", _lock(*base), date(2026, 11, 10), 1),
+        ("expired", _lock(*base), date.fromordinal(EXPIRES.toordinal() + 1), 1),
         ("new direct user", _lock(*base, ("rsa", "0.9.8", ["crypto-bigint"])), ok_day, 1),
         ("elliptic-curve 0.14 on old bigint",
          _lock(("crypto-bigint", "0.5.5", []), ("elliptic-curve", "0.14.3", ["crypto-bigint"])), ok_day, 1),
