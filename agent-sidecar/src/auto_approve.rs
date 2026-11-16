@@ -8,8 +8,9 @@
 //! the folder inside a project root, with the run's writes limited to that project. Everything
 //! else asks, as before.
 //!
-//! Opt-in rules (owner decision 2026-11-16, V1): a rule marked `opt_in` (`node <file>`, `npm run`,
-//! `git commit`) is not approved by default. It runs without a card only inside a project the
+//! Opt-in rules (owner decision 2026-11-16, V1): a rule marked `opt_in` (anything that can run
+//! project-defined code: `node <file>`, npm scripts, the project's tsc, cargo, forge, and git
+//! other than `init`) is not approved by default. It runs without a card only inside a project the
 //! member turned that rule on for ([`ProjectOptIns`], sent by citrate-core as
 //! `autoApproveOptIns`). The member's choice is core's; nothing the agent writes can turn one on.
 
@@ -412,21 +413,52 @@ mod tests {
     }
 
     #[test]
-    fn node_npm_run_and_git_commit_are_opt_in_and_nothing_else_is() {
+    fn everything_that_can_run_project_code_is_opt_in() {
         // V1 (owner decision 2026-11-16): arbitrary code (a project's own script) and commits are
         // off by default; every other shipped rule stays approved by default.
         let l = list();
         let mut ids = l.opt_in_ids();
         ids.sort_unstable();
-        assert_eq!(ids, vec!["git-commit", "node-script", "npm-run"]);
+        assert_eq!(
+            ids,
+            vec![
+                "cargo-offline",
+                "forge-build-test",
+                "git-add",
+                "git-commit",
+                "git-diff",
+                "git-status",
+                "node-script",
+                "npm-run",
+                "npm-test",
+                "npx-tsc"
+            ]
+        );
+        // Everything that can run project-defined code (scripts, build.rs, proc-macros, test
+        // binaries, the project's tsc, forge ffi, git filter, diff and textconv drivers) is opt-in.
         for argv in [
             v(&["node", "build.js"]),
             v(&["npm", "run", "test"]),
+            v(&["npm", "test"]),
+            v(&["npx", "tsc", "--noEmit"]),
+            v(&["forge", "test"]),
+            v(&["cargo", "check", "--offline"]),
+            v(&["git", "status"]),
+            v(&["git", "diff"]),
+            v(&["git", "add", "."]),
             v(&["git", "commit", "-m", "x"]),
         ] {
             assert!(l.matching_rule(&argv).expect("listed").opt_in, "{argv:?}");
         }
-        for argv in [v(&["ls"]), v(&["npm", "test"]), v(&["git", "add", "."])] {
+        for argv in [
+            v(&["ls"]),
+            v(&["pwd"]),
+            v(&["cat", "a"]),
+            v(&["head", "a"]),
+            v(&["tail", "a"]),
+            v(&["wc", "a"]),
+            v(&["git", "init"]),
+        ] {
             assert!(!l.matching_rule(&argv).expect("listed").opt_in, "{argv:?}");
         }
     }
@@ -443,6 +475,7 @@ mod tests {
         };
         // A default rule, an unknown id or a relative root is refused.
         assert!(ProjectOptIns::check(&[doc(&proj, &["ls"])], Some(&l)).is_err());
+        assert!(ProjectOptIns::check(&[doc(&proj, &["git-init"])], Some(&l)).is_err());
         assert!(ProjectOptIns::check(&[doc(&proj, &["rm-rf"])], Some(&l)).is_err());
         assert!(ProjectOptIns::check(
             &[OptInDoc {

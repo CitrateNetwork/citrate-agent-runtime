@@ -451,11 +451,17 @@ async fn the_list_in_effect_is_readable_for_the_app() {
                 .collect()
         })
         .unwrap_or_default();
-    assert_eq!(
-        opt_in,
-        vec!["node-script", "npm-run", "git-commit"],
-        "{body}"
-    );
+    assert_eq!(opt_in.len(), 10, "{body}");
+    for id in [
+        "node-script",
+        "npm-run",
+        "npm-test",
+        "cargo-offline",
+        "git-add",
+        "git-commit",
+    ] {
+        assert!(opt_in.contains(&id), "{body}");
+    }
     // Off: still answers, says so.
     let app = app_for(Arc::new(manager_with(&fx, vec![], Some(shell_open()))));
     let (st, body) = send(&app, "GET", "/shell/auto-approve", None).await;

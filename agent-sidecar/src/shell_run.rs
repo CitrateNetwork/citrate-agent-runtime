@@ -22,7 +22,8 @@
 //! 3. **HIC required, except the auto-approve list (HGW-5, D-16 as amended).** A command that
 //!    matches a rule of [`crate::auto_approve`] runs without a card only when the session is
 //!    untainted, the OS sandbox is enforced, and its folder is inside one of the session's project
-//!    roots (and, for an opt-in rule such as `node <file>`, `npm run` or `git commit`, only in a
+//!    roots (and, for an opt-in rule, anything that can run project code such as `node <file>`,
+//!    `npm test`, `cargo build` or `git add`, only in a
 //!    project the member turned that rule on for, [`crate::auto_approve::ProjectOptIns`]); that
 //!    run may write only the project (not the wider grant), it is recorded
 //!    (`shell.run.auto`), and its result says so (`run.approval = {mode: "auto", rule, project}`).
@@ -154,7 +155,7 @@ impl ShellRunConfig {
 pub fn shell_run_spec() -> ToolSpec {
     ToolSpec {
         name: SHELL_RUN_TOOL.into(),
-        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, listed read and build commands (ls, cat, head, tail, wc, npm test, npx tsc --noEmit, forge build/test, cargo build/test --offline, git init/status/diff/add) run without asking; node <file>, npm run build/test/lint/typecheck and git commit ask unless the member turned them on for that project; git commits are made as the member with a Co-authored-by: Hermes trailer, so do not pass --author or set user.* or trailer config; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
+        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, a few read commands (ls, pwd, cat, head, tail, wc) and git init run without asking; build, test and git commands (node <file>, npm run build/test/lint/typecheck, npm test, npx tsc --noEmit, forge build/test, cargo build/test/check --offline, git status/diff/add/commit) ask unless the member turned them on for that project; git commits are made as the member with a Co-authored-by: Hermes trailer, so do not pass --author or set user.* or trailer config; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

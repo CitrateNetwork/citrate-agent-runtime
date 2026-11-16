@@ -226,9 +226,9 @@ async fn hermes_creates_builds_reads_the_failure_fixes_it_and_commits() {
             create_req_with(
                 fx.rw_doc_for(std::slice::from_ref(&projects_root)),
                 true,
-                // V1: the member turned `npm run` and `git commit` on for their projects folder.
+                // V1: the member turned `npm run`, `git add` and `git commit` on for their projects folder.
                 serde_json::json!({ "autoApproveOptIns": [
-                    { "root": projects_root, "rules": ["npm-run", "git-commit"] }
+                    { "root": projects_root, "rules": ["npm-run", "git-add", "git-commit"] }
                 ] }),
             )
             .expect("req"),
