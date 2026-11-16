@@ -9,6 +9,18 @@
 #   * auto-approve is on (CITRATE_HERMES_AUTO_APPROVE is not `0`).
 # Anything else (other programs or arguments, network, outside a project) still shows a card.
 #
+# Opt-in rules (owner decision 2026-11-16, V1 of the Hermes x FL gap analysis): a rule marked
+# `opt_in = true` can run code the project itself defines, or that the project's own config can
+# point at, so it is NOT approved by default. That covers `node <file>`, npm scripts (`npm run`,
+# and `npm test` with its pre/post scripts), the project's own `tsc`, `cargo` (build.rs,
+# proc-macros, test binaries), `forge` (a foundry.toml with `ffi = true`), and git commands other
+# than `init` (a repository's config and .gitattributes can name filter, diff and textconv
+# programs). It runs without a card only in a project the member turned it on for, one rule at a
+# time, in citrate-core's Hermes settings; core sends that choice as `autoApproveOptIns` when it
+# opens a session. Everywhere else these commands ask.
+#
+# The rules approved by default run no project-defined code, each for the reason on its rule.
+#
 # Rule fields:
 #   id            stable name, recorded with every auto-approved run
 #   program       the bare program name
@@ -20,12 +32,14 @@
 #                 name | none
 #   operand_values  when present, every operand must be one of these exact values
 #   min_operands / max_operands
+#   opt_in        true = off unless the member turned this rule on for the project (see above)
 # Value kinds: relative-path (no absolute path, no `..`, no `~`, no leading `-`), script-name
 # ([A-Za-z0-9:._-], at most 64), name ([A-Za-z0-9_.-]), pattern and text (no NUL; pattern at most
 # 256 bytes, no leading `-`; text at most 4096 bytes), count (digits).
 
 version = 1
 
+# Default: lists directory entries; runs nothing from the project.
 [[rule]]
 id = "ls"
 program = "ls"
@@ -33,11 +47,13 @@ flags = ["-1", "-a", "-A", "-l", "-la", "-al", "-lh", "-lah", "-alh", "-R", "-F"
 operands = "relative-path"
 max_operands = 16
 
+# Default: prints the folder; reads nothing.
 [[rule]]
 id = "pwd"
 program = "pwd"
 operands = "none"
 
+# Default: prints files; runs nothing from the project.
 [[rule]]
 id = "cat"
 program = "cat"
@@ -46,6 +62,7 @@ operands = "relative-path"
 min_operands = 1
 max_operands = 16
 
+# Default: prints the start of files; runs nothing from the project.
 [[rule]]
 id = "head"
 program = "head"
@@ -54,6 +71,7 @@ operands = "relative-path"
 min_operands = 1
 max_operands = 16
 
+# Default: prints the end of files; runs nothing from the project.
 [[rule]]
 id = "tail"
 program = "tail"
@@ -62,6 +80,7 @@ operands = "relative-path"
 min_operands = 1
 max_operands = 16
 
+# Default: counts lines, words and bytes; runs nothing from the project.
 [[rule]]
 id = "wc"
 program = "wc"
@@ -72,6 +91,7 @@ max_operands = 16
 
 [[rule]]
 id = "node-script"
+opt_in = true
 program = "node"
 operands = "relative-path"
 min_operands = 1
@@ -79,6 +99,7 @@ max_operands = 1
 
 [[rule]]
 id = "npm-run"
+opt_in = true
 program = "npm"
 subcommands = ["run", "run-script"]
 flags = ["--silent", "-s"]
@@ -89,6 +110,7 @@ max_operands = 1
 
 [[rule]]
 id = "npm-test"
+opt_in = true
 program = "npm"
 subcommands = ["test", "t"]
 flags = ["--silent", "-s"]
@@ -96,6 +118,7 @@ operands = "none"
 
 [[rule]]
 id = "npx-tsc"
+opt_in = true
 program = "npx"
 subcommands = ["tsc"]
 flags = ["--noEmit", "--pretty"]
@@ -104,6 +127,7 @@ operands = "none"
 
 [[rule]]
 id = "forge-build-test"
+opt_in = true
 program = "forge"
 subcommands = ["build", "test"]
 flags = ["--offline", "--force", "--json", "--summary", "--gas-report", "-vv", "-vvv", "-vvvv"]
@@ -112,6 +136,7 @@ operands = "none"
 
 [[rule]]
 id = "cargo-offline"
+opt_in = true
 program = "cargo"
 subcommands = ["build", "test", "check"]
 require_one_of = ["--offline", "--frozen"]
@@ -120,6 +145,8 @@ value_flags = { "-p" = "name", "--package" = "name", "--test" = "name", "--bin" 
 operands = "pattern"
 max_operands = 1
 
+# Default: creates an empty repository with the system template only (`--template` is refused,
+# hooks are off); there is no repository config or attribute yet to name a program.
 [[rule]]
 id = "git-init"
 program = "git"
@@ -129,6 +156,7 @@ operands = "none"
 
 [[rule]]
 id = "git-status"
+opt_in = true
 program = "git"
 subcommands = ["status"]
 flags = ["-s", "--short", "-b", "--branch", "--porcelain"]
@@ -137,6 +165,7 @@ max_operands = 16
 
 [[rule]]
 id = "git-diff"
+opt_in = true
 program = "git"
 subcommands = ["diff"]
 flags = ["--stat", "--cached", "--staged", "--name-only", "--no-color"]
@@ -145,6 +174,7 @@ max_operands = 16
 
 [[rule]]
 id = "git-add"
+opt_in = true
 program = "git"
 subcommands = ["add"]
 flags = ["-A", "--all", "-u"]
@@ -153,6 +183,7 @@ max_operands = 64
 
 [[rule]]
 id = "git-commit"
+opt_in = true
 program = "git"
 subcommands = ["commit"]
 flags = ["-a", "--all", "-q", "--quiet"]

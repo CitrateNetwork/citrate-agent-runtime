@@ -8,6 +8,8 @@
 //! - `an_auto_approved_run_may_write_only_its_project` (real OS sandbox)
 //! - `auto_approval_can_be_turned_off`
 //! - `auto_approved_runs_are_recorded_for_the_anchor` (real OS sandbox)
+//! - `opt_in_commands_ask_unless_the_member_turned_them_on_for_the_project` (real OS sandbox, V1)
+//! - `an_opt_in_for_a_default_or_unknown_rule_refuses_the_session` (V1)
 //!
 //! "Real OS sandbox" tests run under Seatbelt on macOS and bubblewrap on Linux; where no backend
 //! works they skip, unless `CITRATE_REQUIRE_BWRAP=1` (the Linux CI lane), which makes them fail.
@@ -65,6 +67,28 @@ async fn run_session(
     projects: &[PathBuf],
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
 ) -> (Arc<sessions::Session>, Vec<Answered>) {
+    run_session_opted(
+        fx,
+        calls,
+        cfg,
+        roots,
+        projects,
+        records,
+        serde_json::json!([]),
+    )
+    .await
+}
+
+/// [`run_session`] with the member's per-project opt-ins (`autoApproveOptIns`, V1).
+async fn run_session_opted(
+    fx: &Fx,
+    calls: Vec<citrate_agent_loop::ToolCall>,
+    cfg: shell_run::ShellRunConfig,
+    roots: &[PathBuf],
+    projects: &[PathBuf],
+    records: Option<Arc<citrate_agent_records::DecisionLog>>,
+    opt_ins: serde_json::Value,
+) -> (Arc<sessions::Session>, Vec<Answered>) {
     let mut turns: Vec<AssistantTurn> = calls
         .into_iter()
         .map(|c| AssistantTurn::tools(vec![c]))
@@ -80,7 +104,7 @@ async fn run_session(
             create_req_with(
                 fx.rw_doc_for(roots),
                 true,
-                serde_json::json!({ "projectRoots": projects }),
+                serde_json::json!({ "projectRoots": projects, "autoApproveOptIns": opt_ins }),
             )
             .expect("req"),
         )
@@ -235,13 +259,15 @@ async fn an_auto_approved_run_may_write_only_its_project() {
         ),
     )
     .expect("script");
-    let (s, answered) = run_session(
+    let (s, answered) = run_session_opted(
         &fx,
         vec![shell("c1", &["node", "build.js"], &proj)],
         cfg,
         std::slice::from_ref(&home),
         std::slice::from_ref(&proj),
         None,
+        // V1: `node <file>` runs without a card only where the member turned it on.
+        serde_json::json!([{ "root": proj, "rules": ["node-script"] }]),
     )
     .await;
     assert!(answered.is_empty(), "{answered:?}");
@@ -267,6 +293,109 @@ async fn an_auto_approved_run_may_write_only_its_project() {
             .contains("blocked"),
         "{f}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opt_in_commands_ask_unless_the_member_turned_them_on_for_the_project() {
+    // V1 (owner decision 2026-11-16): `node <file>`, `npm run` and `git commit` are not approved by
+    // default. Without the member's opt-in each one asks, even untainted, inside a project.
+    let Some(cfg) = shell_sandboxed() else { return };
+    // A program that is not installed is refused before anything is asked, so only the installed
+    // ones are proposed (git always is where the sandbox tests run).
+    let installed = |p: &str| {
+        citrate_agent_shell::ShellPolicy::new(
+            citrate_agent_shell::Allowlist::any_program(),
+            cfg.search_path.clone(),
+        )
+        .and_then(|pol| pol.resolve(p))
+        .is_ok()
+    };
+    let fx = Fx::new("auto-optin-off");
+    let proj = fx.proj();
+    let mut calls = Vec::new();
+    let mut expected = Vec::new();
+    for (id, argv) in [
+        ("c1", vec!["node", "build.js"]),
+        ("c2", vec!["npm", "run", "build"]),
+        ("c3", vec!["git", "commit", "-q", "-m", "x"]),
+    ] {
+        if installed(argv[0]) {
+            expected.push(serde_json::json!(argv[0]));
+            calls.push(shell(id, &argv, &proj));
+        }
+    }
+    assert!(installed("git"), "git is needed for this test");
+    let (_s, answered) = run_session(
+        &fx,
+        calls,
+        cfg.clone(),
+        std::slice::from_ref(&proj),
+        std::slice::from_ref(&proj),
+        None,
+    )
+    .await;
+    let asked: Vec<serde_json::Value> = answered
+        .iter()
+        .filter(|a| a.route == "shell")
+        .map(|a| a.card["argv"][0].clone())
+        .collect();
+    assert_eq!(asked, expected, "every opt-in command asked: {answered:?}");
+
+    // Turned on for this project, one rule at a time: only that rule stops asking, and only here.
+    let fx = Fx::new("auto-optin-on");
+    let proj = fx.proj();
+    let other = fx.other();
+    let (s, answered) = run_session_opted(
+        &fx,
+        vec![
+            shell("c1", &["git", "commit", "-q", "-m", "x"], &proj),
+            shell("c2", &["git", "commit", "-q", "-m", "y"], &other),
+        ],
+        cfg,
+        &[proj.clone(), other.clone()],
+        &[proj.clone(), other.clone()],
+        None,
+        serde_json::json!([{ "root": proj, "rules": ["git-commit"] }]),
+    )
+    .await;
+    let asked: Vec<serde_json::Value> = answered
+        .iter()
+        .filter(|a| a.route == "shell")
+        .map(|a| a.card["cwd"].clone())
+        .collect();
+    assert_eq!(
+        asked,
+        vec![serde_json::json!(other.display().to_string())],
+        "only the commit in the other project asked: {answered:?}"
+    );
+    let f = facts(&result_of(&s, "c1").await);
+    assert_eq!(f["run"]["approval"]["mode"], "auto", "{f}");
+    assert_eq!(f["run"]["approval"]["rule"], "git-commit", "{f}");
+}
+
+#[test]
+fn an_opt_in_for_a_default_or_unknown_rule_refuses_the_session() {
+    let fx = Fx::new("auto-optin-bad");
+    let proj = fx.proj();
+    let mut cfg = shell_open();
+    cfg.auto_approve = Some(Arc::new(AutoApproveList::shipped().expect("list")));
+    let mgr = manager_with(&fx, vec![], Some(cfg));
+    for rules in [serde_json::json!(["ls"]), serde_json::json!(["anything"])] {
+        let req = create_req_with(
+            fx.rw_doc_for(std::slice::from_ref(&proj)),
+            true,
+            serde_json::json!({ "autoApproveOptIns": [{ "root": proj, "rules": rules }] }),
+        )
+        .expect("req");
+        assert!(mgr.create(req).is_err(), "{rules}");
+    }
+    let ok = create_req_with(
+        fx.rw_doc_for(std::slice::from_ref(&proj)),
+        true,
+        serde_json::json!({ "autoApproveOptIns": [{ "root": proj, "rules": ["npm-run"] }] }),
+    )
+    .expect("req");
+    assert!(mgr.create(ok).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -309,9 +438,30 @@ async fn the_list_in_effect_is_readable_for_the_app() {
     }
     assert_eq!(
         body["conditions"].as_array().map(|a| a.len()),
-        Some(4),
+        Some(5),
         "{body}"
     );
+    // V1: the opt-in rules say so, for the app to show.
+    let opt_in: Vec<&str> = body["rules"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|r| r["opt_in"] == true)
+                .filter_map(|r| r["id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(opt_in.len(), 10, "{body}");
+    for id in [
+        "node-script",
+        "npm-run",
+        "npm-test",
+        "cargo-offline",
+        "git-add",
+        "git-commit",
+    ] {
+        assert!(opt_in.contains(&id), "{body}");
+    }
     // Off: still answers, says so.
     let app = app_for(Arc::new(manager_with(&fx, vec![], Some(shell_open()))));
     let (st, body) = send(&app, "GET", "/shell/auto-approve", None).await;

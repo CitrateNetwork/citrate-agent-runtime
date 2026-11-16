@@ -22,7 +22,10 @@
 //! 3. **HIC required, except the auto-approve list (HGW-5, D-16 as amended).** A command that
 //!    matches a rule of [`crate::auto_approve`] runs without a card only when the session is
 //!    untainted, the OS sandbox is enforced, and its folder is inside one of the session's project
-//!    roots; that run may write only the project (not the wider grant), it is recorded
+//!    roots (and, for an opt-in rule, anything that can run project code such as `node <file>`,
+//!    `npm test`, `cargo build` or `git add`, only in a
+//!    project the member turned that rule on for, [`crate::auto_approve::ProjectOptIns`]); that
+//!    run may write only the project (not the wider grant), it is recorded
 //!    (`shell.run.auto`), and its result says so (`run.approval = {mode: "auto", rule, project}`).
 //!    Everything else parks as a [`ShellPending`] (the exact argv, the program
 //!    it resolves to, the canonical cwd, the timeout, the sandbox) that citrate-core shows as an
@@ -152,7 +155,7 @@ impl ShellRunConfig {
 pub fn shell_run_spec() -> ToolSpec {
     ToolSpec {
         name: SHELL_RUN_TOOL.into(),
-        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, listed read and build commands (ls, cat, head, node <file>, npm run build/test/lint/typecheck, npm test, forge build/test, cargo build/test --offline, git init/status/diff/add/commit) run without asking; git commits are made as the member with a Co-authored-by: Hermes trailer, so do not pass --author or set user.* or trailer config; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
+        description: "Run one command in a folder the member granted. It runs in an OS sandbox with no network, may write only in that folder, and is stopped at its time limit. Inside a project, a few read commands (ls, pwd, cat, head, tail, wc) and git init run without asking; build, test and git commands (node <file>, npm run build/test/lint/typecheck, npm test, npx tsc --noEmit, forge build/test, cargo build/test/check --offline, git status/diff/add/commit) ask unless the member turned them on for that project; git commits are made as the member with a Co-authored-by: Hermes trailer, so do not pass --author or set user.* or trailer config; for anything else the member sees the exact command and folder and must approve it first. If a command is declined, ask the member; do not retry it. Use the forge_test, slither_scan, aderyn_scan and medusa_fuzz tools for those programs instead.".into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -343,6 +346,8 @@ pub struct ShellRunSession {
     /// project root that holds its folder (and is refused outside a project).
     auto_runner: Arc<ShellRunner>,
     auto_approve: Option<Arc<crate::auto_approve::AutoApproveList>>,
+    /// V1: the projects where the member turned opt-in rules on.
+    opt_ins: Arc<crate::auto_approve::ProjectOptIns>,
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
     approvals: Arc<ShellApprovals>,
     approval_timeout: Duration,
@@ -373,11 +378,22 @@ impl ShellRunSession {
             runner: Arc::new(runner),
             auto_runner: Arc::new(auto_runner),
             auto_approve: cfg.auto_approve.clone(),
+            opt_ins: Arc::new(crate::auto_approve::ProjectOptIns::default()),
             records: None,
             approvals: Arc::new(ShellApprovals::default()),
             approval_timeout: cfg.approval_timeout,
             commit_identity: Arc::new(cfg.commit_identity.clone()),
         })
+    }
+
+    /// V1: the member's per-project opt-ins (`autoApproveOptIns`), checked against this session's
+    /// auto-approve list.
+    pub fn with_opt_ins(mut self, docs: &[crate::auto_approve::OptInDoc]) -> Result<Self, String> {
+        self.opt_ins = Arc::new(crate::auto_approve::ProjectOptIns::check(
+            docs,
+            self.auto_approve.as_deref(),
+        )?);
+        Ok(self)
     }
 
     /// HUP-S2.6: record auto-approved runs in this decision log (when configured).
@@ -398,6 +414,7 @@ impl ShellRunSession {
             runner: self.runner.clone(),
             auto_runner: self.auto_runner.clone(),
             auto_approve: self.auto_approve.clone(),
+            opt_ins: self.opt_ins.clone(),
             records: self.records.clone(),
             approvals: self.approvals.clone(),
             approval_timeout: self.approval_timeout,
@@ -414,6 +431,7 @@ pub struct ShellRunHost {
     runner: Arc<ShellRunner>,
     auto_runner: Arc<ShellRunner>,
     auto_approve: Option<Arc<crate::auto_approve::AutoApproveList>>,
+    opt_ins: Arc<crate::auto_approve::ProjectOptIns>,
     records: Option<Arc<citrate_agent_records::DecisionLog>>,
     approvals: Arc<ShellApprovals>,
     approval_timeout: Duration,
@@ -736,12 +754,17 @@ impl ShellRunHost {
         if self.taint.is_tainted() {
             return None;
         }
-        let rule = self.auto_approve.as_ref()?.matching(argv)?.to_string();
+        let matched = self.auto_approve.as_ref()?.matching_rule(argv)?;
+        let (rule, opt_in) = (matched.id.clone(), matched.opt_in);
         let plan = self.auto_runner.plan(req).ok()?;
         if !plan.sandbox.enforced {
             return None;
         }
         let project = plan.write_roots.first()?.clone();
+        // V1: an opt-in rule runs without a card only where the member turned it on.
+        if opt_in && !self.opt_ins.allows(&rule, &project) {
+            return None;
+        }
         let seq = match &self.records {
             Some(log) => match crate::hic_records::record_auto_decision(
                 log,
