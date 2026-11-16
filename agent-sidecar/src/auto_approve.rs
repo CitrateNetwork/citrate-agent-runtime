@@ -7,6 +7,12 @@
 //! decided in [`crate::shell_run`]: the session must be untainted, the OS sandbox enforced, and
 //! the folder inside a project root, with the run's writes limited to that project. Everything
 //! else asks, as before.
+//!
+//! Opt-in rules (owner decision 2026-11-16, V1): a rule marked `opt_in` (anything that can run
+//! project-defined code: `node <file>`, npm scripts, the project's tsc, cargo, forge, and git
+//! other than `init`) is not approved by default. It runs without a card only inside a project the
+//! member turned that rule on for ([`ProjectOptIns`], sent by citrate-core as
+//! `autoApproveOptIns`). The member's choice is core's; nothing the agent writes can turn one on.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -104,6 +110,10 @@ pub struct Rule {
     pub min_operands: usize,
     #[serde(default = "default_max_operands")]
     pub max_operands: usize,
+    /// V1 (owner decision 2026-11-16): `true` = off unless the member turned this rule on for the
+    /// project ([`ProjectOptIns`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opt_in: bool,
 }
 
 fn default_max_operands() -> usize {
@@ -257,10 +267,94 @@ impl AutoApproveList {
 
     /// The id of the first rule `argv` matches.
     pub fn matching(&self, argv: &[String]) -> Option<&str> {
+        self.matching_rule(argv).map(|r| r.id.as_str())
+    }
+
+    /// The first rule `argv` matches.
+    pub fn matching_rule(&self, argv: &[String]) -> Option<&Rule> {
+        self.rules.iter().find(|r| r.matches(argv))
+    }
+
+    /// The ids of the rules that need the member's per-project opt-in.
+    pub fn opt_in_ids(&self) -> Vec<&str> {
         self.rules
             .iter()
-            .find(|r| r.matches(argv))
+            .filter(|r| r.opt_in)
             .map(|r| r.id.as_str())
+            .collect()
+    }
+}
+
+/// One entry of `autoApproveOptIns` in a `POST /sessions` body: a project folder the member chose
+/// and the opt-in rules they turned on for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OptInDoc {
+    pub root: String,
+    pub rules: Vec<String>,
+}
+
+/// The member's per-project opt-ins for one session, checked against the active list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectOptIns {
+    /// (canonical folder, rule ids), in the order given.
+    entries: Vec<(std::path::PathBuf, std::collections::BTreeSet<String>)>,
+}
+
+/// Most entries `autoApproveOptIns` may carry.
+pub const MAX_OPT_INS: usize = 64;
+
+impl ProjectOptIns {
+    /// Check `docs` against `list`. Refused: more than [`MAX_OPT_INS`] entries, a relative root,
+    /// or a rule id that is not an opt-in rule of the list (a rule that is already approved by
+    /// default, or no rule at all, is a caller bug and must not pass silently). A root that does
+    /// not exist (a deleted project) is left out: an opt-in can only ever let fewer commands run
+    /// without a card, never more.
+    pub fn check(docs: &[OptInDoc], list: Option<&AutoApproveList>) -> Result<Self, String> {
+        if docs.len() > MAX_OPT_INS {
+            return Err(format!(
+                "autoApproveOptIns has {} entries, at most {MAX_OPT_INS}",
+                docs.len()
+            ));
+        }
+        let known: Vec<&str> = list.map(|l| l.opt_in_ids()).unwrap_or_default();
+        let mut entries = Vec::new();
+        for d in docs {
+            let root = Path::new(&d.root);
+            if !root.is_absolute() {
+                return Err(format!(
+                    "autoApproveOptIns root {:?} is not an absolute path",
+                    d.root
+                ));
+            }
+            for r in &d.rules {
+                if list.is_some() && !known.contains(&r.as_str()) {
+                    return Err(format!(
+                        "autoApproveOptIns names {r:?}, which is not an opt-in rule of the auto-approve list"
+                    ));
+                }
+            }
+            let Ok(canonical) = root.canonicalize() else {
+                continue;
+            };
+            if !canonical.is_dir() || d.rules.is_empty() {
+                continue;
+            }
+            entries.push((canonical, d.rules.iter().cloned().collect()));
+        }
+        Ok(ProjectOptIns { entries })
+    }
+
+    /// Whether the member turned `rule` on for `project` (a canonical project root): an entry's
+    /// folder is the project or holds it.
+    pub fn allows(&self, rule: &str, project: &Path) -> bool {
+        self.entries
+            .iter()
+            .any(|(root, rules)| project.starts_with(root) && rules.contains(rule))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -316,6 +410,96 @@ mod tests {
         ] {
             assert_eq!(l.matching(&argv), Some(id), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn everything_that_can_run_project_code_is_opt_in() {
+        // V1 (owner decision 2026-11-16): arbitrary code (a project's own script) and commits are
+        // off by default; every other shipped rule stays approved by default.
+        let l = list();
+        let mut ids = l.opt_in_ids();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "cargo-offline",
+                "forge-build-test",
+                "git-add",
+                "git-commit",
+                "git-diff",
+                "git-status",
+                "node-script",
+                "npm-run",
+                "npm-test",
+                "npx-tsc"
+            ]
+        );
+        // Everything that can run project-defined code (scripts, build.rs, proc-macros, test
+        // binaries, the project's tsc, forge ffi, git filter, diff and textconv drivers) is opt-in.
+        for argv in [
+            v(&["node", "build.js"]),
+            v(&["npm", "run", "test"]),
+            v(&["npm", "test"]),
+            v(&["npx", "tsc", "--noEmit"]),
+            v(&["forge", "test"]),
+            v(&["cargo", "check", "--offline"]),
+            v(&["git", "status"]),
+            v(&["git", "diff"]),
+            v(&["git", "add", "."]),
+            v(&["git", "commit", "-m", "x"]),
+        ] {
+            assert!(l.matching_rule(&argv).expect("listed").opt_in, "{argv:?}");
+        }
+        for argv in [
+            v(&["ls"]),
+            v(&["pwd"]),
+            v(&["cat", "a"]),
+            v(&["head", "a"]),
+            v(&["tail", "a"]),
+            v(&["wc", "a"]),
+            v(&["git", "init"]),
+        ] {
+            assert!(!l.matching_rule(&argv).expect("listed").opt_in, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn project_opt_ins_are_checked_against_the_list() {
+        let l = list();
+        let d = tempfile::tempdir().expect("tmp");
+        let proj = d.path().join("proj");
+        std::fs::create_dir_all(proj.join("sub")).expect("mkdir");
+        let doc = |root: &std::path::Path, rules: &[&str]| OptInDoc {
+            root: root.display().to_string(),
+            rules: rules.iter().map(|r| r.to_string()).collect(),
+        };
+        // A default rule, an unknown id or a relative root is refused.
+        assert!(ProjectOptIns::check(&[doc(&proj, &["ls"])], Some(&l)).is_err());
+        assert!(ProjectOptIns::check(&[doc(&proj, &["git-init"])], Some(&l)).is_err());
+        assert!(ProjectOptIns::check(&[doc(&proj, &["rm-rf"])], Some(&l)).is_err());
+        assert!(ProjectOptIns::check(
+            &[OptInDoc {
+                root: "proj".into(),
+                rules: vec!["node-script".into()]
+            }],
+            Some(&l)
+        )
+        .is_err());
+        let many: Vec<OptInDoc> = (0..=MAX_OPT_INS)
+            .map(|_| doc(&proj, &["node-script"]))
+            .collect();
+        assert!(ProjectOptIns::check(&many, Some(&l)).is_err());
+        // A folder that no longer exists is left out.
+        let gone = ProjectOptIns::check(&[doc(&d.path().join("gone"), &["node-script"])], Some(&l))
+            .expect("checked");
+        assert!(gone.is_empty());
+        // One rule, for this project and the projects inside it, and nowhere else.
+        let o = ProjectOptIns::check(&[doc(&proj, &["node-script"])], Some(&l)).expect("checked");
+        let canon = proj.canonicalize().expect("canon");
+        assert!(o.allows("node-script", &canon));
+        assert!(o.allows("node-script", &canon.join("sub")));
+        assert!(!o.allows("npm-run", &canon));
+        assert!(!o.allows("node-script", d.path()));
     }
 
     #[test]
