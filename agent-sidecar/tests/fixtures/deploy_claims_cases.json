@@ -2758,6 +2758,90 @@
    ]
   },
   {
+   "name": "after I deployed your token, I verified it",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "After I deployed your token, I verified it.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"After I deployed your token, I verified it.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "once I deployed your token, I checked the balance",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "Once I deployed your token, I checked the balance.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"Once I deployed your token, I checked the balance.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "when we deployed it, the address was",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": {},
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "When we deployed it, the address was 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed a deploy claim at 0xaa9148b2f6e5c7d3a1b0c9e8f7d6c5b4a3928170: no trusted deploy receipt in this conversation names it"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "after it was deployed, I sent the receipt",
+   "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
+   "code": null,
+   "turns": [
+    {
+     "outputs": [],
+     "memberTexts": [
+      "deploy my token"
+     ],
+     "answer": "After it was deployed, I sent the receipt.",
+     "expect": {
+      "text": "No deploy ran in this conversation turn, so no contract was deployed by it. There is no contract address to report.",
+      "changed": true,
+      "findings": [
+       "removed \"After it was deployed, I sent the receipt.\": no trusted deploy receipt in this turn"
+      ]
+     }
+    }
+   ]
+  },
+  {
    "name": "keep: once deployed",
    "memberWallet": "0x5aeb8c04c103b46d184307d29a6a58803832bd13",
    "code": null,

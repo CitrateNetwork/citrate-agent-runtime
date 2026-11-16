@@ -763,12 +763,12 @@ fn deploy_requested(member_texts: &[String], assistant_texts: &[String]) -> bool
 
 static NOT_A_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?deployed\b|\b\w+n't\s+(?:yet\s+)?(?:been\s+)?deployed\b|\bno (?:contract|deploy(?:ment)?)\s+(?:was|is|has been|happened|ran)(?:\s+deployed)?\b|\b(?:will|would|can|could|should|may|might|to)\s+be\s+deployed\b|\b(?:once|until|after|before|when|if|unless)\s+(?:it(?:'s| is)?|they(?:'re| are)?|the contract (?:is )?|your contract (?:is )?)?\s*deployed\b|\bnot (?:yet )?(?:live|on[- ]?chain)\b|\bready to (?:be )?deploy(?:ed)?\b|\bdeployed nothing\b|\bnothing (?:was |has been |got )?deployed\b|\b(?:once|when|whenever|after|if|until|unless|before|as soon as)\b[^.!?\n,;]*[,;]|\b(?:once|when|whenever|after|until|unless|before|if|as soon as)\s+(?:it|they|the (?:contract|token|deployment|deploy))\s+(?:is|are|goes|go|has|have)?\s*(?:been\s+)?(?:live|on[- ]?chain|complete|completed|done|confirmed|through|deployed)\b",
+        r"(?i)\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?deployed\b|\b\w+n't\s+(?:yet\s+)?(?:been\s+)?deployed\b|\bno (?:contract|deploy(?:ment)?)\s+(?:was|is|has been|happened|ran)(?:\s+deployed)?\b|\b(?:will|would|can|could|should|may|might|to)\s+be\s+deployed\b|\b(?:once|until|after|before|when|if|unless)\s+(?:it(?:'s| is)?|they(?:'re| are)?|the contract (?:is )?|your contract (?:is )?)?\s*deployed\b|\bnot (?:yet )?(?:live|on[- ]?chain)\b|\bready to (?:be )?deploy(?:ed)?\b|\bdeployed nothing\b|\bnothing (?:was |has been |got )?deployed\b|\b(?:once|when|whenever|after|until|unless|before|if|as soon as)\s+(?:it|they|the (?:contract|token|deployment|deploy))\s+(?:is|are|goes|go|has|have)?\s*(?:been\s+)?(?:live|on[- ]?chain|complete|completed|done|confirmed|through|deployed)\b",
     )
 });
 static DONE_CLAIM: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\b(?:i|i've|i have|we|we've|we have)\s+(?:just\s+|now\s+|already\s+|successfully\s+)*(?:shipped|launched)\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|\b(?:deploy(?:ment)?|contract)\s+(?:is\s+|was\s+|has been\s+)?confirmed\b|\b(?:it|it's|it is|that's|that is|they're|they are|everything is|we're|we are)\s+(?:now\s+)?live\b|\b(?:it|that|everything)\s+went\s+through\b|^\W*(?:now\s+)?live\b|\b(?:contract|token|it|they|deployment|vault|everything)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\b|\b(?:has been|was|is|got)\s+shipped\b|^\W*(?:shipped|launched)\b|^\W*(?:the\s+|your\s+|my\s+)?(?:[\w'-]+\s+){0,2}(?:deployed|shipped|launched)\W*$|^\W*(?:all\s+|both\s+)?deployed\b",
+        r"(?i)\b(?:has|have|had)\s+(?:now\s+)?(?:been\s+)?(?:successfully\s+)?deployed\b|\b(?:was|were|is|are|got)\s+(?:now\s+|successfully\s+)*deployed\b|\b(?:successfully|i|i've|we|we've|you've)\s+deployed\b|\b(?:i|i've|i have|we|we've|we have)\s+(?:just\s+|now\s+|already\s+|successfully\s+|then\s+)*(?:deployed|shipped|launched|published)\b|\b(?:it|they)\s+(?:was|were|got|has been|had been|have been)\s+(?:just\s+|already\s+|successfully\s+)*(?:deployed|shipped|launched|published)\b|\bdeployed\s+(?:successfully|it|them|your|the|both|two|a|an)\b|\bdeploy(?:ment)?\s+(?:is\s+|was\s+)?(?:succeeded|complete|completed|successful|done|finished|went through|worked)\b|\b(?:is|are)\s+now\s+live\b|\bwent\s+live\b|\bnow\s+(?:live|on[- ]?chain)\b|\b(?:contract|token|it|they)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\s+(?:at|on)\b|\b(?:live|on[- ]?chain)\s+(?:at|on)\s+0x|\bsuccessfully\s+(?:launched|created)\b|\bcreated\s+(?:your|the|a|an)\s+(?:new\s+)?(?:\w+\s+)?contract\b|\bcontract\s+(?:was|is|has been)\s+created\b|\b(?:deploy(?:ment)?|contract)\s+(?:is\s+|was\s+|has been\s+)?confirmed\b|\b(?:it|it's|it is|that's|that is|they're|they are|everything is|we're|we are)\s+(?:now\s+)?live\b|\b(?:it|that|everything)\s+went\s+through\b|^\W*(?:now\s+)?live\b|\b(?:contract|token|it|they|deployment|vault|everything)\b[^.!?\n]{0,40}\b(?:is|are)\s+(?:now\s+)?(?:live|on[- ]?chain)\b|\b(?:has been|was|is|got)\s+shipped\b|^\W*(?:shipped|launched)\b|^\W*(?:the\s+|your\s+|my\s+)?(?:[\w'-]+\s+){0,2}(?:deployed|shipped|launched)\W*$|^\W*(?:all\s+|both\s+)?deployed\b",
     )
 });
 static DEPLOY_WORD: LazyLock<Regex> = LazyLock::new(|| {
@@ -849,11 +849,42 @@ pub fn sentences(text: &str) -> Vec<&str> {
     out
 }
 
+/// A conditional or temporal clause that ends in a comma or semicolon ("Once the deployment is
+/// complete, …").
+static COND_CLAUSE: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"(?i)\b(?:once|when|whenever|after|if|until|unless|before|as soon as)\b[^.!?\n,;]*[,;]")
+});
+/// A past-tense deploy by someone ("I deployed", "we shipped", "it was deployed").
+static PAST_DEPLOY: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"(?i)\b(?:i|we|it|they|you|i've|we've|i have|we have)\s+(?:just\s+|already\s+|successfully\s+|then\s+)*(?:deployed|shipped|launched|published)\b|\b(?:was|were|got|has been|had been|have been)\s+(?:just\s+|already\s+|successfully\s+)*(?:deployed|shipped|launched|published)\b",
+    )
+});
+
+/// A conditional clause says nothing happened, so it is taken out. A clause that itself claims a
+/// deploy ("After I deployed your token, …") stays: it is read like any other claim.
+fn drop_conditionals(text: &str) -> String {
+    COND_CLAUSE
+        .replace_all(text, |c: &regex::Captures| {
+            let clause = &c[0];
+            if PAST_DEPLOY.is_match(clause)
+                || DONE_CLAIM.is_match(&NOT_A_CLAIM.replace_all(clause, " "))
+            {
+                clause.to_string()
+            } else {
+                " ".to_string()
+            }
+        })
+        .into_owned()
+}
+
 fn claim_text(sentence: &str) -> String {
     let f = fold(sentence);
     let f = HAS_BEEN.replace_all(&f, "${1} has been");
     let f = IS_DONE.replace_all(&f, "${1} is ${2}");
-    NOT_A_CLAIM.replace_all(&f, " ").into_owned()
+    NOT_A_CLAIM
+        .replace_all(&drop_conditionals(&f), " ")
+        .into_owned()
 }
 
 /// The claim with a leading interjection or short clause taken off.

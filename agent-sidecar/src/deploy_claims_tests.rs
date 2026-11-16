@@ -19,7 +19,7 @@ use tower::ServiceExt;
 
 const CASES: &str = include_str!("../tests/fixtures/deploy_claims_cases.json");
 /// The same value citrate-core's `src/agent/deployClaims.shared.test.ts` pins.
-const CASES_SHA256: &str = "005a323f9f2089294310e58de2e76aa05135d50e8c56a9affe62f670f73451fc";
+const CASES_SHA256: &str = "d9893a7b1c3fc420499fec30e4f115a9a7226dc9ad449ec649d893e06b1d33a5";
 
 struct MapReader {
     code: Option<HashMap<String, u64>>,
@@ -905,6 +905,10 @@ fn a_conditional_word_never_hides_the_claim_after_it() {
         "As soon as you said so I deployed it.",
         "If I recall, it's deployed.",
         "Before lunch I shipped your contract.",
+        // A clause that itself claims a deploy is never taken out.
+        "After I deployed your token, I verified it.",
+        "Once I deployed your token, I checked the balance.",
+        "After it was deployed, I sent the receipt.",
     ] {
         assert!(check(caught).changed, "{caught}");
     }
