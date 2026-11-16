@@ -401,6 +401,18 @@ impl McpHost {
             .contains_key(name)
     }
 
+    /// The configuration of the server that offers the exposed tool `name` now (the route the
+    /// host registered for it; exposed names never collide, so this is exactly one server).
+    pub fn server_for(&self, name: &str) -> Option<ServerConfig> {
+        let idx = self
+            .routes
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+            .map(|r| r.entry)?;
+        self.entries.get(idx).map(|e| e.cfg.clone())
+    }
+
     /// Whether `name` is in the reserved MCP tool namespace.
     pub fn reserved(name: &str) -> bool {
         name.starts_with(TOOL_PREFIX)
