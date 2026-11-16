@@ -13,7 +13,8 @@ stops being true:
    delete it, and this check with it);
 3. today is after EXPIRES (decide again; do not renew by reflex).
 
-EXPIRES moved from 2026-11-09 to 2026-12-16 by owner decision 2026-11-16 (30 days; record:
+EXPIRES is the owner-approved 2026-10-26 window (2027-01-31), which core, chain, comms and
+homestead already carry; moved here from the pre-decision 2026-11-09 on 2026-11-16 (record:
 citrate-security audits/2026-11-16-crypto-bigint-0387-extension). The fix stays the 0.14 curve
 line (citrate-chain#379).
 
@@ -25,7 +26,7 @@ import tomllib
 from datetime import date
 
 ADVISORY = "RUSTSEC-2026-0387"
-EXPIRES = date(2026, 12, 16)
+EXPIRES = date(2027, 1, 31)
 FIXED = (0, 7, 6)
 ALLOWED_USER = "elliptic-curve"
 ALLOWED_USER_LINE = (0, 13)
