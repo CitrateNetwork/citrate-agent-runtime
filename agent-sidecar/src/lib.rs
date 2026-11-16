@@ -324,6 +324,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/tool_results", post(tool_results))
         .route("/sessions/:id/stop", post(stop_session))
+        // #691: a member message for the running chat turn, taken at its next step boundary.
+        .route("/sessions/:id/steer", post(steer_session))
         .route("/sessions/:id/grants", post(replace_grants))
         .route("/sessions/:id/retrieval", get(session_retrieval))
         .route("/sessions/:id/shell/pending", get(shell_pending))
@@ -969,6 +971,7 @@ fn session_status(e: &sessions::SessionError) -> StatusCode {
         sessions::SessionError::TooMany => StatusCode::TOO_MANY_REQUESTS,
         sessions::SessionError::Invalid(_) => StatusCode::BAD_REQUEST,
         sessions::SessionError::NoGrants => StatusCode::CONFLICT,
+        sessions::SessionError::NotSteerable(_) => StatusCode::CONFLICT,
     }
 }
 
@@ -1123,6 +1126,46 @@ async fn tool_results(
     } else {
         // Nothing is waiting for that call (already answered, timed out, or never asked).
         Err(StatusCode::CONFLICT)
+    }
+}
+
+/// #691: `{ "text": … }` for the chat turn running in the session. 202 with how many messages
+/// wait for the next step; 409 when no running chat turn can take it (idle, a workflow, the turn
+/// has answered, or its queue is full), so the client sends it as a new message; 400 for an empty
+/// or too long message.
+async fn steer_session(
+    headers: HeaderMap,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), JsonErr> {
+    let err = |c: StatusCode, m: String| (c, Json(serde_json::json!({ "error": m })));
+    if !authorized(&headers, &st.bearer) {
+        return Err(err(StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    }
+    if st.estop.is_stopped() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "emergency stop engaged".into(),
+        ));
+    }
+    let req: MessageReq = serde_json::from_slice(&body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
+    match st.sessions.steer(&id, &req.text) {
+        Ok(waiting) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "ok": true, "accepted": true, "waiting": waiting })),
+        )),
+        Err(e) => {
+            let msg = match &e {
+                sessions::SessionError::NotSteerable(m) | sessions::SessionError::Invalid(m) => {
+                    m.clone()
+                }
+                sessions::SessionError::NotFound => "no such session".into(),
+                _ => "refused".into(),
+            };
+            Err(err(session_status(&e), msg))
+        }
     }
 }
 
@@ -2571,6 +2614,8 @@ mod sheets_session_tests;
 mod skills_lock_env_tests;
 #[cfg(test)]
 mod skills_session_tests;
+#[cfg(test)]
+mod steer_route_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
